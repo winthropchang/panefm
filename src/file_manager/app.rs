@@ -137,7 +137,7 @@ pub(crate) struct App {
     pub(crate) preview_search: Option<PreviewSearchState>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
-    pub(crate) preview_focus: bool,
+    pub(crate) preview_focus: Option<usize>,
 }
 
 impl App {
@@ -179,7 +179,7 @@ impl App {
             preview_search: None,
             visual_selection: None,
             pending_action: None,
-            preview_focus: false,
+            preview_focus: None,
         })
     }
 
@@ -200,12 +200,12 @@ impl App {
         if self.command_mode {
             return self.handle_command_key(key);
         }
-        if self.preview_focus {
-            return self.handle_preview_key(key);
-        }
         if self.awaiting_ctrl_w {
             self.awaiting_ctrl_w = false;
             return self.handle_ctrl_w(key);
+        }
+        if self.preview_focus == Some(self.focused_pane) {
+            return self.handle_preview_key(key);
         }
 
         let should_continue = match key.code {
@@ -365,7 +365,7 @@ impl App {
                     self.pending_g = false;
                     return Ok(true);
                 }
-                self.preview_focus = false;
+                self.preview_focus = None;
                 self.pending_g = false;
                 self.pending_y = false;
                 self.status = String::from("normal mode");
@@ -416,6 +416,12 @@ impl App {
                 self.current_pane_mut()?.page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.awaiting_ctrl_w = true;
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = String::from("Ctrl-w");
             }
             _ => {
                 self.pending_g = false;
@@ -1173,6 +1179,9 @@ impl App {
             if let Some(layout) = self.layout.clone().close_pane(old_focus) {
                 self.layout = layout;
                 self.panes.remove(&old_focus);
+                if self.preview_focus == Some(old_focus) {
+                    self.preview_focus = None;
+                }
                 self.focused_pane = fallback;
                 self.status = format!("closed pane {old_focus}");
             }
@@ -1184,6 +1193,9 @@ impl App {
         let focused = self.focused_pane;
         self.panes.retain(|id, _| *id == focused);
         self.layout = LayoutNode::Leaf { pane_id: focused };
+        if self.preview_focus != Some(focused) {
+            self.preview_focus = None;
+        }
         self.status = String::from("kept only focused pane");
     }
 
@@ -1286,7 +1298,7 @@ impl App {
 
     /// 進入 preview mode，讓目前焦點 pane 的預覽區放大並接手捲動按鍵。
     pub(crate) fn open_preview_focus(&mut self) {
-        self.preview_focus = true;
+        self.preview_focus = Some(self.focused_pane);
         self.pending_g = false;
         self.pending_y = false;
         self.status = String::from("preview mode");
@@ -1548,7 +1560,9 @@ impl App {
             return true;
         }
 
-        if let Some(pane) = self.panes.get_mut(&self.focused_pane)
+        if let Some(pane) = self
+            .preview_focus
+            .and_then(|pane_id| self.panes.get_mut(&pane_id))
             && pane.has_preview_search()
         {
             pane.clear_preview_search();
@@ -1561,7 +1575,10 @@ impl App {
 
     /// 在 preview mode 中跳到下一個或上一個搜尋結果，並回傳狀態訊息。
     fn jump_preview_match(&mut self, forward: bool) -> io::Result<String> {
-        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
+        let Some(pane) = self
+            .preview_focus
+            .and_then(|pane_id| self.panes.get_mut(&pane_id))
+        else {
             return Ok(String::from("pane no longer exists"));
         };
 
@@ -1799,7 +1816,7 @@ impl App {
                     pane_id,
                     pane,
                     pane_id == self.focused_pane,
-                    self.preview_focus && pane_id == self.focused_pane,
+                    self.preview_focus == Some(pane_id),
                     self.visual_selection.as_ref().and_then(|selection| {
                         (selection.pane_id == pane_id).then_some((selection.anchor, selection.current))
                     }),
@@ -2773,7 +2790,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE))
             .expect("open preview");
-        assert!(app.preview_focus);
+        assert_eq!(app.preview_focus, Some(1));
         assert_eq!(app.status, "preview mode");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
@@ -2786,7 +2803,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("leave preview");
-        assert!(!app.preview_focus);
+        assert_eq!(app.preview_focus, None);
         assert_eq!(app.status, "normal mode");
     }
 
@@ -2895,14 +2912,67 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("clear search");
-        assert!(app.preview_focus);
+        assert_eq!(app.preview_focus, Some(1));
         assert!(!app.panes.get(&1).expect("pane").has_preview_search());
         assert_eq!(app.status, "preview search cleared");
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("leave preview");
-        assert!(!app.preview_focus);
+        assert_eq!(app.preview_focus, None);
         assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 preview mode 中按下 `Ctrl-w l` 可以切換到另一個 pane。
+    fn app_preview_mode_supports_ctrl_w_pane_navigation() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "preview target").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+
+        app.open_preview_focus();
+        assert_eq!(app.preview_focus, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("start ctrl-w");
+        assert!(app.awaiting_ctrl_w);
+        assert_eq!(app.status, "Ctrl-w");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("focus previous pane");
+        assert_eq!(app.focused_pane, 1);
+        assert_eq!(app.preview_focus, Some(2));
+    }
+
+    #[test]
+    /// 驗證 preview 狀態只屬於原本的 pane，切到其他 pane 不會被強制進入 preview mode。
+    fn app_preview_mode_is_scoped_to_its_own_pane() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "beta").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+
+        app.open_preview_focus();
+        assert_eq!(app.preview_focus, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("start ctrl-w");
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("focus previous pane");
+
+        assert_eq!(app.focused_pane, 1);
+        assert_eq!(app.preview_focus, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move in normal mode");
+
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 1);
+        assert_eq!(app.panes.get(&2).expect("pane").preview_scroll, 0);
     }
 
     #[test]
