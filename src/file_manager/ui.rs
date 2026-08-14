@@ -10,17 +10,18 @@ use crate::{
     theme::{Theme, ThemePreset},
 };
 
-use super::{app::RenameMode, pane::PaneState};
+use super::pane::PaneState;
 
-/// 描述 inline rename 視窗目前需要顯示的內容與游標位置。
+/// 描述 inline 編輯器目前需要顯示的內容、標題與游標位置。
 ///
-/// 這個結構只負責把 `App` 的 rename 狀態轉交給 UI，
-/// 讓繪圖函數可以知道目前文字內容、游標在哪裡，以及處於哪一種模式。
+/// 這個結構只負責把 `App` 的輸入狀態轉交給 UI，
+/// 讓繪圖函數可以知道目前文字內容、游標在哪裡、處於哪一種模式，
+/// 還有應該顯示哪一種標題。
 #[derive(Clone, Copy)]
-pub(crate) struct InlineRenameState<'a> {
+pub(crate) struct InlineEditorState<'a> {
     pub(crate) buffer: &'a str,
     pub(crate) cursor: usize,
-    pub(crate) mode: RenameMode,
+    pub(crate) title: &'a str,
 }
 
 /// 繪製單一 pane 的檔案列表與預覽區。
@@ -32,7 +33,7 @@ pub(crate) struct InlineRenameState<'a> {
 /// - `pane: &mut PaneState`，要被渲染的 pane 狀態。
 /// - `focused: bool`，這個 pane 是否具有焦點。
 /// - `theme: Theme`，目前使用中的主題色盤。
-/// - `rename_state: Option<InlineRenameState<'_>>`，若目前正在重新命名，這裡會帶入輸入內容、游標與模式。
+/// - `editor_state: Option<InlineEditorState<'_>>`，若目前有 inline 輸入框，這裡會帶入標題、內容、游標與模式。
 ///
 /// 回傳：`Option<(u16, u16)>`。
 /// - `Some((x, y))` 代表 rename 輸入游標應顯示的位置。
@@ -44,7 +45,7 @@ pub(crate) fn render_pane(
     pane: &mut PaneState,
     focused: bool,
     theme: Theme,
-    rename_state: Option<InlineRenameState<'_>>,
+    editor_state: Option<InlineEditorState<'_>>,
 ) -> Option<(u16, u16)> {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -89,9 +90,9 @@ pub(crate) fn render_pane(
 
     frame.render_stateful_widget(list, chunks[0], &mut pane.list_state);
 
-    let mut rename_cursor = None;
-    if let Some(state) = rename_state {
-        rename_cursor = render_inline_rename(frame, chunks[0], pane, theme, state);
+    let mut editor_cursor = None;
+    if let Some(state) = editor_state {
+        editor_cursor = render_inline_editor(frame, chunks[0], pane, theme, state);
     }
 
     let preview = Paragraph::new(pane.preview_lines(4)).block(
@@ -102,34 +103,34 @@ pub(crate) fn render_pane(
     );
     frame.render_widget(preview, chunks[1]);
 
-    rename_cursor
+    editor_cursor
 }
 
-/// 在目前選取項目下方繪製 inline rename 輸入視窗。
+/// 在列表區域中繪製 inline 輸入視窗，供 rename / create 這類功能重用。
 ///
 /// 參數：
 /// - `frame: &mut ratatui::Frame<'_>`，目前的畫面物件。
 /// - `list_area: Rect`，檔案列表所在的畫面區域。
 /// - `pane: &PaneState`，目前 pane 狀態。
 /// - `theme: Theme`，目前使用中的主題色盤。
-/// - `state: InlineRenameState<'_>`，目前正在編輯的新名稱、游標與模式。
+/// - `state: InlineEditorState<'_>`，目前正在編輯的標題、內容、游標與模式。
 ///
 /// 回傳：`Option<(u16, u16)>`。
 /// - `Some((x, y))` 代表輸入游標應該出現的位置。
 /// - `None` 代表目前沒有足夠空間繪製 rename 區塊。
-fn render_inline_rename(
+fn render_inline_editor(
     frame: &mut ratatui::Frame<'_>,
     list_area: Rect,
     pane: &PaneState,
     theme: Theme,
-    state: InlineRenameState<'_>,
+    state: InlineEditorState<'_>,
 ) -> Option<(u16, u16)> {
-    if pane.entries.is_empty() {
-        return None;
-    }
-
     let inner = Block::default().borders(Borders::ALL).inner(list_area);
-    let selected_row = inner.y.saturating_add(pane.selected as u16);
+    let selected_row = if pane.entries.is_empty() {
+        inner.y
+    } else {
+        inner.y.saturating_add(pane.selected as u16)
+    };
     let box_y = selected_row.saturating_add(1);
 
     if box_y.saturating_add(2) >= inner.y.saturating_add(inner.height) {
@@ -146,10 +147,7 @@ fn render_inline_rename(
     frame.render_widget(Clear, input_area);
     let input_block = Block::default()
         .title(Line::from(Span::styled(
-            match state.mode {
-                RenameMode::Insert => " Rename (insert): ",
-                RenameMode::Normal => " Rename (normal): ",
-            },
+            state.title,
             theme.accent_style().add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)

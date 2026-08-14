@@ -16,7 +16,7 @@ use crate::{
 use super::{
     layout::{LayoutNode, SplitDirection},
     pane::PaneState,
-    ui::{InlineRenameState, centered_rect, render_confirm_dialog, render_pane, render_theme_picker},
+    ui::{InlineEditorState, centered_rect, render_confirm_dialog, render_pane, render_theme_picker},
 };
 
 /// 表示 rename 輸入框目前採用的編輯模式。
@@ -65,6 +65,12 @@ pub(crate) enum PendingAction {
     Rename {
         pane_id: usize,
         original_name: String,
+        buffer: String,
+        cursor: usize,
+        mode: RenameMode,
+    },
+    CreateEntry {
+        pane_id: usize,
         buffer: String,
         cursor: usize,
         mode: RenameMode,
@@ -209,6 +215,12 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.start_rename();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('a') => {
+                self.start_create_entry();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -501,6 +513,185 @@ impl App {
                     }
                 },
             },
+            PendingAction::CreateEntry {
+                pane_id,
+                mut buffer,
+                mut cursor,
+                mut mode,
+            } => match mode {
+                RenameMode::Insert => match key.code {
+                    KeyCode::Char(c) => {
+                        insert_char(&mut buffer, &mut cursor, c);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("insert");
+                    }
+                    KeyCode::Backspace => {
+                        backspace_char(&mut buffer, &mut cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("insert");
+                    }
+                    KeyCode::Left => {
+                        cursor = cursor.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Right => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Enter => {
+                        self.confirm_create_entry(pane_id, &buffer)?;
+                    }
+                    KeyCode::Esc => {
+                        mode = RenameMode::Normal;
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("normal");
+                    }
+                    _ => {
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                },
+                RenameMode::Normal => match key.code {
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        cursor = cursor.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('0') => {
+                        cursor = 0;
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('$') => {
+                        cursor = rename_line_end_cursor(&buffer);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('w') => {
+                        cursor = rename_next_word_start(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('b') => {
+                        cursor = rename_previous_word_start(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('e') => {
+                        cursor = rename_word_end(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('i') => {
+                        mode = RenameMode::Insert;
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("insert");
+                    }
+                    KeyCode::Char('a') => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        mode = RenameMode::Insert;
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("insert");
+                    }
+                    KeyCode::Char('A') => {
+                        cursor = buffer.chars().count();
+                        mode = RenameMode::Insert;
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("insert");
+                    }
+                    KeyCode::Enter => {
+                        self.confirm_create_entry(pane_id, &buffer)?;
+                    }
+                    KeyCode::Esc => {
+                        self.status = String::from("create cancelled");
+                    }
+                    _ => {
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                },
+            },
         }
 
         Ok(true)
@@ -547,6 +738,7 @@ impl App {
         match command {
             "q" => self.status = String::from("use q in normal mode to quit"),
             "rename" => self.start_rename(),
+            "create" => self.start_create_entry(),
             "copy" => self.copy_selected(),
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
@@ -560,6 +752,8 @@ impl App {
             other => {
                 if let Some(name) = other.strip_prefix("theme ") {
                     self.set_theme_by_name(name.trim());
+                } else if let Some(name) = other.strip_prefix("create ") {
+                    self.create_entry_from_command(name)?;
                 } else {
                     self.status = format!("unknown command: {other}");
                 }
@@ -716,6 +910,23 @@ impl App {
         self.status = String::from("rename: insert");
     }
 
+    /// 開始建立新檔案流程，打開一個可直接輸入名稱的 inline 編輯器。
+    ///
+    /// 參數：無。
+    /// 回傳：`()`
+    /// 打開一個可直接輸入建立路徑的 inline 編輯器。
+    ///
+    /// 回傳：`()`
+    pub(crate) fn start_create_entry(&mut self) {
+        self.pending_action = Some(PendingAction::CreateEntry {
+            pane_id: self.focused_pane,
+            buffer: String::new(),
+            cursor: 0,
+            mode: RenameMode::Insert,
+        });
+        self.status = create_status_label("insert");
+    }
+
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
         let Some(entry) = self
@@ -776,6 +987,50 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// 真正執行建立新項目的檔案系統操作。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，要建立項目的目標 pane。
+    /// - `path: &str`，新項目的相對路徑。
+    ///
+    /// 回傳：`io::Result<()>`。
+    pub(crate) fn confirm_create_entry(
+        &mut self,
+        pane_id: usize,
+        path: &str,
+    ) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        match pane.create_entry(path) {
+            Ok(created_name) => {
+                let item_type = if created_name.ends_with('/') {
+                    "directory"
+                } else {
+                    "file"
+                };
+                self.status = format!("created {item_type}: {created_name}");
+            }
+            Err(error) => {
+                self.status = format!("failed to create entry: {error}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 讓命令模式可以直接建立新項目，而不必再開啟 inline 輸入框。
+    ///
+    /// 參數：
+    /// - `path: &str`，命令列中指定的新路徑。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn create_entry_from_command(&mut self, path: &str) -> io::Result<()> {
+        self.confirm_create_entry(self.focused_pane, path)
     }
 
     /// 將目前選取項目放進內部剪貼簿，模式為複製。
@@ -924,10 +1179,23 @@ impl App {
                         cursor,
                         mode,
                         ..
-                    }) if *rename_pane_id == pane_id => Some(InlineRenameState {
+                    }) if *rename_pane_id == pane_id => Some(InlineEditorState {
                         buffer: buffer.as_str(),
                         cursor: *cursor,
-                        mode: *mode,
+                        title: match mode {
+                            RenameMode::Insert => " Rename (insert): ",
+                            RenameMode::Normal => " Rename (normal): ",
+                        },
+                    }),
+                    Some(PendingAction::CreateEntry {
+                        pane_id: create_pane_id,
+                        buffer,
+                        cursor,
+                        mode,
+                    }) if *create_pane_id == pane_id => Some(InlineEditorState {
+                        buffer: buffer.as_str(),
+                        cursor: *cursor,
+                        title: create_editor_title(*mode),
                     }),
                     _ => None,
                 };
@@ -965,8 +1233,12 @@ impl App {
             Span::raw(" delete  "),
             Span::styled("r", self.theme.accent_style()),
             Span::raw(" rename  "),
+            Span::styled("a", self.theme.accent_style()),
+            Span::raw(" create  "),
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
+            Span::styled(":create", self.theme.accent_style()),
+            Span::raw("  "),
             Span::styled(":split :vsplit :close :only", self.theme.accent_style()),
             Span::raw("  "),
             Span::styled(":theme", self.theme.accent_style()),
@@ -998,7 +1270,7 @@ impl App {
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
-            Some(PendingAction::Rename { .. }) => {}
+            Some(PendingAction::Rename { .. }) | Some(PendingAction::CreateEntry { .. }) => {}
             None => {}
         }
 
@@ -1015,9 +1287,23 @@ impl App {
     /// - `None` 代表目前沒有 rename 輸入框，不需要特別切換。
     pub(crate) fn rename_cursor_mode(&self) -> Option<RenameMode> {
         match self.pending_action {
-            Some(PendingAction::Rename { mode, .. }) => Some(mode),
+            Some(PendingAction::Rename { mode, .. })
+            | Some(PendingAction::CreateEntry { mode, .. }) => Some(mode),
             _ => None,
         }
+    }
+}
+
+/// 回傳建立流程的狀態列內容，讓使用者知道目前正處於哪一種編輯模式。
+fn create_status_label(mode: &str) -> String {
+    format!("create entry: {mode}")
+}
+
+/// 依照編輯模式決定建立輸入框的標題文字。
+fn create_editor_title(mode: RenameMode) -> &'static str {
+    match mode {
+        RenameMode::Insert => " Create (append / for dir): ",
+        RenameMode::Normal => " Create (normal): ",
     }
 }
 
@@ -1579,5 +1865,78 @@ mod tests {
         assert!(target_dir.join("beta.txt").exists());
         assert!(app.clipboard.is_none());
         assert_eq!(app.status, "moved: beta.txt");
+    }
+
+    #[test]
+    /// 驗證按下 `o` 後會打開建立新檔案的 inline 輸入框。
+    fn app_start_create_entry_opens_inline_editor() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.start_create_entry();
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::CreateEntry {
+                pane_id: 1,
+                buffer: String::new(),
+                cursor: 0,
+                mode: RenameMode::Insert,
+            })
+        );
+    }
+
+    #[test]
+    /// 驗證命令模式可以直接建立一般檔案與結尾 `/` 的資料夾。
+    fn app_create_commands_create_entries_without_inline_prompt() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.execute_command("create alpha.txt").expect("create file");
+        assert!(dir.path().join("alpha.txt").exists());
+        assert_eq!(app.status, "created file: alpha.txt");
+
+        app.execute_command("create docs/").expect("create dir");
+        assert!(dir.path().join("docs").is_dir());
+        assert_eq!(app.status, "created directory: docs/");
+    }
+
+    #[test]
+    /// 驗證建立流程的 inline 輸入框在 Enter 後會真的建立檔案。
+    fn app_create_file_confirm_creates_entry() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::CreateEntry {
+            pane_id: 1,
+            buffer: String::from("draft.md"),
+            cursor: 8,
+            mode: RenameMode::Insert,
+        });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("create file");
+
+        assert!(dir.path().join("draft.md").exists());
+        assert_eq!(app.status, "created file: draft.md");
+    }
+
+    #[test]
+    /// 驗證建立流程支援巢狀路徑，會先補齊父目錄再建立檔案。
+    fn app_create_nested_file_from_inline_prompt() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::CreateEntry {
+            pane_id: 1,
+            buffer: String::from("test/gg.txt"),
+            cursor: 11,
+            mode: RenameMode::Insert,
+        });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("create nested file");
+
+        assert!(dir.path().join("test").is_dir());
+        assert!(dir.path().join("test").join("gg.txt").exists());
+        assert_eq!(app.status, "created file: test/gg.txt");
     }
 }

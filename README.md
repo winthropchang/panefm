@@ -22,6 +22,10 @@ The app loads config from the first existing path in this order:
 - `yy`: copy the selected file or directory into the internal clipboard
 - `x`: cut the selected file or directory into the internal clipboard
 - `p`: paste the clipboard item into the current directory
+- `a`: create a new entry in the current directory
+  - end the path with `/` to create a directory
+  - omit the trailing `/` to create a file
+  - nested paths like `test/gg.txt` create missing parent directories automatically
 - `Ctrl-w s`: horizontal split
 - `Ctrl-w v`: vertical split
 - `Ctrl-w h j k l`: switch pane focus
@@ -30,6 +34,7 @@ The app loads config from the first existing path in this order:
 - `d`: delete selected file or directory with confirmation
 - `r`: open rename dialog for the selected item
 - `:rename`: open rename dialog for the selected item
+- `:create`, `:create <path>`
 - `:copy`, `:cut`, `:paste`
 - `:split`, `:vsplit`, `:close`, `:only`
 - `:theme`: open the theme picker

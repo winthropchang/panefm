@@ -1,6 +1,6 @@
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use ratatui::{text::Line, widgets::ListState};
@@ -305,6 +305,70 @@ impl PaneState {
 
         Ok(display_name)
     }
+
+    /// 依照輸入路徑建立新項目。
+    ///
+    /// 規則：
+    /// - 結尾有 `/` 代表建立資料夾。
+    /// - 沒有 `/` 結尾代表建立檔案。
+    /// - 中間若包含路徑分隔符，會先建立缺少的父目錄。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要建立項目的目標 pane。
+    /// - `input: &str`，使用者輸入的建立路徑。
+    ///
+    /// 回傳：`io::Result<String>`。
+    /// - 成功時回傳新項目的顯示名稱。
+    /// - 失敗時回傳名稱無效、已存在或建立失敗的錯誤。
+    pub(crate) fn create_entry(&mut self, input: &str) -> io::Result<String> {
+        let request = parse_create_input(input)?;
+        let new_path = self.cwd.join(&request.relative_path);
+
+        if request.is_directory {
+            fs::create_dir_all(
+                new_path
+                    .parent()
+                    .filter(|parent| *parent != self.cwd.as_path())
+                    .unwrap_or(&self.cwd),
+            )?;
+            fs::create_dir(&new_path)?;
+        } else {
+            if let Some(parent) = new_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&new_path)?;
+        }
+
+        self.reload()?;
+        let focus_path = if request.relative_path.components().count() > 1 {
+            match request.relative_path.components().next() {
+                Some(Component::Normal(first)) => self.cwd.join(first),
+                _ => new_path.clone(),
+            }
+        } else {
+            new_path.clone()
+        };
+        self.select_path(&focus_path);
+
+        Ok(request.display_name)
+    }
+
+    /// 將選取狀態移到指定路徑，方便在建立或貼上後立刻聚焦新項目。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要更新選取狀態的 pane。
+    /// - `path: &Path`，希望聚焦的新項目路徑。
+    ///
+    /// 回傳：`()`
+    fn select_path(&mut self, path: &Path) {
+        if let Some(index) = self.entries.iter().position(|candidate| candidate.path == path) {
+            self.selected = index;
+            self.list_state.select(Some(index));
+        }
+    }
 }
 
 /// 計算指定資料夾內的子項目數量。
@@ -511,6 +575,72 @@ fn target_path_file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 驗證新建立項目的名稱是否可用，避免空白名稱或直接包含路徑分隔符。
+///
+/// 參數：
+/// - `name: &str`，使用者輸入的新名稱。
+///
+/// 回傳：`io::Result<&str>`。
+/// - 成功時回傳去除前後空白後的名稱。
+/// - 失敗時回傳名稱無效的錯誤。
+fn validate_new_entry_name(name: &str) -> io::Result<&str> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "name cannot be empty",
+        ));
+    }
+
+    Ok(trimmed_name)
+}
+
+/// 描述一次建立請求解析後的結果。
+struct CreateRequest {
+    relative_path: PathBuf,
+    display_name: String,
+    is_directory: bool,
+}
+
+/// 解析建立輸入，決定要建立檔案還是資料夾，並驗證路徑是否安全。
+fn parse_create_input(input: &str) -> io::Result<CreateRequest> {
+    let trimmed = validate_new_entry_name(input)?;
+    let is_directory = trimmed.ends_with('/');
+    let normalized = trimmed.trim_end_matches('/');
+    if normalized.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "name cannot be empty",
+        ));
+    }
+
+    let relative_path = PathBuf::from(normalized);
+    for component in relative_path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path must stay inside current directory",
+                ));
+            }
+        }
+    }
+
+    let display_name = if is_directory {
+        format!("{normalized}/")
+    } else {
+        normalized.to_string()
+    };
+
+    Ok(CreateRequest {
+        relative_path,
+        display_name,
+        is_directory,
+    })
+}
+
 /// 將畫面顯示用的名稱轉回實際檔案名稱，移除資料夾顯示用的尾端 `/`。
 ///
 /// 參數：
@@ -690,5 +820,67 @@ mod tests {
         assert!(dir.path().join("docs copy 2").is_dir());
         assert!(dir.path().join("docs copy").join("note.txt").exists());
         assert!(dir.path().join("docs copy 2").join("note.txt").exists());
+    }
+
+    #[test]
+    /// 驗證 `PaneState` 可以依照一般名稱建立新檔案並將焦點移到新檔案。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若檔案未建立或選取狀態錯誤則測試失敗。
+    fn pane_state_create_plain_file_adds_new_entry() {
+        let dir = tempdir().expect("tempdir");
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+
+        let created = pane.create_entry("note.txt").expect("create file");
+
+        assert_eq!(created, "note.txt");
+        assert!(dir.path().join("note.txt").exists());
+        assert_eq!(
+            pane.selected_entry().map(FileEntry::display_name),
+            Some(String::from("note.txt"))
+        );
+    }
+
+    #[test]
+    /// 驗證 `PaneState` 可以依照結尾 `/` 建立新資料夾並將焦點移到新資料夾。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若資料夾未建立或選取狀態錯誤則測試失敗。
+    fn pane_state_create_directory_from_trailing_slash_adds_new_entry() {
+        let dir = tempdir().expect("tempdir");
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+
+        let created = pane
+            .create_entry("workspace/")
+            .expect("create directory");
+
+        assert_eq!(created, "workspace/");
+        assert!(dir.path().join("workspace").is_dir());
+        assert_eq!(
+            pane.selected_entry().map(FileEntry::display_name),
+            Some(String::from("workspace/"))
+        );
+    }
+
+    #[test]
+    /// 驗證巢狀建立會自動補齊父目錄，並在最後建立檔案。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若父目錄未建立或檔案未建立則測試失敗。
+    fn pane_state_create_nested_file_builds_parent_directories() {
+        let dir = tempdir().expect("tempdir");
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+
+        let created = pane
+            .create_entry("test/gg.txt")
+            .expect("create nested file");
+
+        assert_eq!(created, "test/gg.txt");
+        assert!(dir.path().join("test").is_dir());
+        assert!(dir.path().join("test").join("gg.txt").exists());
+        assert_eq!(
+            pane.selected_entry().map(FileEntry::display_name),
+            Some(String::from("test/"))
+        );
     }
 }
