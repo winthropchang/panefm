@@ -49,6 +49,12 @@ pub(crate) enum ClipboardOperation {
 pub(crate) struct ClipboardEntry {
     pub(crate) source_path: PathBuf,
     pub(crate) display_name: String,
+}
+
+/// 表示目前內部剪貼簿保存的一批項目與其操作模式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClipboardState {
+    pub(crate) entries: Vec<ClipboardEntry>,
     pub(crate) operation: ClipboardOperation,
 }
 
@@ -66,6 +72,14 @@ pub(crate) struct PreviewSearchState {
     pub(crate) pane_id: usize,
     pub(crate) buffer: String,
     pub(crate) editing: bool,
+}
+
+/// 記錄目前是否處於範圍標記模式，以及起點和目前游標位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisualSelectionState {
+    pub(crate) pane_id: usize,
+    pub(crate) anchor: usize,
+    pub(crate) current: usize,
 }
 
 /// 表示目前正在等待使用者完成的暫時互動。
@@ -118,9 +132,10 @@ pub(crate) struct App {
     pub(crate) awaiting_ctrl_w: bool,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
-    pub(crate) clipboard: Option<ClipboardEntry>,
+    pub(crate) clipboard: Option<ClipboardState>,
     pub(crate) filter: Option<FilterState>,
     pub(crate) preview_search: Option<PreviewSearchState>,
+    pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) preview_focus: bool,
 }
@@ -162,6 +177,7 @@ impl App {
             clipboard: None,
             filter: None,
             preview_search: None,
+            visual_selection: None,
             pending_action: None,
             preview_focus: false,
         })
@@ -177,6 +193,9 @@ impl App {
         }
         if self.preview_search.as_ref().is_some_and(|search| search.editing) {
             return self.handle_preview_search_input_key(key);
+        }
+        if self.visual_selection.is_some() {
+            return self.handle_visual_selection_key(key);
         }
         if self.command_mode {
             return self.handle_command_key(key);
@@ -252,6 +271,12 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.start_rename();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('V') => {
+                self.open_visual_selection()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -395,6 +420,51 @@ impl App {
             _ => {
                 self.pending_g = false;
                 self.status = String::from("preview mode");
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// 處理 visual selection 模式下的鍵盤輸入。
+    pub(crate) fn handle_visual_selection_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Char('V') => {
+                self.commit_visual_selection()?;
+            }
+            KeyCode::Esc => {
+                self.commit_visual_selection()?;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.current_pane_mut()?.move_down();
+                self.sync_visual_selection_cursor();
+                self.status = self.visual_status_label();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.current_pane_mut()?.move_up();
+                self.sync_visual_selection_cursor();
+                self.status = self.visual_status_label();
+            }
+            KeyCode::Char('g') => {
+                if self.pending_g {
+                    self.current_pane_mut()?.move_top();
+                    self.sync_visual_selection_cursor();
+                    self.pending_g = false;
+                    self.status = self.visual_status_label();
+                } else {
+                    self.pending_g = true;
+                    self.status = String::from("visual: pending g");
+                }
+            }
+            KeyCode::Char('G') => {
+                self.current_pane_mut()?.move_bottom();
+                self.sync_visual_selection_cursor();
+                self.pending_g = false;
+                self.status = self.visual_status_label();
+            }
+            _ => {
+                self.pending_g = false;
+                self.status = self.visual_status_label();
             }
         }
 
@@ -975,6 +1045,11 @@ impl App {
             return;
         }
 
+        if self.has_any_marks() {
+            self.clear_all_marks();
+            return;
+        }
+
         self.status = String::from("normal mode");
     }
 
@@ -1001,6 +1076,7 @@ impl App {
             "copy" => self.copy_selected(),
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
+            "unmark" | "unmark-all" => self.clear_marks_in_focused_pane()?,
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
             "theme" => self.open_theme_picker(),
@@ -1234,23 +1310,116 @@ impl App {
         self.preview_search = Some(search);
     }
 
+    /// 進入 visual selection 模式，準備用移動游標的方式框選一段範圍。
+    fn open_visual_selection(&mut self) -> io::Result<()> {
+        let pane_id = self.focused_pane;
+        let selected = self.current_pane_mut()?.selected;
+        self.visual_selection = Some(VisualSelectionState {
+            pane_id,
+            anchor: selected,
+            current: selected,
+        });
+        self.pending_g = false;
+        self.pending_y = false;
+        self.status = String::from("visual: range selection");
+        Ok(())
+    }
+
+    /// 將目前 visual selection 範圍加入已標記清單，並回到一般模式。
+    fn commit_visual_selection(&mut self) -> io::Result<()> {
+        let Some(selection) = self.visual_selection.take() else {
+            return Ok(());
+        };
+        let Some(pane) = self.panes.get_mut(&selection.pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        let added = pane.mark_range(selection.anchor, selection.current);
+        self.status = format!("marked {added} items");
+        self.pending_g = false;
+        Ok(())
+    }
+
+    /// 當 visual selection 模式中游標移動後，更新目前選取範圍的尾端。
+    fn sync_visual_selection_cursor(&mut self) {
+        if let Some(selection) = &mut self.visual_selection
+            && let Some(pane) = self.panes.get(&selection.pane_id)
+        {
+            selection.current = pane.selected;
+        }
+    }
+
+    /// 回傳 visual selection 狀態列文字，包含目前暫時框選的項目數量。
+    fn visual_status_label(&self) -> String {
+        match &self.visual_selection {
+            Some(selection) => {
+                let count = selection.anchor.abs_diff(selection.current) + 1;
+                format!("visual: selecting {count} items")
+            }
+            None => String::from("normal mode"),
+        }
+    }
+
+    /// 清除目前焦點 pane 中所有標記。
+    fn clear_marks_in_focused_pane(&mut self) -> io::Result<()> {
+        let pane = self.current_pane_mut()?;
+        let count = pane.marked_count();
+        pane.clear_marks();
+        self.status = if count == 0 {
+            String::from("no marks to clear")
+        } else {
+            format!("cleared {count} marks")
+        };
+        Ok(())
+    }
+
+    /// 判斷目前是否仍有任何 pane 保留已提交的標記。
+    fn has_any_marks(&self) -> bool {
+        self.panes.values().any(|pane| pane.marked_count() > 0)
+    }
+
+    /// 清掉所有 pane 的已提交標記，讓整個畫面回到一般模式。
+    fn clear_all_marks(&mut self) {
+        let mut cleared = 0usize;
+        for pane in self.panes.values_mut() {
+            cleared += pane.marked_count();
+            pane.clear_marks();
+        }
+
+        self.pending_g = false;
+        self.pending_y = false;
+        self.status = if cleared == 0 {
+            String::from("normal mode")
+        } else {
+            format!("cleared {cleared} marks")
+        };
+    }
+
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
-        let Some(entry) = self
-            .panes
-            .get(&self.focused_pane)
-            .and_then(PaneState::selected_entry)
-            .cloned()
-        else {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
             self.status = String::from("nothing selected to delete");
             return;
         };
 
+        let entries = pane.selected_or_marked_entries();
+        if entries.is_empty() {
+            self.status = String::from("nothing selected to delete");
+            return;
+        }
+
+        let target_name = if entries.len() == 1 {
+            entries[0].display_name()
+        } else {
+            format!("{} items", entries.len())
+        };
+
         self.pending_action = Some(PendingAction::ConfirmDelete {
             pane_id: self.focused_pane,
-            target_name: entry.display_name(),
+            target_name: target_name.clone(),
         });
-        self.status = format!("confirm delete {}: y/n", entry.display_name());
+        self.status = format!("confirm delete {target_name}: y/n");
     }
 
     /// 真正執行刪除目前待確認項目的檔案系統操作。
@@ -1260,9 +1429,16 @@ impl App {
             return Ok(());
         };
 
-        match pane.delete_selected() {
-            Ok(Some(removed_name)) => self.status = format!("deleted {removed_name}"),
-            Ok(None) => self.status = String::from("nothing selected to delete"),
+        match pane.delete_selected_or_marked() {
+            Ok(removed_names) if removed_names.is_empty() => {
+                self.status = String::from("nothing selected to delete");
+            }
+            Ok(removed_names) if removed_names.len() == 1 => {
+                self.status = format!("deleted {}", removed_names[0]);
+            }
+            Ok(removed_names) => {
+                self.status = format!("deleted {} items", removed_names.len());
+            }
             Err(error) => self.status = format!("failed to delete {target_name}: {error}"),
         }
 
@@ -1453,12 +1629,7 @@ impl App {
     ///
     /// 回傳：`()`
     fn store_selected_in_clipboard(&mut self, operation: ClipboardOperation) {
-        let Some(entry) = self
-            .panes
-            .get(&self.focused_pane)
-            .and_then(PaneState::selected_entry)
-            .cloned()
-        else {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
             self.status = match operation {
                 ClipboardOperation::Copy => String::from("nothing selected to copy"),
                 ClipboardOperation::Cut => String::from("nothing selected to cut"),
@@ -1466,17 +1637,34 @@ impl App {
             return;
         };
 
-        let display_name = entry.display_name();
+        let entries: Vec<ClipboardEntry> = pane
+            .selected_or_marked_entries()
+            .into_iter()
+            .map(|entry| {
+                let display_name = entry.display_name();
+                ClipboardEntry {
+                    source_path: entry.path,
+                    display_name,
+                }
+            })
+            .collect();
 
-        self.clipboard = Some(ClipboardEntry {
-            source_path: entry.path,
-            display_name: display_name.clone(),
-            operation,
-        });
+        if entries.is_empty() {
+            self.status = match operation {
+                ClipboardOperation::Copy => String::from("nothing selected to copy"),
+                ClipboardOperation::Cut => String::from("nothing selected to cut"),
+            };
+            return;
+        }
+
+        let count = entries.len();
+        self.clipboard = Some(ClipboardState { entries, operation });
 
         self.status = match operation {
-            ClipboardOperation::Copy => format!("copied {display_name}"),
-            ClipboardOperation::Cut => format!("cut {display_name}"),
+            ClipboardOperation::Copy if count == 1 => String::from("copied 1 item"),
+            ClipboardOperation::Copy => format!("copied {count} items"),
+            ClipboardOperation::Cut if count == 1 => String::from("cut 1 item"),
+            ClipboardOperation::Cut => format!("cut {count} items"),
         };
     }
 
@@ -1501,39 +1689,48 @@ impl App {
             }
         };
 
-        if clipboard.source_path.parent() == Some(target_dir.as_path())
-            && clipboard.operation == ClipboardOperation::Cut
-        {
-            self.status = format!("{} is already in this directory", clipboard.display_name);
+        let mut pasted_count = 0usize;
+        for entry in &clipboard.entries {
+            if entry.source_path.parent() == Some(target_dir.as_path())
+                && clipboard.operation == ClipboardOperation::Cut
+            {
+                continue;
+            }
+
+            let paste_result = match self.panes.get_mut(&self.focused_pane) {
+                Some(pane) => match clipboard.operation {
+                    ClipboardOperation::Copy => pane.copy_entry_into_current_dir(&entry.source_path),
+                    ClipboardOperation::Cut => pane.move_entry_into_current_dir(&entry.source_path),
+                },
+                None => {
+                    self.status = String::from("pane no longer exists");
+                    return Ok(());
+                }
+            };
+
+            if let Err(error) = paste_result {
+                self.status = format!("paste failed for {}: {error}", entry.display_name);
+                return Ok(());
+            }
+
+            pasted_count += 1;
+        }
+
+        if pasted_count == 0 {
+            self.status = String::from("nothing to paste into this directory");
             return Ok(());
         }
 
-        let paste_result = match self.panes.get_mut(&self.focused_pane) {
-            Some(pane) => match clipboard.operation {
-                ClipboardOperation::Copy => pane.copy_entry_into_current_dir(&clipboard.source_path),
-                ClipboardOperation::Cut => pane.move_entry_into_current_dir(&clipboard.source_path),
-            },
-            None => {
-                self.status = String::from("pane no longer exists");
-                return Ok(());
-            }
+        self.reload_all_panes()?;
+        self.status = match clipboard.operation {
+            ClipboardOperation::Copy if pasted_count == 1 => String::from("pasted copy: 1 item"),
+            ClipboardOperation::Copy => format!("pasted copy: {pasted_count} items"),
+            ClipboardOperation::Cut if pasted_count == 1 => String::from("moved: 1 item"),
+            ClipboardOperation::Cut => format!("moved: {pasted_count} items"),
         };
 
-        match paste_result {
-            Ok(pasted_name) => {
-                self.reload_all_panes()?;
-                self.status = match clipboard.operation {
-                    ClipboardOperation::Copy => format!("pasted copy: {pasted_name}"),
-                    ClipboardOperation::Cut => format!("moved: {pasted_name}"),
-                };
-
-                if clipboard.operation == ClipboardOperation::Cut {
-                    self.clipboard = None;
-                }
-            }
-            Err(error) => {
-                self.status = format!("paste failed for {}: {error}", clipboard.display_name);
-            }
+        if clipboard.operation == ClipboardOperation::Cut {
+            self.clipboard = None;
         }
 
         Ok(())
@@ -1603,6 +1800,9 @@ impl App {
                     pane,
                     pane_id == self.focused_pane,
                     self.preview_focus && pane_id == self.focused_pane,
+                    self.visual_selection.as_ref().and_then(|selection| {
+                        (selection.pane_id == pane_id).then_some((selection.anchor, selection.current))
+                    }),
                     self.theme,
                     rename_buffer,
                 );
@@ -1617,6 +1817,8 @@ impl App {
             Span::raw(" move  "),
             Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
+            Span::styled("V", self.theme.accent_style()),
+            Span::raw(" visual mark  "),
             Span::styled("yy", self.theme.accent_style()),
             Span::raw(" copy  "),
             Span::styled("x", self.theme.accent_style()),
@@ -2270,6 +2472,7 @@ mod tests {
             app.clipboard.as_ref().map(|entry| entry.operation),
             Some(ClipboardOperation::Copy)
         );
+        assert_eq!(app.clipboard.as_ref().map(|entry| entry.entries.len()), Some(1));
 
         app.current_pane_mut().expect("pane").cwd = target_dir.clone();
         app.current_pane_mut().expect("pane").reload().expect("reload");
@@ -2278,7 +2481,7 @@ mod tests {
 
         assert!(source_file.exists());
         assert!(target_dir.join("alpha.txt").exists());
-        assert_eq!(app.status, "pasted copy: alpha.txt");
+        assert_eq!(app.status, "pasted copy: 1 item");
     }
 
     #[test]
@@ -2301,6 +2504,7 @@ mod tests {
             app.clipboard.as_ref().map(|entry| entry.operation),
             Some(ClipboardOperation::Cut)
         );
+        assert_eq!(app.clipboard.as_ref().map(|entry| entry.entries.len()), Some(1));
 
         app.current_pane_mut().expect("pane").cwd = target_dir.clone();
         app.current_pane_mut().expect("pane").reload().expect("reload");
@@ -2310,7 +2514,7 @@ mod tests {
         assert!(!source_file.exists());
         assert!(target_dir.join("beta.txt").exists());
         assert!(app.clipboard.is_none());
-        assert_eq!(app.status, "moved: beta.txt");
+        assert_eq!(app.status, "moved: 1 item");
     }
 
     #[test]
@@ -2699,5 +2903,139 @@ mod tests {
             .expect("leave preview");
         assert!(!app.preview_focus);
         assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證可以用 `V` 視覺標記多個項目，並一次放進剪貼簿。
+    fn app_visual_marked_entries_copy_into_clipboard_as_batch() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("pending copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy batch");
+
+        let clipboard = app.clipboard.as_ref().expect("clipboard");
+        assert_eq!(clipboard.operation, ClipboardOperation::Copy);
+        assert_eq!(clipboard.entries.len(), 2);
+        assert_eq!(app.status, "copied 2 items");
+    }
+
+    #[test]
+    /// 驗證 `V` 視覺標記多個項目後，刪除確認會一次刪掉整批項目。
+    fn app_visual_marked_entries_delete_as_batch() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha.txt");
+        let beta = dir.path().join("beta.txt");
+        fs::write(&alpha, "a").expect("alpha");
+        fs::write(&beta, "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+        app.start_delete_confirmation();
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmDelete { ref target_name, .. }) if target_name == "2 items"
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm delete batch");
+
+        assert!(!alpha.exists());
+        assert!(!beta.exists());
+        assert_eq!(app.status, "deleted 2 items");
+    }
+
+    #[test]
+    /// 驗證 `V` 進入 visual selection 後，移動游標再按一次 `V` 會提交整段標記。
+    fn app_visual_selection_commits_range_marks() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+        fs::write(dir.path().join("gamma.txt"), "c").expect("gamma");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down again");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert!(app.visual_selection.is_none());
+        assert_eq!(pane.marked_count(), 3);
+        assert_eq!(app.status, "marked 3 items");
+    }
+
+    #[test]
+    /// 驗證 visual selection 按下 `Esc` 會先提交這一段範圍並離開選取模式。
+    fn app_visual_selection_escape_commits_current_range() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+        fs::write(dir.path().join("gamma.txt"), "c").expect("gamma");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit first range");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move to third");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open second visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("move back");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("commit second visual");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert!(app.visual_selection.is_none());
+        assert_eq!(pane.marked_count(), 3);
+        assert_eq!(app.status, "marked 1 items");
+    }
+
+    #[test]
+    /// 驗證離開選取模式後再按一次 `Esc`，會清掉目前所有已提交標記。
+    fn app_escape_in_normal_mode_clears_all_marks() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear all marks");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert!(app.visual_selection.is_none());
+        assert_eq!(pane.marked_count(), 0);
+        assert_eq!(app.status, "cleared 2 marks");
     }
 }

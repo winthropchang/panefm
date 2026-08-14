@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::BTreeSet,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     fs, io,
@@ -45,6 +46,8 @@ pub(crate) struct PaneState {
     pub(crate) preview_viewport_height: usize,
     /// 目前 preview 內搜尋使用的查詢字串。
     pub(crate) preview_search_query: Option<String>,
+    /// 目前在這個 pane 中已被標記的項目路徑。
+    pub(crate) marked_paths: BTreeSet<PathBuf>,
 }
 
 /// 描述 pane 目前使用的排序方式。
@@ -125,6 +128,7 @@ impl PaneState {
             preview_scroll: 0,
             preview_viewport_height: 4,
             preview_search_query: None,
+            marked_paths: BTreeSet::new(),
         };
         pane.reload()?;
         Ok(pane)
@@ -140,6 +144,8 @@ impl PaneState {
     /// - 失敗時代表讀目錄過程發生 I/O 錯誤。
     pub(crate) fn reload(&mut self) -> io::Result<()> {
         self.entries = read_dir_entries(&self.cwd)?;
+        self.marked_paths
+            .retain(|path| self.entries.iter().any(|entry| &entry.path == path));
         self.sort_entries();
         self.refresh_visible_entries();
         Ok(())
@@ -217,6 +223,63 @@ impl PaneState {
         self.visible_indices
             .get(self.selected)
             .and_then(|index| self.entries.get(*index))
+    }
+
+    /// 判斷指定項目是否已被標記。
+    pub(crate) fn is_marked(&self, entry: &FileEntry) -> bool {
+        self.marked_paths.contains(&entry.path)
+    }
+
+    /// 回傳目前 pane 裡被標記的項目數量。
+    pub(crate) fn marked_count(&self) -> usize {
+        self.marked_paths.len()
+    }
+
+    /// 清除目前 pane 中所有已標記項目。
+    pub(crate) fn clear_marks(&mut self) {
+        self.marked_paths.clear();
+    }
+
+    /// 將索引範圍內的項目加入標記集合，並回傳實際新增了多少項目。
+    pub(crate) fn mark_range(&mut self, start: usize, end: usize) -> usize {
+        if self.visible_indices.is_empty() {
+            return 0;
+        }
+
+        let range_start = start.min(end);
+        let range_end = start.max(end).min(self.visible_indices.len().saturating_sub(1));
+        let mut added = 0usize;
+
+        for visible_index in range_start..=range_end {
+            let Some(entry_index) = self.visible_indices.get(visible_index) else {
+                continue;
+            };
+            let Some(entry) = self.entries.get(*entry_index) else {
+                continue;
+            };
+            if self.marked_paths.insert(entry.path.clone()) {
+                added += 1;
+            }
+        }
+
+        added
+    }
+
+    /// 回傳目前應該參與批次操作的項目清單。
+    ///
+    /// 規則：
+    /// - 若已有標記項目，優先回傳所有標記項目。
+    /// - 若沒有標記項目，則回傳目前選取項目。
+    pub(crate) fn selected_or_marked_entries(&self) -> Vec<FileEntry> {
+        if !self.marked_paths.is_empty() {
+            self.entries
+                .iter()
+                .filter(|entry| self.marked_paths.contains(&entry.path))
+                .cloned()
+                .collect()
+        } else {
+            self.selected_entry().cloned().into_iter().collect()
+        }
     }
 
     /// 回傳目前列表實際可見的項目，供畫面渲染使用。
@@ -459,6 +522,7 @@ impl PaneState {
     /// - `Ok(Some(name))` 代表成功刪除，並回傳顯示名稱。
     /// - `Ok(None)` 代表目前沒有可刪除的選取項目。
     /// - `Err(...)` 代表檔案系統操作失敗。
+    #[allow(dead_code)]
     pub(crate) fn delete_selected(&mut self) -> io::Result<Option<String>> {
         let Some(entry) = self.selected_entry().cloned() else {
             return Ok(None);
@@ -473,6 +537,33 @@ impl PaneState {
         let removed_name = entry.display_name();
         self.reload()?;
         Ok(Some(removed_name))
+    }
+
+    /// 刪除目前選取項目，或是所有已標記項目。
+    ///
+    /// 回傳：
+    /// - `Ok(vec![...])` 代表成功刪除的顯示名稱清單。
+    /// - `Ok(vec![])` 代表目前沒有可刪除項目。
+    /// - `Err(...)` 代表檔案系統操作失敗。
+    pub(crate) fn delete_selected_or_marked(&mut self) -> io::Result<Vec<String>> {
+        let entries = self.selected_or_marked_entries();
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut removed_names = Vec::new();
+        for entry in entries {
+            if entry.is_dir {
+                fs::remove_dir_all(&entry.path)?;
+            } else {
+                fs::remove_file(&entry.path)?;
+            }
+            removed_names.push(entry.display_name());
+        }
+
+        self.marked_paths.clear();
+        self.reload()?;
+        Ok(removed_names)
     }
 
     /// 重新命名目前選取的檔案或資料夾。

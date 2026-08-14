@@ -46,9 +46,12 @@ pub(crate) fn render_pane(
     pane: &mut PaneState,
     focused: bool,
     preview_focused: bool,
+    visual_range: Option<(usize, usize)>,
     theme: Theme,
     editor_state: Option<InlineEditorState<'_>>,
 ) -> Option<(u16, u16)> {
+    let visual_mode_active = visual_range.is_some();
+    let mark_column_active = visual_mode_active || pane.marked_count() > 0;
     let preview_height = area.height.saturating_sub(8).clamp(5, 10);
     let list_height = area.height.saturating_sub(8).clamp(4, 8);
     let chunks = Layout::default()
@@ -67,11 +70,17 @@ pub(crate) fn render_pane(
     };
 
     let filter_suffix = if pane.has_active_filter() { "  [filter]" } else { "" };
+    let mark_suffix = if pane.marked_count() > 0 {
+        format!("  [mark: {}]", pane.marked_count())
+    } else {
+        String::new()
+    };
     let title = format!(
-        " pane {}  {}{}  [sort: {}]",
+        " pane {}  {}{}{}  [sort: {}]",
         pane_id,
         pane.cwd.display(),
         filter_suffix,
+        mark_suffix,
         pane.sort_mode.label()
     );
     let block = Block::default()
@@ -87,7 +96,24 @@ pub(crate) fn render_pane(
     } else {
         visible_entries
             .into_iter()
-            .map(|entry| ListItem::new(render_entry_line(entry, detail_kind, content_width, theme)))
+            .enumerate()
+            .map(|entry| {
+                ListItem::new(render_entry_line(
+                    entry.1,
+                    pane.is_marked(entry.1),
+                    mark_column_active,
+                    visual_range
+                        .map(|(start, end)| {
+                            let range_start = start.min(end);
+                            let range_end = start.max(end);
+                            entry.0 >= range_start && entry.0 <= range_end
+                        })
+                        .unwrap_or(false),
+                    detail_kind,
+                    content_width,
+                    theme,
+                ))
+            })
             .collect()
     };
 
@@ -348,11 +374,19 @@ pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, the
 /// 根據目前排序模式，產生單一列表列的顯示內容。
 fn render_entry_line(
     entry: &super::entry::FileEntry,
+    marked: bool,
+    mark_column_active: bool,
+    visual_selected: bool,
     detail_kind: SortDetailKind,
     width: usize,
     theme: Theme,
 ) -> Line<'static> {
-    let name = entry.display_name();
+    let marker = if mark_column_active {
+        if marked || visual_selected { "[*] " } else { "    " }
+    } else {
+        ""
+    };
+    let name = format!("{marker}{}", entry.display_name());
     let detail = format_sort_detail(entry, detail_kind);
     if detail.is_empty() || width < 8 {
         return Line::from(name);
