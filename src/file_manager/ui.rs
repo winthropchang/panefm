@@ -58,17 +58,23 @@ pub(crate) fn render_pane(
         theme.muted_style()
     };
 
-    let title = format!(" pane {}  {}", pane_id, pane.cwd.display());
+    let filter_suffix = if pane.has_active_filter() {
+        "  [filter]"
+    } else {
+        ""
+    };
+    let title = format!(" pane {}  {}{}", pane_id, pane.cwd.display(), filter_suffix);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let items: Vec<ListItem<'static>> = if pane.entries.is_empty() {
+    let visible_entries = pane.visible_entries();
+    let items: Vec<ListItem<'static>> = if visible_entries.is_empty() {
         vec![ListItem::new(Line::from("empty directory"))]
     } else {
-        pane.entries
-            .iter()
+        visible_entries
+            .into_iter()
             .map(|entry| {
                 let detail = if entry.is_dir {
                     String::from("dir")
@@ -194,6 +200,41 @@ pub(crate) fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect
         .split(vertical[1]);
 
     horizontal[1]
+}
+
+/// 在畫面右上方繪製 filter 輸入框，並回傳游標應該停留的位置。
+pub(crate) fn render_filter_input(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    buffer: &str,
+) -> (u16, u16) {
+    let width = area.width.min(32).max(18);
+    let input_area = Rect {
+        x: area.x + area.width.saturating_sub(width + 1),
+        y: area.y + 1,
+        width,
+        height: 3,
+    };
+
+    frame.render_widget(Clear, input_area);
+    let input_block = Block::default()
+        .title(Line::from(Span::styled(
+            " Filter ",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+    let input_inner = input_block.inner(input_area);
+    frame.render_widget(
+        Paragraph::new(buffer.to_string()).block(input_block),
+        input_area,
+    );
+
+    (
+        input_inner.x.saturating_add(buffer.chars().count() as u16),
+        input_inner.y,
+    )
 }
 
 /// 繪製刪除確認視窗。

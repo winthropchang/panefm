@@ -26,6 +26,9 @@ The app loads config from the first existing path in this order:
   - end the path with `/` to create a directory
   - omit the trailing `/` to create a file
   - nested paths like `test/gg.txt` create missing parent directories automatically
+- `f`: open the filter box on the right side and filter results while typing
+  - first `Esc`: hide the input box but keep the filtered result list
+  - second `Esc`: clear the filter and return to the normal list
 - `Ctrl-w s`: horizontal split
 - `Ctrl-w v`: vertical split
 - `Ctrl-w h j k l`: switch pane focus

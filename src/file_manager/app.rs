@@ -16,7 +16,10 @@ use crate::{
 use super::{
     layout::{LayoutNode, SplitDirection},
     pane::PaneState,
-    ui::{InlineEditorState, centered_rect, render_confirm_dialog, render_pane, render_theme_picker},
+    ui::{
+        InlineEditorState, centered_rect, render_confirm_dialog, render_filter_input, render_pane,
+        render_theme_picker,
+    },
 };
 
 /// 表示 rename 輸入框目前採用的編輯模式。
@@ -47,6 +50,14 @@ pub(crate) struct ClipboardEntry {
     pub(crate) source_path: PathBuf,
     pub(crate) display_name: String,
     pub(crate) operation: ClipboardOperation,
+}
+
+/// 記錄目前 filter 的目標 pane、查詢字串與是否仍在輸入中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilterState {
+    pub(crate) pane_id: usize,
+    pub(crate) buffer: String,
+    pub(crate) editing: bool,
 }
 
 /// 表示目前正在等待使用者完成的暫時互動。
@@ -97,6 +108,7 @@ pub(crate) struct App {
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
     pub(crate) clipboard: Option<ClipboardEntry>,
+    pub(crate) filter: Option<FilterState>,
     pub(crate) pending_action: Option<PendingAction>,
 }
 
@@ -135,6 +147,7 @@ impl App {
             pending_g: false,
             pending_y: false,
             clipboard: None,
+            filter: None,
             pending_action: None,
         })
     }
@@ -143,6 +156,9 @@ impl App {
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if self.pending_action.is_some() {
             return self.handle_pending_action_key(key);
+        }
+        if self.filter.as_ref().is_some_and(|filter| filter.editing) {
+            return self.handle_filter_input_key(key);
         }
         if self.command_mode {
             return self.handle_command_key(key);
@@ -219,6 +235,12 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            KeyCode::Char('f') => {
+                self.open_filter_input();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             KeyCode::Char('a') => {
                 self.start_create_entry();
                 self.pending_g = false;
@@ -258,7 +280,7 @@ impl App {
             KeyCode::Esc => {
                 self.pending_g = false;
                 self.pending_y = false;
-                self.status = String::from("normal mode");
+                self.handle_escape_in_normal_mode();
                 true
             }
             _ => {
@@ -269,6 +291,50 @@ impl App {
         };
 
         Ok(should_continue)
+    }
+
+    /// 處理 filter 輸入框中的鍵盤輸入，並在每次輸入後立即更新列表。
+    pub(crate) fn handle_filter_input_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(mut filter) = self.filter.take() else {
+            return Ok(true);
+        };
+
+        match key.code {
+            KeyCode::Char(c) => {
+                filter.buffer.push(c);
+                self.apply_filter_buffer(&filter);
+                self.status = if filter.buffer.is_empty() {
+                    String::from("filter: all")
+                } else {
+                    format!("filter: {}", filter.buffer)
+                };
+                self.filter = Some(filter);
+            }
+            KeyCode::Backspace => {
+                filter.buffer.pop();
+                self.apply_filter_buffer(&filter);
+                self.status = if filter.buffer.is_empty() {
+                    String::from("filter: all")
+                } else {
+                    format!("filter: {}", filter.buffer)
+                };
+                self.filter = Some(filter);
+            }
+            KeyCode::Esc | KeyCode::Enter => {
+                filter.editing = false;
+                self.status = if filter.buffer.is_empty() {
+                    String::from("filter active")
+                } else {
+                    format!("filter locked: {}", filter.buffer)
+                };
+                self.filter = Some(filter);
+            }
+            _ => {
+                self.filter = Some(filter);
+            }
+        }
+
+        Ok(true)
     }
 
     /// 處理暫時互動視窗的按鍵事件。
@@ -719,6 +785,27 @@ impl App {
         Ok(true)
     }
 
+    /// 在一般模式按下 `Esc` 時，優先處理 filter 的兩段式離開流程。
+    fn handle_escape_in_normal_mode(&mut self) {
+        if let Some(filter) = self.filter.take() {
+            if filter.editing {
+                self.filter = Some(FilterState {
+                    editing: false,
+                    ..filter
+                });
+                self.status = String::from("filter active");
+            } else {
+                if let Some(pane) = self.panes.get_mut(&filter.pane_id) {
+                    pane.clear_filter();
+                }
+                self.status = String::from("normal mode");
+            }
+            return;
+        }
+
+        self.status = String::from("normal mode");
+    }
+
     /// 處理 `Ctrl-w` 前綴後的 pane 操作命令。
     pub(crate) fn handle_ctrl_w(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
@@ -927,6 +1014,18 @@ impl App {
         self.status = create_status_label("insert");
     }
 
+    /// 打開 filter 輸入框，並以目前焦點 pane 作為過濾目標。
+    pub(crate) fn open_filter_input(&mut self) {
+        let filter = FilterState {
+            pane_id: self.focused_pane,
+            buffer: String::new(),
+            editing: true,
+        };
+        self.apply_filter_buffer(&filter);
+        self.status = String::from("filter: all");
+        self.filter = Some(filter);
+    }
+
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
         let Some(entry) = self
@@ -1031,6 +1130,13 @@ impl App {
     /// 回傳：`io::Result<()>`。
     fn create_entry_from_command(&mut self, path: &str) -> io::Result<()> {
         self.confirm_create_entry(self.focused_pane, path)
+    }
+
+    /// 將 filter 文字套用到指定 pane。
+    fn apply_filter_buffer(&mut self, filter: &FilterState) {
+        if let Some(pane) = self.panes.get_mut(&filter.pane_id) {
+            pane.set_filter_query(&filter.buffer);
+        }
     }
 
     /// 將目前選取項目放進內部剪貼簿，模式為複製。
@@ -1235,6 +1341,8 @@ impl App {
             Span::raw(" rename  "),
             Span::styled("a", self.theme.accent_style()),
             Span::raw(" create  "),
+            Span::styled("f", self.theme.accent_style()),
+            Span::raw(" filter  "),
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
@@ -1261,6 +1369,15 @@ impl App {
                     .block(Block::default().title("Command").borders(Borders::ALL)),
                 area,
             );
+        }
+
+        if let Some(filter) = &self.filter
+            && filter.editing
+        {
+            let filter_cursor = render_filter_input(frame, outer[0], self.theme, &filter.buffer);
+            if cursor_position.is_none() {
+                cursor_position = Some(filter_cursor);
+            }
         }
 
         match &self.pending_action {
@@ -1503,7 +1620,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, ClipboardOperation, PendingAction, RenameMode, rename_basename_cursor, rename_next_word_start,
+        App, ClipboardOperation, FilterState, PendingAction, RenameMode, rename_basename_cursor, rename_next_word_start,
         rename_previous_word_start, rename_word_end,
     };
     use crate::{
@@ -1938,5 +2055,96 @@ mod tests {
         assert!(dir.path().join("test").is_dir());
         assert!(dir.path().join("test").join("gg.txt").exists());
         assert_eq!(app.status, "created file: test/gg.txt");
+    }
+
+    #[test]
+    /// 驗證 filter 輸入時會立即過濾列表，第一次 Esc 只收起輸入框。
+    fn app_filter_esc_once_keeps_filtered_results() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open filter");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type filter");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close input");
+
+        let pane = app.panes.get(&1).expect("pane");
+        let visible_names: Vec<String> = pane
+            .visible_entries()
+            .into_iter()
+            .map(|entry| entry.display_name())
+            .collect();
+
+        assert_eq!(visible_names, vec![String::from("alpha.txt"), String::from("beta.txt")]);
+        assert!(app.filter.as_ref().is_some_and(|filter| !filter.editing));
+        assert_eq!(app.status, "filter locked: a");
+    }
+
+    #[test]
+    /// 驗證 filter 第二次 Esc 會完全清掉過濾狀態並恢復一般畫面。
+    fn app_filter_esc_twice_clears_filter() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open filter");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("type filter");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close input");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear filter");
+
+        let pane = app.panes.get(&1).expect("pane");
+        let visible_names: Vec<String> = pane
+            .visible_entries()
+            .into_iter()
+            .map(|entry| entry.display_name())
+            .collect();
+
+        assert_eq!(
+            visible_names,
+            vec![String::from("alpha.txt"), String::from("beta.txt")]
+        );
+        assert!(app.filter.is_none());
+        assert!(!pane.has_active_filter());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證連續重新開啟 filter 時，不會殘留上一輪輸入的關鍵字。
+    fn app_reopening_filter_starts_with_empty_buffer() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open filter");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("type filter");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close input");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear filter");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("reopen filter");
+
+        assert_eq!(
+            app.filter,
+            Some(FilterState {
+                pane_id: 1,
+                buffer: String::new(),
+                editing: true,
+            })
+        );
+        assert_eq!(app.status, "filter: all");
     }
 }

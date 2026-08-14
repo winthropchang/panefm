@@ -21,6 +21,10 @@ pub(crate) struct PaneState {
     pub(crate) selected: usize,
     /// `ratatui` 的列表狀態，供畫面渲染使用。
     pub(crate) list_state: ListState,
+    /// 目前啟用中的過濾字串，`None` 代表沒有啟用 filter。
+    pub(crate) filter_query: Option<String>,
+    /// 目前實際顯示在列表中的項目索引。
+    pub(crate) visible_indices: Vec<usize>,
 }
 
 impl PaneState {
@@ -38,6 +42,8 @@ impl PaneState {
             entries: Vec::new(),
             selected: 0,
             list_state: ListState::default(),
+            filter_query: None,
+            visible_indices: Vec::new(),
         };
         pane.reload()?;
         Ok(pane)
@@ -53,13 +59,7 @@ impl PaneState {
     /// - 失敗時代表讀目錄過程發生 I/O 錯誤。
     pub(crate) fn reload(&mut self) -> io::Result<()> {
         self.entries = read_dir_entries(&self.cwd)?;
-        if self.entries.is_empty() {
-            self.selected = 0;
-            self.list_state.select(None);
-        } else {
-            self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-            self.list_state.select(Some(self.selected));
-        }
+        self.refresh_visible_entries();
         Ok(())
     }
 
@@ -70,7 +70,7 @@ impl PaneState {
     ///
     /// 回傳：`()`
     pub(crate) fn move_up(&mut self) {
-        if self.entries.is_empty() {
+        if self.visible_indices.is_empty() {
             return;
         }
         self.selected = self.selected.saturating_sub(1);
@@ -84,10 +84,10 @@ impl PaneState {
     ///
     /// 回傳：`()`
     pub(crate) fn move_down(&mut self) {
-        if self.entries.is_empty() {
+        if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(self.entries.len().saturating_sub(1));
+        self.selected = (self.selected + 1).min(self.visible_indices.len().saturating_sub(1));
         self.list_state.select(Some(self.selected));
     }
 
@@ -98,7 +98,7 @@ impl PaneState {
     ///
     /// 回傳：`()`
     pub(crate) fn move_top(&mut self) {
-        if self.entries.is_empty() {
+        if self.visible_indices.is_empty() {
             return;
         }
         self.selected = 0;
@@ -112,10 +112,10 @@ impl PaneState {
     ///
     /// 回傳：`()`
     pub(crate) fn move_bottom(&mut self) {
-        if self.entries.is_empty() {
+        if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = self.entries.len() - 1;
+        self.selected = self.visible_indices.len() - 1;
         self.list_state.select(Some(self.selected));
     }
 
@@ -128,7 +128,17 @@ impl PaneState {
     /// - `Some(...)` 代表有選取項目。
     /// - `None` 代表目前目錄為空。
     pub(crate) fn selected_entry(&self) -> Option<&FileEntry> {
-        self.entries.get(self.selected)
+        self.visible_indices
+            .get(self.selected)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    /// 回傳目前列表實際可見的項目，供畫面渲染使用。
+    pub(crate) fn visible_entries(&self) -> Vec<&FileEntry> {
+        self.visible_indices
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .collect()
     }
 
     /// 若目前選到的是資料夾，則進入該資料夾。
@@ -145,6 +155,7 @@ impl PaneState {
         {
             self.cwd = entry.path.clone();
             self.selected = 0;
+            self.filter_query = None;
             self.reload()?;
         }
         Ok(())
@@ -162,6 +173,7 @@ impl PaneState {
         if let Some(parent) = self.cwd.parent() {
             self.cwd = parent.to_path_buf();
             self.selected = 0;
+            self.filter_query = None;
             self.reload()?;
         }
         Ok(())
@@ -238,9 +250,14 @@ impl PaneState {
         self.reload()?;
 
         if let Some(index) = self
-            .entries
+            .visible_indices
             .iter()
-            .position(|candidate| candidate.path == new_path)
+            .position(|visible_index| {
+                self.entries
+                    .get(*visible_index)
+                    .map(|candidate| candidate.path == new_path)
+                    .unwrap_or(false)
+            })
         {
             self.selected = index;
             self.list_state.select(Some(index));
@@ -269,9 +286,14 @@ impl PaneState {
 
         let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
         if let Some(index) = self
-            .entries
+            .visible_indices
             .iter()
-            .position(|candidate| candidate.path == pasted_path)
+            .position(|visible_index| {
+                self.entries
+                    .get(*visible_index)
+                    .map(|candidate| candidate.path == pasted_path)
+                    .unwrap_or(false)
+            })
         {
             self.selected = index;
             self.list_state.select(Some(index));
@@ -295,9 +317,14 @@ impl PaneState {
 
         let moved_path = self.cwd.join(trimmed_display_name(&display_name));
         if let Some(index) = self
-            .entries
+            .visible_indices
             .iter()
-            .position(|candidate| candidate.path == moved_path)
+            .position(|visible_index| {
+                self.entries
+                    .get(*visible_index)
+                    .map(|candidate| candidate.path == moved_path)
+                    .unwrap_or(false)
+            })
         {
             self.selected = index;
             self.list_state.select(Some(index));
@@ -364,9 +391,60 @@ impl PaneState {
     ///
     /// 回傳：`()`
     fn select_path(&mut self, path: &Path) {
-        if let Some(index) = self.entries.iter().position(|candidate| candidate.path == path) {
+        if let Some(index) = self.visible_indices.iter().position(|visible_index| {
+            self.entries
+                .get(*visible_index)
+                .map(|candidate| candidate.path == path)
+                .unwrap_or(false)
+        }) {
             self.selected = index;
             self.list_state.select(Some(index));
+        }
+    }
+
+    /// 套用新的 filter 字串，並立即更新可見清單。
+    pub(crate) fn set_filter_query(&mut self, query: &str) {
+        let trimmed = query.trim();
+        self.filter_query = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        self.refresh_visible_entries();
+    }
+
+    /// 清除目前的 filter，恢復成顯示全部項目。
+    pub(crate) fn clear_filter(&mut self) {
+        self.filter_query = None;
+        self.refresh_visible_entries();
+    }
+
+    /// 判斷目前是否仍處於過濾後的列表狀態。
+    pub(crate) fn has_active_filter(&self) -> bool {
+        self.filter_query.is_some()
+    }
+
+    /// 重新計算目前實際應該顯示的項目與選取位置。
+    fn refresh_visible_entries(&mut self) {
+        self.visible_indices = match &self.filter_query {
+            Some(query) => {
+                let query = query.to_lowercase();
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.name.to_lowercase().contains(&query))
+                    .map(|(index, _)| index)
+                    .collect()
+            }
+            None => (0..self.entries.len()).collect(),
+        };
+
+        if self.visible_indices.is_empty() {
+            self.selected = 0;
+            self.list_state.select(None);
+        } else {
+            self.selected = self.selected.min(self.visible_indices.len().saturating_sub(1));
+            self.list_state.select(Some(self.selected));
         }
     }
 }
