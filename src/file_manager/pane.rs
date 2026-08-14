@@ -319,11 +319,12 @@ impl PaneState {
     /// - 成功時代表已回到父目錄或目前已無父目錄。
     /// - 失敗時代表重新載入父目錄內容時發生錯誤。
     pub(crate) fn go_parent(&mut self) -> io::Result<()> {
+        let current_dir = self.cwd.clone();
         if let Some(parent) = self.cwd.parent() {
             self.cwd = parent.to_path_buf();
-            self.selected = 0;
             self.filter_query = None;
             self.reload()?;
+            self.select_path(&current_dir);
         }
         Ok(())
     }
@@ -1615,16 +1616,22 @@ mod tests {
     /// 回傳：無；若目錄切換行為錯誤則測試失敗。
     fn pane_state_enters_and_leaves_directories() {
         let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("alpha")).expect("alpha dir");
         let child = dir.path().join("child");
         fs::create_dir(&child).expect("child dir");
         fs::write(child.join("note.txt"), "hello").expect("note");
 
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        pane.move_down();
         pane.enter_selected().expect("enter child");
         assert_eq!(pane.cwd, child);
 
         pane.go_parent().expect("back parent");
         assert_eq!(pane.cwd, dir.path());
+        assert_eq!(
+            pane.selected_entry().map(FileEntry::display_name),
+            Some(String::from("child/"))
+        );
     }
 
     #[test]
