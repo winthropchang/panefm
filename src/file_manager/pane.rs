@@ -25,6 +25,8 @@ pub(crate) struct PaneState {
     pub(crate) filter_query: Option<String>,
     /// 目前實際顯示在列表中的項目索引。
     pub(crate) visible_indices: Vec<usize>,
+    /// 是否顯示以 `.` 開頭的隱藏檔案與資料夾。
+    pub(crate) show_hidden: bool,
 }
 
 impl PaneState {
@@ -44,6 +46,7 @@ impl PaneState {
             list_state: ListState::default(),
             filter_query: None,
             visible_indices: Vec::new(),
+            show_hidden: false,
         };
         pane.reload()?;
         Ok(pane)
@@ -424,6 +427,12 @@ impl PaneState {
         self.filter_query.is_some()
     }
 
+    /// 切換目前 pane 是否顯示隱藏檔。
+    pub(crate) fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.refresh_visible_entries();
+    }
+
     /// 重新計算目前實際應該顯示的項目與選取位置。
     fn refresh_visible_entries(&mut self) {
         self.visible_indices = match &self.filter_query {
@@ -432,11 +441,18 @@ impl PaneState {
                 self.entries
                     .iter()
                     .enumerate()
+                    .filter(|(_, entry)| self.show_hidden || !is_hidden_name(&entry.name))
                     .filter(|(_, entry)| entry.name.to_lowercase().contains(&query))
                     .map(|(index, _)| index)
                     .collect()
             }
-            None => (0..self.entries.len()).collect(),
+            None => self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| self.show_hidden || !is_hidden_name(&entry.name))
+                .map(|(index, _)| index)
+                .collect(),
         };
 
         if self.visible_indices.is_empty() {
@@ -447,6 +463,11 @@ impl PaneState {
             self.list_state.select(Some(self.selected));
         }
     }
+}
+
+/// 判斷檔名是否屬於隱藏檔或隱藏資料夾。
+fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 /// 計算指定資料夾內的子項目數量。
@@ -959,6 +980,33 @@ mod tests {
         assert_eq!(
             pane.selected_entry().map(FileEntry::display_name),
             Some(String::from("test/"))
+        );
+    }
+
+    #[test]
+    /// 驗證預設不顯示隱藏檔，切換後才會出現在列表中。
+    fn pane_state_toggle_hidden_changes_visible_entries() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".secret"), "s").expect("hidden");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("normal");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let initial_names: Vec<String> = pane
+            .visible_entries()
+            .into_iter()
+            .map(FileEntry::display_name)
+            .collect();
+        assert_eq!(initial_names, vec![String::from("alpha.txt")]);
+
+        pane.toggle_hidden();
+        let toggled_names: Vec<String> = pane
+            .visible_entries()
+            .into_iter()
+            .map(FileEntry::display_name)
+            .collect();
+        assert_eq!(
+            toggled_names,
+            vec![String::from(".secret"), String::from("alpha.txt")]
         );
     }
 }

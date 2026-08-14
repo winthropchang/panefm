@@ -241,6 +241,12 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            KeyCode::Char('.') => {
+                self.toggle_hidden_files()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             KeyCode::Char('a') => {
                 self.start_create_entry();
                 self.pending_g = false;
@@ -1139,6 +1145,18 @@ impl App {
         }
     }
 
+    /// 切換目前焦點 pane 的隱藏檔顯示狀態。
+    fn toggle_hidden_files(&mut self) -> io::Result<()> {
+        let pane = self.current_pane_mut()?;
+        pane.toggle_hidden();
+        self.status = if pane.show_hidden {
+            String::from("showing hidden files")
+        } else {
+            String::from("hiding hidden files")
+        };
+        Ok(())
+    }
+
     /// 將目前選取項目放進內部剪貼簿，模式為複製。
     ///
     /// 參數：無。
@@ -1343,6 +1361,8 @@ impl App {
             Span::raw(" create  "),
             Span::styled("f", self.theme.accent_style()),
             Span::raw(" filter  "),
+            Span::styled(".", self.theme.accent_style()),
+            Span::raw(" hidden  "),
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
@@ -2146,5 +2166,44 @@ mod tests {
             })
         );
         assert_eq!(app.status, "filter: all");
+    }
+
+    #[test]
+    /// 驗證按下 `.` 後會顯示隱藏檔，並可與 filter 一起使用。
+    fn app_toggle_hidden_reveals_hidden_entries_and_works_with_filter() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".secret"), "s").expect("hidden");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("normal");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        let initial_names: Vec<String> = app
+            .panes
+            .get(&1)
+            .expect("pane")
+            .visible_entries()
+            .into_iter()
+            .map(|entry| entry.display_name())
+            .collect();
+        assert_eq!(initial_names, vec![String::from("alpha.txt")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .expect("toggle hidden");
+        assert_eq!(app.status, "showing hidden files");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open filter");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("filter hidden");
+
+        let filtered_names: Vec<String> = app
+            .panes
+            .get(&1)
+            .expect("pane")
+            .visible_entries()
+            .into_iter()
+            .map(|entry| entry.display_name())
+            .collect();
+        assert_eq!(filtered_names, vec![String::from(".secret")]);
     }
 }

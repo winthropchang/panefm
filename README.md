@@ -29,6 +29,7 @@ The app loads config from the first existing path in this order:
 - `f`: open the filter box on the right side and filter results while typing
   - first `Esc`: hide the input box but keep the filtered result list
   - second `Esc`: clear the filter and return to the normal list
+- `.`: toggle hidden files and directories
 - `Ctrl-w s`: horizontal split
 - `Ctrl-w v`: vertical split
 - `Ctrl-w h j k l`: switch pane focus
