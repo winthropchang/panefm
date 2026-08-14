@@ -3,7 +3,6 @@ use std::{
     fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::Result;
@@ -20,10 +19,18 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+pub mod config;
 pub mod theme;
 
+use crate::config::{AppConfig, load_config};
 use crate::theme::{Theme, ThemePreset};
 
+/// 啟動整個 terminal file manager。
+///
+/// 參數：無。
+/// 回傳：`Result<()>`。
+/// - 成功時代表 TUI 已正常啟動並在結束後完成清理。
+/// - 失敗時代表初始化、事件迴圈或終端還原流程中出現錯誤。
 pub fn run() -> Result<()> {
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal);
@@ -31,6 +38,12 @@ pub fn run() -> Result<()> {
     result
 }
 
+/// 建立並初始化 TUI 所需的 terminal 環境。
+///
+/// 參數：無。
+/// 回傳：`Result<Terminal<CrosstermBackend<Stdout>>>`。
+/// - 成功時回傳已進入 alternate screen 並啟用 raw mode 的 terminal。
+/// - 失敗時回傳終端初始化相關錯誤。
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -39,6 +52,14 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(backend)?)
 }
 
+/// 將 terminal 從 TUI 狀態恢復成一般命令列狀態。
+///
+/// 參數：
+/// - `terminal: &mut Terminal<CrosstermBackend<Stdout>>`，目前使用中的 terminal 實例。
+///
+/// 回傳：`Result<()>`。
+/// - 成功時代表 raw mode 與 alternate screen 都已正確還原。
+/// - 失敗時代表終端清理過程發生錯誤。
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -46,14 +67,26 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
+/// 執行主事件迴圈，負責持續重畫畫面並接收鍵盤輸入。
+///
+/// 參數：
+/// - `terminal: &mut Terminal<CrosstermBackend<Stdout>>`，要被用來渲染畫面的 terminal。
+///
+/// 回傳：`Result<()>`。
+/// - 成功時代表使用者正常離開應用程式。
+/// - 失敗時代表設定檔載入、事件讀取或畫面更新過程出錯。
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let mut app = App::new(cwd)?;
+    let loaded_config = load_config(&cwd)?;
+    let poll_rate = loaded_config.config.poll_rate;
+    let mut app = App::new(cwd, loaded_config)?;
 
     loop {
+        // 每一輪都先完整重畫，再依照設定好的 poll rate 等待輸入。
+        // 這種事件迴圈結構很常見於 TUI 程式：畫面與輸入共用同一個主循環。
         terminal.draw(|frame| app.render(frame))?;
 
-        if event::poll(Duration::from_millis(150))?
+        if event::poll(poll_rate)?
             && let Event::Key(key) = event::read()?
             && !app.handle_key(key)?
         {
@@ -64,6 +97,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     Ok(())
 }
 
+/// 表示目錄列表中的單一檔案或資料夾項目。
+///
+/// 這個結構是檔案瀏覽清單與預覽系統共用的最小單位資料。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileEntry {
     name: String,
@@ -73,6 +109,14 @@ struct FileEntry {
 }
 
 impl FileEntry {
+    /// 產生適合顯示在列表中的名稱。
+    ///
+    /// 參數：
+    /// - `self: &FileEntry`，目前的檔案項目。
+    ///
+    /// 回傳：`String`。
+    /// - 若是資料夾，名稱尾端會補上 `/`。
+    /// - 若是一般檔案，直接回傳原名稱。
     fn display_name(&self) -> String {
         if self.is_dir {
             format!("{}/", self.name)
@@ -82,8 +126,14 @@ impl FileEntry {
     }
 }
 
+/// 表示單一 pane 的完整瀏覽狀態。
+///
+/// 每個 pane 都獨立維護自己的目錄、游標與列表狀態，
+/// 這樣分割視窗後每個區塊才可以各自操作。
 #[derive(Debug)]
 struct PaneState {
+    // 每個 pane 都有自己的 cwd 與選取狀態，
+    // 這樣分割視窗後，每個窗格才能獨立瀏覽不同目錄。
     cwd: PathBuf,
     entries: Vec<FileEntry>,
     selected: usize,
@@ -91,6 +141,14 @@ struct PaneState {
 }
 
 impl PaneState {
+    /// 建立一個新的 pane 狀態，並立即載入指定目錄內容。
+    ///
+    /// 參數：
+    /// - `cwd: PathBuf`，這個 pane 啟動時要顯示的目錄。
+    ///
+    /// 回傳：`io::Result<PaneState>`。
+    /// - 成功時回傳已載入目錄內容的 pane。
+    /// - 失敗時回傳讀取目錄時發生的 I/O 錯誤。
     fn new(cwd: PathBuf) -> io::Result<Self> {
         let mut pane = Self {
             cwd,
@@ -102,8 +160,18 @@ impl PaneState {
         Ok(pane)
     }
 
+    /// 重新掃描目前目錄，並同步更新列表與游標位置。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要被更新的 pane 狀態。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表目錄內容已重新載入。
+    /// - 失敗時代表讀目錄過程發生 I/O 錯誤。
     fn reload(&mut self) -> io::Result<()> {
         self.entries = read_dir_entries(&self.cwd)?;
+        // reload 後要重新修正 selected，
+        // 否則刪除檔案或切換目錄後，舊索引可能會超出範圍。
         if self.entries.is_empty() {
             self.selected = 0;
             self.list_state.select(None);
@@ -114,6 +182,12 @@ impl PaneState {
         Ok(())
     }
 
+    /// 將列表選取游標向上移動一格。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要被移動游標的 pane。
+    ///
+    /// 回傳：`()`
     fn move_up(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -122,6 +196,12 @@ impl PaneState {
         self.list_state.select(Some(self.selected));
     }
 
+    /// 將列表選取游標向下移動一格。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要被移動游標的 pane。
+    ///
+    /// 回傳：`()`
     fn move_down(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -130,6 +210,12 @@ impl PaneState {
         self.list_state.select(Some(self.selected));
     }
 
+    /// 將列表選取游標跳到最上方。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要被更新的 pane。
+    ///
+    /// 回傳：`()`
     fn move_top(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -138,6 +224,12 @@ impl PaneState {
         self.list_state.select(Some(self.selected));
     }
 
+    /// 將列表選取游標跳到最下方。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要被更新的 pane。
+    ///
+    /// 回傳：`()`
     fn move_bottom(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -146,10 +238,26 @@ impl PaneState {
         self.list_state.select(Some(self.selected));
     }
 
+    /// 取得目前游標指向的檔案項目。
+    ///
+    /// 參數：
+    /// - `self: &PaneState`，目前的 pane 狀態。
+    ///
+    /// 回傳：`Option<&FileEntry>`。
+    /// - `Some(...)` 代表有選取項目。
+    /// - `None` 代表目前目錄為空。
     fn selected_entry(&self) -> Option<&FileEntry> {
         self.entries.get(self.selected)
     }
 
+    /// 若目前選到的是資料夾，則進入該資料夾。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要切換目錄的 pane。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表已完成目錄切換或目前選項不是資料夾。
+    /// - 失敗時代表進入目錄或重新載入內容時發生錯誤。
     fn enter_selected(&mut self) -> io::Result<()> {
         if let Some(entry) = self.selected_entry()
             && entry.is_dir
@@ -161,6 +269,14 @@ impl PaneState {
         Ok(())
     }
 
+    /// 回到目前目錄的上一層。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要切換到父目錄的 pane。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表已回到父目錄或目前已無父目錄。
+    /// - 失敗時代表重新載入父目錄內容時發生錯誤。
     fn go_parent(&mut self) -> io::Result<()> {
         if let Some(parent) = self.cwd.parent() {
             self.cwd = parent.to_path_buf();
@@ -170,7 +286,17 @@ impl PaneState {
         Ok(())
     }
 
+    /// 依照目前選取項目產生預覽區要顯示的文字行。
+    ///
+    /// 參數：
+    /// - `self: &PaneState`，目前的 pane 狀態。
+    /// - `max_lines: usize`，預覽區最多顯示的行數。
+    ///
+    /// 回傳：`Vec<Line<'static>>`，可直接交給 `ratatui` 的 Paragraph 渲染。
     fn preview_lines(&self, max_lines: usize) -> Vec<Line<'static>> {
+        // preview 的策略很保守：
+        // 資料夾只顯示摘要，文字檔顯示內容，其他檔案則顯示基本資訊。
+        // 這樣可以先保證穩定，再慢慢擴充更完整的預覽系統。
         match self.selected_entry() {
             Some(entry) if entry.is_dir => vec![
                 Line::from(format!("dir: {}", entry.path.display())),
@@ -181,11 +307,22 @@ impl PaneState {
         }
     }
 
+    /// 刪除目前選取的檔案或資料夾。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，執行刪除的 pane。
+    ///
+    /// 回傳：`io::Result<Option<String>>`。
+    /// - `Ok(Some(name))` 代表成功刪除，並回傳顯示名稱。
+    /// - `Ok(None)` 代表目前沒有可刪除的選取項目。
+    /// - `Err(...)` 代表檔案系統操作失敗。
     fn delete_selected(&mut self) -> io::Result<Option<String>> {
         let Some(entry) = self.selected_entry().cloned() else {
             return Ok(None);
         };
 
+        // 這裡故意直接區分檔案與資料夾刪除，
+        // 因為兩者呼叫的 filesystem API 不同，錯誤型態也可能不同。
         if entry.is_dir {
             fs::remove_dir_all(&entry.path)?;
         } else {
@@ -198,16 +335,32 @@ impl PaneState {
     }
 }
 
+/// 計算指定資料夾內的子項目數量。
+///
+/// 參數：
+/// - `path: &Path`，要計算內容數量的資料夾路徑。
+///
+/// 回傳：`usize`，讀取成功時為項目數量，失敗時回傳 `0`。
 fn count_items(path: &Path) -> usize {
     fs::read_dir(path).map(|iter| iter.count()).unwrap_or(0)
 }
 
+/// 讀取指定檔案並產生預覽內容。
+///
+/// 參數：
+/// - `path: &Path`，要預覽的檔案路徑。
+/// - `max_lines: usize`，最多要顯示的行數。
+///
+/// 回傳：`Vec<Line<'static>>`。
+/// - 成功時回傳可直接渲染的預覽內容。
+/// - 若檔案過大、非文字或無法讀取，則回傳說明訊息。
 fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
     let Ok(metadata) = fs::metadata(path) else {
         return vec![Line::from("unable to read metadata")];
     };
 
     if metadata.len() > 128 * 1024 {
+        // 大檔案先跳過內容預覽，避免畫面更新時把整個 TUI 卡住。
         return vec![
             Line::from(format!("file: {}", path.display())),
             Line::from(format!("size: {} bytes", metadata.len())),
@@ -229,6 +382,14 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
     }
 }
 
+/// 讀取指定目錄，並整理成可顯示的檔案項目清單。
+///
+/// 參數：
+/// - `path: &Path`，要掃描的目錄路徑。
+///
+/// 回傳：`io::Result<Vec<FileEntry>>`。
+/// - 成功時回傳已排序的檔案與資料夾清單。
+/// - 失敗時回傳讀取目錄或 metadata 時的 I/O 錯誤。
 fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
 
@@ -253,12 +414,19 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
     Ok(entries)
 }
 
+/// 表示 pane 分割的方向。
+///
+/// `Horizontal` 代表上下分割，`Vertical` 代表左右分割。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitDirection {
     Horizontal,
     Vertical,
 }
 
+/// 表示整個多視窗布局的樹狀結構。
+///
+/// 葉節點代表單一 pane，中間節點代表一次分割行為，
+/// 因此可以自然表達巢狀 split 的畫面配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LayoutNode {
     Leaf {
@@ -272,6 +440,15 @@ enum LayoutNode {
 }
 
 impl LayoutNode {
+    /// 將指定 pane 的葉節點替換成新的 split 節點。
+    ///
+    /// 參數：
+    /// - `self: LayoutNode`，目前的布局樹。
+    /// - `target: usize`，要被分割的 pane id。
+    /// - `direction: SplitDirection`，新的分割方向。
+    /// - `new_pane_id: usize`，新建立 pane 的 id。
+    ///
+    /// 回傳：`LayoutNode`，套用分割後的新布局樹。
     fn split_leaf(self, target: usize, direction: SplitDirection, new_pane_id: usize) -> Self {
         match self {
             LayoutNode::Leaf { pane_id } if pane_id == target => LayoutNode::Split {
@@ -294,6 +471,15 @@ impl LayoutNode {
         }
     }
 
+    /// 從布局樹中移除指定 pane。
+    ///
+    /// 參數：
+    /// - `self: LayoutNode`，目前的布局樹。
+    /// - `target: usize`，要關閉的 pane id。
+    ///
+    /// 回傳：`Option<LayoutNode>`。
+    /// - `Some(...)` 代表移除後仍有可用布局。
+    /// - `None` 代表移除後已沒有任何 pane。
     fn close_pane(self, target: usize) -> Option<Self> {
         match self {
             LayoutNode::Leaf { pane_id } => {
@@ -323,6 +509,13 @@ impl LayoutNode {
         }
     }
 
+    /// 依照布局樹順序收集所有 pane id。
+    ///
+    /// 參數：
+    /// - `self: &LayoutNode`，目前的布局樹。
+    /// - `output: &mut Vec<usize>`，要寫入結果的容器。
+    ///
+    /// 回傳：`()`
     fn pane_ids(&self, output: &mut Vec<usize>) {
         match self {
             LayoutNode::Leaf { pane_id } => output.push(*pane_id),
@@ -333,6 +526,14 @@ impl LayoutNode {
         }
     }
 
+    /// 計算每個 pane 在畫面上應該佔據的矩形區域。
+    ///
+    /// 參數：
+    /// - `self: &LayoutNode`，目前的布局樹。
+    /// - `area: Rect`，目前節點可使用的畫面範圍。
+    /// - `map: &mut BTreeMap<usize, Rect>`，收集 pane id 與畫面區塊的對應表。
+    ///
+    /// 回傳：`()`
     fn render_rects(&self, area: Rect, map: &mut BTreeMap<usize, Rect>) {
         match self {
             LayoutNode::Leaf { pane_id } => {
@@ -357,14 +558,27 @@ impl LayoutNode {
     }
 }
 
+/// 表示目前正在等待使用者完成的暫時互動。
+///
+/// 只要有 pending action，輸入會先被它攔截，
+/// 而不會直接進到一般檔案瀏覽模式。
 #[derive(Debug, PartialEq, Eq)]
 enum PendingAction {
+    // PendingAction 代表目前有一個「需要優先處理的暫時互動」。
+    // 只要它存在，輸入就不會再直接進到一般檔案瀏覽模式。
     ConfirmDelete { pane_id: usize, target_name: String },
     ThemePicker { selected: usize },
 }
 
+/// 表示整個應用程式的核心狀態。
+///
+/// 這個結構整合了設定、主題、視窗布局、焦點與互動模式，
+/// 是整個 TUI 運作時最主要的狀態容器。
 #[derive(Debug)]
 struct App {
+    // App 是整個 TUI 的核心狀態容器。
+    // 只要一個動作會影響整體畫面或操作模式，通常就會落在這裡管理。
+    config: AppConfig,
     theme: Theme,
     theme_preset: ThemePreset,
     panes: BTreeMap<usize, PaneState>,
@@ -380,19 +594,34 @@ struct App {
 }
 
 impl App {
-    fn new(cwd: PathBuf) -> io::Result<Self> {
+    /// 建立一個新的應用程式狀態。
+    ///
+    /// 參數：
+    /// - `cwd: PathBuf`，啟動時第一個 pane 要打開的目錄。
+    /// - `loaded_config: crate::config::LoadedConfig`，啟動時已載入的設定與來源資訊。
+    ///
+    /// 回傳：`io::Result<App>`。
+    /// - 成功時回傳完整初始化的應用程式狀態。
+    /// - 失敗時回傳建立第一個 pane 或載入目錄時的 I/O 錯誤。
+    fn new(cwd: PathBuf, loaded_config: crate::config::LoadedConfig) -> io::Result<Self> {
         let pane = PaneState::new(cwd)?;
         let mut panes = BTreeMap::new();
         panes.insert(1, pane);
+        let theme_preset = loaded_config.config.theme_preset;
+        let startup_status = match loaded_config.source {
+            Some(path) => format!("loaded config: {}", path.display()),
+            None => String::from("normal mode"),
+        };
 
         Ok(Self {
-            theme: ThemePreset::Default.into(),
-            theme_preset: ThemePreset::Default,
+            config: loaded_config.config,
+            theme: theme_preset.into(),
+            theme_preset,
             panes,
             layout: LayoutNode::Leaf { pane_id: 1 },
             focused_pane: 1,
             next_pane_id: 2,
-            status: String::from("normal mode"),
+            status: startup_status,
             command_mode: false,
             command_buffer: String::new(),
             awaiting_ctrl_w: false,
@@ -401,7 +630,21 @@ impl App {
         })
     }
 
+    /// 處理一般輸入事件的總入口。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `key: KeyEvent`，使用者按下的按鍵事件。
+    ///
+    /// 回傳：`Result<bool>`。
+    /// - `Ok(true)` 代表繼續執行事件迴圈。
+    /// - `Ok(false)` 代表應用程式應該結束。
+    /// - `Err(...)` 代表處理過程發生錯誤。
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // 輸入處理的優先順序很重要：
+        // 1. 若有 popup / confirm 這種暫時互動，先讓它攔截按鍵
+        // 2. 若在 command mode，就交給命令列編輯
+        // 3. 最後才是正常瀏覽模式
         if self.pending_action.is_some() {
             return self.handle_pending_action_key(key);
         }
@@ -487,11 +730,22 @@ impl App {
         Ok(should_continue)
     }
 
+    /// 處理暫時互動視窗的按鍵事件。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `key: KeyEvent`，使用者輸入的按鍵事件。
+    ///
+    /// 回傳：`Result<bool>`。
+    /// - `Ok(true)` 代表互動完成後仍繼續執行應用程式。
+    /// - `Err(...)` 代表執行刪除或其他互動時發生錯誤。
     fn handle_pending_action_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(action) = self.pending_action.take() else {
             return Ok(true);
         };
 
+        // 先 take 再決定是否放回 pending_action，
+        // 可以避免同時借用 self 與 self.pending_action 時出現借用衝突。
         match action {
             PendingAction::ConfirmDelete {
                 pane_id,
@@ -538,6 +792,15 @@ impl App {
         Ok(true)
     }
 
+    /// 處理 command mode 中的按鍵編輯與送出行為。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `key: KeyEvent`，使用者按下的按鍵。
+    ///
+    /// 回傳：`Result<bool>`。
+    /// - `Ok(true)` 代表 command mode 處理完成後繼續執行。
+    /// - `Err(...)` 代表命令執行時發生錯誤。
     fn handle_command_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc => {
@@ -561,6 +824,15 @@ impl App {
         Ok(true)
     }
 
+    /// 處理 `Ctrl-w` 前綴後的 pane 操作命令。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `key: KeyEvent`，`Ctrl-w` 之後接續輸入的按鍵。
+    ///
+    /// 回傳：`Result<bool>`。
+    /// - `Ok(true)` 代表指令處理完成並繼續執行。
+    /// - `Err(...)` 代表分割或切換過程中發生錯誤。
     fn handle_ctrl_w(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('h') | KeyCode::Char('k') => self.focus_previous_pane(),
@@ -576,7 +848,18 @@ impl App {
         Ok(true)
     }
 
+    /// 執行 command mode 送出的命令字串。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `command: &str`，使用者輸入的命令內容。
+    ///
+    /// 回傳：`Result<()>`。
+    /// - 成功時代表命令已完成或已更新狀態訊息。
+    /// - 失敗時代表命令觸發的底層操作失敗。
     fn execute_command(&mut self, command: &str) -> Result<()> {
+        // command mode 目前維持簡單字串匹配。
+        // 對現在的專案規模來說，這比過早引入完整 parser 更容易修改。
         match command {
             "q" => {
                 self.status = String::from("use q in normal mode to quit");
@@ -601,12 +884,29 @@ impl App {
         Ok(())
     }
 
+    /// 取得目前有焦點的 pane 可變參考。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`io::Result<&mut PaneState>`。
+    /// - 成功時回傳目前焦點 pane。
+    /// - 失敗時代表焦點指向不存在的 pane。
     fn current_pane_mut(&mut self) -> io::Result<&mut PaneState> {
         self.panes
             .get_mut(&self.focused_pane)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused pane"))
     }
 
+    /// 將目前焦點 pane 依指定方向分割成兩個 pane。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `direction: SplitDirection`，要採用的分割方向。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表新 pane 已建立並加入布局。
+    /// - 失敗時代表建立 pane 或複製目錄狀態時發生錯誤。
     fn split_current(&mut self, direction: SplitDirection) -> io::Result<()> {
         let cwd = self
             .panes
@@ -630,12 +930,24 @@ impl App {
         Ok(())
     }
 
+    /// 依照目前布局順序取得所有 pane id。
+    ///
+    /// 參數：
+    /// - `self: &App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`Vec<usize>`，依畫面遍歷順序排列的 pane id 清單。
     fn ordered_pane_ids(&self) -> Vec<usize> {
         let mut ids = Vec::new();
         self.layout.pane_ids(&mut ids);
         ids
     }
 
+    /// 將焦點切換到下一個 pane。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn focus_next_pane(&mut self) {
         let ids = self.ordered_pane_ids();
         if let Some(index) = ids.iter().position(|id| *id == self.focused_pane) {
@@ -644,6 +956,12 @@ impl App {
         }
     }
 
+    /// 將焦點切換到上一個 pane。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn focus_previous_pane(&mut self) {
         let ids = self.ordered_pane_ids();
         if let Some(index) = ids.iter().position(|id| *id == self.focused_pane) {
@@ -652,6 +970,12 @@ impl App {
         }
     }
 
+    /// 關閉目前有焦點的 pane。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn close_current_pane(&mut self) {
         let ids = self.ordered_pane_ids();
         if ids.len() <= 1 {
@@ -675,6 +999,12 @@ impl App {
         }
     }
 
+    /// 僅保留目前有焦點的 pane，其餘全部關閉。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn only_current_pane(&mut self) {
         let focused = self.focused_pane;
         self.panes.retain(|id, _| *id == focused);
@@ -682,12 +1012,26 @@ impl App {
         self.status = String::from("kept only focused pane");
     }
 
+    /// 將主題切換到下一個內建預設值。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn cycle_theme(&mut self) {
         let next = self.theme_preset.next();
         self.apply_theme(next);
     }
 
+    /// 打開主題選擇視窗，並將選項焦點設在目前主題。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn open_theme_picker(&mut self) {
+        // 打開主題視窗時，預設焦點會落在目前主題，
+        // 這樣使用者一進來就能知道現在是哪一套。
         let selected = ThemePreset::ALL
             .iter()
             .position(|preset| *preset == self.theme_preset)
@@ -696,6 +1040,13 @@ impl App {
         self.status = String::from("theme picker: use j/k and Enter");
     }
 
+    /// 依照主題名稱字串套用指定主題。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `name: &str`，要切換到的主題名稱。
+    ///
+    /// 回傳：`()`
     fn set_theme_by_name(&mut self, name: &str) {
         match ThemePreset::from_name(name) {
             Some(preset) => self.apply_theme(preset),
@@ -710,12 +1061,25 @@ impl App {
         }
     }
 
+    /// 直接套用指定的主題預設值。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `preset: ThemePreset`，要套用的主題預設值。
+    ///
+    /// 回傳：`()`
     fn apply_theme(&mut self, preset: ThemePreset) {
         self.theme_preset = preset;
         self.theme = preset.into();
         self.status = format!("theme: {}", preset.name());
     }
 
+    /// 開始刪除確認流程，建立一個待確認的刪除互動。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    ///
+    /// 回傳：`()`
     fn start_delete_confirmation(&mut self) {
         let Some(entry) = self
             .panes
@@ -734,6 +1098,16 @@ impl App {
         self.status = format!("confirm delete {}: y/n", entry.display_name());
     }
 
+    /// 真正執行刪除目前待確認項目的檔案系統操作。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `pane_id: usize`，來源 pane 的 id。
+    /// - `target_name: &str`，用於狀態訊息顯示的目標名稱。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表刪除流程已完成並更新狀態訊息。
+    /// - 失敗時代表刪除過程發生 I/O 錯誤。
     fn confirm_delete(&mut self, pane_id: usize, target_name: &str) -> io::Result<()> {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             self.status = String::from("pane no longer exists");
@@ -755,6 +1129,13 @@ impl App {
         Ok(())
     }
 
+    /// 根據目前應用程式狀態繪製整個畫面。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前的應用程式狀態。
+    /// - `frame: &mut ratatui::Frame<'_>`，本次重繪使用的畫面物件。
+    ///
+    /// 回傳：`()`
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -767,6 +1148,8 @@ impl App {
 
         let mut pane_rects = BTreeMap::new();
         self.layout.render_rects(outer[0], &mut pane_rects);
+        // layout tree 先把每個 pane 應該佔的矩形算出來，
+        // 之後 render 階段只要根據 pane_id 把內容畫進對應區塊即可。
         for (pane_id, rect) in pane_rects {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 render_pane(
@@ -817,16 +1200,27 @@ impl App {
 
         match &self.pending_action {
             Some(PendingAction::ConfirmDelete { target_name, .. }) => {
-                render_confirm_dialog(frame, frame.area(), target_name, self.theme);
+                render_confirm_dialog(frame, frame.area(), target_name, self.theme, &self.config);
             }
             Some(PendingAction::ThemePicker { selected }) => {
-                render_theme_picker(frame, frame.area(), self.theme, *selected);
+                render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
             None => {}
         }
     }
 }
 
+/// 繪製單一 pane 的檔案列表與預覽區。
+///
+/// 參數：
+/// - `frame: &mut ratatui::Frame<'_>`，目前的畫面物件。
+/// - `area: Rect`，這個 pane 在畫面上可使用的矩形範圍。
+/// - `pane_id: usize`，目前 pane 的識別值。
+/// - `pane: &mut PaneState`，要被渲染的 pane 狀態。
+/// - `focused: bool`，這個 pane 是否具有焦點。
+/// - `theme: Theme`，目前使用中的主題色盤。
+///
+/// 回傳：`()`
 fn render_pane(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -835,6 +1229,9 @@ fn render_pane(
     focused: bool,
     theme: Theme,
 ) {
+    // 每個 pane 目前固定分成兩塊：
+    // 上半部是檔案列表，下半部是預覽區。
+    // 未來如果要加更完整的 metadata 或 preview pane，這裡會是主要延伸點。
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(6)])
@@ -887,7 +1284,17 @@ fn render_pane(
     frame.render_widget(preview, chunks[1]);
 }
 
+/// 在指定區域中計算一個置中的 popup 矩形。
+///
+/// 參數：
+/// - `area: Rect`，整體可用畫面範圍。
+/// - `width_percent: u16`，popup 寬度占整體寬度的百分比。
+/// - `height: u16`，popup 的固定高度列數。
+///
+/// 回傳：`Rect`，可直接拿來繪製 popup 的置中區域。
 fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
+    // popup 全都共用這個 helper，把視窗放到畫面中央。
+    // 寬度用百分比、高度用固定列數，對 terminal 來說比較直覺。
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -909,13 +1316,29 @@ fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
     horizontal[1]
 }
 
+/// 繪製刪除確認視窗。
+///
+/// 參數：
+/// - `frame: &mut ratatui::Frame<'_>`，目前的畫面物件。
+/// - `area: Rect`，整體可用畫面範圍。
+/// - `target_name: &str`，要顯示的刪除目標名稱。
+/// - `theme: Theme`，目前使用中的主題色盤。
+/// - `config: &AppConfig`，控制 popup 尺寸的應用程式設定。
+///
+/// 回傳：`()`
 fn render_confirm_dialog(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     target_name: &str,
     theme: Theme,
+    config: &AppConfig,
 ) {
-    let dialog_area = centered_rect(area, 60, 5);
+    // 刪除確認視窗刻意保持很小，讓焦點集中在「你是否真的要刪除」。
+    let dialog_area = centered_rect(
+        area,
+        config.confirm_dialog_width_percent,
+        config.confirm_dialog_height,
+    );
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(
         Paragraph::new(vec![
@@ -934,8 +1357,30 @@ fn render_confirm_dialog(
     );
 }
 
-fn render_theme_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme, selected: usize) {
-    let dialog_area = centered_rect(area, 42, 8);
+/// 繪製主題選擇視窗。
+///
+/// 參數：
+/// - `frame: &mut ratatui::Frame<'_>`，目前的畫面物件。
+/// - `area: Rect`，整體可用畫面範圍。
+/// - `theme: Theme`，目前使用中的主題色盤。
+/// - `selected: usize`，主題選單目前選取的索引位置。
+/// - `config: &AppConfig`，控制 popup 尺寸的應用程式設定。
+///
+/// 回傳：`()`
+fn render_theme_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    selected: usize,
+    config: &AppConfig,
+) {
+    // 主題選單用 ListState 來管理游標位置，
+    // 好處是和左側檔案列表的操作模型一致，未來也比較容易抽成共用元件。
+    let dialog_area = centered_rect(
+        area,
+        config.theme_picker_width_percent,
+        config.theme_picker_height,
+    );
     frame.render_widget(Clear, dialog_area);
 
     let items: Vec<ListItem<'static>> = ThemePreset::ALL
@@ -967,6 +1412,10 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    /// 驗證 split 操作會將目標葉節點替換成新的分割節點。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若布局結果不正確則測試失敗。
     fn split_leaf_replaces_target_with_split_node() {
         let layout = LayoutNode::Leaf { pane_id: 1 };
         let updated = layout.split_leaf(1, SplitDirection::Vertical, 2);
@@ -982,6 +1431,10 @@ mod tests {
     }
 
     #[test]
+    /// 驗證關閉其中一個 pane 後，父 split 會正確收斂。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若布局未正確收斂則測試失敗。
     fn close_pane_collapses_parent_split() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
@@ -993,6 +1446,10 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 pane 重新載入目錄時，資料夾會排在檔案前面。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若排序規則錯誤則測試失敗。
     fn pane_state_lists_directories_before_files() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("nested")).expect("nested dir");
@@ -1008,6 +1465,10 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 pane 可以正確進入子目錄並返回父目錄。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若目錄切換行為錯誤則測試失敗。
     fn pane_state_enters_and_leaves_directories() {
         let dir = tempdir().expect("tempdir");
         let child = dir.path().join("child");
@@ -1023,9 +1484,20 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 `only_current_pane` 會只保留目前焦點窗格。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若多餘 pane 未被移除則測試失敗。
     fn app_only_keeps_focused_pane() {
         let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            crate::config::LoadedConfig {
+                config: AppConfig::default(),
+                source: None,
+            },
+        )
+        .expect("app");
         app.split_current(SplitDirection::Vertical).expect("split");
         app.only_current_pane();
 
@@ -1039,6 +1511,10 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 `PaneState` 可以正確刪除目前選取的檔案。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若檔案未被刪除或狀態未更新則測試失敗。
     fn pane_state_delete_selected_file_removes_it() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -1053,12 +1529,23 @@ mod tests {
     }
 
     #[test]
+    /// 驗證刪除確認流程在確認後會真正刪除選取項目。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若刪除流程未成功套用則測試失敗。
     fn app_delete_confirmation_removes_selected_entry() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("delete-me.txt");
         fs::write(&file_path, "hello").expect("file");
 
-        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            crate::config::LoadedConfig {
+                config: AppConfig::default(),
+                source: None,
+            },
+        )
+        .expect("app");
         app.start_delete_confirmation();
         assert!(matches!(
             app.pending_action,
@@ -1074,9 +1561,20 @@ mod tests {
     }
 
     #[test]
+    /// 驗證輪替主題時會切換到下一個預設值。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若主題未正確輪替則測試失敗。
     fn app_cycle_theme_switches_to_next_preset() {
         let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            crate::config::LoadedConfig {
+                config: AppConfig::default(),
+                source: None,
+            },
+        )
+        .expect("app");
 
         app.cycle_theme();
 
@@ -1086,9 +1584,20 @@ mod tests {
     }
 
     #[test]
+    /// 驗證打開主題選擇視窗時，游標會落在目前主題。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若預設選取位置錯誤則測試失敗。
     fn app_open_theme_picker_tracks_current_preset() {
         let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            crate::config::LoadedConfig {
+                config: AppConfig::default(),
+                source: None,
+            },
+        )
+        .expect("app");
 
         app.open_theme_picker();
 
@@ -1099,9 +1608,20 @@ mod tests {
     }
 
     #[test]
+    /// 驗證依主題名稱字串指定主題時會正確更新狀態。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若主題未正確切換則測試失敗。
     fn app_set_theme_by_name_updates_theme() {
         let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            crate::config::LoadedConfig {
+                config: AppConfig::default(),
+                source: None,
+            },
+        )
+        .expect("app");
 
         app.set_theme_by_name("ocean");
 
@@ -1111,9 +1631,20 @@ mod tests {
     }
 
     #[test]
+    /// 驗證在主題選擇視窗按下 Enter 後會套用目前選取的主題。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若主題未依選單選取值套用則測試失敗。
     fn app_theme_picker_confirm_applies_selected_theme() {
         let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            crate::config::LoadedConfig {
+                config: AppConfig::default(),
+                source: None,
+            },
+        )
+        .expect("app");
         app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))

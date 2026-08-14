@@ -8,6 +8,13 @@ Minimal terminal file manager prototype built with Rust, `ratatui`, and `crosste
 cargo run
 ```
 
+The app loads config from the first existing path in this order:
+
+1. `TFM_CONFIG=/absolute/path/to/config.toml`
+2. `./config.toml`
+3. `$XDG_CONFIG_HOME/terminal-file-manager/config.toml`
+4. `~/.config/terminal-file-manager/config.toml`
+
 ## Controls
 
 - `h j k l`: move / parent / up / enter
@@ -41,3 +48,16 @@ If you want to tune the current look:
 - Keep the field meanings stable: `accent`, `focus_border`, `muted`, `selection_bg`, `danger`
 - Add a new preset by extending `ThemePreset`, then add its palette in `impl From<ThemePreset> for Theme`
 - Inside the theme picker, use `j/k` or arrow keys to move, `Enter` to apply, and `Esc` to cancel
+
+## Config
+
+Start from [config.toml.example](/Users/otto/Documents/terminal-file-manager/config.toml.example).
+
+Available keys:
+
+- `theme = "default" | "forest" | "ocean"`
+- `poll_rate_ms = 150`
+- `[confirm_dialog].width_percent`
+- `[confirm_dialog].height`
+- `[theme_picker].width_percent`
+- `[theme_picker].height`
