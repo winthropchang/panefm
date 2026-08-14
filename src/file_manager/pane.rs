@@ -253,6 +253,58 @@ impl PaneState {
         };
         Ok(Some(renamed_name))
     }
+
+    /// 將外部來源的檔案或資料夾複製到目前 pane 的目錄中。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要接收新項目的目標 pane。
+    /// - `source_path: &Path`，原始檔案或資料夾路徑。
+    ///
+    /// 回傳：`io::Result<String>`。
+    /// - 成功時回傳貼上後的顯示名稱。
+    /// - 失敗時回傳檔案系統操作錯誤，例如目標已存在或無法讀寫。
+    pub(crate) fn copy_entry_into_current_dir(&mut self, source_path: &Path) -> io::Result<String> {
+        let display_name = copy_path_into_dir(source_path, &self.cwd)?;
+        self.reload()?;
+
+        let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|candidate| candidate.path == pasted_path)
+        {
+            self.selected = index;
+            self.list_state.select(Some(index));
+        }
+
+        Ok(display_name)
+    }
+
+    /// 將外部來源的檔案或資料夾移動到目前 pane 的目錄中。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要接收新項目的目標 pane。
+    /// - `source_path: &Path`，原始檔案或資料夾路徑。
+    ///
+    /// 回傳：`io::Result<String>`。
+    /// - 成功時回傳貼上後的顯示名稱。
+    /// - 失敗時回傳檔案系統操作錯誤，例如目標已存在或來源不可用。
+    pub(crate) fn move_entry_into_current_dir(&mut self, source_path: &Path) -> io::Result<String> {
+        let display_name = move_path_into_dir(source_path, &self.cwd)?;
+        self.reload()?;
+
+        let moved_path = self.cwd.join(trimmed_display_name(&display_name));
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|candidate| candidate.path == moved_path)
+        {
+            self.selected = index;
+            self.list_state.select(Some(index));
+        }
+
+        Ok(display_name)
+    }
 }
 
 /// 計算指定資料夾內的子項目數量。
@@ -299,6 +351,174 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
             Line::from("binary or non-utf8 file"),
         ],
     }
+}
+
+/// 將單一路徑複製到目標資料夾，支援檔案與整個資料夾樹。
+///
+/// 參數：
+/// - `source_path: &Path`，來源檔案或資料夾。
+/// - `target_dir: &Path`，貼上目標資料夾。
+///
+/// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
+fn copy_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
+    let file_name = source_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name"))?;
+    let target_path = unique_target_path(target_dir, file_name);
+
+    if source_path.is_dir() {
+        copy_dir_recursive(source_path, &target_path)?;
+        Ok(format!("{}/", target_path_file_name(&target_path)))
+    } else {
+        fs::copy(source_path, &target_path)?;
+        Ok(target_path_file_name(&target_path))
+    }
+}
+
+/// 將單一路徑移動到目標資料夾。
+///
+/// 參數：
+/// - `source_path: &Path`，來源檔案或資料夾。
+/// - `target_dir: &Path`，貼上目標資料夾。
+///
+/// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
+fn move_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
+    let file_name = source_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name"))?;
+    let target_path = unique_target_path(target_dir, file_name);
+
+    fs::rename(source_path, &target_path)?;
+
+    if target_path.is_dir() {
+        Ok(format!("{}/", target_path_file_name(&target_path)))
+    } else {
+        Ok(target_path_file_name(&target_path))
+    }
+}
+
+/// 遞迴複製整個資料夾，保留所有子目錄與檔案。
+///
+/// 參數：
+/// - `source_dir: &Path`，來源資料夾。
+/// - `target_dir: &Path`，目標資料夾。
+///
+/// 回傳：`io::Result<()>`。
+fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
+    fs::create_dir(target_dir)?;
+
+    for item in fs::read_dir(source_dir)? {
+        let item = item?;
+        let item_path = item.path();
+        let next_target = target_dir.join(item.file_name());
+
+        if item.file_type()?.is_dir() {
+            copy_dir_recursive(&item_path, &next_target)?;
+        } else {
+            fs::copy(&item_path, &next_target)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 根據目標資料夾現況，產生一個不與既有項目衝突的新路徑。
+///
+/// 參數：
+/// - `target_dir: &Path`，要貼入項目的目錄。
+/// - `original_name: &std::ffi::OsStr`，來源項目的原始檔名。
+///
+/// 回傳：`PathBuf`，可安全使用的新目標路徑。
+fn unique_target_path(target_dir: &Path, original_name: &std::ffi::OsStr) -> PathBuf {
+    let original_name = original_name.to_string_lossy();
+    let initial_candidate = target_dir.join(original_name.as_ref());
+    if !initial_candidate.exists() {
+        return initial_candidate;
+    }
+
+    let (base_name, extension) = split_name_for_duplicate(&original_name);
+    let mut duplicate_index = 1usize;
+
+    loop {
+        let candidate_name = if duplicate_index == 1 {
+            duplicate_name(&base_name, extension.as_deref(), None)
+        } else {
+            duplicate_name(&base_name, extension.as_deref(), Some(duplicate_index))
+        };
+        let candidate_path = target_dir.join(candidate_name);
+        if !candidate_path.exists() {
+            return candidate_path;
+        }
+        duplicate_index += 1;
+    }
+}
+
+/// 將檔名拆成「主名稱」與「副檔名」，方便產生重複貼上的新名稱。
+///
+/// 參數：
+/// - `name: &str`，原始檔名。
+///
+/// 回傳：`(String, Option<String>)`。
+/// - 第一個值是主名稱。
+/// - 第二個值是副檔名，若沒有副檔名則為 `None`。
+fn split_name_for_duplicate(name: &str) -> (String, Option<String>) {
+    if name.starts_with('.') && !name[1..].contains('.') {
+        return (name.to_string(), None);
+    }
+
+    match name.rsplit_once('.') {
+        Some((base_name, extension)) if !base_name.is_empty() => {
+            (base_name.to_string(), Some(extension.to_string()))
+        }
+        _ => (name.to_string(), None),
+    }
+}
+
+/// 依照主名稱、副檔名與重複次數產生新的不衝突檔名。
+///
+/// 參數：
+/// - `base_name: &str`，檔案主名稱。
+/// - `extension: Option<&str>`，副檔名。
+/// - `duplicate_index: Option<usize>`，若有重複次數，會附加在 `copy` 後面。
+///
+/// 回傳：`String`，可直接作為新檔名的字串。
+fn duplicate_name(base_name: &str, extension: Option<&str>, duplicate_index: Option<usize>) -> String {
+    let mut candidate = String::from(base_name);
+    candidate.push_str(" copy");
+
+    if let Some(index) = duplicate_index {
+        candidate.push(' ');
+        candidate.push_str(&index.to_string());
+    }
+
+    if let Some(extension) = extension {
+        candidate.push('.');
+        candidate.push_str(extension);
+    }
+
+    candidate
+}
+
+/// 取出路徑最後一段作為顯示名稱，若缺少檔名則回傳空字串。
+///
+/// 參數：
+/// - `path: &Path`，要讀取名稱的路徑。
+///
+/// 回傳：`String`，最後一段檔名。
+fn target_path_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// 將畫面顯示用的名稱轉回實際檔案名稱，移除資料夾顯示用的尾端 `/`。
+///
+/// 參數：
+/// - `display_name: &str`，畫面上顯示的檔名。
+///
+/// 回傳：`&str`，可用來組合實際路徑的名稱。
+fn trimmed_display_name(display_name: &str) -> &str {
+    display_name.trim_end_matches('/')
 }
 
 /// 讀取指定目錄，並整理成可顯示的檔案項目清單。
@@ -419,5 +639,56 @@ mod tests {
             pane.selected_entry().map(FileEntry::display_name),
             Some(String::from("beta.txt"))
         );
+    }
+
+    #[test]
+    /// 驗證同一個目錄內重複複製檔案時，會自動產生不衝突的新檔名。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若重複名稱處理錯誤則測試失敗。
+    fn pane_state_copy_into_same_directory_creates_duplicate_file_name() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let first_copy = pane
+            .copy_entry_into_current_dir(&file_path)
+            .expect("first copy");
+        let second_copy = pane
+            .copy_entry_into_current_dir(&file_path)
+            .expect("second copy");
+
+        assert_eq!(first_copy, "alpha copy.txt");
+        assert_eq!(second_copy, "alpha copy 2.txt");
+        assert!(dir.path().join("alpha copy.txt").exists());
+        assert!(dir.path().join("alpha copy 2.txt").exists());
+    }
+
+    #[test]
+    /// 驗證同一個目錄內重複複製資料夾時，也會自動產生不衝突的新名稱。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若資料夾重複名稱處理錯誤則測試失敗。
+    fn pane_state_copy_into_same_directory_creates_duplicate_directory_name() {
+        let dir = tempdir().expect("tempdir");
+        let folder_path = dir.path().join("docs");
+        fs::create_dir(&folder_path).expect("folder");
+        fs::write(folder_path.join("note.txt"), "hello").expect("note");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let first_copy = pane
+            .copy_entry_into_current_dir(&folder_path)
+            .expect("first copy");
+        let second_copy = pane
+            .copy_entry_into_current_dir(&folder_path)
+            .expect("second copy");
+
+        assert_eq!(first_copy, "docs copy/");
+        assert_eq!(second_copy, "docs copy 2/");
+        assert!(dir.path().join("docs copy").is_dir());
+        assert!(dir.path().join("docs copy 2").is_dir());
+        assert!(dir.path().join("docs copy").join("note.txt").exists());
+        assert!(dir.path().join("docs copy 2").join("note.txt").exists());
     }
 }

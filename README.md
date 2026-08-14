@@ -19,6 +19,9 @@ The app loads config from the first existing path in this order:
 
 - `h j k l`: move / parent / up / enter
 - `gg` / `G`: jump to top or bottom
+- `yy`: copy the selected file or directory into the internal clipboard
+- `x`: cut the selected file or directory into the internal clipboard
+- `p`: paste the clipboard item into the current directory
 - `Ctrl-w s`: horizontal split
 - `Ctrl-w v`: vertical split
 - `Ctrl-w h j k l`: switch pane focus
@@ -27,6 +30,7 @@ The app loads config from the first existing path in this order:
 - `d`: delete selected file or directory with confirmation
 - `r`: open rename dialog for the selected item
 - `:rename`: open rename dialog for the selected item
+- `:copy`, `:cut`, `:paste`
 - `:split`, `:vsplit`, `:close`, `:only`
 - `:theme`: open the theme picker
 - `:theme next`, `:theme default`, `:theme forest`, `:theme ocean`

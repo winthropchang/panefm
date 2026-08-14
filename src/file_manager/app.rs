@@ -29,6 +29,26 @@ pub(crate) enum RenameMode {
     Normal,
 }
 
+/// 表示目前剪貼簿保存的是複製還是剪下操作。
+///
+/// 這個模式會決定 `p` 貼上時，是保留來源還是把來源移動到新位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardOperation {
+    Copy,
+    Cut,
+}
+
+/// 記錄目前暫存在檔案管理器內部剪貼簿中的單一項目。
+///
+/// 這一版先支援單一檔案或資料夾，之後若要擴充多選，
+/// 可以再把這個結構改成清單形式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClipboardEntry {
+    pub(crate) source_path: PathBuf,
+    pub(crate) display_name: String,
+    pub(crate) operation: ClipboardOperation,
+}
+
 /// 表示目前正在等待使用者完成的暫時互動。
 ///
 /// 只要有 pending action，輸入會先被它攔截，
@@ -69,6 +89,8 @@ pub(crate) struct App {
     pub(crate) command_buffer: String,
     pub(crate) awaiting_ctrl_w: bool,
     pub(crate) pending_g: bool,
+    pub(crate) pending_y: bool,
+    pub(crate) clipboard: Option<ClipboardEntry>,
     pub(crate) pending_action: Option<PendingAction>,
 }
 
@@ -105,6 +127,8 @@ impl App {
             command_buffer: String::new(),
             awaiting_ctrl_w: false,
             pending_g: false,
+            pending_y: false,
+            clipboard: None,
             pending_action: None,
         })
     }
@@ -128,31 +152,38 @@ impl App {
                 self.command_mode = true;
                 self.command_buffer.clear();
                 self.status = String::from("command mode");
+                self.pending_g = false;
+                self.pending_y = false;
                 true
             }
             KeyCode::Char('j') => {
                 self.current_pane_mut()?.move_down();
                 self.pending_g = false;
+                self.pending_y = false;
                 true
             }
             KeyCode::Char('k') => {
                 self.current_pane_mut()?.move_up();
                 self.pending_g = false;
+                self.pending_y = false;
                 true
             }
             KeyCode::Char('h') => {
                 self.current_pane_mut()?.go_parent()?;
                 self.status = String::from("moved to parent directory");
                 self.pending_g = false;
+                self.pending_y = false;
                 true
             }
             KeyCode::Char('l') | KeyCode::Enter => {
                 self.current_pane_mut()?.enter_selected()?;
                 self.status = String::from("opened directory");
                 self.pending_g = false;
+                self.pending_y = false;
                 true
             }
             KeyCode::Char('g') => {
+                self.pending_y = false;
                 if self.pending_g {
                     self.current_pane_mut()?.move_top();
                     self.pending_g = false;
@@ -166,32 +197,61 @@ impl App {
             KeyCode::Char('G') => {
                 self.current_pane_mut()?.move_bottom();
                 self.pending_g = false;
+                self.pending_y = false;
                 self.status = String::from("jumped to bottom");
                 true
             }
             KeyCode::Char('d') => {
                 self.start_delete_confirmation();
                 self.pending_g = false;
+                self.pending_y = false;
                 true
             }
             KeyCode::Char('r') => {
                 self.start_rename();
                 self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('x') => {
+                self.cut_selected();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('p') => {
+                self.paste_into_focused_pane()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('y') => {
+                self.pending_g = false;
+                if self.pending_y {
+                    self.copy_selected();
+                    self.pending_y = false;
+                } else {
+                    self.pending_y = true;
+                    self.status = String::from("pending: y");
+                }
                 true
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
+                self.pending_y = false;
                 self.status = String::from("Ctrl-w");
                 true
             }
             KeyCode::Esc => {
                 self.pending_g = false;
+                self.pending_y = false;
                 self.status = String::from("normal mode");
                 true
             }
             _ => {
                 self.pending_g = false;
+                self.pending_y = false;
                 true
             }
         };
@@ -487,6 +547,9 @@ impl App {
         match command {
             "q" => self.status = String::from("use q in normal mode to quit"),
             "rename" => self.start_rename(),
+            "copy" => self.copy_selected(),
+            "cut" => self.cut_selected(),
+            "paste" => self.paste_into_focused_pane()?,
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -715,6 +778,129 @@ impl App {
         Ok(())
     }
 
+    /// 將目前選取項目放進內部剪貼簿，模式為複製。
+    ///
+    /// 參數：無。
+    /// 回傳：`()`
+    pub(crate) fn copy_selected(&mut self) {
+        self.store_selected_in_clipboard(ClipboardOperation::Copy);
+    }
+
+    /// 將目前選取項目放進內部剪貼簿，模式為剪下。
+    ///
+    /// 參數：無。
+    /// 回傳：`()`
+    pub(crate) fn cut_selected(&mut self) {
+        self.store_selected_in_clipboard(ClipboardOperation::Cut);
+    }
+
+    /// 把目前焦點 pane 的選取項目寫入剪貼簿。
+    ///
+    /// 參數：
+    /// - `operation: ClipboardOperation`，要記錄成複製或剪下。
+    ///
+    /// 回傳：`()`
+    fn store_selected_in_clipboard(&mut self, operation: ClipboardOperation) {
+        let Some(entry) = self
+            .panes
+            .get(&self.focused_pane)
+            .and_then(PaneState::selected_entry)
+            .cloned()
+        else {
+            self.status = match operation {
+                ClipboardOperation::Copy => String::from("nothing selected to copy"),
+                ClipboardOperation::Cut => String::from("nothing selected to cut"),
+            };
+            return;
+        };
+
+        let display_name = entry.display_name();
+
+        self.clipboard = Some(ClipboardEntry {
+            source_path: entry.path,
+            display_name: display_name.clone(),
+            operation,
+        });
+
+        self.status = match operation {
+            ClipboardOperation::Copy => format!("copied {display_name}"),
+            ClipboardOperation::Cut => format!("cut {display_name}"),
+        };
+    }
+
+    /// 將內部剪貼簿中的項目貼到目前有焦點的 pane 目錄。
+    ///
+    /// 參數：無。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表貼上流程已完成，並同步更新所有 pane。
+    /// - 失敗時代表目標目錄或檔案系統操作失敗。
+    pub(crate) fn paste_into_focused_pane(&mut self) -> io::Result<()> {
+        let Some(clipboard) = self.clipboard.clone() else {
+            self.status = String::from("clipboard is empty");
+            return Ok(());
+        };
+
+        let target_dir = match self.panes.get(&self.focused_pane) {
+            Some(pane) => pane.cwd.clone(),
+            None => {
+                self.status = String::from("pane no longer exists");
+                return Ok(());
+            }
+        };
+
+        if clipboard.source_path.parent() == Some(target_dir.as_path())
+            && clipboard.operation == ClipboardOperation::Cut
+        {
+            self.status = format!("{} is already in this directory", clipboard.display_name);
+            return Ok(());
+        }
+
+        let paste_result = match self.panes.get_mut(&self.focused_pane) {
+            Some(pane) => match clipboard.operation {
+                ClipboardOperation::Copy => pane.copy_entry_into_current_dir(&clipboard.source_path),
+                ClipboardOperation::Cut => pane.move_entry_into_current_dir(&clipboard.source_path),
+            },
+            None => {
+                self.status = String::from("pane no longer exists");
+                return Ok(());
+            }
+        };
+
+        match paste_result {
+            Ok(pasted_name) => {
+                self.reload_all_panes()?;
+                self.status = match clipboard.operation {
+                    ClipboardOperation::Copy => format!("pasted copy: {pasted_name}"),
+                    ClipboardOperation::Cut => format!("moved: {pasted_name}"),
+                };
+
+                if clipboard.operation == ClipboardOperation::Cut {
+                    self.clipboard = None;
+                }
+            }
+            Err(error) => {
+                self.status = format!("paste failed for {}: {error}", clipboard.display_name);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 重新整理所有 pane，讓跨目錄操作後的內容保持同步。
+    ///
+    /// 參數：無。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表所有 pane 都已重新載入。
+    /// - 失敗時代表至少有一個 pane 在重新讀取時發生錯誤。
+    fn reload_all_panes(&mut self) -> io::Result<()> {
+        for pane in self.panes.values_mut() {
+            pane.reload()?;
+        }
+        Ok(())
+    }
+
     /// 根據目前應用程式狀態繪製整個畫面。
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let outer = Layout::default()
@@ -765,6 +951,12 @@ impl App {
             Span::raw(" move  "),
             Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
+            Span::styled("yy", self.theme.accent_style()),
+            Span::raw(" copy  "),
+            Span::styled("x", self.theme.accent_style()),
+            Span::raw(" cut  "),
+            Span::styled("p", self.theme.accent_style()),
+            Span::raw(" paste  "),
             Span::styled("Ctrl-w s/v", self.theme.accent_style()),
             Span::raw(" split  "),
             Span::styled("Ctrl-w h/j/k/l", self.theme.accent_style()),
@@ -1025,7 +1217,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, PendingAction, RenameMode, rename_basename_cursor, rename_next_word_start,
+        App, ClipboardOperation, PendingAction, RenameMode, rename_basename_cursor, rename_next_word_start,
         rename_previous_word_start, rename_word_end,
     };
     use crate::{
@@ -1322,5 +1514,70 @@ mod tests {
                 mode: RenameMode::Insert,
             })
         );
+    }
+
+    #[test]
+    /// 驗證 `yy` 複製後可以用 `p` 把檔案貼到另一個目錄，且來源會保留。
+    fn app_copy_and_paste_preserves_source_file() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("alpha.txt");
+        fs::write(&source_file, "hello").expect("file");
+
+        let mut app =
+            App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("pending copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy");
+
+        assert_eq!(
+            app.clipboard.as_ref().map(|entry| entry.operation),
+            Some(ClipboardOperation::Copy)
+        );
+
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut().expect("pane").reload().expect("reload");
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("paste");
+
+        assert!(source_file.exists());
+        assert!(target_dir.join("alpha.txt").exists());
+        assert_eq!(app.status, "pasted copy: alpha.txt");
+    }
+
+    #[test]
+    /// 驗證 `x` 剪下後可以用 `p` 移動檔案，且剪貼簿會在成功後清空。
+    fn app_cut_and_paste_moves_file_and_clears_clipboard() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("beta.txt");
+        fs::write(&source_file, "hello").expect("file");
+
+        let mut app =
+            App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("cut");
+
+        assert_eq!(
+            app.clipboard.as_ref().map(|entry| entry.operation),
+            Some(ClipboardOperation::Cut)
+        );
+
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut().expect("pane").reload().expect("reload");
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("paste");
+
+        assert!(!source_file.exists());
+        assert!(target_dir.join("beta.txt").exists());
+        assert!(app.clipboard.is_none());
+        assert_eq!(app.status, "moved: beta.txt");
     }
 }
