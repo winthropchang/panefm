@@ -45,13 +45,19 @@ pub(crate) fn render_pane(
     pane_id: usize,
     pane: &mut PaneState,
     focused: bool,
+    preview_focused: bool,
     theme: Theme,
     editor_state: Option<InlineEditorState<'_>>,
 ) -> Option<(u16, u16)> {
     let preview_height = area.height.saturating_sub(8).clamp(5, 10);
+    let list_height = area.height.saturating_sub(8).clamp(4, 8);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(preview_height)])
+        .constraints(if preview_focused {
+            [Constraint::Length(list_height), Constraint::Min(6)]
+        } else {
+            [Constraint::Min(3), Constraint::Length(preview_height)]
+        })
         .split(area);
 
     let border_style = if focused {
@@ -99,11 +105,23 @@ pub(crate) fn render_pane(
 
     let preview_title = pane
         .selected_entry()
-        .map(|entry| format!("Preview: {}", entry.name))
+        .map(|entry| {
+            let mut title = format!("Preview: {}", entry.name);
+            if preview_focused {
+                title.push_str("  [preview]");
+            }
+            if pane.has_preview_scroll() {
+                title.push_str("  ^");
+            }
+            if pane.preview_has_more_below() {
+                title.push_str("  v");
+            }
+            title
+        })
         .unwrap_or_else(|| "Preview".to_string());
-    let preview = Paragraph::new(
-        pane.preview_lines(chunks[1].height.saturating_sub(2).max(1) as usize),
-    )
+    let preview_viewport_height = chunks[1].height.saturating_sub(2).max(1) as usize;
+    pane.set_preview_viewport_height(preview_viewport_height);
+    let preview = Paragraph::new(pane.preview_lines(preview_viewport_height))
     .block(
         Block::default()
             .title(preview_title)

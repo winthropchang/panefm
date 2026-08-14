@@ -35,6 +35,10 @@ pub(crate) struct PaneState {
     pub(crate) sort_mode: SortMode,
     /// 隨機排序時使用的種子，讓每次重新套用時都能洗牌。
     pub(crate) random_seed: u64,
+    /// 目前 preview 在內容中的捲動偏移量。
+    pub(crate) preview_scroll: usize,
+    /// 目前 preview 區實際可顯示的列數，供捲動邏輯計算上下界。
+    pub(crate) preview_viewport_height: usize,
 }
 
 /// 描述 pane 目前使用的排序方式。
@@ -112,6 +116,8 @@ impl PaneState {
             show_hidden: false,
             sort_mode: SortMode::Natural { reverse: false },
             random_seed,
+            preview_scroll: 0,
+            preview_viewport_height: 4,
         };
         pane.reload()?;
         Ok(pane)
@@ -144,6 +150,7 @@ impl PaneState {
         }
         self.selected = self.selected.saturating_sub(1);
         self.list_state.select(Some(self.selected));
+        self.preview_scroll = 0;
     }
 
     /// 將列表選取游標向下移動一格。
@@ -158,6 +165,7 @@ impl PaneState {
         }
         self.selected = (self.selected + 1).min(self.visible_indices.len().saturating_sub(1));
         self.list_state.select(Some(self.selected));
+        self.preview_scroll = 0;
     }
 
     /// 將列表選取游標跳到最上方。
@@ -172,6 +180,7 @@ impl PaneState {
         }
         self.selected = 0;
         self.list_state.select(Some(self.selected));
+        self.preview_scroll = 0;
     }
 
     /// 將列表選取游標跳到最下方。
@@ -186,6 +195,7 @@ impl PaneState {
         }
         self.selected = self.visible_indices.len() - 1;
         self.list_state.select(Some(self.selected));
+        self.preview_scroll = 0;
     }
 
     /// 取得目前游標指向的檔案項目。
@@ -256,11 +266,80 @@ impl PaneState {
     ///
     /// 回傳：`Vec<Line<'static>>`，可直接交給 `ratatui` 的 Paragraph 渲染。
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<Line<'static>> {
+        self.preview_content_lines()
+            .into_iter()
+            .skip(self.preview_scroll)
+            .take(max_lines.max(1))
+            .collect()
+    }
+
+    /// 更新 preview 區目前實際可顯示的列數，供捲動行為使用。
+    pub(crate) fn set_preview_viewport_height(&mut self, height: usize) {
+        self.preview_viewport_height = height.max(1);
+        self.clamp_preview_scroll();
+    }
+
+    /// 將 preview 向下捲動指定列數。
+    pub(crate) fn scroll_preview_down(&mut self, lines: usize) {
+        let max_scroll = self.max_preview_scroll();
+        self.preview_scroll = (self.preview_scroll + lines).min(max_scroll);
+    }
+
+    /// 將 preview 向上捲動指定列數。
+    pub(crate) fn scroll_preview_up(&mut self, lines: usize) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(lines);
+    }
+
+    /// 將 preview 捲到最上方。
+    pub(crate) fn scroll_preview_top(&mut self) {
+        self.preview_scroll = 0;
+    }
+
+    /// 將 preview 捲到最下方。
+    pub(crate) fn scroll_preview_bottom(&mut self) {
+        self.preview_scroll = self.max_preview_scroll();
+    }
+
+    /// 依照目前 viewport 高度向下翻半頁。
+    pub(crate) fn page_preview_down(&mut self) {
+        let step = (self.preview_viewport_height / 2).max(1);
+        self.scroll_preview_down(step);
+    }
+
+    /// 依照目前 viewport 高度向上翻半頁。
+    pub(crate) fn page_preview_up(&mut self) {
+        let step = (self.preview_viewport_height / 2).max(1);
+        self.scroll_preview_up(step);
+    }
+
+    /// 判斷目前 preview 是否已經有捲動位置。
+    pub(crate) fn has_preview_scroll(&self) -> bool {
+        self.preview_scroll > 0
+    }
+
+    /// 判斷目前 preview 是否還有更多內容可以往下捲動。
+    pub(crate) fn preview_has_more_below(&self) -> bool {
+        self.preview_scroll < self.max_preview_scroll()
+    }
+
+    /// 回傳完整 preview 內容最多可以向下捲到哪一列。
+    fn max_preview_scroll(&self) -> usize {
+        let total_lines = self.preview_content_lines().len();
+        total_lines.saturating_sub(self.preview_viewport_height.max(1))
+    }
+
+    /// 產生目前選取項目的完整 preview 內容，供捲動切片與上下界計算使用。
+    fn preview_content_lines(&self) -> Vec<Line<'static>> {
         match self.selected_entry() {
-            Some(entry) if entry.is_dir => preview_directory(entry, max_lines),
-            Some(entry) => preview_file(&entry.path, max_lines),
+            Some(entry) if entry.is_dir => preview_directory(entry, usize::MAX),
+            Some(entry) => preview_file(&entry.path, usize::MAX),
             None => vec![Line::from("empty directory")],
         }
+    }
+
+    /// 當列表或 viewport 發生變化時，把 preview 捲動位置壓回合法範圍。
+    fn clamp_preview_scroll(&mut self) {
+        self.preview_scroll = self.preview_scroll.min(self.max_preview_scroll());
     }
 
     /// 刪除目前選取的檔案或資料夾。
@@ -466,6 +545,7 @@ impl PaneState {
             self.selected = index;
             self.list_state.select(Some(index));
         }
+        self.preview_scroll = 0;
     }
 
     /// 套用新的 filter 字串，並立即更新可見清單。
@@ -535,6 +615,7 @@ impl PaneState {
             self.selected = self.selected.min(self.visible_indices.len().saturating_sub(1));
             self.list_state.select(Some(self.selected));
         }
+        self.preview_scroll = 0;
     }
 
     /// 依照目前排序模式重排完整項目列表。

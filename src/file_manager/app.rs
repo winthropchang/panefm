@@ -113,6 +113,7 @@ pub(crate) struct App {
     pub(crate) clipboard: Option<ClipboardEntry>,
     pub(crate) filter: Option<FilterState>,
     pub(crate) pending_action: Option<PendingAction>,
+    pub(crate) preview_focus: bool,
 }
 
 impl App {
@@ -152,6 +153,7 @@ impl App {
             clipboard: None,
             filter: None,
             pending_action: None,
+            preview_focus: false,
         })
     }
 
@@ -165,6 +167,9 @@ impl App {
         }
         if self.command_mode {
             return self.handle_command_key(key);
+        }
+        if self.preview_focus {
+            return self.handle_preview_key(key);
         }
         if self.awaiting_ctrl_w {
             self.awaiting_ctrl_w = false;
@@ -238,6 +243,12 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            KeyCode::Char('P') => {
+                self.open_preview_focus();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             KeyCode::Char(',') => {
                 self.open_sort_picker();
                 self.pending_g = false;
@@ -306,6 +317,59 @@ impl App {
         };
 
         Ok(should_continue)
+    }
+
+    /// 處理 preview mode 的鍵盤輸入，讓使用者可以專心在預覽區捲動內容。
+    pub(crate) fn handle_preview_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('P') => {
+                self.preview_focus = false;
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = String::from("normal mode");
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.current_pane_mut()?.scroll_preview_down(1);
+                self.pending_g = false;
+                self.status = String::from("preview mode");
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.current_pane_mut()?.scroll_preview_up(1);
+                self.pending_g = false;
+                self.status = String::from("preview mode");
+            }
+            KeyCode::Char('g') => {
+                if self.pending_g {
+                    self.current_pane_mut()?.scroll_preview_top();
+                    self.pending_g = false;
+                    self.status = String::from("preview: top");
+                } else {
+                    self.pending_g = true;
+                    self.status = String::from("preview: pending g");
+                }
+            }
+            KeyCode::Char('G') => {
+                self.current_pane_mut()?.scroll_preview_bottom();
+                self.pending_g = false;
+                self.status = String::from("preview: bottom");
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.current_pane_mut()?.page_preview_down();
+                self.pending_g = false;
+                self.status = String::from("preview: page down");
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.current_pane_mut()?.page_preview_up();
+                self.pending_g = false;
+                self.status = String::from("preview: page up");
+            }
+            _ => {
+                self.pending_g = false;
+                self.status = String::from("preview mode");
+            }
+        }
+
+        Ok(true)
     }
 
     /// 處理 filter 輸入框中的鍵盤輸入，並在每次輸入後立即更新列表。
@@ -866,6 +930,7 @@ impl App {
             "copy" => self.copy_selected(),
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
+            "preview" => self.open_preview_focus(),
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -1069,6 +1134,14 @@ impl App {
         self.apply_filter_buffer(&filter);
         self.status = String::from("filter: all");
         self.filter = Some(filter);
+    }
+
+    /// 進入 preview mode，讓目前焦點 pane 的預覽區放大並接手捲動按鍵。
+    pub(crate) fn open_preview_focus(&mut self) {
+        self.preview_focus = true;
+        self.pending_g = false;
+        self.pending_y = false;
+        self.status = String::from("preview mode");
     }
 
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
@@ -1379,6 +1452,7 @@ impl App {
                     pane_id,
                     pane,
                     pane_id == self.focused_pane,
+                    self.preview_focus && pane_id == self.focused_pane,
                     self.theme,
                     rename_buffer,
                 );
@@ -1407,6 +1481,8 @@ impl App {
             Span::raw(" delete  "),
             Span::styled("r", self.theme.accent_style()),
             Span::raw(" rename  "),
+            Span::styled("P", self.theme.accent_style()),
+            Span::raw(" preview  "),
             Span::styled("a", self.theme.accent_style()),
             Span::raw(" create  "),
             Span::styled("f", self.theme.accent_style()),
@@ -1418,6 +1494,8 @@ impl App {
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
+            Span::raw("  "),
+            Span::styled(":preview", self.theme.accent_style()),
             Span::raw("  "),
             Span::styled(":split :vsplit :close :only", self.theme.accent_style()),
             Span::raw("  "),
@@ -2298,5 +2376,79 @@ mod tests {
             app.panes.get(&1).expect("pane").sort_mode,
             SortMode::Modified { reverse: true }
         );
+    }
+
+    #[test]
+    /// 驗證進入 preview mode 後，`j/k` 會改成捲動 preview，Esc 會離開該模式。
+    fn app_preview_mode_scrolls_and_exits_cleanly() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("notes.txt"),
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+        )
+        .expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_preview_viewport_height(4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE))
+            .expect("open preview");
+        assert!(app.preview_focus);
+        assert_eq!(app.status, "preview mode");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("scroll down");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("scroll up");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("leave preview");
+        assert!(!app.preview_focus);
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 preview mode 支援半頁捲動與 `gg/G` 的上下端跳轉。
+    fn app_preview_mode_supports_paging_and_boundary_jumps() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("readme.md"),
+            "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n",
+        )
+        .expect("readme");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_preview_viewport_height(4);
+        app.open_preview_focus();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("page down");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE))
+            .expect("bottom");
+        let bottom_scroll = app.panes.get(&1).expect("pane").preview_scroll;
+        assert!(bottom_scroll > 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("pending g");
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("top");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("page down again");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("page up");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
     }
 }
