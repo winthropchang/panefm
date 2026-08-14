@@ -17,7 +17,10 @@ cargo run
 - `Ctrl-w h j k l`: switch pane focus
 - `Ctrl-w c`: close current pane
 - `Ctrl-w o`: keep only current pane
+- `d`: delete selected file or directory with confirmation
 - `:split`, `:vsplit`, `:close`, `:only`
+- `:theme`: open the theme picker
+- `:theme next`, `:theme default`, `:theme forest`, `:theme ocean`
 - `q`: quit
 
 ## Test
@@ -25,3 +28,16 @@ cargo run
 ```bash
 cargo test
 ```
+
+## Theme
+
+Colors are centralized in `src/theme.rs`.
+Change `Theme::default_theme()` to update the active palette, or use the built-in presets like `Theme::forest_theme()` and `Theme::ocean_theme()` as a starting point.
+
+Each preset is selected through `ThemePreset` and converted into a `Theme`.
+If you want to tune the current look:
+
+- Edit the color values inside `Theme::default_theme()`
+- Keep the field meanings stable: `accent`, `focus_border`, `muted`, `selection_bg`, `danger`
+- Add a new preset by extending `ThemePreset`, then add its palette in `impl From<ThemePreset> for Theme`
+- Inside the theme picker, use `j/k` or arrow keys to move, `Enter` to apply, and `Esc` to cancel

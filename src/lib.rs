@@ -16,10 +16,13 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+pub mod theme;
+
+use crate::theme::{Theme, ThemePreset};
 
 pub fn run() -> Result<()> {
     let mut terminal = setup_terminal()?;
@@ -176,6 +179,22 @@ impl PaneState {
             Some(entry) => preview_file(&entry.path, max_lines),
             None => vec![Line::from("empty directory")],
         }
+    }
+
+    fn delete_selected(&mut self) -> io::Result<Option<String>> {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return Ok(None);
+        };
+
+        if entry.is_dir {
+            fs::remove_dir_all(&entry.path)?;
+        } else {
+            fs::remove_file(&entry.path)?;
+        }
+
+        let removed_name = entry.display_name();
+        self.reload()?;
+        Ok(Some(removed_name))
     }
 }
 
@@ -338,8 +357,16 @@ impl LayoutNode {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PendingAction {
+    ConfirmDelete { pane_id: usize, target_name: String },
+    ThemePicker { selected: usize },
+}
+
 #[derive(Debug)]
 struct App {
+    theme: Theme,
+    theme_preset: ThemePreset,
     panes: BTreeMap<usize, PaneState>,
     layout: LayoutNode,
     focused_pane: usize,
@@ -349,6 +376,7 @@ struct App {
     command_buffer: String,
     awaiting_ctrl_w: bool,
     pending_g: bool,
+    pending_action: Option<PendingAction>,
 }
 
 impl App {
@@ -358,6 +386,8 @@ impl App {
         panes.insert(1, pane);
 
         Ok(Self {
+            theme: ThemePreset::Default.into(),
+            theme_preset: ThemePreset::Default,
             panes,
             layout: LayoutNode::Leaf { pane_id: 1 },
             focused_pane: 1,
@@ -367,10 +397,15 @@ impl App {
             command_buffer: String::new(),
             awaiting_ctrl_w: false,
             pending_g: false,
+            pending_action: None,
         })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.pending_action.is_some() {
+            return self.handle_pending_action_key(key);
+        }
+
         if self.command_mode {
             return self.handle_command_key(key);
         }
@@ -427,6 +462,11 @@ impl App {
                 self.status = String::from("jumped to bottom");
                 true
             }
+            KeyCode::Char('d') => {
+                self.start_delete_confirmation();
+                self.pending_g = false;
+                true
+            }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
@@ -445,6 +485,57 @@ impl App {
         };
 
         Ok(should_continue)
+    }
+
+    fn handle_pending_action_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(action) = self.pending_action.take() else {
+            return Ok(true);
+        };
+
+        match action {
+            PendingAction::ConfirmDelete {
+                pane_id,
+                target_name,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_delete(pane_id, &target_name)?;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.status = format!("delete cancelled: {target_name}");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::ConfirmDelete {
+                        pane_id,
+                        target_name: target_name.clone(),
+                    });
+                    self.status = format!("confirm delete {target_name}: y/n");
+                }
+            },
+            PendingAction::ThemePicker { mut selected } => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    selected = (selected + 1) % ThemePreset::ALL.len();
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    selected = (selected + ThemePreset::ALL.len() - 1) % ThemePreset::ALL.len();
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                KeyCode::Enter => {
+                    self.apply_theme(ThemePreset::ALL[selected]);
+                }
+                KeyCode::Esc => {
+                    self.status = String::from("theme picker cancelled");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = String::from("theme picker: use j/k and Enter");
+                }
+            },
+        }
+
+        Ok(true)
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -490,6 +581,8 @@ impl App {
             "q" => {
                 self.status = String::from("use q in normal mode to quit");
             }
+            "theme" => self.open_theme_picker(),
+            "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
             "vsplit" => self.split_current(SplitDirection::Vertical)?,
             "close" => self.close_current_pane(),
@@ -498,7 +591,11 @@ impl App {
                 self.status = String::from("normal mode");
             }
             other => {
-                self.status = format!("unknown command: {other}");
+                if let Some(name) = other.strip_prefix("theme ") {
+                    self.set_theme_by_name(name.trim());
+                } else {
+                    self.status = format!("unknown command: {other}");
+                }
             }
         }
         Ok(())
@@ -585,6 +682,79 @@ impl App {
         self.status = String::from("kept only focused pane");
     }
 
+    fn cycle_theme(&mut self) {
+        let next = self.theme_preset.next();
+        self.apply_theme(next);
+    }
+
+    fn open_theme_picker(&mut self) {
+        let selected = ThemePreset::ALL
+            .iter()
+            .position(|preset| *preset == self.theme_preset)
+            .unwrap_or(0);
+        self.pending_action = Some(PendingAction::ThemePicker { selected });
+        self.status = String::from("theme picker: use j/k and Enter");
+    }
+
+    fn set_theme_by_name(&mut self, name: &str) {
+        match ThemePreset::from_name(name) {
+            Some(preset) => self.apply_theme(preset),
+            None => {
+                let available = ThemePreset::ALL
+                    .iter()
+                    .map(|preset| preset.name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status = format!("unknown theme: {name}. available: {available}");
+            }
+        }
+    }
+
+    fn apply_theme(&mut self, preset: ThemePreset) {
+        self.theme_preset = preset;
+        self.theme = preset.into();
+        self.status = format!("theme: {}", preset.name());
+    }
+
+    fn start_delete_confirmation(&mut self) {
+        let Some(entry) = self
+            .panes
+            .get(&self.focused_pane)
+            .and_then(PaneState::selected_entry)
+            .cloned()
+        else {
+            self.status = String::from("nothing selected to delete");
+            return;
+        };
+
+        self.pending_action = Some(PendingAction::ConfirmDelete {
+            pane_id: self.focused_pane,
+            target_name: entry.display_name(),
+        });
+        self.status = format!("confirm delete {}: y/n", entry.display_name());
+    }
+
+    fn confirm_delete(&mut self, pane_id: usize, target_name: &str) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        match pane.delete_selected() {
+            Ok(Some(removed_name)) => {
+                self.status = format!("deleted {removed_name}");
+            }
+            Ok(None) => {
+                self.status = String::from("nothing selected to delete");
+            }
+            Err(error) => {
+                self.status = format!("failed to delete {target_name}: {error}");
+            }
+        }
+
+        Ok(())
+    }
+
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -599,23 +769,31 @@ impl App {
         self.layout.render_rects(outer[0], &mut pane_rects);
         for (pane_id, rect) in pane_rects {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
-                render_pane(frame, rect, pane_id, pane, pane_id == self.focused_pane);
+                render_pane(
+                    frame,
+                    rect,
+                    pane_id,
+                    pane,
+                    pane_id == self.focused_pane,
+                    self.theme,
+                );
             }
         }
 
         let help = Paragraph::new(Line::from(vec![
-            Span::styled("hjkl", Style::default().fg(Color::Yellow)),
+            Span::styled("hjkl", self.theme.accent_style()),
             Span::raw(" move  "),
-            Span::styled("gg/G", Style::default().fg(Color::Yellow)),
+            Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
-            Span::styled("Ctrl-w s/v", Style::default().fg(Color::Yellow)),
+            Span::styled("Ctrl-w s/v", self.theme.accent_style()),
             Span::raw(" split  "),
-            Span::styled("Ctrl-w h/j/k/l", Style::default().fg(Color::Yellow)),
+            Span::styled("Ctrl-w h/j/k/l", self.theme.accent_style()),
             Span::raw(" focus  "),
-            Span::styled(
-                ":split :vsplit :close :only",
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled("d", self.theme.accent_style()),
+            Span::raw(" delete  "),
+            Span::styled(":split :vsplit :close :only", self.theme.accent_style()),
+            Span::raw("  "),
+            Span::styled(":theme", self.theme.accent_style()),
         ]))
         .block(Block::default().borders(Borders::TOP));
         frame.render_widget(help, outer[1]);
@@ -636,6 +814,16 @@ impl App {
                 area,
             );
         }
+
+        match &self.pending_action {
+            Some(PendingAction::ConfirmDelete { target_name, .. }) => {
+                render_confirm_dialog(frame, frame.area(), target_name, self.theme);
+            }
+            Some(PendingAction::ThemePicker { selected }) => {
+                render_theme_picker(frame, frame.area(), self.theme, *selected);
+            }
+            None => {}
+        }
     }
 }
 
@@ -645,6 +833,7 @@ fn render_pane(
     pane_id: usize,
     pane: &mut PaneState,
     focused: bool,
+    theme: Theme,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -652,11 +841,9 @@ fn render_pane(
         .split(area);
 
     let border_style = if focused {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
+        theme.focused_border_style()
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme.muted_style()
     };
 
     let title = format!(" pane {}  {}", pane_id, pane.cwd.display());
@@ -678,10 +865,7 @@ fn render_pane(
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(entry.display_name()),
-                    Span::styled(
-                        format!("  [{detail}]"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("  [{detail}]"), theme.muted_style()),
                 ]))
             })
             .collect()
@@ -689,7 +873,7 @@ fn render_pane(
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::Blue))
+        .highlight_style(theme.selected_item_style())
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, chunks[0], &mut pane.list_state);
@@ -723,6 +907,58 @@ fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
         .split(vertical[1]);
 
     horizontal[1]
+}
+
+fn render_confirm_dialog(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    target_name: &str,
+    theme: Theme,
+) {
+    let dialog_area = centered_rect(area, 60, 5);
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Delete {target_name}?")),
+            Line::from("Press y to confirm, n or Esc to cancel."),
+        ])
+        .block(
+            Block::default()
+                .title(Line::from(Span::styled(
+                    " Confirm Delete ",
+                    theme.danger_title_style(),
+                )))
+                .borders(Borders::ALL),
+        ),
+        dialog_area,
+    );
+}
+
+fn render_theme_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme, selected: usize) {
+    let dialog_area = centered_rect(area, 42, 8);
+    frame.render_widget(Clear, dialog_area);
+
+    let items: Vec<ListItem<'static>> = ThemePreset::ALL
+        .iter()
+        .map(|preset| ListItem::new(Line::from(preset.name().to_string())))
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(Line::from(Span::styled(
+                    " Theme Picker ",
+                    theme.accent_style().add_modifier(Modifier::BOLD),
+                )))
+                .borders(Borders::ALL),
+        )
+        .highlight_style(theme.selected_item_style())
+        .highlight_symbol("> ");
+
+    frame.render_stateful_widget(list, dialog_area, &mut list_state);
 }
 
 #[cfg(test)]
@@ -800,5 +1036,91 @@ mod tests {
                 pane_id: app.focused_pane
             }
         );
+    }
+
+    #[test]
+    fn pane_state_delete_selected_file_removes_it() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let removed = pane.delete_selected().expect("delete");
+
+        assert_eq!(removed, Some(String::from("alpha.txt")));
+        assert!(!file_path.exists());
+        assert!(pane.entries.is_empty());
+    }
+
+    #[test]
+    fn app_delete_confirmation_removes_selected_entry() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("delete-me.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.start_delete_confirmation();
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmDelete { .. })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm delete");
+
+        assert!(!file_path.exists());
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "deleted delete-me.txt");
+    }
+
+    #[test]
+    fn app_cycle_theme_switches_to_next_preset() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+
+        app.cycle_theme();
+
+        assert_eq!(app.theme_preset, ThemePreset::Forest);
+        assert_eq!(app.theme, ThemePreset::Forest.into());
+        assert_eq!(app.status, "theme: forest");
+    }
+
+    #[test]
+    fn app_open_theme_picker_tracks_current_preset() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+
+        app.open_theme_picker();
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::ThemePicker { selected: 0 })
+        );
+    }
+
+    #[test]
+    fn app_set_theme_by_name_updates_theme() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+
+        app.set_theme_by_name("ocean");
+
+        assert_eq!(app.theme_preset, ThemePreset::Ocean);
+        assert_eq!(app.theme, ThemePreset::Ocean.into());
+        assert_eq!(app.status, "theme: ocean");
+    }
+
+    #[test]
+    fn app_theme_picker_confirm_applies_selected_theme() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("apply theme");
+
+        assert_eq!(app.theme_preset, ThemePreset::Ocean);
+        assert_eq!(app.theme, ThemePreset::Ocean.into());
+        assert_eq!(app.status, "theme: ocean");
     }
 }
