@@ -7,7 +7,11 @@ use std::{
     time::SystemTime,
 };
 
-use ratatui::{text::Line, widgets::ListState};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::ListState,
+};
 
 use super::entry::FileEntry;
 
@@ -39,6 +43,8 @@ pub(crate) struct PaneState {
     pub(crate) preview_scroll: usize,
     /// 目前 preview 區實際可顯示的列數，供捲動邏輯計算上下界。
     pub(crate) preview_viewport_height: usize,
+    /// 目前 preview 內搜尋使用的查詢字串。
+    pub(crate) preview_search_query: Option<String>,
 }
 
 /// 描述 pane 目前使用的排序方式。
@@ -118,6 +124,7 @@ impl PaneState {
             random_seed,
             preview_scroll: 0,
             preview_viewport_height: 4,
+            preview_search_query: None,
         };
         pane.reload()?;
         Ok(pane)
@@ -317,6 +324,16 @@ impl PaneState {
         self.preview_scroll > 0
     }
 
+    /// 判斷目前 preview 是否正在套用搜尋條件。
+    pub(crate) fn has_preview_search(&self) -> bool {
+        self.preview_search_query.is_some()
+    }
+
+    /// 取得目前 preview 搜尋字串，供 UI 顯示狀態使用。
+    pub(crate) fn preview_search_query(&self) -> Option<&str> {
+        self.preview_search_query.as_deref()
+    }
+
     /// 判斷目前 preview 是否還有更多內容可以往下捲動。
     pub(crate) fn preview_has_more_below(&self) -> bool {
         self.preview_scroll < self.max_preview_scroll()
@@ -324,12 +341,22 @@ impl PaneState {
 
     /// 回傳完整 preview 內容最多可以向下捲到哪一列。
     fn max_preview_scroll(&self) -> usize {
-        let total_lines = self.preview_content_lines().len();
+        let total_lines = self.raw_preview_content_lines().len();
         total_lines.saturating_sub(self.preview_viewport_height.max(1))
     }
 
     /// 產生目前選取項目的完整 preview 內容，供捲動切片與上下界計算使用。
     fn preview_content_lines(&self) -> Vec<Line<'static>> {
+        let lines = self.raw_preview_content_lines();
+        if let Some(query) = self.preview_search_query.as_deref() {
+            highlight_preview_matches(lines, query)
+        } else {
+            lines
+        }
+    }
+
+    /// 產生目前選取項目的完整 preview 原始內容，不套用任何搜尋高亮。
+    fn raw_preview_content_lines(&self) -> Vec<Line<'static>> {
         match self.selected_entry() {
             Some(entry) if entry.is_dir => preview_directory(entry, usize::MAX),
             Some(entry) => preview_file(&entry.path, usize::MAX),
@@ -340,6 +367,87 @@ impl PaneState {
     /// 當列表或 viewport 發生變化時，把 preview 捲動位置壓回合法範圍。
     fn clamp_preview_scroll(&mut self) {
         self.preview_scroll = self.preview_scroll.min(self.max_preview_scroll());
+    }
+
+    /// 對 preview 內容套用搜尋條件，並跳到第一個命中的結果。
+    pub(crate) fn set_preview_search_query(&mut self, query: &str) {
+        let trimmed = query.trim();
+        self.preview_search_query = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+
+        if self.preview_search_query.is_some() {
+            self.preview_scroll = 0;
+            self.jump_to_preview_match(true);
+        } else {
+            self.preview_scroll = 0;
+        }
+    }
+
+    /// 清除 preview 搜尋條件與其高亮狀態。
+    pub(crate) fn clear_preview_search(&mut self) {
+        self.preview_search_query = None;
+    }
+
+    /// 跳到下一個 preview 搜尋命中結果，若已到底則循環回第一個。
+    pub(crate) fn jump_to_next_preview_match(&mut self) -> bool {
+        self.jump_to_preview_match(true)
+    }
+
+    /// 跳到上一個 preview 搜尋命中結果，若已到頂則循環回最後一個。
+    pub(crate) fn jump_to_previous_preview_match(&mut self) -> bool {
+        self.jump_to_preview_match(false)
+    }
+
+    /// 回傳目前 preview 搜尋命中的總數，供狀態列顯示。
+    pub(crate) fn preview_match_count(&self) -> usize {
+        let Some(query) = self.preview_search_query.as_deref() else {
+            return 0;
+        };
+        let query = query.to_lowercase();
+        self.raw_preview_content_lines()
+            .into_iter()
+            .filter(|line| line.to_string().to_lowercase().contains(&query))
+            .count()
+    }
+
+    /// 依照方向跳到 preview 搜尋的下一個或上一個命中位置。
+    fn jump_to_preview_match(&mut self, forward: bool) -> bool {
+        let Some(query) = self.preview_search_query.as_deref() else {
+            return false;
+        };
+
+        let query = query.to_lowercase();
+        let matches: Vec<usize> = self
+            .raw_preview_content_lines()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, line)| line.to_string().to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect();
+
+        let target = if forward {
+            matches
+                .iter()
+                .copied()
+                .find(|index| *index > self.preview_scroll)
+                .or_else(|| matches.first().copied())
+        } else {
+            matches
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| *index < self.preview_scroll)
+                .or_else(|| matches.last().copied())
+        };
+        let Some(target) = target else {
+            return false;
+        };
+
+        self.preview_scroll = target.min(self.max_preview_scroll());
+        true
     }
 
     /// 刪除目前選取的檔案或資料夾。
@@ -953,6 +1061,37 @@ fn preview_image_summary(bytes: &[u8], extension: Option<&str>) -> Option<Vec<St
 
     lines.push(String::from("image preview is not available in terminal"));
     Some(lines)
+}
+
+/// 將命中的搜尋字串套用到 preview 行內容上，讓目前查詢結果更容易辨識。
+fn highlight_preview_matches(lines: Vec<Line<'static>>, query: &str) -> Vec<Line<'static>> {
+    let lower_query = query.to_lowercase();
+    if lower_query.is_empty() {
+        return lines;
+    }
+
+    lines.into_iter()
+        .map(|line| highlight_preview_line(line.to_string(), &lower_query))
+        .collect()
+}
+
+/// 將單一 preview 文字行轉成帶高亮的 `Line`。
+fn highlight_preview_line(text: String, lower_query: &str) -> Line<'static> {
+    let lower_text = text.to_lowercase();
+    let Some(start) = lower_text.find(lower_query) else {
+        return Line::from(text);
+    };
+    let end = start + lower_query.len();
+
+    let head = text.get(..start).unwrap_or_default().to_string();
+    let body = text.get(start..end).unwrap_or_default().to_string();
+    let tail = text.get(end..).unwrap_or_default().to_string();
+
+    Line::from(vec![
+        Span::styled(head, Style::default()),
+        Span::styled(body, Style::default().add_modifier(Modifier::REVERSED)),
+        Span::styled(tail, Style::default()),
+    ])
 }
 
 /// 依照副檔名為常見二進位檔案補上格式描述。

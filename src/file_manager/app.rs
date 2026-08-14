@@ -18,7 +18,7 @@ use super::{
     pane::{PaneState, SortMode},
     ui::{
         InlineEditorState, centered_rect, render_confirm_dialog, render_filter_input, render_pane,
-        render_theme_picker,
+        render_preview_search_input, render_theme_picker,
     },
 };
 
@@ -55,6 +55,14 @@ pub(crate) struct ClipboardEntry {
 /// 記錄目前 filter 的目標 pane、查詢字串與是否仍在輸入中。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilterState {
+    pub(crate) pane_id: usize,
+    pub(crate) buffer: String,
+    pub(crate) editing: bool,
+}
+
+/// 記錄目前 preview search 的目標 pane、查詢字串與是否仍在輸入中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreviewSearchState {
     pub(crate) pane_id: usize,
     pub(crate) buffer: String,
     pub(crate) editing: bool,
@@ -112,6 +120,7 @@ pub(crate) struct App {
     pub(crate) pending_y: bool,
     pub(crate) clipboard: Option<ClipboardEntry>,
     pub(crate) filter: Option<FilterState>,
+    pub(crate) preview_search: Option<PreviewSearchState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) preview_focus: bool,
 }
@@ -152,6 +161,7 @@ impl App {
             pending_y: false,
             clipboard: None,
             filter: None,
+            preview_search: None,
             pending_action: None,
             preview_focus: false,
         })
@@ -164,6 +174,9 @@ impl App {
         }
         if self.filter.as_ref().is_some_and(|filter| filter.editing) {
             return self.handle_filter_input_key(key);
+        }
+        if self.preview_search.as_ref().is_some_and(|search| search.editing) {
+            return self.handle_preview_search_input_key(key);
         }
         if self.command_mode {
             return self.handle_command_key(key);
@@ -323,10 +336,26 @@ impl App {
     pub(crate) fn handle_preview_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('P') => {
+                if self.clear_preview_search_if_active() {
+                    self.pending_g = false;
+                    return Ok(true);
+                }
                 self.preview_focus = false;
                 self.pending_g = false;
                 self.pending_y = false;
                 self.status = String::from("normal mode");
+            }
+            KeyCode::Char('/') => {
+                self.open_preview_search_input();
+                self.pending_g = false;
+            }
+            KeyCode::Char('n') => {
+                self.pending_g = false;
+                self.status = self.jump_preview_match(true)?;
+            }
+            KeyCode::Char('N') => {
+                self.pending_g = false;
+                self.status = self.jump_preview_match(false)?;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.current_pane_mut()?.scroll_preview_down(1);
@@ -366,6 +395,48 @@ impl App {
             _ => {
                 self.pending_g = false;
                 self.status = String::from("preview mode");
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// 處理 preview search 輸入框中的鍵盤輸入，並在每次輸入後立即更新命中位置。
+    pub(crate) fn handle_preview_search_input_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(mut search) = self.preview_search.take() else {
+            return Ok(true);
+        };
+
+        match key.code {
+            KeyCode::Char(c) => {
+                search.buffer.push(c);
+                self.apply_preview_search_buffer(&search);
+                self.status =
+                    preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
+                self.preview_search = Some(search);
+            }
+            KeyCode::Backspace => {
+                search.buffer.pop();
+                self.apply_preview_search_buffer(&search);
+                self.status =
+                    preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
+                self.preview_search = Some(search);
+            }
+            KeyCode::Esc | KeyCode::Enter => {
+                search.editing = false;
+                self.status = if search.buffer.is_empty() {
+                    String::from("preview mode")
+                } else {
+                    format!(
+                        "preview search locked: {} ({})",
+                        search.buffer,
+                        self.preview_match_count(search.pane_id)
+                    )
+                };
+                self.preview_search = Some(search);
+            }
+            _ => {
+                self.preview_search = Some(search);
             }
         }
 
@@ -931,6 +1002,7 @@ impl App {
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
             "preview" => self.open_preview_focus(),
+            "preview-search" => self.open_preview_search_input(),
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -1144,6 +1216,24 @@ impl App {
         self.status = String::from("preview mode");
     }
 
+    /// 打開 preview search 輸入框，並沿用目前已存在的搜尋字串。
+    pub(crate) fn open_preview_search_input(&mut self) {
+        let existing = self
+            .panes
+            .get(&self.focused_pane)
+            .and_then(|pane| pane.preview_search_query())
+            .unwrap_or_default()
+            .to_string();
+        let search = PreviewSearchState {
+            pane_id: self.focused_pane,
+            buffer: existing,
+            editing: true,
+        };
+        self.apply_preview_search_buffer(&search);
+        self.status = preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
+        self.preview_search = Some(search);
+    }
+
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
         let Some(entry) = self
@@ -1255,6 +1345,66 @@ impl App {
         if let Some(pane) = self.panes.get_mut(&filter.pane_id) {
             pane.set_filter_query(&filter.buffer);
         }
+    }
+
+    /// 將 preview search 文字套用到指定 pane，並讓 preview 跳到命中位置。
+    fn apply_preview_search_buffer(&mut self, search: &PreviewSearchState) {
+        if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+            pane.set_preview_search_query(&search.buffer);
+        }
+    }
+
+    /// 回傳指定 pane 目前 preview 搜尋命中的數量。
+    fn preview_match_count(&self, pane_id: usize) -> usize {
+        self.panes
+            .get(&pane_id)
+            .map(PaneState::preview_match_count)
+            .unwrap_or(0)
+    }
+
+    /// 清除目前 preview 的搜尋狀態；若有清除任何內容則回傳 `true`。
+    fn clear_preview_search_if_active(&mut self) -> bool {
+        if let Some(search) = self.preview_search.take() {
+            if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                pane.clear_preview_search();
+            }
+            self.status = String::from("preview search cleared");
+            return true;
+        }
+
+        if let Some(pane) = self.panes.get_mut(&self.focused_pane)
+            && pane.has_preview_search()
+        {
+            pane.clear_preview_search();
+            self.status = String::from("preview search cleared");
+            return true;
+        }
+
+        false
+    }
+
+    /// 在 preview mode 中跳到下一個或上一個搜尋結果，並回傳狀態訊息。
+    fn jump_preview_match(&mut self, forward: bool) -> io::Result<String> {
+        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
+            return Ok(String::from("pane no longer exists"));
+        };
+
+        let Some(query) = pane.preview_search_query().map(str::to_string) else {
+            return Ok(String::from("preview search is empty"));
+        };
+
+        let found = if forward {
+            pane.jump_to_next_preview_match()
+        } else {
+            pane.jump_to_previous_preview_match()
+        };
+        let count = pane.preview_match_count();
+
+        Ok(if found {
+            format!("preview search: {query} ({count})")
+        } else {
+            format!("preview search: {query} (0)")
+        })
     }
 
     /// 切換目前焦點 pane 的隱藏檔顯示狀態。
@@ -1483,6 +1633,8 @@ impl App {
             Span::raw(" rename  "),
             Span::styled("P", self.theme.accent_style()),
             Span::raw(" preview  "),
+            Span::styled("/ n N", self.theme.accent_style()),
+            Span::raw(" search  "),
             Span::styled("a", self.theme.accent_style()),
             Span::raw(" create  "),
             Span::styled("f", self.theme.accent_style()),
@@ -1494,6 +1646,8 @@ impl App {
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
+            Span::raw("  "),
+            Span::styled(":preview-search", self.theme.accent_style()),
             Span::raw("  "),
             Span::styled(":preview", self.theme.accent_style()),
             Span::raw("  "),
@@ -1527,6 +1681,16 @@ impl App {
             let filter_cursor = render_filter_input(frame, outer[0], self.theme, &filter.buffer);
             if cursor_position.is_none() {
                 cursor_position = Some(filter_cursor);
+            }
+        }
+
+        if let Some(search) = &self.preview_search
+            && search.editing
+        {
+            let search_cursor =
+                render_preview_search_input(frame, outer[0], self.theme, &search.buffer);
+            if cursor_position.is_none() {
+                cursor_position = Some(search_cursor);
             }
         }
 
@@ -1567,6 +1731,15 @@ impl App {
 /// 回傳建立流程的狀態列內容，讓使用者知道目前正處於哪一種編輯模式。
 fn create_status_label(mode: &str) -> String {
     format!("create entry: {mode}")
+}
+
+/// 依照目前 preview search 文字與命中數量產生狀態列訊息。
+fn preview_search_status(buffer: &str, matches: usize) -> String {
+    if buffer.is_empty() {
+        String::from("preview search: all")
+    } else {
+        format!("preview search: {buffer} ({matches})")
+    }
 }
 
 /// 依照編輯模式決定建立輸入框的標題文字。
@@ -2450,5 +2623,81 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
             .expect("page up");
         assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+    }
+
+    #[test]
+    /// 驗證 preview mode 中的 `/` 會打開搜尋輸入框，並在輸入時立即更新搜尋結果。
+    fn app_preview_search_opens_and_tracks_matches() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("notes.txt"),
+            "alpha\nbeta\ngamma\nbeta line\n",
+        )
+        .expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_preview_viewport_height(3);
+        app.open_preview_focus();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open preview search");
+        assert!(app.preview_search.as_ref().is_some_and(|search| search.editing));
+
+        for ch in ['b', 'e', 't', 'a'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type search");
+        }
+        assert_eq!(app.panes.get(&1).expect("pane").preview_match_count(), 2);
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 6);
+        assert_eq!(app.status, "preview search: beta (2)");
+    }
+
+    #[test]
+    /// 驗證 preview search 支援 `n/N` 跳轉命中結果，Esc 先清搜尋再離開 preview mode。
+    fn app_preview_search_navigation_and_escape_flow() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("readme.md"),
+            "zero\nmatch one\nmiddle\nmatch two\nend\n",
+        )
+        .expect("readme");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_preview_viewport_height(3);
+        app.open_preview_focus();
+        app.open_preview_search_input();
+        for ch in ['m', 'a', 't', 'c', 'h'] {
+            app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock search");
+
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 6);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next match");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 7);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE))
+            .expect("previous match");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 6);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear search");
+        assert!(app.preview_focus);
+        assert!(!app.panes.get(&1).expect("pane").has_preview_search());
+        assert_eq!(app.status, "preview search cleared");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("leave preview");
+        assert!(!app.preview_focus);
+        assert_eq!(app.status, "normal mode");
     }
 }

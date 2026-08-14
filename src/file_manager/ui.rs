@@ -110,6 +110,9 @@ pub(crate) fn render_pane(
             if preview_focused {
                 title.push_str("  [preview]");
             }
+            if let Some(query) = pane.preview_search_query() {
+                title.push_str(&format!("  [/{}]", query));
+            }
             if pane.has_preview_scroll() {
                 title.push_str("  ^");
             }
@@ -223,11 +226,12 @@ pub(crate) fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect
     horizontal[1]
 }
 
-/// 在畫面右上方繪製 filter 輸入框，並回傳游標應該停留的位置。
-pub(crate) fn render_filter_input(
+/// 在畫面右上方繪製小型輸入框，供 filter 與 preview search 這類短文字輸入重用。
+fn render_top_right_input(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     theme: Theme,
+    title: &str,
     buffer: &str,
 ) -> (u16, u16) {
     let width = area.width.min(32).max(18);
@@ -241,7 +245,7 @@ pub(crate) fn render_filter_input(
     frame.render_widget(Clear, input_area);
     let input_block = Block::default()
         .title(Line::from(Span::styled(
-            " Filter ",
+            title,
             theme.accent_style().add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)
@@ -256,6 +260,26 @@ pub(crate) fn render_filter_input(
         input_inner.x.saturating_add(buffer.chars().count() as u16),
         input_inner.y,
     )
+}
+
+/// 在畫面右上方繪製 filter 輸入框，並回傳游標應該停留的位置。
+pub(crate) fn render_filter_input(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    buffer: &str,
+) -> (u16, u16) {
+    render_top_right_input(frame, area, theme, " Filter ", buffer)
+}
+
+/// 在畫面右上方繪製 preview search 輸入框，並回傳游標應該停留的位置。
+pub(crate) fn render_preview_search_input(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    buffer: &str,
+) -> (u16, u16) {
+    render_top_right_input(frame, area, theme, " Preview Search ", buffer)
 }
 
 /// 在畫面底部繪製排序選單，模仿 mature-reference 的快捷鍵提示面板。
