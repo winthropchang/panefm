@@ -48,9 +48,10 @@ pub(crate) fn render_pane(
     theme: Theme,
     editor_state: Option<InlineEditorState<'_>>,
 ) -> Option<(u16, u16)> {
+    let preview_height = area.height.saturating_sub(8).clamp(5, 10);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(6)])
+        .constraints([Constraint::Min(3), Constraint::Length(preview_height)])
         .split(area);
 
     let border_style = if focused {
@@ -96,9 +97,16 @@ pub(crate) fn render_pane(
         editor_cursor = render_inline_editor(frame, chunks[0], pane, theme, state);
     }
 
-    let preview = Paragraph::new(pane.preview_lines(4)).block(
+    let preview_title = pane
+        .selected_entry()
+        .map(|entry| format!("Preview: {}", entry.name))
+        .unwrap_or_else(|| "Preview".to_string());
+    let preview = Paragraph::new(
+        pane.preview_lines(chunks[1].height.saturating_sub(2).max(1) as usize),
+    )
+    .block(
         Block::default()
-            .title("Preview")
+            .title(preview_title)
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
             .border_style(border_style),
     );

@@ -257,10 +257,7 @@ impl PaneState {
     /// 回傳：`Vec<Line<'static>>`，可直接交給 `ratatui` 的 Paragraph 渲染。
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<Line<'static>> {
         match self.selected_entry() {
-            Some(entry) if entry.is_dir => vec![
-                Line::from(format!("dir: {}", entry.path.display())),
-                Line::from(format!("items: {}", count_items(&entry.path))),
-            ],
+            Some(entry) if entry.is_dir => preview_directory(entry, max_lines),
             Some(entry) => preview_file(&entry.path, max_lines),
             None => vec![Line::from("empty directory")],
         }
@@ -699,6 +696,53 @@ fn count_items(path: &Path) -> usize {
     fs::read_dir(path).map(|iter| iter.count()).unwrap_or(0)
 }
 
+/// 為資料夾產生較完整的預覽內容，包含路徑、項目數與部分子項目名稱。
+///
+/// 參數：
+/// - `entry: &FileEntry`，目前被預覽的資料夾項目。
+/// - `max_lines: usize`，預覽區最多可顯示的列數。
+///
+/// 回傳：`Vec<Line<'static>>`，可直接渲染的資料夾摘要內容。
+fn preview_directory(entry: &FileEntry, max_lines: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("path: {}", entry.path.display())),
+        Line::from(format!("items: {}", count_items(&entry.path))),
+    ];
+
+    if max_lines <= lines.len() {
+        lines.truncate(max_lines);
+        return lines;
+    }
+
+    let remaining = max_lines.saturating_sub(lines.len());
+    if remaining == 0 {
+        return lines;
+    }
+
+    match fs::read_dir(&entry.path) {
+        Ok(read_dir) => {
+            let child_names: Vec<String> = read_dir
+                .filter_map(|child| child.ok())
+                .map(|child| child.file_name().to_string_lossy().to_string())
+                .take(remaining)
+                .collect();
+
+            if child_names.is_empty() {
+                lines.push(Line::from("empty directory"));
+            } else {
+                lines.push(Line::from("contents:"));
+                for name in child_names.into_iter().take(max_lines.saturating_sub(lines.len())) {
+                    lines.push(Line::from(format!("  {name}")));
+                }
+            }
+        }
+        Err(_) => lines.push(Line::from("unable to read directory contents")),
+    }
+
+    lines.truncate(max_lines);
+    lines
+}
+
 /// 讀取指定檔案並產生預覽內容。
 ///
 /// 參數：
@@ -713,26 +757,254 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
         return vec![Line::from("unable to read metadata")];
     };
 
-    if metadata.len() > 128 * 1024 {
-        return vec![
-            Line::from(format!("file: {}", path.display())),
-            Line::from(format!("size: {} bytes", metadata.len())),
-            Line::from("preview skipped for files larger than 128 KiB"),
-        ];
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_lowercase());
+    let mut lines = vec![
+        Line::from(format!("path: {}", path.display())),
+        Line::from(format!("size: {}", format_size_preview(metadata.len()))),
+    ];
+
+    if let Ok(modified) = metadata.modified() {
+        lines.push(Line::from(format!(
+            "modified: {}",
+            format_system_time_preview(modified)
+        )));
     }
 
-    match fs::read_to_string(path) {
-        Ok(contents) => contents
-            .lines()
-            .take(max_lines.max(1))
-            .map(|line| Line::from(line.to_owned()))
-            .collect(),
-        Err(_) => vec![
-            Line::from(format!("file: {}", path.display())),
-            Line::from(format!("size: {} bytes", metadata.len())),
-            Line::from("binary or non-utf8 file"),
-        ],
+    if max_lines <= lines.len() {
+        lines.truncate(max_lines);
+        return lines;
     }
+
+    if let Some(kind_label) = preview_kind_label(extension.as_deref()) {
+        lines.push(Line::from(format!("kind: {kind_label}")));
+    }
+
+    if metadata.len() > 128 * 1024 {
+        lines.push(Line::from("preview skipped for files larger than 128 KiB"));
+        lines.truncate(max_lines);
+        return lines;
+    }
+
+    let Ok(bytes) = fs::read(path) else {
+        lines.push(Line::from("unable to read file contents"));
+        lines.truncate(max_lines);
+        return lines;
+    };
+
+    if let Some(image_summary) = preview_image_summary(&bytes, extension.as_deref()) {
+        lines.extend(image_summary.into_iter().map(Line::from));
+        lines.truncate(max_lines);
+        return lines;
+    }
+
+    match String::from_utf8(bytes) {
+        Ok(contents) => {
+            lines.push(Line::from(""));
+
+            let available_content_lines = max_lines.saturating_sub(lines.len());
+            if available_content_lines == 0 {
+                return lines;
+            }
+
+            let content_lines: Vec<&str> = contents.lines().collect();
+            if content_lines.is_empty() {
+                lines.push(Line::from("[empty file]"));
+                lines.truncate(max_lines);
+                return lines;
+            }
+
+            let truncated = content_lines.len() > available_content_lines;
+            for (index, line) in content_lines.into_iter().take(available_content_lines).enumerate()
+            {
+                lines.push(Line::from(format!("{:>3} {}", index + 1, line)));
+            }
+
+            if truncated && !lines.is_empty() {
+                let last_index = lines.len() - 1;
+                lines[last_index] = Line::from("...");
+            }
+
+            lines.truncate(max_lines);
+            lines
+        }
+        Err(_) => {
+            if let Some(binary_label) = preview_binary_label(extension.as_deref()) {
+                lines.push(Line::from(format!("format: {binary_label}")));
+            }
+            lines.push(Line::from("binary or non-utf8 file"));
+            lines.truncate(max_lines);
+            lines
+        }
+    }
+}
+
+/// 依照副檔名回傳較適合顯示在 preview 的檔案類型標籤。
+fn preview_kind_label(extension: Option<&str>) -> Option<&'static str> {
+    match extension.unwrap_or_default() {
+        "rs" => Some("rust source"),
+        "toml" => Some("toml config"),
+        "json" => Some("json data"),
+        "md" | "markdown" => Some("markdown document"),
+        "yml" | "yaml" => Some("yaml config"),
+        "txt" | "log" => Some("text file"),
+        "sh" | "bash" | "zsh" => Some("shell script"),
+        "js" => Some("javascript source"),
+        "ts" => Some("typescript source"),
+        "py" => Some("python source"),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => Some("image"),
+        "zip" => Some("archive"),
+        "pdf" => Some("pdf document"),
+        _ => None,
+    }
+}
+
+/// 為常見圖片檔案產生摘要資訊，顯示格式與尺寸。
+fn preview_image_summary(bytes: &[u8], extension: Option<&str>) -> Option<Vec<String>> {
+    let image_info = detect_image_info(bytes, extension)?;
+    let mut lines = vec![format!("format: {}", image_info.format)];
+
+    if let Some((width, height)) = image_info.dimensions {
+        lines.push(format!("dimensions: {} x {}", width, height));
+    }
+
+    lines.push(String::from("image preview is not available in terminal"));
+    Some(lines)
+}
+
+/// 依照副檔名為常見二進位檔案補上格式描述。
+fn preview_binary_label(extension: Option<&str>) -> Option<&'static str> {
+    match extension.unwrap_or_default() {
+        "zip" => Some("zip archive"),
+        "pdf" => Some("pdf document"),
+        "png" => Some("png image"),
+        "jpg" | "jpeg" => Some("jpeg image"),
+        "gif" => Some("gif image"),
+        "webp" => Some("webp image"),
+        _ => None,
+    }
+}
+
+/// 保存圖片檔案的格式與尺寸資訊，供 preview 區使用。
+struct ImageInfo {
+    format: &'static str,
+    dimensions: Option<(u32, u32)>,
+}
+
+/// 從檔案位元組與副檔名推測是否為常見圖片，並嘗試取出尺寸。
+fn detect_image_info(bytes: &[u8], extension: Option<&str>) -> Option<ImageInfo> {
+    if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return Some(ImageInfo {
+            format: "png image",
+            dimensions: Some((width, height)),
+        });
+    }
+
+    if bytes.len() >= 10 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        let width = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+        let height = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+        return Some(ImageInfo {
+            format: "gif image",
+            dimensions: Some((width, height)),
+        });
+    }
+
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some(ImageInfo {
+            format: "webp image",
+            dimensions: None,
+        });
+    }
+
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        return Some(ImageInfo {
+            format: "jpeg image",
+            dimensions: jpeg_dimensions(bytes),
+        });
+    }
+
+    match extension.unwrap_or_default() {
+        "png" => Some(ImageInfo {
+            format: "png image",
+            dimensions: None,
+        }),
+        "jpg" | "jpeg" => Some(ImageInfo {
+            format: "jpeg image",
+            dimensions: None,
+        }),
+        "gif" => Some(ImageInfo {
+            format: "gif image",
+            dimensions: None,
+        }),
+        "webp" => Some(ImageInfo {
+            format: "webp image",
+            dimensions: None,
+        }),
+        _ => None,
+    }
+}
+
+/// 從 JPEG 檔頭中掃描 SOF 區塊，盡量取出圖片尺寸。
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut index = 2usize;
+
+    while index + 8 < bytes.len() {
+        if bytes[index] != 0xFF {
+            index += 1;
+            continue;
+        }
+
+        let marker = bytes[index + 1];
+        index += 2;
+
+        if marker == 0xD8 || marker == 0xD9 {
+            continue;
+        }
+
+        if index + 2 > bytes.len() {
+            break;
+        }
+
+        let segment_length = u16::from_be_bytes([bytes[index], bytes[index + 1]]) as usize;
+        if segment_length < 2 || index + segment_length > bytes.len() {
+            break;
+        }
+
+        if matches!(
+            marker,
+            0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF
+        ) && index + 7 < bytes.len()
+        {
+            let height = u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]) as u32;
+            let width = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
+            return Some((width, height));
+        }
+
+        index += segment_length;
+    }
+
+    None
+}
+
+/// 將檔案大小格式化成適合 preview 區閱讀的字串。
+fn format_size_preview(size: u64) -> String {
+    match size {
+        0..=1023 => format!("{size} b"),
+        1024..=1_048_575 => format!("{:.1} kb", size as f64 / 1024.0),
+        1_048_576..=1_073_741_823 => format!("{:.1} mb", size as f64 / 1_048_576.0),
+        _ => format!("{:.1} G", size as f64 / 1_073_741_824.0),
+    }
+}
+
+/// 將系統時間格式化成 preview 區較容易閱讀的時間字串。
+fn format_system_time_preview(value: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(value)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 /// 將單一路徑複製到目標資料夾，支援檔案與整個資料夾樹。
@@ -1253,5 +1525,101 @@ mod tests {
             vec![String::from("large.txt"), String::from("small.txt")]
         );
         assert_eq!(pane.sort_mode, SortMode::Size { reverse: true });
+    }
+
+    #[test]
+    /// 驗證資料夾 preview 會包含摘要資訊與部分子項目名稱。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 preview 缺少目錄摘要或子項目清單則測試失敗。
+    fn pane_state_directory_preview_shows_summary_and_children() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("nested")).expect("nested dir");
+        fs::write(dir.path().join("nested").join("alpha.txt"), "hello").expect("alpha");
+        fs::write(dir.path().join("nested").join("beta.txt"), "world").expect("beta");
+
+        let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let preview: Vec<String> = pane
+            .preview_lines(6)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+
+        assert!(preview.iter().any(|line| line.starts_with("path: ")));
+        assert!(preview.iter().any(|line| line == "items: 2"));
+        assert!(preview.iter().any(|line| line == "contents:"));
+        assert!(preview.iter().any(|line| line.contains("alpha.txt")));
+    }
+
+    #[test]
+    /// 驗證文字檔 preview 會顯示檔案資訊與帶有行號的內容。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 preview 沒有顯示 metadata 或內容行號則測試失敗。
+    fn pane_state_file_preview_shows_metadata_and_numbered_lines() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("notes.txt"),
+            "first line\nsecond line\nthird line\n",
+        )
+        .expect("notes");
+
+        let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let preview: Vec<String> = pane
+            .preview_lines(8)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+
+        assert!(preview.iter().any(|line| line.starts_with("path: ")));
+        assert!(preview.iter().any(|line| line.starts_with("size: ")));
+        assert!(preview.iter().any(|line| line.starts_with("modified: ")));
+        assert!(preview.iter().any(|line| line == "  1 first line"));
+        assert!(preview.iter().any(|line| line == "  2 second line"));
+    }
+
+    #[test]
+    /// 驗證圖片 preview 會顯示圖片格式、尺寸與終端摘要訊息。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若圖片摘要資訊缺少格式或尺寸則測試失敗。
+    fn pane_state_image_preview_shows_format_and_dimensions() {
+        let dir = tempdir().expect("tempdir");
+        let png_bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I',
+            b'H', b'D', b'R', 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x01, 0xE0,
+        ];
+        fs::write(dir.path().join("wallpaper.png"), png_bytes).expect("png");
+
+        let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let preview: Vec<String> = pane
+            .preview_lines(8)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+
+        assert!(preview.iter().any(|line| line == "kind: image"));
+        assert!(preview.iter().any(|line| line == "format: png image"));
+        assert!(preview.iter().any(|line| line == "dimensions: 640 x 480"));
+    }
+
+    #[test]
+    /// 驗證常見設定檔會顯示對應的 kind 標籤，方便快速辨識檔案類型。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 preview 沒有顯示預期的類型標籤則測試失敗。
+    fn pane_state_config_preview_shows_kind_label() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("config.toml"), "theme = \"nightfox\"\n").expect("toml");
+
+        let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let preview: Vec<String> = pane
+            .preview_lines(6)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+
+        assert!(preview.iter().any(|line| line == "kind: toml config"));
+        assert!(preview.iter().any(|line| line == "  1 theme = \"nightfox\""));
     }
 }
