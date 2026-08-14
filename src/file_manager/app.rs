@@ -350,7 +350,37 @@ impl App {
                         });
                     }
                     KeyCode::Char('$') => {
-                        cursor = buffer.chars().count();
+                        cursor = rename_line_end_cursor(&buffer);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('w') => {
+                        cursor = rename_next_word_start(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('b') => {
+                        cursor = rename_previous_word_start(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('e') => {
+                        cursor = rename_word_end(&buffer, cursor);
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
                             original_name,
@@ -360,6 +390,30 @@ impl App {
                         });
                     }
                     KeyCode::Char('i') => {
+                        mode = RenameMode::Insert;
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: insert");
+                    }
+                    KeyCode::Char('a') => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        mode = RenameMode::Insert;
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: insert");
+                    }
+                    KeyCode::Char('A') => {
+                        cursor = buffer.chars().count();
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -834,6 +888,124 @@ fn move_cursor_right(buffer: &str, cursor: usize) -> usize {
     (cursor + 1).min(end)
 }
 
+/// 回傳 normal 模式中 `$` 應該停留的位置，也就是最後一個可見字元。
+///
+/// 參數：
+/// - `buffer: &str`，目前正在編輯的檔名字串。
+///
+/// 回傳：`usize`，normal 模式游標應停留的字元索引。
+fn rename_line_end_cursor(buffer: &str) -> usize {
+    buffer.chars().count().saturating_sub(1)
+}
+
+/// 判斷某個字元是否應該被視為檔名中的「單字內容」。
+///
+/// 參數：
+/// - `ch: char`，要判斷的字元。
+///
+/// 回傳：`bool`。
+/// - `true` 代表它屬於單字本體，例如英數字。
+/// - `false` 代表它是分隔符，例如 `-`、`_`、`.` 或空白。
+fn is_rename_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+}
+
+/// 找出 normal 模式下 `w` 應跳到的位置，也就是下一段名稱的開頭。
+///
+/// 參數：
+/// - `buffer: &str`，目前正在編輯的檔名字串。
+/// - `cursor: usize`，目前的字元游標位置。
+///
+/// 回傳：`usize`，下一個單字的起始字元索引。
+fn rename_next_word_start(buffer: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return 0;
+    }
+
+    let mut index = cursor.min(len);
+    if index < len && is_rename_word_char(chars[index]) {
+        while index < len && is_rename_word_char(chars[index]) {
+            index += 1;
+        }
+    }
+
+    while index < len && !is_rename_word_char(chars[index]) {
+        index += 1;
+    }
+
+    index.min(rename_line_end_cursor(buffer))
+}
+
+/// 找出 normal 模式下 `b` 應跳到的位置，也就是前一段名稱的開頭。
+///
+/// 參數：
+/// - `buffer: &str`，目前正在編輯的檔名字串。
+/// - `cursor: usize`，目前的字元游標位置。
+///
+/// 回傳：`usize`，前一個單字的起始字元索引。
+fn rename_previous_word_start(buffer: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    if chars.is_empty() {
+        return 0;
+    }
+
+    let mut index = cursor.min(chars.len().saturating_sub(1));
+    if !is_rename_word_char(chars[index]) {
+        while index > 0 && !is_rename_word_char(chars[index]) {
+            index -= 1;
+        }
+        if index == 0 && !is_rename_word_char(chars[index]) {
+            return 0;
+        }
+    } else if index > 0 {
+        index -= 1;
+        while index > 0 && !is_rename_word_char(chars[index]) {
+            index -= 1;
+        }
+        if index == 0 && !is_rename_word_char(chars[index]) {
+            return 0;
+        }
+    }
+
+    while index > 0 && is_rename_word_char(chars[index - 1]) {
+        index -= 1;
+    }
+
+    index
+}
+
+/// 找出 normal 模式下 `e` 應跳到的位置，也就是目前或下一段名稱的結尾。
+///
+/// 參數：
+/// - `buffer: &str`，目前正在編輯的檔名字串。
+/// - `cursor: usize`，目前的字元游標位置。
+///
+/// 回傳：`usize`，目標單字最後一個字元的索引。
+fn rename_word_end(buffer: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return 0;
+    }
+
+    let mut index = cursor.min(len.saturating_sub(1));
+    while index < len && !is_rename_word_char(chars[index]) {
+        index += 1;
+    }
+
+    if index >= len {
+        return rename_line_end_cursor(buffer);
+    }
+
+    while index + 1 < len && is_rename_word_char(chars[index + 1]) {
+        index += 1;
+    }
+
+    index
+}
+
 /// 找出 rename 一開始應該停留的位置，預設會停在副檔名前，方便先改主檔名。
 ///
 /// 參數：
@@ -852,7 +1024,10 @@ fn rename_basename_cursor(name: &str) -> usize {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{App, PendingAction, RenameMode, rename_basename_cursor};
+    use super::{
+        App, PendingAction, RenameMode, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end,
+    };
     use crate::{
         config::{AppConfig, LoadedConfig},
         file_manager::layout::{LayoutNode, SplitDirection},
@@ -1054,6 +1229,96 @@ mod tests {
                 original_name: String::from("alpha.txt"),
                 buffer: String::from("alpha.txt"),
                 cursor: 4,
+                mode: RenameMode::Insert,
+            })
+        );
+    }
+
+    #[test]
+    /// 驗證 rename 的 Vim 單字移動會依照檔名分隔符正確跳轉。
+    fn rename_word_motion_helpers_follow_filename_segments() {
+        let name = "my-long_file.txt";
+
+        assert_eq!(rename_next_word_start(name, 0), 3);
+        assert_eq!(rename_next_word_start(name, 3), 8);
+        assert_eq!(rename_next_word_start(name, 8), 13);
+
+        assert_eq!(rename_previous_word_start(name, 13), 8);
+        assert_eq!(rename_previous_word_start(name, 8), 3);
+        assert_eq!(rename_previous_word_start(name, 3), 0);
+
+        assert_eq!(rename_word_end(name, 0), 1);
+        assert_eq!(rename_word_end(name, 3), 6);
+        assert_eq!(rename_word_end(name, 8), 11);
+        assert_eq!(rename_word_end(name, 12), 15);
+    }
+
+    #[test]
+    /// 驗證 rename 的 normal 模式支援 `w`、`b`、`e`、`a`、`A` 這些 Vim 風格操作。
+    fn rename_normal_mode_supports_vim_word_motions_and_insert_shortcuts() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("my-long_file.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_rename();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("switch to normal");
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("move to previous word");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("move to next word");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("move to word end");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("append after cursor");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Rename {
+                pane_id: 1,
+                original_name: String::from("my-long_file.txt"),
+                buffer: String::from("my-long_file.txt"),
+                cursor: 16,
+                mode: RenameMode::Insert,
+            })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("back to normal");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
+            .expect("jump to start");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("jump to next word");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("jump to end of word");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("append inside basename");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Rename {
+                pane_id: 1,
+                original_name: String::from("my-long_file.txt"),
+                buffer: String::from("my-long_file.txt"),
+                cursor: 7,
+                mode: RenameMode::Insert,
+            })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("back to normal again");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+            .expect("append at end");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Rename {
+                pane_id: 1,
+                original_name: String::from("my-long_file.txt"),
+                buffer: String::from("my-long_file.txt"),
+                cursor: 16,
                 mode: RenameMode::Insert,
             })
         );
