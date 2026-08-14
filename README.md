@@ -25,6 +25,8 @@ The app loads config from the first existing path in this order:
 - `Ctrl-w c`: close current pane
 - `Ctrl-w o`: keep only current pane
 - `d`: delete selected file or directory with confirmation
+- `r`: open rename dialog for the selected item
+- `:rename`: open rename dialog for the selected item
 - `:split`, `:vsplit`, `:close`, `:only`
 - `:theme`: open the theme picker
 - `:theme next`, `:theme default`, `:theme forest`, `:theme ocean`

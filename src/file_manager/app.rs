@@ -16,8 +16,18 @@ use crate::{
 use super::{
     layout::{LayoutNode, SplitDirection},
     pane::PaneState,
-    ui::{centered_rect, render_confirm_dialog, render_pane, render_theme_picker},
+    ui::{InlineRenameState, centered_rect, render_confirm_dialog, render_pane, render_theme_picker},
 };
+
+/// 表示 rename 輸入框目前採用的編輯模式。
+///
+/// `Insert` 代表可以直接插入文字，游標會顯示成細線；
+/// `Normal` 代表遵循 Vim 的一般模式，只負責移動游標與切換模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenameMode {
+    Insert,
+    Normal,
+}
 
 /// 表示目前正在等待使用者完成的暫時互動。
 ///
@@ -25,8 +35,20 @@ use super::{
 /// 而不會直接進到一般檔案瀏覽模式。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PendingAction {
-    ConfirmDelete { pane_id: usize, target_name: String },
-    ThemePicker { selected: usize },
+    ConfirmDelete {
+        pane_id: usize,
+        target_name: String,
+    },
+    ThemePicker {
+        selected: usize,
+    },
+    Rename {
+        pane_id: usize,
+        original_name: String,
+        buffer: String,
+        cursor: usize,
+        mode: RenameMode,
+    },
 }
 
 /// 表示整個應用程式的核心狀態。
@@ -152,6 +174,11 @@ impl App {
                 self.pending_g = false;
                 true
             }
+            KeyCode::Char('r') => {
+                self.start_rename();
+                self.pending_g = false;
+                true
+            }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
@@ -217,6 +244,149 @@ impl App {
                     self.status = String::from("theme picker: use j/k and Enter");
                 }
             },
+            PendingAction::Rename {
+                pane_id,
+                original_name,
+                mut buffer,
+                mut cursor,
+                mut mode,
+            } => match mode {
+                RenameMode::Insert => match key.code {
+                    KeyCode::Char(c) => {
+                        insert_char(&mut buffer, &mut cursor, c);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: insert");
+                    }
+                    KeyCode::Backspace => {
+                        backspace_char(&mut buffer, &mut cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: insert");
+                    }
+                    KeyCode::Left => {
+                        cursor = cursor.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Right => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Enter => {
+                        self.confirm_rename(pane_id, &original_name, &buffer)?;
+                    }
+                    KeyCode::Esc => {
+                        mode = RenameMode::Normal;
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: normal");
+                    }
+                    _ => {
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                },
+                RenameMode::Normal => match key.code {
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        cursor = cursor.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('0') => {
+                        cursor = 0;
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('$') => {
+                        cursor = buffer.chars().count();
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Char('i') => {
+                        mode = RenameMode::Insert;
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: insert");
+                    }
+                    KeyCode::Enter => {
+                        self.confirm_rename(pane_id, &original_name, &buffer)?;
+                    }
+                    KeyCode::Esc => {
+                        self.status = format!("rename cancelled: {original_name}");
+                    }
+                    _ => {
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                },
+            },
         }
 
         Ok(true)
@@ -262,6 +432,7 @@ impl App {
     pub(crate) fn execute_command(&mut self, command: &str) -> Result<()> {
         match command {
             "q" => self.status = String::from("use q in normal mode to quit"),
+            "rename" => self.start_rename(),
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -406,6 +577,28 @@ impl App {
         self.status = format!("theme: {}", preset.name());
     }
 
+    /// 開始重新命名流程，建立一個待輸入的新名稱互動。
+    pub(crate) fn start_rename(&mut self) {
+        let Some(entry) = self
+            .panes
+            .get(&self.focused_pane)
+            .and_then(PaneState::selected_entry)
+            .cloned()
+        else {
+            self.status = String::from("nothing selected to rename");
+            return;
+        };
+
+        self.pending_action = Some(PendingAction::Rename {
+            pane_id: self.focused_pane,
+            original_name: entry.display_name(),
+            cursor: rename_basename_cursor(&entry.name),
+            buffer: entry.name,
+            mode: RenameMode::Insert,
+        });
+        self.status = String::from("rename: insert");
+    }
+
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
         let Some(entry) = self
@@ -441,6 +634,33 @@ impl App {
         Ok(())
     }
 
+    /// 真正執行重新命名目前待確認項目的檔案系統操作。
+    pub(crate) fn confirm_rename(
+        &mut self,
+        pane_id: usize,
+        original_name: &str,
+        new_name: &str,
+    ) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        match pane.rename_selected(new_name) {
+            Ok(Some(renamed_name)) => {
+                self.status = format!("renamed {original_name} -> {renamed_name}");
+            }
+            Ok(None) => {
+                self.status = String::from("nothing selected to rename");
+            }
+            Err(error) => {
+                self.status = format!("failed to rename {original_name}: {error}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// 根據目前應用程式狀態繪製整個畫面。
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let outer = Layout::default()
@@ -454,16 +674,35 @@ impl App {
 
         let mut pane_rects = BTreeMap::new();
         self.layout.render_rects(outer[0], &mut pane_rects);
+        let mut cursor_position = None;
         for (pane_id, rect) in pane_rects {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
-                render_pane(
+                let rename_buffer = match &self.pending_action {
+                    Some(PendingAction::Rename {
+                        pane_id: rename_pane_id,
+                        buffer,
+                        cursor,
+                        mode,
+                        ..
+                    }) if *rename_pane_id == pane_id => Some(InlineRenameState {
+                        buffer: buffer.as_str(),
+                        cursor: *cursor,
+                        mode: *mode,
+                    }),
+                    _ => None,
+                };
+                let pane_cursor = render_pane(
                     frame,
                     rect,
                     pane_id,
                     pane,
                     pane_id == self.focused_pane,
                     self.theme,
+                    rename_buffer,
                 );
+                if cursor_position.is_none() {
+                    cursor_position = pane_cursor;
+                }
             }
         }
 
@@ -478,6 +717,10 @@ impl App {
             Span::raw(" focus  "),
             Span::styled("d", self.theme.accent_style()),
             Span::raw(" delete  "),
+            Span::styled("r", self.theme.accent_style()),
+            Span::raw(" rename  "),
+            Span::styled(":rename", self.theme.accent_style()),
+            Span::raw(" dialog  "),
             Span::styled(":split :vsplit :close :only", self.theme.accent_style()),
             Span::raw("  "),
             Span::styled(":theme", self.theme.accent_style()),
@@ -509,8 +752,99 @@ impl App {
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
+            Some(PendingAction::Rename { .. }) => {}
             None => {}
         }
+
+        if let Some((x, y)) = cursor_position {
+            frame.set_cursor_position((x, y));
+        }
+    }
+
+    /// 回傳目前畫面應該呈現的 rename 游標模式。
+    ///
+    /// 回傳：`Option<RenameMode>`。
+    /// - `Some(RenameMode::Insert)` 代表應顯示細線游標。
+    /// - `Some(RenameMode::Normal)` 代表應顯示方塊游標。
+    /// - `None` 代表目前沒有 rename 輸入框，不需要特別切換。
+    pub(crate) fn rename_cursor_mode(&self) -> Option<RenameMode> {
+        match self.pending_action {
+            Some(PendingAction::Rename { mode, .. }) => Some(mode),
+            _ => None,
+        }
+    }
+}
+
+/// 將字元插入到指定的字元游標位置，並在插入後把游標往右移一格。
+///
+/// 參數：
+/// - `buffer: &mut String`，目前正在編輯的檔名字串。
+/// - `cursor: &mut usize`，以字元數計算的游標位置。
+/// - `ch: char`，要插入的新字元。
+///
+/// 回傳：`()`
+fn insert_char(buffer: &mut String, cursor: &mut usize, ch: char) {
+    let byte_index = char_to_byte_index(buffer, *cursor);
+    buffer.insert(byte_index, ch);
+    *cursor += 1;
+}
+
+/// 刪除游標左側的一個字元，行為對齊一般文字編輯器的 Backspace。
+///
+/// 參數：
+/// - `buffer: &mut String`，目前正在編輯的檔名字串。
+/// - `cursor: &mut usize`，以字元數計算的游標位置。
+///
+/// 回傳：`()`
+fn backspace_char(buffer: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+
+    let remove_at = *cursor - 1;
+    let start = char_to_byte_index(buffer, remove_at);
+    let end = char_to_byte_index(buffer, *cursor);
+    buffer.replace_range(start..end, "");
+    *cursor -= 1;
+}
+
+/// 把字元游標位置轉成 Rust 字串的位元組索引，方便做安全的字串編輯。
+///
+/// 參數：
+/// - `text: &str`，來源字串。
+/// - `char_index: usize`，以字元數表示的目標位置。
+///
+/// 回傳：`usize`，對應的位元組索引。
+fn char_to_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+/// 將游標往右移動一個字元，但不會超過字串末端。
+///
+/// 參數：
+/// - `buffer: &str`，目前正在編輯的檔名字串。
+/// - `cursor: usize`，目前的字元游標位置。
+///
+/// 回傳：`usize`，移動後的新游標位置。
+fn move_cursor_right(buffer: &str, cursor: usize) -> usize {
+    let end = buffer.chars().count();
+    (cursor + 1).min(end)
+}
+
+/// 找出 rename 一開始應該停留的位置，預設會停在副檔名前，方便先改主檔名。
+///
+/// 參數：
+/// - `name: &str`，目前選取項目的原始名稱。
+///
+/// 回傳：`usize`，以字元數表示的初始游標位置。
+fn rename_basename_cursor(name: &str) -> usize {
+    let dot_index = name.rfind('.').filter(|index| *index > 0);
+    match dot_index {
+        Some(index) => name[..index].chars().count(),
+        None => name.chars().count(),
     }
 }
 
@@ -518,7 +852,7 @@ impl App {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{App, PendingAction};
+    use super::{App, PendingAction, RenameMode, rename_basename_cursor};
     use crate::{
         config::{AppConfig, LoadedConfig},
         file_manager::layout::{LayoutNode, SplitDirection},
@@ -626,5 +960,102 @@ mod tests {
         assert_eq!(app.theme_preset, ThemePreset::Ocean);
         assert_eq!(app.theme, ThemePreset::Ocean.into());
         assert_eq!(app.status, "theme: ocean");
+    }
+
+    #[test]
+    /// 驗證打開重新命名視窗時，會帶入目前選取項目的原名稱與預設輸入值。
+    fn app_start_rename_opens_dialog_with_selected_name() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_rename();
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Rename {
+                pane_id: 1,
+                original_name: String::from("alpha.txt"),
+                buffer: String::from("alpha.txt"),
+                cursor: 5,
+                mode: RenameMode::Insert,
+            })
+        );
+    }
+
+    #[test]
+    /// 驗證在重新命名視窗按下 Enter 後會套用新的檔名。
+    fn app_rename_confirm_updates_selected_entry() {
+        let dir = tempdir().expect("tempdir");
+        let old_path = dir.path().join("alpha.txt");
+        let new_path = dir.path().join("beta.txt");
+        fs::write(&old_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::Rename {
+            pane_id: 1,
+            original_name: String::from("alpha.txt"),
+            buffer: String::from("beta.txt"),
+            cursor: 4,
+            mode: RenameMode::Insert,
+        });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("rename");
+
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+        assert_eq!(app.status, "renamed alpha.txt -> beta.txt");
+    }
+
+    #[test]
+    /// 驗證 rename 預設游標會停在副檔名前，方便優先修改主檔名。
+    fn rename_basename_cursor_stops_before_extension() {
+        assert_eq!(rename_basename_cursor("alpha.txt"), 5);
+        assert_eq!(rename_basename_cursor("archive.tar.gz"), 11);
+        assert_eq!(rename_basename_cursor(".gitignore"), 10);
+        assert_eq!(rename_basename_cursor("folder"), 6);
+    }
+
+    #[test]
+    /// 驗證 rename 可以在 insert 與 normal 模式之間切換，並保留游標位置。
+    fn rename_mode_switches_between_insert_and_normal() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_rename();
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("switch to normal");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Rename {
+                pane_id: 1,
+                original_name: String::from("alpha.txt"),
+                buffer: String::from("alpha.txt"),
+                cursor: 5,
+                mode: RenameMode::Normal,
+            })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("move left");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("back to insert");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Rename {
+                pane_id: 1,
+                original_name: String::from("alpha.txt"),
+                buffer: String::from("alpha.txt"),
+                cursor: 4,
+                mode: RenameMode::Insert,
+            })
+        );
     }
 }

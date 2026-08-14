@@ -209,6 +209,50 @@ impl PaneState {
         self.reload()?;
         Ok(Some(removed_name))
     }
+
+    /// 重新命名目前選取的檔案或資料夾。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，執行重新命名的 pane。
+    /// - `new_name: &str`，新的檔案或資料夾名稱。
+    ///
+    /// 回傳：`io::Result<Option<String>>`。
+    /// - `Ok(Some(name))` 代表成功重新命名，並回傳新的顯示名稱。
+    /// - `Ok(None)` 代表目前沒有可重新命名的選取項目。
+    /// - `Err(...)` 代表重新命名過程中的檔案系統操作失敗。
+    pub(crate) fn rename_selected(&mut self, new_name: &str) -> io::Result<Option<String>> {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return Ok(None);
+        };
+
+        let trimmed_name = new_name.trim();
+        if trimmed_name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "new name cannot be empty",
+            ));
+        }
+
+        let new_path = entry.path.parent().unwrap_or(&self.cwd).join(trimmed_name);
+        fs::rename(&entry.path, &new_path)?;
+        self.reload()?;
+
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|candidate| candidate.path == new_path)
+        {
+            self.selected = index;
+            self.list_state.select(Some(index));
+        }
+
+        let renamed_name = if entry.is_dir {
+            format!("{trimmed_name}/")
+        } else {
+            trimmed_name.to_string()
+        };
+        Ok(Some(renamed_name))
+    }
 }
 
 /// 計算指定資料夾內的子項目數量。
@@ -352,5 +396,28 @@ mod tests {
         assert_eq!(removed, Some(String::from("alpha.txt")));
         assert!(!file_path.exists());
         assert!(pane.entries.is_empty());
+    }
+
+    #[test]
+    /// 驗證 `PaneState` 可以正確重新命名目前選取的檔案。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若檔案未改名或狀態未更新則測試失敗。
+    fn pane_state_rename_selected_file_updates_entry() {
+        let dir = tempdir().expect("tempdir");
+        let old_path = dir.path().join("alpha.txt");
+        let new_path = dir.path().join("beta.txt");
+        fs::write(&old_path, "hello").expect("file");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let renamed = pane.rename_selected("beta.txt").expect("rename");
+
+        assert_eq!(renamed, Some(String::from("beta.txt")));
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+        assert_eq!(
+            pane.selected_entry().map(FileEntry::display_name),
+            Some(String::from("beta.txt"))
+        );
     }
 }

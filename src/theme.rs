@@ -78,6 +78,7 @@ pub struct Theme {
     pub focus_border: Color,
     pub muted: Color,
     pub selection_bg: Color,
+    pub selection_fg: Color,
     pub danger: Color,
 }
 
@@ -97,6 +98,7 @@ impl Theme {
         focus_border: Color,
         muted: Color,
         selection_bg: Color,
+        selection_fg: Color,
         danger: Color,
     ) -> Self {
         Self {
@@ -104,6 +106,7 @@ impl Theme {
             focus_border,
             muted,
             selection_bg,
+            selection_fg,
             danger,
         }
     }
@@ -117,7 +120,8 @@ impl Theme {
             Color::Yellow,
             Color::Green,
             Color::DarkGray,
-            Color::Blue,
+            Color::Gray,
+            Color::Black,
             Color::LightRed,
         )
     }
@@ -131,7 +135,8 @@ impl Theme {
             Color::LightGreen,
             Color::Green,
             Color::Gray,
-            Color::DarkGray,
+            Color::Rgb(90, 90, 90),
+            Color::White,
             Color::LightRed,
         )
     }
@@ -145,7 +150,8 @@ impl Theme {
             Color::LightCyan,
             Color::Cyan,
             Color::Gray,
-            Color::Blue,
+            Color::Rgb(70, 80, 95),
+            Color::White,
             Color::LightRed,
         )
     }
@@ -189,7 +195,7 @@ impl Theme {
     ///
     /// 回傳：`Style`，用來表示目前游標所在的項目。
     pub fn selected_item_style(self) -> Style {
-        Style::default().bg(self.selection_bg)
+        Style::default().bg(self.selection_bg).fg(self.selection_fg)
     }
 
     /// 產生危險操作標題的文字樣式。
