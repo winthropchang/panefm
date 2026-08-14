@@ -21,6 +21,7 @@
 - preview 已支援 focus mode，且可與列表區塊交換比例，讓預覽放大。
 - 預覽中已支援搜尋。
 - pane 已支援分割與關閉。
+- preview 現在已改成 pane 各自獨立的狀態，不再是全域共享。
 
 ## 目前的 `V` 視覺標記規則
 
@@ -35,6 +36,8 @@
 ## 這次最後補上的行為
 
 - 進入子目錄後再回上一層，游標會回到剛剛離開的那個目錄，不會跳回第一列。
+- 在 preview 中可用 `Ctrl-w` 切換 pane。
+- preview 狀態只屬於原本那個 pane；切到其他 pane 不會被強制進入 preview。
 
 ## 建議下一步優先做的功能
 
@@ -53,6 +56,8 @@
 
 - `de4873b` `Add visual selection workflow`
 - `9d78ace` `Preserve selection when leaving directories`
+- `2d9e0e4` `Add development notes`
+- `8532293` `Scope preview mode to each pane`
 
 ## 接續開發時建議先做的事
 
