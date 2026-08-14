@@ -1,6 +1,10 @@
 use std::{
+    cmp::Ordering,
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     fs, io,
     path::{Component, Path, PathBuf},
+    time::SystemTime,
 };
 
 use ratatui::{text::Line, widgets::ListState};
@@ -27,6 +31,64 @@ pub(crate) struct PaneState {
     pub(crate) visible_indices: Vec<usize>,
     /// 是否顯示以 `.` 開頭的隱藏檔案與資料夾。
     pub(crate) show_hidden: bool,
+    /// 目前使用中的排序模式。
+    pub(crate) sort_mode: SortMode,
+    /// 隨機排序時使用的種子，讓每次重新套用時都能洗牌。
+    pub(crate) random_seed: u64,
+}
+
+/// 描述 pane 目前使用的排序方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortMode {
+    Alphabetical { reverse: bool },
+    Natural { reverse: bool },
+    Size { reverse: bool },
+    Modified { reverse: bool },
+    Created { reverse: bool },
+    Extension { reverse: bool },
+    Random,
+}
+
+impl SortMode {
+    /// 回傳適合顯示在狀態列中的名稱。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Alphabetical { reverse: false } => "alphabetical",
+            Self::Alphabetical { reverse: true } => "alphabetical (reverse)",
+            Self::Natural { reverse: false } => "natural",
+            Self::Natural { reverse: true } => "natural (reverse)",
+            Self::Size { reverse: false } => "size",
+            Self::Size { reverse: true } => "size (reverse)",
+            Self::Modified { reverse: false } => "modified",
+            Self::Modified { reverse: true } => "modified (reverse)",
+            Self::Created { reverse: false } => "birth",
+            Self::Created { reverse: true } => "birth (reverse)",
+            Self::Extension { reverse: false } => "extension",
+            Self::Extension { reverse: true } => "extension (reverse)",
+            Self::Random => "random",
+        }
+    }
+
+    /// 回傳右側欄位目前應該顯示的資訊類型。
+    pub(crate) fn detail_kind(self) -> SortDetailKind {
+        match self {
+            Self::Size { .. } => SortDetailKind::Size,
+            Self::Modified { .. } => SortDetailKind::Modified,
+            Self::Created { .. } => SortDetailKind::Created,
+            Self::Extension { .. } => SortDetailKind::Extension,
+            _ => SortDetailKind::None,
+        }
+    }
+}
+
+/// 描述列表右側欄位目前應該顯示哪一種排序依據。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortDetailKind {
+    None,
+    Size,
+    Modified,
+    Created,
+    Extension,
 }
 
 impl PaneState {
@@ -39,6 +101,7 @@ impl PaneState {
     /// - 成功時回傳已載入目錄內容的 pane。
     /// - 失敗時回傳讀取目錄時發生的 I/O 錯誤。
     pub(crate) fn new(cwd: PathBuf) -> io::Result<Self> {
+        let random_seed = seed_from_path(&cwd);
         let mut pane = Self {
             cwd,
             entries: Vec::new(),
@@ -47,6 +110,8 @@ impl PaneState {
             filter_query: None,
             visible_indices: Vec::new(),
             show_hidden: false,
+            sort_mode: SortMode::Natural { reverse: false },
+            random_seed,
         };
         pane.reload()?;
         Ok(pane)
@@ -62,6 +127,7 @@ impl PaneState {
     /// - 失敗時代表讀目錄過程發生 I/O 錯誤。
     pub(crate) fn reload(&mut self) -> io::Result<()> {
         self.entries = read_dir_entries(&self.cwd)?;
+        self.sort_entries();
         self.refresh_visible_entries();
         Ok(())
     }
@@ -433,6 +499,16 @@ impl PaneState {
         self.refresh_visible_entries();
     }
 
+    /// 切換到下一個排序模式，並立即重排目前列表。
+    pub(crate) fn set_sort_mode(&mut self, sort_mode: SortMode) {
+        self.sort_mode = sort_mode;
+        if matches!(sort_mode, SortMode::Random) {
+            self.random_seed = self.random_seed.wrapping_add(1);
+        }
+        self.sort_entries();
+        self.refresh_visible_entries();
+    }
+
     /// 重新計算目前實際應該顯示的項目與選取位置。
     fn refresh_visible_entries(&mut self) {
         self.visible_indices = match &self.filter_query {
@@ -463,11 +539,154 @@ impl PaneState {
             self.list_state.select(Some(self.selected));
         }
     }
+
+    /// 依照目前排序模式重排完整項目列表。
+    fn sort_entries(&mut self) {
+        let sort_mode = self.sort_mode;
+        let random_seed = self.random_seed;
+        self.entries.sort_by(|left, right| {
+            if matches!(sort_mode, SortMode::Random) {
+                match (left.is_dir, right.is_dir) {
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    _ => random_key(left, random_seed).cmp(&random_key(right, random_seed)),
+                }
+            } else {
+                compare_entries(left, right, sort_mode)
+            }
+        });
+    }
 }
 
 /// 判斷檔名是否屬於隱藏檔或隱藏資料夾。
 fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
+}
+
+/// 依照 pane 目前設定的排序模式重排清單，並維持資料夾優先。
+fn compare_entries(left: &FileEntry, right: &FileEntry, sort_mode: SortMode) -> Ordering {
+    match (left.is_dir, right.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => {
+            let primary = match sort_mode {
+                SortMode::Alphabetical { reverse } => compare_with_reverse(
+                    left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+                    reverse,
+                ),
+                SortMode::Natural { reverse } => {
+                    compare_with_reverse(natural_cmp(&left.name, &right.name), reverse)
+                }
+                SortMode::Size { reverse } => {
+                    compare_with_reverse(left.size.cmp(&right.size), reverse)
+                }
+                SortMode::Modified { reverse } => {
+                    compare_with_reverse(left.modified.cmp(&right.modified), reverse)
+                }
+                SortMode::Created { reverse } => {
+                    compare_with_reverse(left.created.cmp(&right.created), reverse)
+                }
+                SortMode::Extension { reverse } => compare_with_reverse(
+                    file_extension(left)
+                        .cmp(&file_extension(right))
+                        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
+                    reverse,
+                ),
+                SortMode::Random => Ordering::Equal,
+            };
+
+            if primary == Ordering::Equal {
+                left.name.to_lowercase().cmp(&right.name.to_lowercase())
+            } else {
+                primary
+            }
+        }
+    }
+}
+
+/// 依照 reverse 旗標決定是否翻轉比較結果。
+fn compare_with_reverse(ordering: Ordering, reverse: bool) -> Ordering {
+    if reverse {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+/// 取出檔案副檔名作為小寫字串，資料夾則回傳空字串。
+fn file_extension(entry: &FileEntry) -> String {
+    if entry.is_dir {
+        String::new()
+    } else {
+        entry
+            .path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    }
+}
+
+/// 用比較接近自然排序的方式比較兩個名稱，讓數字片段能按數值排序。
+fn natural_cmp(left: &str, right: &str) -> Ordering {
+    let left_parts = split_natural_parts(left);
+    let right_parts = split_natural_parts(right);
+
+    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
+        let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+            (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+            _ => left_part.to_lowercase().cmp(&right_part.to_lowercase()),
+        };
+
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    left_parts.len().cmp(&right_parts.len())
+}
+
+/// 將名稱拆成數字與文字片段，供自然排序比較使用。
+fn split_natural_parts(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_digits = None;
+
+    for character in value.chars() {
+        let is_digit = character.is_ascii_digit();
+        match in_digits {
+            Some(flag) if flag == is_digit => current.push(character),
+            Some(_) => {
+                parts.push(std::mem::take(&mut current));
+                current.push(character);
+                in_digits = Some(is_digit);
+            }
+            None => {
+                current.push(character);
+                in_digits = Some(is_digit);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
+}
+
+/// 根據路徑內容產生一個基本種子，供隨機排序使用。
+fn seed_from_path(path: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 使用隨機排序時，依照目前種子為每個項目產生穩定但可變動的排序鍵。
+fn random_key(entry: &FileEntry, seed: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    entry.path.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 計算指定資料夾內的子項目數量。
@@ -770,14 +989,10 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
             path: item.path(),
             is_dir: file_type.is_dir(),
             size: metadata.len(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            created: metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
         });
     }
-
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
 
     Ok(entries)
 }
@@ -788,7 +1003,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::PaneState;
+    use super::{PaneState, SortMode};
     use crate::file_manager::entry::FileEntry;
 
     #[test]
@@ -1008,5 +1223,35 @@ mod tests {
             toggled_names,
             vec![String::from(".secret"), String::from("alpha.txt")]
         );
+    }
+
+    #[test]
+    /// 驗證排序模式會提供對應的人類可讀標籤。
+    fn sort_mode_labels_match_expected_names() {
+        assert_eq!(SortMode::Alphabetical { reverse: false }.label(), "alphabetical");
+        assert_eq!(SortMode::Size { reverse: true }.label(), "size (reverse)");
+        assert_eq!(SortMode::Modified { reverse: false }.label(), "modified");
+    }
+
+    #[test]
+    /// 驗證切換到大小排序後，較大的檔案會排在前面。
+    fn pane_state_sort_by_size_reorders_files() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("small.txt"), "a").expect("small");
+        fs::write(dir.path().join("large.txt"), "abcdef").expect("large");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        pane.set_sort_mode(SortMode::Size { reverse: true });
+
+        let names: Vec<String> = pane
+            .visible_entries()
+            .into_iter()
+            .map(FileEntry::display_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![String::from("large.txt"), String::from("small.txt")]
+        );
+        assert_eq!(pane.sort_mode, SortMode::Size { reverse: true });
     }
 }

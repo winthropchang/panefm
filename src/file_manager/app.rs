@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     layout::{LayoutNode, SplitDirection},
-    pane::PaneState,
+    pane::{PaneState, SortMode},
     ui::{
         InlineEditorState, centered_rect, render_confirm_dialog, render_filter_input, render_pane,
         render_theme_picker,
@@ -69,6 +69,9 @@ pub(crate) enum PendingAction {
     ConfirmDelete {
         pane_id: usize,
         target_name: String,
+    },
+    SortPicker {
+        pane_id: usize,
     },
     ThemePicker {
         selected: usize,
@@ -235,6 +238,12 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            KeyCode::Char(',') => {
+                self.open_sort_picker();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             KeyCode::Char('f') => {
                 self.open_filter_input();
                 self.pending_g = false;
@@ -366,6 +375,28 @@ impl App {
                         target_name: target_name.clone(),
                     });
                     self.status = format!("confirm delete {target_name}: y/n");
+                }
+            },
+            PendingAction::SortPicker { pane_id } => match key.code {
+                KeyCode::Char('m') => self.apply_sort_mode(pane_id, SortMode::Modified { reverse: false })?,
+                KeyCode::Char('M') => self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?,
+                KeyCode::Char('b') => self.apply_sort_mode(pane_id, SortMode::Created { reverse: false })?,
+                KeyCode::Char('B') => self.apply_sort_mode(pane_id, SortMode::Created { reverse: true })?,
+                KeyCode::Char('a') => self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: false })?,
+                KeyCode::Char('A') => self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: true })?,
+                KeyCode::Char('n') => self.apply_sort_mode(pane_id, SortMode::Natural { reverse: false })?,
+                KeyCode::Char('N') => self.apply_sort_mode(pane_id, SortMode::Natural { reverse: true })?,
+                KeyCode::Char('e') => self.apply_sort_mode(pane_id, SortMode::Extension { reverse: false })?,
+                KeyCode::Char('E') => self.apply_sort_mode(pane_id, SortMode::Extension { reverse: true })?,
+                KeyCode::Char('s') => self.apply_sort_mode(pane_id, SortMode::Size { reverse: false })?,
+                KeyCode::Char('S') => self.apply_sort_mode(pane_id, SortMode::Size { reverse: true })?,
+                KeyCode::Char('r') => self.apply_sort_mode(pane_id, SortMode::Random)?,
+                KeyCode::Esc => {
+                    self.status = String::from("sort cancelled");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::SortPicker { pane_id });
+                    self.status = String::from("sort: choose a key from the panel");
                 }
             },
             PendingAction::ThemePicker { mut selected } => match key.code {
@@ -959,6 +990,14 @@ impl App {
         self.status = String::from("theme picker: use j/k and Enter");
     }
 
+    /// 打開底部排序面板，等待使用者輸入排序快捷鍵。
+    pub(crate) fn open_sort_picker(&mut self) {
+        self.pending_action = Some(PendingAction::SortPicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from("sort: choose a key from the panel");
+    }
+
     /// 依照主題名稱字串套用指定主題。
     pub(crate) fn set_theme_by_name(&mut self, name: &str) {
         match ThemePreset::from_name(name) {
@@ -1154,6 +1193,17 @@ impl App {
         } else {
             String::from("hiding hidden files")
         };
+        Ok(())
+    }
+
+    /// 將指定 pane 套用某一種排序模式。
+    fn apply_sort_mode(&mut self, pane_id: usize, sort_mode: SortMode) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        pane.set_sort_mode(sort_mode);
+        self.status = format!("sort: {}", pane.sort_mode.label());
         Ok(())
     }
 
@@ -1363,6 +1413,8 @@ impl App {
             Span::raw(" filter  "),
             Span::styled(".", self.theme.accent_style()),
             Span::raw(" hidden  "),
+            Span::styled(",", self.theme.accent_style()),
+            Span::raw(" sort  "),
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
@@ -1403,6 +1455,9 @@ impl App {
         match &self.pending_action {
             Some(PendingAction::ConfirmDelete { target_name, .. }) => {
                 render_confirm_dialog(frame, frame.area(), target_name, self.theme, &self.config);
+            }
+            Some(PendingAction::SortPicker { .. }) => {
+                super::ui::render_sort_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
@@ -1645,7 +1700,10 @@ mod tests {
     };
     use crate::{
         config::{AppConfig, LoadedConfig},
-        file_manager::layout::{LayoutNode, SplitDirection},
+        file_manager::{
+            layout::{LayoutNode, SplitDirection},
+            pane::SortMode,
+        },
         theme::ThemePreset,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2205,5 +2263,40 @@ mod tests {
             .map(|entry| entry.display_name())
             .collect();
         assert_eq!(filtered_names, vec![String::from(".secret")]);
+    }
+
+    #[test]
+    /// 驗證按下 `,` 後可以用排序面板快捷鍵套用排序模式。
+    fn app_sort_picker_applies_selected_mode() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("small.txt"), "a").expect("small");
+        fs::write(dir.path().join("large.txt"), "abcdef").expect("large");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
+            .expect("open sort picker");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::SortPicker { pane_id: 1 })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("sort by size");
+        assert_eq!(app.status, "sort: size");
+        assert_eq!(
+            app.panes.get(&1).expect("pane").sort_mode,
+            SortMode::Size { reverse: false }
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
+            .expect("open sort picker again");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE))
+            .expect("sort by modified reverse");
+        assert_eq!(app.status, "sort: modified (reverse)");
+        assert_eq!(
+            app.panes.get(&1).expect("pane").sort_mode,
+            SortMode::Modified { reverse: true }
+        );
     }
 }

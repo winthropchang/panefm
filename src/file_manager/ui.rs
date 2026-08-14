@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
@@ -10,7 +11,7 @@ use crate::{
     theme::{Theme, ThemePreset},
 };
 
-use super::pane::PaneState;
+use super::pane::{PaneState, SortDetailKind};
 
 /// 描述 inline 編輯器目前需要顯示的內容、標題與游標位置。
 ///
@@ -58,34 +59,28 @@ pub(crate) fn render_pane(
         theme.muted_style()
     };
 
-    let filter_suffix = if pane.has_active_filter() {
-        "  [filter]"
-    } else {
-        ""
-    };
-    let title = format!(" pane {}  {}{}", pane_id, pane.cwd.display(), filter_suffix);
+    let filter_suffix = if pane.has_active_filter() { "  [filter]" } else { "" };
+    let title = format!(
+        " pane {}  {}{}  [sort: {}]",
+        pane_id,
+        pane.cwd.display(),
+        filter_suffix,
+        pane.sort_mode.label()
+    );
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 
     let visible_entries = pane.visible_entries();
+    let content_width = chunks[0].width.saturating_sub(4) as usize;
+    let detail_kind = pane.sort_mode.detail_kind();
     let items: Vec<ListItem<'static>> = if visible_entries.is_empty() {
         vec![ListItem::new(Line::from("empty directory"))]
     } else {
         visible_entries
             .into_iter()
-            .map(|entry| {
-                let detail = if entry.is_dir {
-                    String::from("dir")
-                } else {
-                    format!("{}b", entry.size)
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw(entry.display_name()),
-                    Span::styled(format!("  [{detail}]"), theme.muted_style()),
-                ]))
-            })
+            .map(|entry| ListItem::new(render_entry_line(entry, detail_kind, content_width, theme)))
             .collect()
     };
 
@@ -235,6 +230,166 @@ pub(crate) fn render_filter_input(
         input_inner.x.saturating_add(buffer.chars().count() as u16),
         input_inner.y,
     )
+}
+
+/// 在畫面底部繪製排序選單，模仿 mature-reference 的快捷鍵提示面板。
+pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
+    let panel_height = 7;
+    let panel_area = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(panel_height),
+        width: area.width,
+        height: panel_height,
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(",m", theme.accent_style()),
+            Span::raw(" -> modified  "),
+            Span::styled(",M", theme.accent_style()),
+            Span::raw(" -> modified (reverse)  "),
+            Span::styled(",b", theme.accent_style()),
+            Span::raw(" -> birth  "),
+            Span::styled(",B", theme.accent_style()),
+            Span::raw(" -> birth (reverse)"),
+        ]),
+        Line::from(vec![
+            Span::styled(",a", theme.accent_style()),
+            Span::raw(" -> alphabetical  "),
+            Span::styled(",A", theme.accent_style()),
+            Span::raw(" -> alphabetical (reverse)  "),
+            Span::styled(",n", theme.accent_style()),
+            Span::raw(" -> natural  "),
+            Span::styled(",N", theme.accent_style()),
+            Span::raw(" -> natural (reverse)"),
+        ]),
+        Line::from(vec![
+            Span::styled(",e", theme.accent_style()),
+            Span::raw(" -> extension  "),
+            Span::styled(",E", theme.accent_style()),
+            Span::raw(" -> extension (reverse)  "),
+            Span::styled(",s", theme.accent_style()),
+            Span::raw(" -> size  "),
+            Span::styled(",S", theme.accent_style()),
+            Span::raw(" -> size (reverse)"),
+        ]),
+        Line::from(vec![
+            Span::styled(",r", theme.accent_style()),
+            Span::raw(" -> random  "),
+            Span::styled("Esc", theme.accent_style()),
+            Span::raw(" -> cancel"),
+        ]),
+    ];
+
+    frame.render_widget(Clear, panel_area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Line::from(Span::styled(
+                    " Sort ",
+                    theme.accent_style().add_modifier(Modifier::BOLD),
+                )))
+                .borders(Borders::TOP),
+        ),
+        panel_area,
+    );
+}
+
+/// 根據目前排序模式，產生單一列表列的顯示內容。
+fn render_entry_line(
+    entry: &super::entry::FileEntry,
+    detail_kind: SortDetailKind,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let name = entry.display_name();
+    let detail = format_sort_detail(entry, detail_kind);
+    if detail.is_empty() || width < 8 {
+        return Line::from(name);
+    }
+
+    let name_len = name.chars().count();
+    let detail_len = detail.chars().count();
+    let spacer_len = width.saturating_sub(name_len + detail_len).max(1);
+
+    Line::from(vec![
+        Span::raw(name),
+        Span::raw(" ".repeat(spacer_len)),
+        Span::styled(detail, theme.muted_style()),
+    ])
+}
+
+/// 依照目前排序依據，決定右側欄位要顯示的文字。
+fn format_sort_detail(entry: &super::entry::FileEntry, detail_kind: SortDetailKind) -> String {
+    match detail_kind {
+        SortDetailKind::None => String::new(),
+        SortDetailKind::Size => {
+            if entry.is_dir {
+                String::from("dir")
+            } else {
+                format_size_short(entry.size)
+            }
+        }
+        SortDetailKind::Modified => format_system_time(entry.modified),
+        SortDetailKind::Created => format_system_time(entry.created),
+        SortDetailKind::Extension => {
+            if entry.is_dir {
+                String::from("dir")
+            } else {
+                entry.path
+                    .extension()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }
+        }
+    }
+}
+
+/// 把 `SystemTime` 轉成比較容易閱讀的本地時間字串。
+fn format_system_time(value: std::time::SystemTime) -> String {
+    let datetime: DateTime<Local> = value.into();
+    datetime.format("%m/%d %H:%M").to_string()
+}
+
+/// 把位元組大小轉成較容易閱讀的短格式。
+fn format_size_short(size: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let size = size as f64;
+    if size >= GB {
+        format_compact_size(size / GB, "G")
+    } else if size >= MB {
+        format_compact_size(size / MB, "mb")
+    } else if size >= KB {
+        format_compact_size(size / KB, "kb")
+    } else {
+        format!("{}b", size as u64)
+    }
+}
+
+/// 將大小數值格式化成最多一位小數的緊湊字串。
+fn format_compact_size(value: f64, suffix: &str) -> String {
+    if value >= 10.0 || value.fract() == 0.0 {
+        format!("{:.0}{suffix}", value)
+    } else {
+        format!("{value:.1}{suffix}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_size_short;
+
+    #[test]
+    /// 驗證大小格式會轉成人類較容易閱讀的單位顯示。
+    fn format_size_short_uses_compact_units() {
+        assert_eq!(format_size_short(512), "512b");
+        assert_eq!(format_size_short(2_048), "2kb");
+        assert_eq!(format_size_short(1_572_864), "1.5mb");
+        assert_eq!(format_size_short(3_221_225_472), "3G");
+    }
 }
 
 /// 繪製刪除確認視窗。

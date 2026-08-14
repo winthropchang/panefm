@@ -30,6 +30,14 @@ The app loads config from the first existing path in this order:
   - first `Esc`: hide the input box but keep the filtered result list
   - second `Esc`: clear the filter and return to the normal list
 - `.`: toggle hidden files and directories
+- `,`: open the sort panel
+  - `,m` / `,M`: sort by modified time (forward / reverse)
+  - `,b` / `,B`: sort by birth time (forward / reverse)
+  - `,e` / `,E`: sort by extension (forward / reverse)
+  - `,a` / `,A`: sort alphabetically (forward / reverse)
+  - `,n` / `,N`: sort naturally (forward / reverse)
+  - `,s` / `,S`: sort by size (forward / reverse)
+  - `,r`: sort randomly
 - `Ctrl-w s`: horizontal split
 - `Ctrl-w v`: vertical split
 - `Ctrl-w h j k l`: switch pane focus

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::SystemTime};
 
 /// 表示目錄列表中的單一檔案或資料夾項目。
 ///
@@ -9,6 +9,8 @@ pub(crate) struct FileEntry {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
     pub(crate) size: u64,
+    pub(crate) modified: SystemTime,
+    pub(crate) created: SystemTime,
 }
 
 impl FileEntry {
