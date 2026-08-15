@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::{
+    archive::{ExtractedArchive, compress_entries_to_zip, extract_entries},
     bookmark::{BookmarkEntry, BookmarkStore, bookmark_file_path},
     layout::{LayoutNode, SplitDirection},
     open::{
@@ -2281,6 +2282,8 @@ impl App {
             "copy" => self.copy_selected(),
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
+            "compress" => self.compress_selected_entries()?,
+            "extract" => self.extract_selected_archives()?,
             "open" => self.open_selected_with_default()?,
             "open-picker" => self.open_selected_with_picker()?,
             "vim" => {
@@ -3227,6 +3230,79 @@ impl App {
         };
     }
 
+    /// 將目前選取或標記的項目壓成單一 zip 檔，並在完成後刷新所有 pane。
+    fn compress_selected_entries(&mut self) -> io::Result<()> {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("nothing selected to compress");
+            return Ok(());
+        };
+
+        let entries = pane.selected_or_marked_entries();
+        if entries.is_empty() {
+            self.status = String::from("nothing selected to compress");
+            return Ok(());
+        }
+
+        let target_dir = pane.cwd.clone();
+        let archive_path = compress_entries_to_zip(&target_dir, &entries)?;
+        self.reload_all_panes()?;
+        if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
+            let _ = pane.reveal_path(&archive_path);
+        }
+
+        self.status = if entries.len() == 1 {
+            format!(
+                "compressed {} -> {}",
+                entries[0].display_name(),
+                archive_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("archive.zip")
+            )
+        } else {
+            format!(
+                "compressed {} items -> {}",
+                entries.len(),
+                archive_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("archive.zip")
+            )
+        };
+        Ok(())
+    }
+
+    /// 解開目前選取或標記的壓縮檔，並盡量把游標帶到第一個輸出結果。
+    fn extract_selected_archives(&mut self) -> io::Result<()> {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("nothing selected to extract");
+            return Ok(());
+        };
+
+        let entries = pane.selected_or_marked_entries();
+        if entries.is_empty() {
+            self.status = String::from("nothing selected to extract");
+            return Ok(());
+        }
+
+        let target_dir = pane.cwd.clone();
+        let (extracted, skipped) = extract_entries(&target_dir, &entries)?;
+        if extracted.is_empty() {
+            self.status = if skipped == 0 {
+                String::from("nothing selected to extract")
+            } else {
+                format!("no supported archives selected (skipped {skipped})")
+            };
+            return Ok(());
+        }
+
+        self.reload_all_panes()?;
+        self.reveal_first_extracted_output(&extracted)?;
+
+        self.status = extraction_status_label(&extracted, skipped);
+        Ok(())
+    }
+
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
@@ -4066,6 +4142,17 @@ impl App {
     fn reload_all_panes(&mut self) -> io::Result<()> {
         for pane in self.panes.values_mut() {
             pane.reload()?;
+        }
+        Ok(())
+    }
+
+    /// 將目前焦點 pane 的游標帶到第一個解壓結果，方便使用者立刻繼續操作。
+    fn reveal_first_extracted_output(&mut self, extracted: &[ExtractedArchive]) -> io::Result<()> {
+        let Some(first) = extracted.first() else {
+            return Ok(());
+        };
+        if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
+            let _ = pane.reveal_path(&first.output_path);
         }
         Ok(())
     }
@@ -4932,6 +5019,18 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("paste"),
         ),
         help_entry(
+            ":compress",
+            "",
+            "把目前選取或標記的項目壓成 zip；多選時預設檔名為 archive.zip",
+            HelpAction::Command("compress"),
+        ),
+        help_entry(
+            ":extract",
+            "",
+            "解開目前選取或標記的壓縮檔，支援 zip、tar.gz、tar、gz",
+            HelpAction::Command("extract"),
+        ),
+        help_entry(
             ":open",
             "o / Enter",
             "用預設外部方式打開目前選取項目；文字檔走 $EDITOR，其他交給系統",
@@ -5084,6 +5183,26 @@ fn help_panel_lines(query: &str) -> Vec<HelpPanelLine> {
         .into_iter()
         .map(|entry| entry.line)
         .collect()
+}
+
+/// 根據解壓結果數量與略過項目數，整理出適合顯示在狀態列的訊息。
+fn extraction_status_label(extracted: &[ExtractedArchive], skipped: usize) -> String {
+    if extracted.len() == 1 {
+        let output_name = extracted[0]
+            .output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output");
+        if skipped == 0 {
+            format!("extracted {output_name}")
+        } else {
+            format!("extracted {output_name} (skipped {skipped})")
+        }
+    } else if skipped == 0 {
+        format!("extracted {} archives", extracted.len())
+    } else {
+        format!("extracted {} archives (skipped {skipped})", extracted.len())
+    }
 }
 
 /// 根據目前 command mode 的輸入內容，整理出適合顯示的命令補全候選。
@@ -6281,7 +6400,7 @@ mod tests {
             }
             other => panic!("unexpected pending action: {other:?}"),
         }
-        assert_eq!(app.status, "help: res (2)");
+        assert_eq!(app.status, "help: res (3)");
     }
 
     #[test]
@@ -6808,6 +6927,59 @@ mod tests {
         assert_eq!(
             app.status,
             format!("moved 1 item -> {}", target_dir.display())
+        );
+    }
+
+    #[test]
+    /// 驗證 `:compress` 會把目前選取項目壓成 zip，並把游標帶到新壓縮檔。
+    fn app_compress_command_creates_zip_and_reveals_result() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello zip").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("compress").expect("compress");
+
+        let archive_path = dir.path().join("notes.txt.zip");
+        assert!(archive_path.exists());
+        assert_eq!(app.status, "compressed notes.txt -> notes.txt.zip");
+        assert_eq!(
+            app.current_pane_mut()
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "notes.txt.zip"
+        );
+    }
+
+    #[test]
+    /// 驗證 `:extract` 會解開目前選取的 zip，並將游標帶到輸出目錄。
+    fn app_extract_command_unpacks_zip_and_reveals_output() {
+        let dir = tempdir().expect("tempdir");
+        let folder = dir.path().join("demo");
+        fs::create_dir(&folder).expect("dir");
+        fs::write(folder.join("alpha.txt"), "hello").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("compress").expect("compress dir");
+
+        let archive_path = dir.path().join("demo.zip");
+        assert!(archive_path.exists());
+
+        app.execute_command("extract").expect("extract zip");
+
+        let extracted_dir = dir.path().join("demo copy");
+        assert!(extracted_dir.is_dir());
+        assert!(extracted_dir.join("demo").join("alpha.txt").exists());
+        assert_eq!(app.status, "extracted demo copy");
+        assert_eq!(
+            app.current_pane_mut()
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "demo copy"
         );
     }
 
