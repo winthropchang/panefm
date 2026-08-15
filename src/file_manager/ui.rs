@@ -387,10 +387,7 @@ pub(crate) fn render_global_search_panel(
         .borders(Borders::ALL)
         .border_style(theme.accent_style());
     let input_inner = block.inner(panel_area);
-    frame.render_widget(
-        Paragraph::new(buffer.to_string()).block(block),
-        panel_area,
-    );
+    frame.render_widget(Paragraph::new(buffer.to_string()).block(block), panel_area);
 
     (
         input_inner

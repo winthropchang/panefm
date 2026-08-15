@@ -2,7 +2,11 @@ use std::{
     collections::BTreeMap,
     io,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
 };
 
@@ -22,11 +26,11 @@ use crate::{
 use super::{
     layout::{LayoutNode, SplitDirection},
     pane::{PaneState, SortMode},
-    search::{GlobalSearchEntry, collect_search_entries, filter_search_entries},
+    search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
     ui::{
         InlineEditorState, SearchListState, centered_rect, render_confirm_dialog,
-        render_filter_input, render_global_search_panel, render_pane,
-        render_preview_search_input, render_theme_picker,
+        render_filter_input, render_global_search_panel, render_pane, render_preview_search_input,
+        render_theme_picker,
     },
 };
 
@@ -95,14 +99,6 @@ pub(crate) struct GlobalSearchState {
     pub(crate) results: Vec<GlobalSearchEntry>,
 }
 
-/// 背景 global search 完成後，回傳給主執行緒的結果訊息。
-#[derive(Debug)]
-pub(crate) struct GlobalSearchMessage {
-    pub(crate) pane_id: usize,
-    pub(crate) query: String,
-    pub(crate) results: io::Result<Vec<GlobalSearchEntry>>,
-}
-
 /// 記錄目前是否處於範圍標記模式，以及起點和目前游標位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisualSelectionState {
@@ -165,7 +161,8 @@ pub(crate) struct App {
     pub(crate) filter: Option<FilterState>,
     pub(crate) preview_search: Option<PreviewSearchState>,
     pub(crate) global_search: Option<GlobalSearchState>,
-    pub(crate) global_search_rx: Option<Receiver<GlobalSearchMessage>>,
+    pub(crate) global_search_rx: Option<Receiver<GlobalSearchEvent>>,
+    pub(crate) global_search_cancelled: Option<Arc<AtomicBool>>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) preview_focus: Option<usize>,
@@ -210,6 +207,7 @@ impl App {
             preview_search: None,
             global_search: None,
             global_search_rx: None,
+            global_search_cancelled: None,
             visual_selection: None,
             pending_action: None,
             preview_focus: None,
@@ -592,8 +590,7 @@ impl App {
                     search.editing = false;
                 }
                 KeyCode::Esc => {
-                    self.global_search_rx = None;
-                    self.status = String::from("normal mode");
+                    self.cancel_global_search();
                 }
                 _ => {}
             }
@@ -680,10 +677,9 @@ impl App {
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('h') => {
                 self.pending_g = false;
-                self.global_search_rx = None;
-                self.status = String::from("normal mode");
+                self.cancel_global_search();
             }
             _ => {
                 self.pending_g = false;
@@ -1536,7 +1532,7 @@ impl App {
         };
         self.status = String::from("global search (insert): type query and Enter");
         self.global_search = Some(search);
-        self.global_search_rx = None;
+        self.cancel_global_search_worker();
         Ok(())
     }
 
@@ -1785,6 +1781,8 @@ impl App {
 
     /// 啟動一個背景 global search 工作，避免在大型目錄中阻塞主介面。
     fn start_global_search(&mut self, search: &mut GlobalSearchState) -> io::Result<()> {
+        self.cancel_global_search_worker();
+
         let pane_id = search.pane_id;
         let root_dir = search.root_dir.clone();
         let query = search.buffer.clone();
@@ -1795,14 +1793,19 @@ impl App {
             .unwrap_or(false);
 
         let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         thread::spawn(move || {
-            let results = collect_search_entries(&root_dir, show_hidden)
-                .map(|entries| filter_search_entries(&entries, &query, 200));
-            let _ = tx.send(GlobalSearchMessage {
+            stream_search_entries(
                 pane_id,
-                query,
-                results,
-            });
+                &root_dir,
+                show_hidden,
+                &query,
+                200,
+                24,
+                worker_cancelled,
+                tx,
+            );
         });
 
         search.loading = true;
@@ -1810,7 +1813,23 @@ impl App {
         search.selected = 0;
         search.results.clear();
         self.global_search_rx = Some(rx);
+        self.global_search_cancelled = Some(cancelled);
         Ok(())
+    }
+
+    /// 要求目前的 global search 背景工作停止，避免使用者離開畫面後仍持續掃描。
+    fn cancel_global_search_worker(&mut self) {
+        if let Some(cancelled) = self.global_search_cancelled.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.global_search_rx = None;
+    }
+
+    /// 關閉 global search 畫面，並同步停止正在進行中的背景搜尋。
+    fn cancel_global_search(&mut self) {
+        self.cancel_global_search_worker();
+        self.global_search = None;
+        self.status = String::from("normal mode");
     }
 
     /// 回傳指定 pane 目前 preview 搜尋命中的數量。
@@ -1885,8 +1904,8 @@ impl App {
         };
 
         pane.reveal_path(&entry.path)?;
+        self.cancel_global_search_worker();
         self.global_search = None;
-        self.global_search_rx = None;
         self.status = format!("search opened: {}", entry.relative_path);
         Ok(())
     }
@@ -2115,13 +2134,12 @@ impl App {
                             .then_some((selection.anchor, selection.current))
                     }),
                     self.global_search.as_ref().and_then(|search| {
-                        (search.pane_id == pane_id && (search.loading || search.searched)).then_some(
-                            SearchListState {
+                        (search.pane_id == pane_id && (search.loading || search.searched))
+                            .then_some(SearchListState {
                                 results: &search.results,
                                 selected: search.selected,
                                 loading: search.loading,
-                            },
-                        )
+                            })
                     }),
                     self.theme,
                     rename_buffer,
@@ -2278,41 +2296,64 @@ impl App {
         let Some(receiver) = &self.global_search_rx else {
             return;
         };
-
-        let Ok(message) = receiver.try_recv() else {
-            return;
-        };
-        self.global_search_rx = None;
-
-        let Some(search) = &mut self.global_search else {
-            return;
-        };
-        if search.pane_id != message.pane_id || search.buffer != message.query {
+        let messages: Vec<GlobalSearchEvent> = receiver.try_iter().collect();
+        if messages.is_empty() {
             return;
         }
 
-        search.loading = false;
-        match message.results {
-            Ok(results) => {
-                search.results = results;
-                search.selected = search.selected.min(search.results.len().saturating_sub(1));
-                if search.results.is_empty() {
-                    search.selected = 0;
+        let mut finished = false;
+        for message in messages {
+            let Some(search) = &mut self.global_search else {
+                break;
+            };
+
+            match message {
+                GlobalSearchEvent::Chunk {
+                    pane_id,
+                    query,
+                    mut entries,
+                } => {
+                    if search.pane_id != pane_id || search.buffer != query {
+                        continue;
+                    }
+                    search.results.append(&mut entries);
+                    search.results.sort_by(|left, right| {
+                        left.relative_path
+                            .to_lowercase()
+                            .cmp(&right.relative_path.to_lowercase())
+                            .then_with(|| left.relative_path.cmp(&right.relative_path))
+                    });
+                    search.results.truncate(200);
+                    search.selected = search.selected.min(search.results.len().saturating_sub(1));
+                    search.searched = true;
+                    self.status = global_search_status(
+                        &search.buffer,
+                        search.results.len(),
+                        search.editing,
+                        search.searched,
+                        true,
+                    );
                 }
-                search.searched = true;
-                self.status = global_search_status(
-                    &search.buffer,
-                    search.results.len(),
-                    search.editing,
-                    search.searched,
-                    search.loading,
-                );
+                GlobalSearchEvent::Done { pane_id, query } => {
+                    if search.pane_id != pane_id || search.buffer != query {
+                        continue;
+                    }
+                    search.loading = false;
+                    search.searched = true;
+                    self.status = global_search_status(
+                        &search.buffer,
+                        search.results.len(),
+                        search.editing,
+                        search.searched,
+                        search.loading,
+                    );
+                    finished = true;
+                }
             }
-            Err(error) => {
-                search.results.clear();
-                search.searched = false;
-                self.status = format!("global search failed: {error}");
-            }
+        }
+
+        if finished {
+            self.cancel_global_search_worker();
         }
     }
 }
@@ -2556,6 +2597,8 @@ fn rename_basename_cursor(name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use tempfile::tempdir;
 
     use super::{
@@ -3472,6 +3515,65 @@ mod tests {
             Some(String::from("guide.md"))
         );
         assert_eq!(app.status, "search opened: docs/guide.md");
+    }
+
+    #[test]
+    /// 驗證在 global search 執行中按下 Esc，會關閉介面並要求背景搜尋停止。
+    fn app_global_search_escape_cancels_background_work() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("guide.md"), "guide").expect("guide");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open search");
+        for ch in ['g', 'u', 'i', 'd'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("start search");
+        let cancelled = app
+            .global_search_cancelled
+            .as_ref()
+            .expect("cancel flag")
+            .clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel search");
+
+        assert!(app.global_search.is_none());
+        assert!(app.global_search_rx.is_none());
+        assert!(app.global_search_cancelled.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證在 global search 結果列表中按下 h，會安全返回一般列表。
+    fn app_global_search_h_leaves_results_list() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("guide.md"), "guide").expect("guide");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open search");
+        for ch in ['g', 'u', 'i', 'd'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("start search");
+        wait_for_global_search(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("leave search");
+
+        assert!(app.global_search.is_none());
+        assert!(app.global_search_rx.is_none());
+        assert_eq!(app.status, "normal mode");
     }
 
     #[test]

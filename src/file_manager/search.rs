@@ -1,7 +1,14 @@
 use std::{
-    io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
 };
+
+#[cfg(test)]
+use std::io;
 
 use ignore::WalkBuilder;
 
@@ -16,6 +23,21 @@ pub(crate) struct GlobalSearchEntry {
     pub(crate) is_dir: bool,
 }
 
+/// 描述背景 global search 分批回傳給主執行緒的訊息類型。
+#[derive(Debug)]
+pub(crate) enum GlobalSearchEvent {
+    Chunk {
+        pane_id: usize,
+        query: String,
+        entries: Vec<GlobalSearchEntry>,
+    },
+    Done {
+        pane_id: usize,
+        query: String,
+    },
+}
+
+#[cfg(test)]
 /// 遞迴掃描指定根目錄下的檔案與資料夾，建立 global search 的候選資料集。
 ///
 /// 參數：
@@ -73,6 +95,7 @@ pub(crate) fn collect_search_entries(
     Ok(entries)
 }
 
+#[cfg(test)]
 /// 依照使用者輸入的查詢文字，過濾目前可顯示的 global search 結果。
 ///
 /// 參數：
@@ -101,6 +124,131 @@ pub(crate) fn filter_search_entries(
         .take(limit.max(1))
         .cloned()
         .collect()
+}
+
+/// 以分批方式掃描搜尋結果，找到一批符合項目就立即透過 channel 傳回。
+///
+/// 參數：
+/// - `pane_id: usize`，這次搜尋所屬的 pane。
+/// - `root: &Path`，要遞迴搜尋的根目錄。
+/// - `show_hidden: bool`，是否把隱藏檔一起納入搜尋。
+/// - `query: &str`，目前要比對的搜尋文字。
+/// - `limit: usize`，最多回傳多少筆結果。
+/// - `chunk_size: usize`，每次分批回傳的結果數量。
+/// - `cancelled: Arc<AtomicBool>`，主執行緒可用來要求背景搜尋提早停止。
+/// - `sender: Sender<GlobalSearchEvent>`，用來回傳搜尋進度的 channel。
+///
+/// 回傳：`()`
+pub(crate) fn stream_search_entries(
+    pane_id: usize,
+    root: &Path,
+    show_hidden: bool,
+    query: &str,
+    limit: usize,
+    chunk_size: usize,
+    cancelled: Arc<AtomicBool>,
+    sender: Sender<GlobalSearchEvent>,
+) {
+    let walker = WalkBuilder::new(root).hidden(!show_hidden).build();
+    let query_lower = query.trim().to_lowercase();
+    let mut batch = Vec::new();
+    let mut matched = 0usize;
+
+    for entry in walker {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_dir = file_type.is_dir();
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let relative_path = if is_dir {
+            format!("{relative}/")
+        } else {
+            relative
+        };
+
+        if !query_lower.is_empty() && !relative_path.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+
+        batch.push(GlobalSearchEntry {
+            path: path.to_path_buf(),
+            relative_path,
+            is_dir,
+        });
+        matched += 1;
+
+        if batch.len() >= chunk_size.max(1) {
+            batch.sort_by(|left, right| {
+                left.relative_path
+                    .to_lowercase()
+                    .cmp(&right.relative_path.to_lowercase())
+                    .then_with(|| left.relative_path.cmp(&right.relative_path))
+            });
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if sender
+                .send(GlobalSearchEvent::Chunk {
+                    pane_id,
+                    query: query.to_string(),
+                    entries: std::mem::take(&mut batch),
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        if matched >= limit.max(1) {
+            break;
+        }
+    }
+
+    if !batch.is_empty() {
+        batch.sort_by(|left, right| {
+            left.relative_path
+                .to_lowercase()
+                .cmp(&right.relative_path.to_lowercase())
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        if sender
+            .send(GlobalSearchEvent::Chunk {
+                pane_id,
+                query: query.to_string(),
+                entries: batch,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = sender.send(GlobalSearchEvent::Done {
+        pane_id,
+        query: query.to_string(),
+    });
 }
 
 #[cfg(test)]
