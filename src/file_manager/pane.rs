@@ -697,6 +697,19 @@ impl PaneState {
         Ok(display_name)
     }
 
+    /// 將來源檔案或資料夾移動到指定目錄，不要求目標目錄必須是目前 pane 的 cwd。
+    ///
+    /// 參數：
+    /// - `source_path: &Path`，要被移動的來源路徑。
+    /// - `target_dir: &Path`，要接收項目的目標目錄。
+    ///
+    /// 回傳：`io::Result<String>`。
+    /// - 成功時回傳移動後可用於顯示的名稱。
+    /// - 失敗時回傳檔案系統移動過程中的錯誤。
+    pub(crate) fn move_path_to_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
+        move_path_into_dir(source_path, target_dir)
+    }
+
     /// 依照輸入路徑建立新項目。
     ///
     /// 規則：

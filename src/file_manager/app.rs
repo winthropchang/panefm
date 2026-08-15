@@ -335,14 +335,27 @@ impl App {
             self.pending_y = false;
             return Ok(true);
         }
-        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::SHIFT) {
+        if key_matches_shifted_letter(&key, 'O') {
             self.open_selected_with_picker()?;
             self.pending_g = false;
             self.pending_y = false;
             return Ok(true);
         }
-        if key.code == KeyCode::Char('O') {
-            self.open_selected_with_picker()?;
+        if key_matches_shifted_letter(&key, 'G') {
+            self.current_pane_mut()?.move_bottom();
+            self.pending_g = false;
+            self.pending_y = false;
+            self.status = String::from("jumped to bottom");
+            return Ok(true);
+        }
+        if key_matches_shifted_letter(&key, 'V') {
+            self.open_visual_selection()?;
+            self.pending_g = false;
+            self.pending_y = false;
+            return Ok(true);
+        }
+        if key_matches_shifted_letter(&key, 'P') {
+            self.open_preview_focus();
             self.pending_g = false;
             self.pending_y = false;
             return Ok(true);
@@ -405,13 +418,6 @@ impl App {
                 }
                 true
             }
-            KeyCode::Char('G') => {
-                self.current_pane_mut()?.move_bottom();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.status = String::from("jumped to bottom");
-                true
-            }
             KeyCode::Char('d') => {
                 self.start_delete_confirmation();
                 self.pending_g = false;
@@ -420,18 +426,6 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.start_rename();
-                self.pending_g = false;
-                self.pending_y = false;
-                true
-            }
-            KeyCode::Char('V') => {
-                self.open_visual_selection()?;
-                self.pending_g = false;
-                self.pending_y = false;
-                true
-            }
-            KeyCode::Char('P') => {
-                self.open_preview_focus();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -532,8 +526,31 @@ impl App {
 
     /// 處理 preview mode 的鍵盤輸入，讓使用者可以專心在預覽區捲動內容。
     pub(crate) fn handle_preview_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key_matches_shifted_letter(&key, 'P') {
+            if self.clear_preview_search_if_active() {
+                self.pending_g = false;
+                return Ok(true);
+            }
+            self.preview_focus = None;
+            self.pending_g = false;
+            self.pending_y = false;
+            self.status = String::from("normal mode");
+            return Ok(true);
+        }
+        if key_matches_shifted_letter(&key, 'N') {
+            self.pending_g = false;
+            self.status = self.jump_preview_match(false)?;
+            return Ok(true);
+        }
+        if key_matches_shifted_letter(&key, 'G') {
+            self.current_pane_mut()?.scroll_preview_bottom();
+            self.pending_g = false;
+            self.status = String::from("preview: bottom");
+            return Ok(true);
+        }
+
         match key.code {
-            KeyCode::Esc | KeyCode::Char('P') => {
+            KeyCode::Esc => {
                 if self.clear_preview_search_if_active() {
                     self.pending_g = false;
                     return Ok(true);
@@ -550,10 +567,6 @@ impl App {
             KeyCode::Char('n') => {
                 self.pending_g = false;
                 self.status = self.jump_preview_match(true)?;
-            }
-            KeyCode::Char('N') => {
-                self.pending_g = false;
-                self.status = self.jump_preview_match(false)?;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.current_pane_mut()?.scroll_preview_down(1);
@@ -574,11 +587,6 @@ impl App {
                     self.pending_g = true;
                     self.status = String::from("preview: pending g");
                 }
-            }
-            KeyCode::Char('G') => {
-                self.current_pane_mut()?.scroll_preview_bottom();
-                self.pending_g = false;
-                self.status = String::from("preview: bottom");
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.current_pane_mut()?.page_preview_down();
@@ -607,10 +615,19 @@ impl App {
 
     /// 處理 visual selection 模式下的鍵盤輸入。
     pub(crate) fn handle_visual_selection_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key_matches_shifted_letter(&key, 'V') {
+            self.commit_visual_selection()?;
+            return Ok(true);
+        }
+        if key_matches_shifted_letter(&key, 'G') {
+            self.current_pane_mut()?.move_bottom();
+            self.sync_visual_selection_cursor();
+            self.pending_g = false;
+            self.status = self.visual_status_label();
+            return Ok(true);
+        }
+
         match key.code {
-            KeyCode::Char('V') => {
-                self.commit_visual_selection()?;
-            }
             KeyCode::Esc => {
                 self.commit_visual_selection()?;
             }
@@ -634,12 +651,6 @@ impl App {
                     self.pending_g = true;
                     self.status = String::from("visual: pending g");
                 }
-            }
-            KeyCode::Char('G') => {
-                self.current_pane_mut()?.move_bottom();
-                self.sync_visual_selection_cursor();
-                self.pending_g = false;
-                self.status = self.visual_status_label();
             }
             _ => {
                 self.pending_g = false;
@@ -896,41 +907,41 @@ impl App {
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
+                _ if key_matches_shifted_letter(&key, 'M') => {
+                    self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?
+                }
                 KeyCode::Char('m') => {
                     self.apply_sort_mode(pane_id, SortMode::Modified { reverse: false })?
                 }
-                KeyCode::Char('M') => {
-                    self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?
+                _ if key_matches_shifted_letter(&key, 'B') => {
+                    self.apply_sort_mode(pane_id, SortMode::Created { reverse: true })?
                 }
                 KeyCode::Char('b') => {
                     self.apply_sort_mode(pane_id, SortMode::Created { reverse: false })?
                 }
-                KeyCode::Char('B') => {
-                    self.apply_sort_mode(pane_id, SortMode::Created { reverse: true })?
+                _ if key_matches_shifted_letter(&key, 'A') => {
+                    self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: true })?
                 }
                 KeyCode::Char('a') => {
                     self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: false })?
                 }
-                KeyCode::Char('A') => {
-                    self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: true })?
+                _ if key_matches_shifted_letter(&key, 'N') => {
+                    self.apply_sort_mode(pane_id, SortMode::Natural { reverse: true })?
                 }
                 KeyCode::Char('n') => {
                     self.apply_sort_mode(pane_id, SortMode::Natural { reverse: false })?
                 }
-                KeyCode::Char('N') => {
-                    self.apply_sort_mode(pane_id, SortMode::Natural { reverse: true })?
+                _ if key_matches_shifted_letter(&key, 'E') => {
+                    self.apply_sort_mode(pane_id, SortMode::Extension { reverse: true })?
                 }
                 KeyCode::Char('e') => {
                     self.apply_sort_mode(pane_id, SortMode::Extension { reverse: false })?
                 }
-                KeyCode::Char('E') => {
-                    self.apply_sort_mode(pane_id, SortMode::Extension { reverse: true })?
+                _ if key_matches_shifted_letter(&key, 'S') => {
+                    self.apply_sort_mode(pane_id, SortMode::Size { reverse: true })?
                 }
                 KeyCode::Char('s') => {
                     self.apply_sort_mode(pane_id, SortMode::Size { reverse: false })?
-                }
-                KeyCode::Char('S') => {
-                    self.apply_sort_mode(pane_id, SortMode::Size { reverse: true })?
                 }
                 KeyCode::Char('r') => self.apply_sort_mode(pane_id, SortMode::Random)?,
                 KeyCode::Esc => {
@@ -1002,6 +1013,106 @@ impl App {
                     });
                     self.status = status;
                 } else {
+                    if key_matches_shifted_letter(&key, 'G') {
+                        if len > 0 {
+                            selected = len - 1;
+                        }
+                        self.pending_g = false;
+                        let search_buffer = search.buffer.clone();
+                        let search_editing = search.editing;
+                        let marked_count = marked_ids.len();
+                        self.pending_action = Some(PendingAction::TrashPanel {
+                            pane_id,
+                            selected,
+                            search,
+                            marked_ids,
+                            visual_anchor,
+                        });
+                        self.status = trash_panel_status(
+                            &search_buffer,
+                            len,
+                            selected,
+                            search_editing,
+                            marked_count,
+                        );
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'V') {
+                        self.pending_g = false;
+                        if let Some(anchor) = visual_anchor.take() {
+                            let added = self.commit_trash_visual_selection(
+                                &entries,
+                                &mut marked_ids,
+                                anchor,
+                                selected,
+                            );
+                            self.status = if added == 0 {
+                                format!("trash: kept {} marked items", marked_ids.len())
+                            } else {
+                                format!("trash: marked {} items", marked_ids.len())
+                            };
+                        } else if len > 0 {
+                            visual_anchor = Some(selected);
+                            self.status = self.trash_visual_status_label(
+                                selected,
+                                selected,
+                                marked_ids.len(),
+                            );
+                        }
+                        self.pending_action = Some(PendingAction::TrashPanel {
+                            pane_id,
+                            selected,
+                            search,
+                            marked_ids,
+                            visual_anchor,
+                        });
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'R') {
+                        self.pending_g = false;
+                        self.restore_all_trash_entries(&entries)?;
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'D') {
+                        self.pending_g = false;
+                        let target_ids =
+                            self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
+                        if target_ids.len() <= 1 {
+                            self.delete_trash_entry(
+                                pane_id,
+                                &entries,
+                                selected,
+                                search,
+                                marked_ids,
+                                visual_anchor,
+                            )?;
+                        } else {
+                            let selected_entries = entries
+                                .iter()
+                                .filter(|entry| target_ids.iter().any(|id| id == &entry.id))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            self.clear_filtered_trash_entries(
+                                pane_id,
+                                &selected_entries,
+                                search,
+                                Vec::new(),
+                                None,
+                            )?;
+                        }
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'C') {
+                        self.pending_g = false;
+                        self.clear_filtered_trash_entries(
+                            pane_id,
+                            &entries,
+                            search,
+                            marked_ids,
+                            visual_anchor,
+                        )?;
+                        return Ok(true);
+                    }
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => {
                             if len > 0 {
@@ -1021,38 +1132,9 @@ impl App {
                                 self.pending_g = true;
                             }
                         }
-                        KeyCode::Char('G') => {
-                            if len > 0 {
-                                selected = len - 1;
-                            }
-                            self.pending_g = false;
-                        }
                         KeyCode::Char('f') => {
                             search.editing = true;
                             self.pending_g = false;
-                        }
-                        KeyCode::Char('V') => {
-                            self.pending_g = false;
-                            if let Some(anchor) = visual_anchor.take() {
-                                let added = self.commit_trash_visual_selection(
-                                    &entries,
-                                    &mut marked_ids,
-                                    anchor,
-                                    selected,
-                                );
-                                self.status = if added == 0 {
-                                    format!("trash: kept {} marked items", marked_ids.len())
-                                } else {
-                                    format!("trash: marked {} items", marked_ids.len())
-                                };
-                            } else if len > 0 {
-                                visual_anchor = Some(selected);
-                                self.status = self.trash_visual_status_label(
-                                    selected,
-                                    selected,
-                                    marked_ids.len(),
-                                );
-                            }
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if len > 0 {
@@ -1078,51 +1160,6 @@ impl App {
                                     .collect::<Vec<_>>();
                                 self.restore_all_trash_entries(&selected_entries)?;
                             }
-                            return Ok(true);
-                        }
-                        KeyCode::Char('R') => {
-                            self.pending_g = false;
-                            self.restore_all_trash_entries(&entries)?;
-                            return Ok(true);
-                        }
-                        KeyCode::Char('D') => {
-                            self.pending_g = false;
-                            let target_ids =
-                                self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
-                            if target_ids.len() <= 1 {
-                                self.delete_trash_entry(
-                                    pane_id,
-                                    &entries,
-                                    selected,
-                                    search,
-                                    marked_ids,
-                                    visual_anchor,
-                                )?;
-                            } else {
-                                let selected_entries = entries
-                                    .iter()
-                                    .filter(|entry| target_ids.iter().any(|id| id == &entry.id))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                self.clear_filtered_trash_entries(
-                                    pane_id,
-                                    &selected_entries,
-                                    search,
-                                    Vec::new(),
-                                    None,
-                                )?;
-                            }
-                            return Ok(true);
-                        }
-                        KeyCode::Char('C') => {
-                            self.pending_g = false;
-                            self.clear_filtered_trash_entries(
-                                pane_id,
-                                &entries,
-                                search,
-                                marked_ids,
-                                visual_anchor,
-                            )?;
                             return Ok(true);
                         }
                         KeyCode::Esc => {
@@ -1209,6 +1246,20 @@ impl App {
                     });
                     self.status = status;
                 } else {
+                    if key_matches_shifted_letter(&key, 'G') {
+                        if filtered_len > 0 {
+                            selected = filtered_len - 1;
+                        }
+                        self.pending_g = false;
+                        let status = help_panel_status(&search.buffer, filtered_len, false);
+                        self.pending_action = Some(PendingAction::HelpPanel {
+                            pane_id,
+                            selected,
+                            search,
+                        });
+                        self.status = status;
+                        return Ok(true);
+                    }
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => {
                             if filtered_len > 0 {
@@ -1225,12 +1276,6 @@ impl App {
                             } else {
                                 self.pending_g = true;
                             }
-                        }
-                        KeyCode::Char('G') => {
-                            if filtered_len > 0 {
-                                selected = filtered_len - 1;
-                            }
-                            self.pending_g = false;
                         }
                         KeyCode::Char('f') => {
                             search.editing = true;
@@ -1276,6 +1321,15 @@ impl App {
             } => {
                 let entries = self.bookmark_store.list();
                 let len = entries.len();
+                if key_matches_shifted_letter(&key, 'G') {
+                    if len > 0 {
+                        selected = len - 1;
+                    }
+                    self.pending_g = false;
+                    self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
+                    self.status = bookmark_list_status(len, selected);
+                    return Ok(true);
+                }
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if len > 0 {
@@ -1294,12 +1348,6 @@ impl App {
                         } else {
                             self.pending_g = true;
                         }
-                    }
-                    KeyCode::Char('G') => {
-                        if len > 0 {
-                            selected = len - 1;
-                        }
-                        self.pending_g = false;
                     }
                     KeyCode::Enter | KeyCode::Char('l') => {
                         self.pending_g = false;
@@ -1439,6 +1487,18 @@ impl App {
                         });
                     }
                 },
+                RenameMode::Normal if key_matches_shifted_letter(&key, 'A') => {
+                    cursor = buffer.chars().count();
+                    mode = RenameMode::Insert;
+                    self.pending_action = Some(PendingAction::Rename {
+                        pane_id,
+                        original_name,
+                        buffer,
+                        cursor,
+                        mode,
+                    });
+                    self.status = String::from("rename: insert");
+                }
                 RenameMode::Normal => match key.code {
                     KeyCode::Char('h') | KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
@@ -1523,18 +1583,6 @@ impl App {
                     }
                     KeyCode::Char('a') => {
                         cursor = move_cursor_right(&buffer, cursor);
-                        mode = RenameMode::Insert;
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = String::from("rename: insert");
-                    }
-                    KeyCode::Char('A') => {
-                        cursor = buffer.chars().count();
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1629,6 +1677,17 @@ impl App {
                         });
                     }
                 },
+                RenameMode::Normal if key_matches_shifted_letter(&key, 'A') => {
+                    cursor = buffer.chars().count();
+                    mode = RenameMode::Insert;
+                    self.pending_action = Some(PendingAction::CreateEntry {
+                        pane_id,
+                        buffer,
+                        cursor,
+                        mode,
+                    });
+                    self.status = create_status_label("insert");
+                }
                 RenameMode::Normal => match key.code {
                     KeyCode::Char('h') | KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
@@ -1705,17 +1764,6 @@ impl App {
                     }
                     KeyCode::Char('a') => {
                         cursor = move_cursor_right(&buffer, cursor);
-                        mode = RenameMode::Insert;
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = create_status_label("insert");
-                    }
-                    KeyCode::Char('A') => {
-                        cursor = buffer.chars().count();
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1855,6 +1903,10 @@ impl App {
                     self.set_theme_by_name(name.trim());
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;
+                } else if let Some(args) = other.strip_prefix("move-panel ") {
+                    self.move_selected_to_pane_id(args.trim())?;
+                } else if let Some(path) = other.strip_prefix("move ") {
+                    self.move_selected_to_path(path.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark set ") {
                     self.set_bookmark_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark jump ") {
@@ -3293,6 +3345,114 @@ impl App {
         Ok(())
     }
 
+    /// 將目前選取或已標記的項目直接移動到指定路徑。
+    ///
+    /// 參數：
+    /// - `target: &str`，目標目錄，可以是絕對路徑或相對於目前 pane 的路徑。
+    ///
+    /// 回傳：`io::Result<()>`。
+    pub(crate) fn move_selected_to_path(&mut self, target: &str) -> io::Result<()> {
+        let Some(target_dir) = self.resolve_move_target_dir(target) else {
+            self.status = String::from("usage: move <target-dir>");
+            return Ok(());
+        };
+        self.move_selected_entries_into_dir(&target_dir)
+    }
+
+    /// 將目前選取或已標記的項目移到指定 pane 目前所在的目錄。
+    ///
+    /// 參數：
+    /// - `target: &str`，目標 pane 編號字串。
+    ///
+    /// 回傳：`io::Result<()>`。
+    pub(crate) fn move_selected_to_pane_id(&mut self, target: &str) -> io::Result<()> {
+        let Some(target_pane_id) = parse_pane_id_argument(target) else {
+            self.status = format!(
+                "usage: move-panel <pane-id>. available: {}",
+                self.available_pane_ids_label()
+            );
+            return Ok(());
+        };
+        let Some(target_dir) = self.panes.get(&target_pane_id).map(|pane| pane.cwd.clone()) else {
+            self.status = format!(
+                "unknown pane {target_pane_id}. available: {}",
+                self.available_pane_ids_label()
+            );
+            return Ok(());
+        };
+        self.move_selected_entries_into_dir(&target_dir)
+    }
+
+    /// 將目前焦點 pane 的選取項目批次移動到目標目錄。
+    fn move_selected_entries_into_dir(&mut self, target_dir: &std::path::Path) -> io::Result<()> {
+        let Some(source_pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        let source_dir = source_pane.cwd.clone();
+        let entries = source_pane.selected_or_marked_entries();
+
+        if entries.is_empty() {
+            self.status = String::from("nothing selected to move");
+            return Ok(());
+        }
+
+        if !target_dir.exists() {
+            self.status = format!("move target does not exist: {}", target_dir.display());
+            return Ok(());
+        }
+        if !target_dir.is_dir() {
+            self.status = format!("move target is not a directory: {}", target_dir.display());
+            return Ok(());
+        }
+        if source_dir == target_dir {
+            self.status = String::from("move target is the current directory");
+            return Ok(());
+        }
+
+        let mut moved_count = 0usize;
+        for entry in &entries {
+            if let Err(error) = PaneState::move_path_to_dir(&entry.path, target_dir) {
+                self.status = format!("move failed for {}: {error}", entry.display_name());
+                return Ok(());
+            }
+            moved_count += 1;
+        }
+
+        self.reload_all_panes()?;
+        self.status = if moved_count == 1 {
+            format!("moved 1 item -> {}", target_dir.display())
+        } else {
+            format!("moved {moved_count} items -> {}", target_dir.display())
+        };
+        Ok(())
+    }
+
+    /// 將命令列中的 move 目標字串解析成實際目錄路徑。
+    fn resolve_move_target_dir(&self, target: &str) -> Option<PathBuf> {
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let base_dir = self.panes.get(&self.focused_pane)?.cwd.clone();
+        let path = PathBuf::from(trimmed);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        })
+    }
+
+    /// 將目前可用的 pane 編號整理成易讀字串，供錯誤訊息與提示使用。
+    fn available_pane_ids_label(&self) -> String {
+        self.ordered_pane_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// 重新整理所有 pane，讓跨目錄操作後的內容保持同步。
     ///
     /// 參數：無。
@@ -3767,6 +3927,35 @@ fn parse_bookmark_argument(args: &str) -> Option<char> {
     Some(key)
 }
 
+/// 從命令列參數中取出 pane 編號。
+///
+/// 參數：
+/// - `args: &str`，使用者在 `:move-panel ...` 後輸入的內容。
+///
+/// 回傳：`Option<usize>`。
+/// - `Some(usize)` 代表成功解析成有效編號。
+/// - `None` 代表輸入為空、不是數字或小於 1。
+fn parse_pane_id_argument(args: &str) -> Option<usize> {
+    let trimmed = args.trim();
+    let id = trimmed.parse::<usize>().ok()?;
+    (id > 0).then_some(id)
+}
+
+/// 判斷某些終端送出的 `Shift+字母` 是否應視為大寫命令。
+///
+/// 參數：
+/// - `key: &KeyEvent`，目前收到的鍵盤事件。
+/// - `uppercase: char`，邏輯上希望匹配的大寫英文字母。
+///
+/// 回傳：`bool`。
+/// - `true` 代表事件要視為這個大寫命令。
+/// - `false` 代表不是。
+fn key_matches_shifted_letter(key: &KeyEvent, uppercase: char) -> bool {
+    let lower = uppercase.to_ascii_lowercase();
+    key.code == KeyCode::Char(uppercase)
+        || (key.code == KeyCode::Char(lower) && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 /// 根據目前書籤彈窗的內容，產生適合顯示在狀態列的提示文字。
 fn bookmark_list_status(count: usize, selected: usize) -> String {
     if count == 0 {
@@ -3893,6 +4082,18 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "x",
             "剪下目前選取項目到內部剪貼簿",
             HelpAction::Command("cut"),
+        ),
+        help_entry(
+            ":move <path>",
+            "",
+            "直接把目前選取或標記的項目移動到指定目錄",
+            HelpAction::Command("move ."),
+        ),
+        help_entry(
+            ":move-panel",
+            "",
+            "把目前選取或標記的項目移動到指定 pane 編號目前所在的目錄",
+            HelpAction::Command("move-panel 2"),
         ),
         help_entry(
             ":paste",
@@ -4359,8 +4560,8 @@ mod tests {
 
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RenameMode,
-        help_entries, rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
-        rename_word_end,
+        VisualSelectionState, help_entries, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end,
     };
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
@@ -4739,6 +4940,20 @@ mod tests {
             app.pending_action,
             Some(PendingAction::OpenPicker { .. })
         ));
+    }
+
+    #[test]
+    /// 驗證某些終端把 `Shift+p` 回報成 `p + Shift` 時，也能正確進入 preview mode。
+    fn app_shift_p_opens_preview_mode() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT))
+            .expect("open preview with shifted p");
+
+        assert_eq!(app.preview_focus, Some(1));
+        assert_eq!(app.status, "preview mode");
     }
 
     #[test]
@@ -5378,6 +5593,73 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 `:move <path>` 會把目前選取的檔案直接移到指定目錄。
+    fn app_move_command_moves_selected_entry_to_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("gamma.txt");
+        fs::write(&source_file, "hello").expect("file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.execute_command(&format!("move {}", target_dir.display()))
+            .expect("move command");
+
+        assert!(!source_file.exists());
+        assert!(target_dir.join("gamma.txt").exists());
+        assert_eq!(
+            app.status,
+            format!("moved 1 item -> {}", target_dir.display())
+        );
+    }
+
+    #[test]
+    /// 驗證 `:move-panel <id>` 會把目前選取的檔案移到指定 pane 的目錄。
+    fn app_move_panel_command_moves_selected_entry_to_target_pane_dir() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("delta.txt");
+        fs::write(&source_file, "hello").expect("file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
+        app.focus_previous_pane();
+
+        app.execute_command("move-panel 2").expect("move panel");
+
+        assert!(!source_file.exists());
+        assert!(target_dir.join("delta.txt").exists());
+        assert_eq!(
+            app.status,
+            format!("moved 1 item -> {}", target_dir.display())
+        );
+    }
+
+    #[test]
+    /// 驗證 `:move-panel <id>` 若指定不存在的 pane，會提示目前可用的 pane 編號。
+    fn app_move_panel_command_reports_available_panes_for_unknown_target() {
+        let dir = tempdir().expect("tempdir");
+        let source_file = dir.path().join("epsilon.txt");
+        fs::write(&source_file, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("move-panel 9").expect("move panel");
+
+        assert!(source_file.exists());
+        assert_eq!(app.status, "unknown pane 9. available: 1");
+    }
+
+    #[test]
     /// 驗證按下 `o` 後會打開建立新檔案的 inline 輸入框。
     fn app_start_create_entry_opens_inline_editor() {
         let dir = tempdir().expect("tempdir");
@@ -5612,6 +5894,25 @@ mod tests {
             .expect("open sort picker again");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE))
             .expect("sort by modified reverse");
+        assert_eq!(app.status, "sort: modified (reverse)");
+        assert_eq!(
+            app.panes.get(&1).expect("pane").sort_mode,
+            SortMode::Modified { reverse: true }
+        );
+    }
+
+    #[test]
+    /// 驗證 sort panel 也接受 `m + Shift` 這類終端事件，正確套用反向排序。
+    fn app_sort_picker_shift_m_applies_reverse_modified() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
+            .expect("open sort picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::SHIFT))
+            .expect("sort by modified reverse");
+
         assert_eq!(app.status, "sort: modified (reverse)");
         assert_eq!(
             app.panes.get(&1).expect("pane").sort_mode,
@@ -6035,6 +6336,43 @@ mod tests {
         assert!(app.visual_selection.is_none());
         assert_eq!(pane.marked_count(), 3);
         assert_eq!(app.status, "marked 3 items");
+    }
+
+    #[test]
+    /// 驗證某些終端把 `Shift+v` 回報成 `v + Shift` 時，也能正確進入 visual selection。
+    fn app_shift_v_opens_visual_selection() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SHIFT))
+            .expect("open visual with shifted v");
+
+        assert_eq!(
+            app.visual_selection,
+            Some(VisualSelectionState {
+                pane_id: 1,
+                anchor: 0,
+                current: 0,
+            })
+        );
+        assert_eq!(app.status, "visual: range selection");
+    }
+
+    #[test]
+    /// 驗證某些終端把 `Shift+g` 回報成 `g + Shift` 時，也能正確執行 `G` 跳到列表底部。
+    fn app_shift_g_jumps_to_bottom() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+        fs::write(dir.path().join("gamma.txt"), "c").expect("gamma");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT))
+            .expect("jump bottom with shifted g");
+
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 2);
+        assert_eq!(app.status, "jumped to bottom");
     }
 
     #[test]
