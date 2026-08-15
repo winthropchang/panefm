@@ -36,11 +36,11 @@ use super::{
     search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
     trash::{TrashListEntry, TrashStore},
     ui::{
-        BookmarkPanelLine, HelpPanelLine, InlineEditorState, InlinePickerState, PaneListState,
-        RegexRenamePanelLine, SearchListState, TrashPanelLine, render_bookmark_picker,
-        render_command_palette, render_confirm_dialog, render_filter_input,
-        render_global_search_panel, render_pane, render_preview_search_input,
-        render_theme_picker,
+        BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
+        InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TrashPanelLine,
+        render_bookmark_picker, render_command_palette, render_confirm_dialog,
+        render_filter_input, render_global_search_panel, render_pane,
+        render_preview_search_input, render_theme_picker,
     },
 };
 
@@ -226,6 +226,7 @@ pub(crate) struct App {
     pub(crate) status: String,
     pub(crate) command_mode: bool,
     pub(crate) command_buffer: String,
+    pub(crate) command_suggestion_selected: usize,
     pub(crate) awaiting_ctrl_w: bool,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
@@ -295,6 +296,7 @@ impl App {
             status: startup_status,
             command_mode: false,
             command_buffer: String::new(),
+            command_suggestion_selected: 0,
             awaiting_ctrl_w: false,
             pending_g: false,
             pending_y: false,
@@ -389,51 +391,58 @@ impl App {
         }
 
         let should_continue = match key.code {
-            KeyCode::Char('q') => false,
+            _ if key_matches_plain_letter(&key, 'q') => false,
             KeyCode::Char(':') | KeyCode::Char(';')
                 if key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.command_mode = true;
                 self.command_buffer.clear();
+                self.command_suggestion_selected = 0;
                 self.status = String::from("command mode");
                 self.pending_g = false;
                 self.pending_y = false;
                 self.pending_bookmark = None;
                 true
             }
-            KeyCode::Char('j') => {
+            _ if key_matches_plain_letter(&key, 'j') => {
                 self.current_pane_mut()?.move_down();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('k') => {
+            _ if key_matches_plain_letter(&key, 'k') => {
                 self.current_pane_mut()?.move_up();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('h') => {
+            _ if key_matches_plain_letter(&key, 'h') => {
                 self.current_pane_mut()?.go_parent()?;
                 self.status = String::from("moved to parent directory");
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('l') => {
+            _ if key_matches_plain_letter(&key, 'l') => {
                 self.current_pane_mut()?.enter_selected()?;
                 self.status = String::from("opened directory");
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('o') | KeyCode::Enter => {
+            KeyCode::Enter => {
                 self.open_selected_with_default()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('g') => {
+            _ if key_matches_plain_letter(&key, 'o') => {
+                self.open_selected_with_default()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_plain_letter(&key, 'g') => {
                 self.pending_y = false;
                 if self.pending_g {
                     self.current_pane_mut()?.move_top();
@@ -445,13 +454,13 @@ impl App {
                 }
                 true
             }
-            KeyCode::Char('d') => {
+            _ if key_matches_plain_letter(&key, 'd') => {
                 self.start_delete_confirmation();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('r') => {
+            _ if key_matches_plain_letter(&key, 'r') => {
                 self.start_rename();
                 self.pending_g = false;
                 self.pending_y = false;
@@ -463,13 +472,13 @@ impl App {
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('f') => {
+            _ if key_matches_plain_letter(&key, 'f') => {
                 self.open_filter_input();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('s') => {
+            _ if key_matches_plain_letter(&key, 's') => {
                 self.open_global_search()?;
                 self.pending_g = false;
                 self.pending_y = false;
@@ -481,25 +490,25 @@ impl App {
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('a') => {
+            _ if key_matches_plain_letter(&key, 'a') => {
                 self.start_create_entry();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('x') => {
+            _ if key_matches_plain_letter(&key, 'x') => {
                 self.cut_selected();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('p') => {
+            _ if key_matches_plain_letter(&key, 'p') => {
                 self.paste_into_focused_pane()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('y') => {
+            _ if key_matches_plain_letter(&key, 'y') => {
                 self.pending_g = false;
                 self.pending_bookmark = None;
                 if self.pending_y {
@@ -511,7 +520,7 @@ impl App {
                 }
                 true
             }
-            KeyCode::Char('m') => {
+            _ if key_matches_plain_letter(&key, 'm') => {
                 self.pending_g = false;
                 self.pending_y = false;
                 self.pending_bookmark = Some(BookmarkPrompt::Set);
@@ -525,7 +534,7 @@ impl App {
                 self.status = String::from("bookmark: press a key to jump");
                 true
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if key_matches_ctrl_letter(&key, 'w') => {
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
                 self.pending_y = false;
@@ -591,21 +600,31 @@ impl App {
                 self.open_preview_search_input();
                 self.pending_g = false;
             }
-            KeyCode::Char('n') => {
+            _ if key_matches_plain_letter(&key, 'n') => {
                 self.pending_g = false;
                 self.status = self.jump_preview_match(true)?;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 self.current_pane_mut()?.scroll_preview_down(1);
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            _ if key_matches_plain_letter(&key, 'j') => {
+                self.current_pane_mut()?.scroll_preview_down(1);
+                self.pending_g = false;
+                self.status = String::from("preview mode");
+            }
+            KeyCode::Up => {
                 self.current_pane_mut()?.scroll_preview_up(1);
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
-            KeyCode::Char('g') => {
+            _ if key_matches_plain_letter(&key, 'k') => {
+                self.current_pane_mut()?.scroll_preview_up(1);
+                self.pending_g = false;
+                self.status = String::from("preview mode");
+            }
+            _ if key_matches_plain_letter(&key, 'g') => {
                 if self.pending_g {
                     self.current_pane_mut()?.scroll_preview_top();
                     self.pending_g = false;
@@ -615,17 +634,17 @@ impl App {
                     self.status = String::from("preview: pending g");
                 }
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if key_matches_ctrl_letter(&key, 'd') => {
                 self.current_pane_mut()?.page_preview_down();
                 self.pending_g = false;
                 self.status = String::from("preview: page down");
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if key_matches_ctrl_letter(&key, 'u') => {
                 self.current_pane_mut()?.page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if key_matches_ctrl_letter(&key, 'w') => {
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
                 self.pending_y = false;
@@ -658,17 +677,27 @@ impl App {
             KeyCode::Esc => {
                 self.commit_visual_selection()?;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 self.current_pane_mut()?.move_down();
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            _ if key_matches_plain_letter(&key, 'j') => {
+                self.current_pane_mut()?.move_down();
+                self.sync_visual_selection_cursor();
+                self.status = self.visual_status_label();
+            }
+            KeyCode::Up => {
                 self.current_pane_mut()?.move_up();
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
-            KeyCode::Char('g') => {
+            _ if key_matches_plain_letter(&key, 'k') => {
+                self.current_pane_mut()?.move_up();
+                self.sync_visual_selection_cursor();
+                self.status = self.visual_status_label();
+            }
+            _ if key_matches_plain_letter(&key, 'g') => {
                 if self.pending_g {
                     self.current_pane_mut()?.move_top();
                     self.sync_visual_selection_cursor();
@@ -780,7 +809,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 search.selected = (search.selected + 1).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
                     &search.buffer,
@@ -791,7 +820,18 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            _ if key_matches_plain_letter(&key, 'j') => {
+                search.selected = (search.selected + 1).min(search.results.len().saturating_sub(1));
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            KeyCode::Up => {
                 search.selected = search.selected.saturating_sub(1);
                 self.status = global_search_status(
                     &search.buffer,
@@ -802,7 +842,18 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
-            KeyCode::Char('g') => {
+            _ if key_matches_plain_letter(&key, 'k') => {
+                search.selected = search.selected.saturating_sub(1);
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            _ if key_matches_plain_letter(&key, 'g') => {
                 if self.pending_g {
                     search.selected = 0;
                     self.pending_g = false;
@@ -818,7 +869,7 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
-            KeyCode::Char('G') => {
+            _ if key_matches_shifted_letter(&key, 'G') => {
                 if !search.results.is_empty() {
                     search.selected = search.results.len() - 1;
                 }
@@ -832,7 +883,7 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
-            KeyCode::Char('i') | KeyCode::Char('s') => {
+            _ if key_matches_plain_letter(&key, 'i') || key_matches_plain_letter(&key, 's') => {
                 search.editing = true;
                 self.pending_g = false;
                 self.status = global_search_status(
@@ -844,11 +895,19 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
-            KeyCode::Enter | KeyCode::Char('l') => {
+            KeyCode::Enter => {
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
-            KeyCode::Esc | KeyCode::Char('h') => {
+            _ if key_matches_plain_letter(&key, 'l') => {
+                self.pending_g = false;
+                self.open_global_search_result(search)?;
+            }
+            KeyCode::Esc => {
+                self.pending_g = false;
+                self.cancel_global_search();
+            }
+            _ if key_matches_plain_letter(&key, 'h') => {
                 self.pending_g = false;
                 self.cancel_global_search();
             }
@@ -925,10 +984,13 @@ impl App {
                 pane_id,
                 target_name,
             } => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                _ if key_matches_letter_any_case(&key, 'y') => {
                     self.confirm_delete(pane_id, &target_name)?;
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyCode::Esc => {
+                    self.status = format!("trash cancelled: {target_name}");
+                }
+                _ if key_matches_letter_any_case(&key, 'n') => {
                     self.status = format!("trash cancelled: {target_name}");
                 }
                 _ => {
@@ -943,40 +1005,42 @@ impl App {
                 _ if key_matches_shifted_letter(&key, 'M') => {
                     self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?
                 }
-                KeyCode::Char('m') => {
+                _ if key_matches_plain_letter(&key, 'm') => {
                     self.apply_sort_mode(pane_id, SortMode::Modified { reverse: false })?
                 }
                 _ if key_matches_shifted_letter(&key, 'B') => {
                     self.apply_sort_mode(pane_id, SortMode::Created { reverse: true })?
                 }
-                KeyCode::Char('b') => {
+                _ if key_matches_plain_letter(&key, 'b') => {
                     self.apply_sort_mode(pane_id, SortMode::Created { reverse: false })?
                 }
                 _ if key_matches_shifted_letter(&key, 'A') => {
                     self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: true })?
                 }
-                KeyCode::Char('a') => {
+                _ if key_matches_plain_letter(&key, 'a') => {
                     self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: false })?
                 }
                 _ if key_matches_shifted_letter(&key, 'N') => {
                     self.apply_sort_mode(pane_id, SortMode::Natural { reverse: true })?
                 }
-                KeyCode::Char('n') => {
+                _ if key_matches_plain_letter(&key, 'n') => {
                     self.apply_sort_mode(pane_id, SortMode::Natural { reverse: false })?
                 }
                 _ if key_matches_shifted_letter(&key, 'E') => {
                     self.apply_sort_mode(pane_id, SortMode::Extension { reverse: true })?
                 }
-                KeyCode::Char('e') => {
+                _ if key_matches_plain_letter(&key, 'e') => {
                     self.apply_sort_mode(pane_id, SortMode::Extension { reverse: false })?
                 }
                 _ if key_matches_shifted_letter(&key, 'S') => {
                     self.apply_sort_mode(pane_id, SortMode::Size { reverse: true })?
                 }
-                KeyCode::Char('s') => {
+                _ if key_matches_plain_letter(&key, 's') => {
                     self.apply_sort_mode(pane_id, SortMode::Size { reverse: false })?
                 }
-                KeyCode::Char('r') => self.apply_sort_mode(pane_id, SortMode::Random)?,
+                _ if key_matches_plain_letter(&key, 'r') => {
+                    self.apply_sort_mode(pane_id, SortMode::Random)?
+                }
                 KeyCode::Esc => {
                     self.status = String::from("sort cancelled");
                 }
@@ -986,12 +1050,22 @@ impl App {
                 }
             },
             PendingAction::ThemePicker { mut selected } => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
+                KeyCode::Down => {
                     selected = (selected + 1) % ThemePreset::ALL.len();
                     self.pending_action = Some(PendingAction::ThemePicker { selected });
                     self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                _ if key_matches_plain_letter(&key, 'j') => {
+                    selected = (selected + 1) % ThemePreset::ALL.len();
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                KeyCode::Up => {
+                    selected = (selected + ThemePreset::ALL.len() - 1) % ThemePreset::ALL.len();
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                _ if key_matches_plain_letter(&key, 'k') => {
                     selected = (selected + ThemePreset::ALL.len() - 1) % ThemePreset::ALL.len();
                     self.pending_action = Some(PendingAction::ThemePicker { selected });
                     self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
@@ -1149,17 +1223,27 @@ impl App {
                         return Ok(true);
                     }
                     match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
+                        KeyCode::Down => {
                             if len > 0 {
                                 selected = (selected + 1).min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
-                        KeyCode::Char('k') | KeyCode::Up => {
+                        _ if key_matches_plain_letter(&key, 'j') => {
+                            if len > 0 {
+                                selected = (selected + 1).min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Up => {
                             selected = selected.saturating_sub(1);
                             self.pending_g = false;
                         }
-                        KeyCode::Char('g') => {
+                        _ if key_matches_plain_letter(&key, 'k') => {
+                            selected = selected.saturating_sub(1);
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'g') => {
                             if self.pending_g {
                                 selected = 0;
                                 self.pending_g = false;
@@ -1167,21 +1251,37 @@ impl App {
                                 self.pending_g = true;
                             }
                         }
-                        KeyCode::Char('f') => {
+                        _ if key_matches_plain_letter(&key, 'f') => {
                             search.editing = true;
                             self.pending_g = false;
                         }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        _ if key_matches_ctrl_letter(&key, 'd') => {
                             if len > 0 {
                                 selected = (selected + 10).min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        _ if key_matches_ctrl_letter(&key, 'u') => {
                             selected = selected.saturating_sub(10);
                             self.pending_g = false;
                         }
-                        KeyCode::Enter | KeyCode::Char('l') => {
+                        KeyCode::Enter => {
+                            self.pending_g = false;
+                            let target_ids =
+                                self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
+                            if target_ids.len() <= 1 {
+                                self.restore_trash_entry(&entries, selected)?;
+                            } else {
+                                let selected_entries = entries
+                                    .iter()
+                                    .filter(|entry| target_ids.iter().any(|id| id == &entry.id))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                self.restore_all_trash_entries(&selected_entries)?;
+                            }
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 'l') => {
                             self.pending_g = false;
                             let target_ids =
                                 self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
@@ -1220,7 +1320,9 @@ impl App {
                                 return Ok(true);
                             }
                         }
-                        KeyCode::Char('q') | KeyCode::Char('h') => {
+                        _ if key_matches_plain_letter(&key, 'q')
+                            || key_matches_plain_letter(&key, 'h') =>
+                        {
                             self.pending_g = false;
                             self.status = String::from("normal mode");
                             return Ok(true);
@@ -1298,15 +1400,23 @@ impl App {
                         return Ok(true);
                     }
                     match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
+                        KeyCode::Down => {
                             if filtered_len > 0 {
                                 selected = (selected + 1).min(filtered_len.saturating_sub(1));
                             }
                         }
-                        KeyCode::Char('k') | KeyCode::Up => {
+                        _ if key_matches_plain_letter(&key, 'j') => {
+                            if filtered_len > 0 {
+                                selected = (selected + 1).min(filtered_len.saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Up => {
                             selected = selected.saturating_sub(1);
                         }
-                        KeyCode::Char('g') => {
+                        _ if key_matches_plain_letter(&key, 'k') => {
+                            selected = selected.saturating_sub(1);
+                        }
+                        _ if key_matches_plain_letter(&key, 'g') => {
                             if self.pending_g {
                                 selected = 0;
                                 self.pending_g = false;
@@ -1314,26 +1424,36 @@ impl App {
                                 self.pending_g = true;
                             }
                         }
-                        KeyCode::Char('f') => {
+                        _ if key_matches_plain_letter(&key, 'f') => {
                             search.editing = true;
                             self.pending_g = false;
                         }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        _ if key_matches_ctrl_letter(&key, 'd') => {
                             if filtered_len > 0 {
                                 selected = (selected + 10).min(filtered_len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        _ if key_matches_ctrl_letter(&key, 'u') => {
                             selected = selected.saturating_sub(10);
                             self.pending_g = false;
                         }
-                        KeyCode::Enter | KeyCode::Char('l') => {
+                        KeyCode::Enter => {
                             self.pending_g = false;
                             self.execute_help_entry(&filtered_entries, selected)?;
                             return Ok(true);
                         }
-                        KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => {
+                        _ if key_matches_plain_letter(&key, 'l') => {
+                            self.pending_g = false;
+                            self.execute_help_entry(&filtered_entries, selected)?;
+                            return Ok(true);
+                        }
+                        KeyCode::Esc | KeyCode::F(1) => {
+                            self.pending_g = false;
+                            self.restore_help_return_state(false)?;
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
                             self.pending_g = false;
                             self.restore_help_return_state(false)?;
                             return Ok(true);
@@ -1368,17 +1488,27 @@ impl App {
                     return Ok(true);
                 }
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    KeyCode::Down => {
                         if len > 0 {
                             selected = (selected + 1).min(len.saturating_sub(1));
                         }
                         self.pending_g = false;
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
+                    _ if key_matches_plain_letter(&key, 'j') => {
+                        if len > 0 {
+                            selected = (selected + 1).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         self.pending_g = false;
                     }
-                    KeyCode::Char('g') => {
+                    _ if key_matches_plain_letter(&key, 'k') => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'g') => {
                         if self.pending_g {
                             selected = 0;
                             self.pending_g = false;
@@ -1386,12 +1516,24 @@ impl App {
                             self.pending_g = true;
                         }
                     }
-                    KeyCode::Enter | KeyCode::Char('l') => {
+                    KeyCode::Enter => {
                         self.pending_g = false;
                         self.open_bookmark_from_list(pane_id, &entries, selected)?;
                         return Ok(true);
                     }
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                    _ if key_matches_plain_letter(&key, 'l') => {
+                        self.pending_g = false;
+                        self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                        return Ok(true);
+                    }
+                    KeyCode::Esc => {
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
+                    _ if key_matches_plain_letter(&key, 'q')
+                        || key_matches_plain_letter(&key, 'h') =>
+                    {
                         self.pending_g = false;
                         self.status = String::from("normal mode");
                         return Ok(true);
@@ -1410,7 +1552,7 @@ impl App {
             } => {
                 let options = open_picker_options(&target);
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    KeyCode::Down => {
                         if !options.is_empty() {
                             selected = (selected + 1).min(options.len().saturating_sub(1));
                         }
@@ -1421,7 +1563,18 @@ impl App {
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
+                    _ if key_matches_plain_letter(&key, 'j') => {
+                        if !options.is_empty() {
+                            selected = (selected + 1).min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
@@ -1430,14 +1583,35 @@ impl App {
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
-                    KeyCode::Enter | KeyCode::Char('l') => {
+                    _ if key_matches_plain_letter(&key, 'k') => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    KeyCode::Enter => {
                         if let Some(option) = options.get(selected) {
                             self.queue_open_action(target.clone(), option.action)?;
                         } else {
                             self.status = String::from("open with: no option selected");
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                    _ if key_matches_plain_letter(&key, 'l') => {
+                        if let Some(option) = options.get(selected) {
+                            self.queue_open_action(target.clone(), option.action)?;
+                        } else {
+                            self.status = String::from("open with: no option selected");
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.status = String::from("normal mode");
+                    }
+                    _ if key_matches_plain_letter(&key, 'q')
+                        || key_matches_plain_letter(&key, 'h') =>
+                    {
                         self.status = String::from("normal mode");
                     }
                     _ => {
@@ -1539,7 +1713,7 @@ impl App {
                     self.status = String::from("rename: insert");
                 }
                 RenameMode::Normal => match key.code {
-                    KeyCode::Char('h') | KeyCode::Left => {
+                    KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1549,7 +1723,27 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('l') | KeyCode::Right => {
+                    _ if key_matches_plain_letter(&key, 'h') => {
+                        cursor = cursor.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Right => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    _ if key_matches_plain_letter(&key, 'l') => {
                         cursor = move_cursor_right(&buffer, cursor);
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1579,7 +1773,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('w') => {
+                    _ if key_matches_plain_letter(&key, 'w') => {
                         cursor = rename_next_word_start(&buffer, cursor);
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1589,7 +1783,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('b') => {
+                    _ if key_matches_plain_letter(&key, 'b') => {
                         cursor = rename_previous_word_start(&buffer, cursor);
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1599,7 +1793,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('e') => {
+                    _ if key_matches_plain_letter(&key, 'e') => {
                         cursor = rename_word_end(&buffer, cursor);
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1609,7 +1803,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('i') => {
+                    _ if key_matches_plain_letter(&key, 'i') => {
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -1620,7 +1814,7 @@ impl App {
                         });
                         self.status = String::from("rename: insert");
                     }
-                    KeyCode::Char('a') => {
+                    _ if key_matches_plain_letter(&key, 'a') => {
                         cursor = move_cursor_right(&buffer, cursor);
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::Rename {
@@ -1730,7 +1924,7 @@ impl App {
                     self.status = create_status_label("insert");
                 }
                 RenameMode::Normal => match key.code {
-                    KeyCode::Char('h') | KeyCode::Left => {
+                    KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1739,7 +1933,25 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('l') | KeyCode::Right => {
+                    _ if key_matches_plain_letter(&key, 'h') => {
+                        cursor = cursor.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Right => {
+                        cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    _ if key_matches_plain_letter(&key, 'l') => {
                         cursor = move_cursor_right(&buffer, cursor);
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1766,7 +1978,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('w') => {
+                    _ if key_matches_plain_letter(&key, 'w') => {
                         cursor = rename_next_word_start(&buffer, cursor);
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1775,7 +1987,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('b') => {
+                    _ if key_matches_plain_letter(&key, 'b') => {
                         cursor = rename_previous_word_start(&buffer, cursor);
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1784,7 +1996,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('e') => {
+                    _ if key_matches_plain_letter(&key, 'e') => {
                         cursor = rename_word_end(&buffer, cursor);
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1793,7 +2005,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('i') => {
+                    _ if key_matches_plain_letter(&key, 'i') => {
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -1803,7 +2015,7 @@ impl App {
                         });
                         self.status = create_status_label("insert");
                     }
-                    KeyCode::Char('a') => {
+                    _ if key_matches_plain_letter(&key, 'a') => {
                         cursor = move_cursor_right(&buffer, cursor);
                         mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::CreateEntry {
@@ -1839,7 +2051,7 @@ impl App {
             } => {
                 let len = previews.len();
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    KeyCode::Down => {
                         if len > 0 {
                             selected = (selected + 1).min(len.saturating_sub(1));
                         }
@@ -1852,7 +2064,20 @@ impl App {
                             previews,
                         });
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
+                    _ if key_matches_plain_letter(&key, 'j') => {
+                        if len > 0 {
+                            selected = (selected + 1).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
@@ -1863,7 +2088,18 @@ impl App {
                             previews,
                         });
                     }
-                    KeyCode::Char('g') => {
+                    _ if key_matches_plain_letter(&key, 'k') => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    _ if key_matches_plain_letter(&key, 'g') => {
                         if self.pending_g {
                             selected = 0;
                             self.pending_g = false;
@@ -1891,11 +2127,21 @@ impl App {
                             previews,
                         });
                     }
-                    KeyCode::Enter | KeyCode::Char('l') => {
+                    KeyCode::Enter => {
                         self.pending_g = false;
                         self.apply_regex_rename_preview(pane_id, &previews)?;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                    _ if key_matches_plain_letter(&key, 'l') => {
+                        self.pending_g = false;
+                        self.apply_regex_rename_preview(pane_id, &previews)?;
+                    }
+                    KeyCode::Esc => {
+                        self.pending_g = false;
+                        self.status = String::from("regex rename cancelled");
+                    }
+                    _ if key_matches_plain_letter(&key, 'q')
+                        || key_matches_plain_letter(&key, 'h') =>
+                    {
                         self.pending_g = false;
                         self.status = String::from("regex rename cancelled");
                     }
@@ -1919,25 +2165,58 @@ impl App {
         Ok(true)
     }
 
-    /// 處理 command mode 中的按鍵編輯與送出行為。
+    /// 處理 command mode 中的按鍵編輯、候選切換與送出行為。
     pub(crate) fn handle_command_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let suggestions = command_suggestions(&self.command_buffer);
+        if let Some(direction) = command_suggestion_navigation(&key) {
+            if !suggestions.is_empty() {
+                match direction {
+                    SuggestionNavigation::Next => {
+                        self.command_suggestion_selected =
+                            (self.command_suggestion_selected + 1) % suggestions.len();
+                    }
+                    SuggestionNavigation::Previous => {
+                        self.command_suggestion_selected =
+                            (self.command_suggestion_selected + suggestions.len() - 1)
+                                % suggestions.len();
+                    }
+                }
+            }
+            return Ok(true);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.command_mode = false;
                 self.command_buffer.clear();
+                self.command_suggestion_selected = 0;
                 self.status = String::from("normal mode");
             }
             KeyCode::Backspace => {
                 self.command_buffer.pop();
+                self.command_suggestion_selected = 0;
             }
             KeyCode::Enter => {
-                let command = std::mem::take(&mut self.command_buffer);
-                self.command_mode = false;
-                self.execute_command(command.trim())?;
+                let selected_suggestion = suggestions
+                    .get(self.command_suggestion_selected.min(suggestions.len().saturating_sub(1)))
+                    .map(|entry| entry.command.trim_start_matches(':').to_string());
+                let current = self.command_buffer.trim();
+                if let Some(suggestion) = selected_suggestion
+                    && !suggestion.is_empty()
+                    && suggestion != current
+                {
+                    self.command_buffer = suggestion;
+                } else {
+                    let command = std::mem::take(&mut self.command_buffer);
+                    self.command_mode = false;
+                    self.command_suggestion_selected = 0;
+                    self.execute_command(command.trim())?;
+                }
             }
             KeyCode::Char(_) => {
                 if let Some(c) = typed_char_from_key(&key) {
                     self.command_buffer.push(c);
+                    self.command_suggestion_selected = 0;
                 }
             }
             _ => {}
@@ -1974,12 +2253,20 @@ impl App {
     /// 處理 `Ctrl-w` 前綴後的 pane 操作命令。
     pub(crate) fn handle_ctrl_w(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
-            KeyCode::Char('h') | KeyCode::Char('k') => self.focus_previous_pane(),
-            KeyCode::Char('l') | KeyCode::Char('j') => self.focus_next_pane(),
-            KeyCode::Char('v') => self.split_current(SplitDirection::Vertical)?,
-            KeyCode::Char('s') => self.split_current(SplitDirection::Horizontal)?,
-            KeyCode::Char('c') => self.close_current_pane(),
-            KeyCode::Char('o') => self.only_current_pane(),
+            _ if key_matches_plain_letter(&key, 'h') || key_matches_plain_letter(&key, 'k') => {
+                self.focus_previous_pane()
+            }
+            _ if key_matches_plain_letter(&key, 'l') || key_matches_plain_letter(&key, 'j') => {
+                self.focus_next_pane()
+            }
+            _ if key_matches_plain_letter(&key, 'v') => {
+                self.split_current(SplitDirection::Vertical)?
+            }
+            _ if key_matches_plain_letter(&key, 's') => {
+                self.split_current(SplitDirection::Horizontal)?
+            }
+            _ if key_matches_plain_letter(&key, 'c') => self.close_current_pane(),
+            _ if key_matches_plain_letter(&key, 'o') => self.only_current_pane(),
             _ => self.status = String::from("unknown Ctrl-w command"),
         }
         Ok(true)
@@ -4052,7 +4339,14 @@ impl App {
             && let Some(area) = pane_rects.get(&self.focused_pane)
         {
             let command_cursor =
-                render_command_palette(frame, *area, self.theme, &self.command_buffer);
+                render_command_palette(
+                    frame,
+                    *area,
+                    self.theme,
+                    &self.command_buffer,
+                    &command_suggestions(&self.command_buffer),
+                    self.command_suggestion_selected,
+                );
             if cursor_position.is_none() {
                 cursor_position = Some(command_cursor);
             }
@@ -4409,6 +4703,14 @@ fn typed_char_from_key(key: &KeyEvent) -> Option<char> {
     })
 }
 
+/// 判斷目前按鍵是否是沒有 modifier 的一般小寫命令鍵。
+///
+/// 這類按鍵主要用在 normal mode、panel 導航或 Vim 風格命令，
+/// 目的是把「文字輸入」與「功能命令」分成兩條不同路徑處理。
+fn key_matches_plain_letter(key: &KeyEvent, lowercase: char) -> bool {
+    key.code == KeyCode::Char(lowercase) && key.modifiers.is_empty()
+}
+
 /// 判斷某些終端送出的 `Shift+字母` 是否應視為大寫命令。
 ///
 /// 參數：
@@ -4422,6 +4724,60 @@ fn key_matches_shifted_letter(key: &KeyEvent, uppercase: char) -> bool {
     let lower = uppercase.to_ascii_lowercase();
     key.code == KeyCode::Char(uppercase)
         || (key.code == KeyCode::Char(lower) && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+/// 判斷某個英文字母命令是否要接受大小寫等價輸入。
+///
+/// 這主要用在 `y/n` 這種確認提示，或某些不區分大小寫的互動按鍵。
+fn key_matches_letter_any_case(key: &KeyEvent, letter: char) -> bool {
+    let lower = letter.to_ascii_lowercase();
+    let upper = letter.to_ascii_uppercase();
+    key_matches_plain_letter(key, lower) || key_matches_shifted_letter(key, upper)
+}
+
+/// 判斷 `Ctrl+字母` 指令，支援不同終端可能送出的大小寫字元格式。
+fn key_matches_ctrl_letter(key: &KeyEvent, letter: char) -> bool {
+    let lower = letter.to_ascii_lowercase();
+    let upper = letter.to_ascii_uppercase();
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(c) if c == lower || c == upper)
+}
+
+/// 描述 command mode 補全候選目前要往前還是往後切換。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestionNavigation {
+    Next,
+    Previous,
+}
+
+/// 把不同終端可能送出的快捷鍵格式，統一轉成 command 補全的切換方向。
+///
+/// 目前支援：
+/// - `Shift+N` / `Shift+P`
+/// - `Ctrl+N` / `Ctrl+P`
+/// - `Tab` / `Shift+Tab`
+/// - `Down` / `Up`
+///
+/// 這樣就算不同 terminal 對 modifier 的回報格式不一致，
+/// command mode 仍然至少有一組可用的候選切換方式。
+fn command_suggestion_navigation(key: &KeyEvent) -> Option<SuggestionNavigation> {
+    if key_matches_shifted_letter(key, 'N')
+        || key_matches_ctrl_letter(key, 'n')
+        || key.code == KeyCode::Tab
+        || key.code == KeyCode::Down
+    {
+        return Some(SuggestionNavigation::Next);
+    }
+
+    if key_matches_shifted_letter(key, 'P')
+        || key_matches_ctrl_letter(key, 'p')
+        || key.code == KeyCode::BackTab
+        || key.code == KeyCode::Up
+    {
+        return Some(SuggestionNavigation::Previous);
+    }
+
+    None
 }
 
 /// 根據目前書籤彈窗的內容，產生適合顯示在狀態列的提示文字。
@@ -4730,6 +5086,40 @@ fn help_panel_lines(query: &str) -> Vec<HelpPanelLine> {
         .collect()
 }
 
+/// 根據目前 command mode 的輸入內容，整理出適合顯示的命令補全候選。
+fn command_suggestions(query: &str) -> Vec<CommandSuggestionLine> {
+    let trimmed = query.trim();
+    let mut suggestions = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for entry in help_entries("") {
+        let HelpAction::Command(command) = entry.action else {
+            continue;
+        };
+        if !(trimmed.is_empty()
+            || command.starts_with(trimmed)
+            || command
+                .split_whitespace()
+                .next()
+                .is_some_and(|head| head.starts_with(trimmed)))
+        {
+            continue;
+        }
+        if !seen.insert(command.to_string()) {
+            continue;
+        }
+        suggestions.push(CommandSuggestionLine {
+            command: entry.line.command,
+            description: entry.line.description,
+        });
+        if suggestions.len() >= 8 {
+            break;
+        }
+    }
+
+    suggestions
+}
+
 /// 建立單一功能說明列與其動作。
 fn help_entry(command: &str, shortcut: &str, description: &str, action: HelpAction) -> HelpEntry {
     HelpEntry {
@@ -5034,9 +5424,10 @@ mod tests {
 
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RegexRenameOutcome,
-        RenameMode, VisualSelectionState, help_entries, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end,
-        typed_char_from_key,
+        RenameMode, VisualSelectionState, command_suggestion_navigation, command_suggestions,
+        help_entries, key_matches_ctrl_letter, key_matches_letter_any_case,
+        key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
@@ -5090,6 +5481,69 @@ mod tests {
     }
 
     #[test]
+    /// 驗證功能型按鍵 helper 會接受常見的 terminal 事件變體。
+    fn key_normalization_helpers_accept_terminal_variants() {
+        assert!(key_matches_shifted_letter(
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT),
+            'N'
+        ));
+        assert!(key_matches_shifted_letter(
+            &KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE),
+            'N'
+        ));
+        assert!(key_matches_ctrl_letter(
+            &KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            'p'
+        ));
+        assert!(key_matches_ctrl_letter(
+            &KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            'p'
+        ));
+        assert!(key_matches_letter_any_case(
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            'y'
+        ));
+        assert!(key_matches_letter_any_case(
+            &KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE),
+            'y'
+        ));
+    }
+
+    #[test]
+    /// 驗證 command 補全的切換快捷鍵支援多種常見 terminal 回報格式。
+    fn command_suggestion_navigation_accepts_terminal_variants() {
+        assert_eq!(
+            command_suggestion_navigation(&KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::SHIFT
+            )),
+            Some(super::SuggestionNavigation::Next)
+        );
+        assert_eq!(
+            command_suggestion_navigation(&KeyEvent::new(
+                KeyCode::Char('N'),
+                KeyModifiers::CONTROL
+            )),
+            Some(super::SuggestionNavigation::Next)
+        );
+        assert_eq!(
+            command_suggestion_navigation(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(super::SuggestionNavigation::Next)
+        );
+        assert_eq!(
+            command_suggestion_navigation(&KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::SHIFT
+            )),
+            Some(super::SuggestionNavigation::Previous)
+        );
+        assert_eq!(
+            command_suggestion_navigation(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(super::SuggestionNavigation::Previous)
+        );
+    }
+
+    #[test]
     /// 驗證 command mode 也會把 `Shift+6` 正規化成 `^`，避免 regex 指令難以輸入。
     fn app_command_mode_accepts_shifted_caret_symbol() {
         let dir = tempdir().expect("tempdir");
@@ -5101,6 +5555,115 @@ mod tests {
             .expect("type caret");
 
         assert_eq!(app.command_buffer, "^");
+    }
+
+    #[test]
+    /// 驗證 command mode 的補全候選會隨輸入過濾，並可用候選切換快捷鍵往返移動。
+    fn app_command_mode_cycles_autocomplete_suggestions() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("type t");
+
+        let suggestions = command_suggestions(&app.command_buffer);
+        assert!(!suggestions.is_empty());
+        assert_eq!(app.command_suggestion_selected, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("next suggestion");
+        assert_eq!(app.command_suggestion_selected, 1.min(suggestions.len() - 1));
+
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .expect("previous suggestion");
+        assert_eq!(app.command_suggestion_selected, 0);
+    }
+
+    #[test]
+    /// 驗證 command mode 會接受不同終端送出的候選切換事件格式。
+    fn app_command_mode_cycles_autocomplete_accepts_terminal_variants() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("type t");
+
+        let suggestions = command_suggestions(&app.command_buffer);
+        assert!(!suggestions.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("type n normally");
+        assert_eq!(app.command_buffer, "tn");
+        assert_eq!(app.command_suggestion_selected, 0);
+
+        app.command_buffer = String::from("t");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT))
+            .expect("next suggestion with lowercase+shift");
+        assert_eq!(app.command_suggestion_selected, 1.min(suggestions.len() - 1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::CONTROL))
+            .expect("next suggestion with uppercase ctrl");
+        assert_eq!(
+            app.command_suggestion_selected,
+            (2).min(suggestions.len().saturating_sub(1))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("next suggestion with down");
+        assert_eq!(
+            app.command_suggestion_selected,
+            (3).min(suggestions.len().saturating_sub(1))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE))
+            .expect("previous suggestion with uppercase char");
+        assert_eq!(
+            app.command_suggestion_selected,
+            (2).min(suggestions.len().saturating_sub(1))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("previous suggestion with up");
+        assert_eq!(
+            app.command_suggestion_selected,
+            (1).min(suggestions.len().saturating_sub(1))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .expect("previous suggestion with backtab");
+        assert_eq!(app.command_suggestion_selected, 0);
+    }
+
+    #[test]
+    /// 驗證 command mode 按下 Enter 會先補齊候選，命令完整時再執行。
+    fn app_command_mode_enter_autocompletes_then_executes() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("type r");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("autocomplete rename");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "rename");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute rename");
+
+        assert!(!app.command_mode);
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::Rename { .. })
+        ));
     }
 
     #[test]

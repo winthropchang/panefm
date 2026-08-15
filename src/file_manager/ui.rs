@@ -98,6 +98,13 @@ pub(crate) struct RegexRenamePanelLine {
     pub(crate) status: String,
 }
 
+/// 描述 command palette 中單一條命令補全候選。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandSuggestionLine {
+    pub(crate) command: String,
+    pub(crate) description: String,
+}
+
 /// 繪製單一 pane 的檔案列表與預覽區。
 ///
 /// 參數：
@@ -751,8 +758,11 @@ pub(crate) fn render_command_palette(
     area: Rect,
     theme: Theme,
     buffer: &str,
+    suggestions: &[CommandSuggestionLine],
+    selected: usize,
 ) -> (u16, u16) {
-    let popup_area = centered_rect(area, 70, 3);
+    let popup_height = (suggestions.len().min(6) as u16).saturating_add(3).max(3);
+    let popup_area = centered_rect(area, 70, popup_height);
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .title(Line::from(Span::styled(
@@ -762,10 +772,38 @@ pub(crate) fn render_command_palette(
         .borders(Borders::ALL)
         .border_style(theme.accent_style());
     let inner = block.inner(popup_area);
-    frame.render_widget(
-        Paragraph::new(format!(":{}", buffer)).block(block),
-        popup_area,
-    );
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(format!(":{}", buffer)), chunks[0]);
+
+    if !suggestions.is_empty() && chunks.len() > 1 {
+        let items = suggestions
+            .iter()
+            .map(|line| {
+                ListItem::new(Line::from(format!(
+                    "{:<22}  {}",
+                    truncate_text(&line.command, 22),
+                    line.description
+                )))
+            })
+            .collect::<Vec<_>>();
+        let mut list_state = ListState::default();
+        list_state.select(Some(selected.min(suggestions.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_style(theme.selected_item_style())
+                .highlight_symbol("▶ "),
+            chunks[1],
+            &mut list_state,
+        );
+    }
 
     (
         inner
