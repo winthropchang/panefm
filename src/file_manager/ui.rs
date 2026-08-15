@@ -60,6 +60,7 @@ pub(crate) struct TrashPanelLine {
     pub(crate) name: String,
     pub(crate) original_path: String,
     pub(crate) deleted_at: String,
+    pub(crate) marked: bool,
 }
 
 /// 描述說明面板中單一列要顯示的內容。
@@ -177,8 +178,9 @@ pub(crate) fn render_pane(
                 .iter()
                 .map(|line| {
                     ListItem::new(Line::from(format!(
-                        "{:<20}  {:<16}  {}",
-                        truncate_text(&line.name, 20),
+                        "{} {:<20}  {:<16}  {}",
+                        if line.marked { "*" } else { " " },
+                        truncate_text(&line.name, 19),
                         line.deleted_at,
                         line.original_path
                     )))
