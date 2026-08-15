@@ -22,6 +22,8 @@
 - 預覽中已支援搜尋。
 - pane 已支援分割與關閉。
 - preview 現在已改成 pane 各自獨立的狀態，不再是全域共享。
+- 已加入第一版 global search：
+  `s` 先打開輸入框，按下 `Enter` 後背景搜尋，主列表會切成 loading / 搜尋結果。
 
 ## 目前的 `V` 視覺標記規則
 
@@ -38,11 +40,22 @@
 - 進入子目錄後再回上一層，游標會回到剛剛離開的那個目錄，不會跳回第一列。
 - 在 preview 中可用 `Ctrl-w` 切換 pane。
 - preview 狀態只屬於原本那個 pane；切到其他 pane 不會被強制進入 preview。
+- global search 一開始只顯示輸入框，主列表維持原樣。
+- global search 真正開始搜尋後，主列表才切成 `Loading search results...` 與搜尋結果。
+
+## 已知待優化問題
+
+- global search 在超大目錄中的體感速度仍明顯落後 mature-reference。
+- 目前已改善成：
+  按下 `s` 不會立刻掃描、搜尋改成背景執行、主列表有 loading 提示。
+- 但仍未完成：
+  分批回傳結果、搜尋可取消、chunked loading、搜尋 task 調度優化。
+- 這一塊之後要優先朝 mature-reference 類似方向優化，這不是小修，是需要花時間處理的效能工程。
 
 ## 建議下一步優先做的功能
 
 - global search
-  使用者前面有提到未來想把 `s` 留給 global search，這會是很自然的下一步。
+  第一版已完成，下一步要把重點轉成效能優化與更像 mature-reference 的體感。
 - 更完整的 visual mode
   目前 `V` 已可做範圍標記，但之後可以補更多 Vim 式移動與操作整合。
 - 多 pane 專屬操作
@@ -58,9 +71,12 @@
 - `9d78ace` `Preserve selection when leaving directories`
 - `2d9e0e4` `Add development notes`
 - `8532293` `Scope preview mode to each pane`
+- `1eada83` `Add global search workflow`
 
 ## 接續開發時建議先做的事
 
 1. 先執行 `cargo test`，確認基線狀態正常。
 2. 打開這份筆記確認上次討論到哪裡。
-3. 依照下一步優先順序，從 global search 或 visual mode 強化開始。
+3. 先處理 global search 的效能優化：
+   背景搜尋分批回傳、loading 更細緻、可取消任務。
+4. 再回頭做 visual mode / open-edit / trash 這些功能補強。
