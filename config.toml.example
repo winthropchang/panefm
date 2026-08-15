@@ -1,10 +1,28 @@
+[ui]
 theme = "forest"
 poll_rate_ms = 120
 
-[confirm_dialog]
+[ui.preview]
+height = 8
+focus_list_height = 6
+
+[ui.dialog.confirm]
 width_percent = 60
 height = 5
 
-[theme_picker]
+[ui.dialog.theme_picker]
 width_percent = 42
 height = 8
+
+[pane]
+show_hidden = false
+default_sort = "natural"
+default_sort_reverse = false
+
+[search]
+global_search_limit = 200
+global_search_chunk_size = 24
+show_loading = true
+
+[behavior]
+cancel_search_on_leave = true

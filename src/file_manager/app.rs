@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -19,7 +20,7 @@ use ratatui::{
 };
 
 use crate::{
-    config::{AppConfig, LoadedConfig},
+    config::{AppConfig, LoadedConfig, StartupSort},
     theme::{Theme, ThemePreset},
 };
 
@@ -27,10 +28,11 @@ use super::{
     layout::{LayoutNode, SplitDirection},
     pane::{PaneState, SortMode},
     search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
+    trash::{TrashListEntry, TrashStore},
     ui::{
-        InlineEditorState, SearchListState, centered_rect, render_confirm_dialog,
-        render_filter_input, render_global_search_panel, render_pane, render_preview_search_input,
-        render_theme_picker,
+        HelpPanelLine, InlineEditorState, PaneListState, SearchListState, TrashPanelLine,
+        centered_rect, render_confirm_dialog, render_filter_input, render_global_search_panel,
+        render_pane, render_preview_search_input, render_theme_picker,
     },
 };
 
@@ -107,6 +109,13 @@ pub(crate) struct VisualSelectionState {
     pub(crate) current: usize,
 }
 
+/// 描述暫時面板中的搜尋輸入狀態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanelSearchState {
+    pub(crate) buffer: String,
+    pub(crate) editing: bool,
+}
+
 /// 表示目前正在等待使用者完成的暫時互動。
 ///
 /// 只要有 pending action，輸入會先被它攔截，
@@ -122,6 +131,16 @@ pub(crate) enum PendingAction {
     },
     ThemePicker {
         selected: usize,
+    },
+    TrashPanel {
+        pane_id: usize,
+        selected: usize,
+        search: PanelSearchState,
+    },
+    HelpPanel {
+        pane_id: usize,
+        selected: usize,
+        search: PanelSearchState,
     },
     Rename {
         pane_id: usize,
@@ -147,6 +166,7 @@ pub(crate) struct App {
     pub(crate) config: AppConfig,
     pub(crate) theme: Theme,
     pub(crate) theme_preset: ThemePreset,
+    pub(crate) trash_store: TrashStore,
     pub(crate) panes: BTreeMap<usize, PaneState>,
     pub(crate) layout: LayoutNode,
     pub(crate) focused_pane: usize,
@@ -179,10 +199,12 @@ impl App {
     /// - 成功時回傳完整初始化的應用程式狀態。
     /// - 失敗時回傳建立第一個 pane 或載入目錄時的 I/O 錯誤。
     pub(crate) fn new(cwd: PathBuf, loaded_config: LoadedConfig) -> io::Result<Self> {
-        let pane = PaneState::new(cwd)?;
+        let trash_store = TrashStore::new(&cwd)?;
+        let mut pane = PaneState::new(cwd)?;
+        apply_config_to_pane(&loaded_config.config, &mut pane);
         let mut panes = BTreeMap::new();
         panes.insert(1, pane);
-        let theme_preset = loaded_config.config.theme_preset;
+        let theme_preset = loaded_config.config.ui.theme_preset;
         let startup_status = match loaded_config.source {
             Some(path) => format!("loaded config: {}", path.display()),
             None => String::from("normal mode"),
@@ -192,6 +214,7 @@ impl App {
             config: loaded_config.config,
             theme: theme_preset.into(),
             theme_preset,
+            trash_store,
             panes,
             layout: LayoutNode::Leaf { pane_id: 1 },
             focused_pane: 1,
@@ -339,6 +362,12 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.open_global_search()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::F(1) => {
+                self.open_help_panel();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -756,14 +785,14 @@ impl App {
                     self.confirm_delete(pane_id, &target_name)?;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.status = format!("delete cancelled: {target_name}");
+                    self.status = format!("trash cancelled: {target_name}");
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::ConfirmDelete {
                         pane_id,
                         target_name: target_name.clone(),
                     });
-                    self.status = format!("confirm delete {target_name}: y/n");
+                    self.status = format!("confirm trash {target_name}: y/n");
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
@@ -832,6 +861,192 @@ impl App {
                     self.status = String::from("theme picker: use j/k and Enter");
                 }
             },
+            PendingAction::TrashPanel {
+                pane_id,
+                mut selected,
+                mut search,
+            } => {
+                let entries = trash_panel_entries(&self.trash_store, &search.buffer)?;
+                let len = entries.len();
+                if search.editing {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            search.buffer.push(c);
+                            selected = 0;
+                        }
+                        KeyCode::Backspace => {
+                            search.buffer.pop();
+                            selected = 0;
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
+                        }
+                        _ => {}
+                    }
+                    let next_len = trash_panel_entries(&self.trash_store, &search.buffer)?.len();
+                    let status =
+                        trash_panel_status(&search.buffer, next_len, selected, search.editing);
+                    self.pending_action = Some(PendingAction::TrashPanel {
+                        pane_id,
+                        selected,
+                        search,
+                    });
+                    self.status = status;
+                } else {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if len > 0 {
+                                selected = (selected + 1).min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            selected = selected.saturating_sub(1);
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('g') => {
+                            if self.pending_g {
+                                selected = 0;
+                                self.pending_g = false;
+                            } else {
+                                self.pending_g = true;
+                            }
+                        }
+                        KeyCode::Char('G') => {
+                            if len > 0 {
+                                selected = len - 1;
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('f') => {
+                            search.editing = true;
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if len > 0 {
+                                selected = (selected + 10).min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            selected = selected.saturating_sub(10);
+                            self.pending_g = false;
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => {
+                            self.pending_g = false;
+                            self.restore_trash_entry(&entries, selected)?;
+                            return Ok(true);
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ => {
+                            self.pending_g = false;
+                        }
+                    }
+                    let status = trash_panel_status(&search.buffer, len, selected, search.editing);
+                    self.pending_action = Some(PendingAction::TrashPanel {
+                        pane_id,
+                        selected,
+                        search,
+                    });
+                    self.status = status;
+                }
+            }
+            PendingAction::HelpPanel {
+                pane_id,
+                mut selected,
+                mut search,
+            } => {
+                let filtered_entries = help_entries(&search.buffer);
+                let filtered_len = filtered_entries.len();
+                if search.editing {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            search.buffer.push(c);
+                            selected = 0;
+                        }
+                        KeyCode::Backspace => {
+                            search.buffer.pop();
+                            selected = 0;
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
+                        }
+                        _ => {}
+                    }
+                    let next_len = help_entries(&search.buffer).len();
+                    let status = help_panel_status(&search.buffer, next_len, search.editing);
+                    self.pending_action = Some(PendingAction::HelpPanel {
+                        pane_id,
+                        selected,
+                        search,
+                    });
+                    self.status = status;
+                } else {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if filtered_len > 0 {
+                                selected = (selected + 1).min(filtered_len.saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Char('g') => {
+                            if self.pending_g {
+                                selected = 0;
+                                self.pending_g = false;
+                            } else {
+                                self.pending_g = true;
+                            }
+                        }
+                        KeyCode::Char('G') => {
+                            if filtered_len > 0 {
+                                selected = filtered_len - 1;
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('f') => {
+                            search.editing = true;
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if filtered_len > 0 {
+                                selected = (selected + 10).min(filtered_len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            selected = selected.saturating_sub(10);
+                            self.pending_g = false;
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => {
+                            self.pending_g = false;
+                            self.execute_help_entry(&filtered_entries, selected)?;
+                            return Ok(true);
+                        }
+                        KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => {
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ => {
+                            self.pending_g = false;
+                        }
+                    }
+                    let next_count = help_entries(&search.buffer).len();
+                    let status = help_panel_status(&search.buffer, next_count, false);
+                    self.pending_action = Some(PendingAction::HelpPanel {
+                        pane_id,
+                        selected,
+                        search,
+                    });
+                    self.status = status;
+                }
+            }
             PendingAction::Rename {
                 pane_id,
                 original_name,
@@ -1288,6 +1503,9 @@ impl App {
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
             "search" => self.open_global_search()?,
+            "trash" => self.open_trash_panel()?,
+            "help" => self.open_help_panel(),
+            "restore" => self.restore_latest_from_trash()?,
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -1317,16 +1535,20 @@ impl App {
 
     /// 將目前焦點 pane 依指定方向分割成兩個 pane。
     pub(crate) fn split_current(&mut self, direction: SplitDirection) -> io::Result<()> {
-        let cwd = self
+        let source_pane = self
             .panes
             .get(&self.focused_pane)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused pane"))?
-            .cwd
-            .clone();
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused pane"))?;
+        let cwd = source_pane.cwd.clone();
+        let show_hidden = source_pane.show_hidden;
+        let sort_mode = source_pane.sort_mode;
 
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
-        self.panes.insert(new_id, PaneState::new(cwd)?);
+        let mut pane = PaneState::new(cwd)?;
+        pane.set_show_hidden(show_hidden);
+        pane.set_sort_mode(sort_mode);
+        self.panes.insert(new_id, pane);
         self.layout = self
             .layout
             .clone()
@@ -1438,6 +1660,33 @@ impl App {
             pane_id: self.focused_pane,
         });
         self.status = String::from("sort: choose a key from the panel");
+    }
+
+    /// 打開 trash 面板，列出目前可還原的項目。
+    pub(crate) fn open_trash_panel(&mut self) -> io::Result<()> {
+        self.pending_action = Some(PendingAction::TrashPanel {
+            pane_id: self.focused_pane,
+            selected: 0,
+            search: PanelSearchState {
+                buffer: String::new(),
+                editing: false,
+            },
+        });
+        self.status = trash_panel_status("", self.trash_store.list_entries()?.len(), 0, false);
+        Ok(())
+    }
+
+    /// 打開 F1 功能說明面板，支援 Vim 式滾動與面板內搜尋。
+    pub(crate) fn open_help_panel(&mut self) {
+        self.pending_action = Some(PendingAction::HelpPanel {
+            pane_id: self.focused_pane,
+            selected: 0,
+            search: PanelSearchState {
+                buffer: String::new(),
+                editing: false,
+            },
+        });
+        self.status = help_panel_status("", help_entries("").len(), false);
     }
 
     /// 依照主題名稱字串套用指定主題。
@@ -1652,13 +1901,13 @@ impl App {
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
     pub(crate) fn start_delete_confirmation(&mut self) {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("nothing selected to delete");
+            self.status = String::from("nothing selected to trash");
             return;
         };
 
         let entries = pane.selected_or_marked_entries();
         if entries.is_empty() {
-            self.status = String::from("nothing selected to delete");
+            self.status = String::from("nothing selected to trash");
             return;
         }
 
@@ -1672,29 +1921,110 @@ impl App {
             pane_id: self.focused_pane,
             target_name: target_name.clone(),
         });
-        self.status = format!("confirm delete {target_name}: y/n");
+        self.status = format!("confirm trash {target_name}: y/n");
     }
 
-    /// 真正執行刪除目前待確認項目的檔案系統操作。
+    /// 真正執行將目前待確認項目移到 trash 的檔案系統操作。
     pub(crate) fn confirm_delete(&mut self, pane_id: usize, target_name: &str) -> io::Result<()> {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             self.status = String::from("pane no longer exists");
             return Ok(());
         };
 
-        match pane.delete_selected_or_marked() {
-            Ok(removed_names) if removed_names.is_empty() => {
-                self.status = String::from("nothing selected to delete");
+        let trash_store = self.trash_store.clone();
+        match pane.trash_selected_or_marked(&trash_store) {
+            Ok(trashed_names) if trashed_names.is_empty() => {
+                self.status = String::from("nothing selected to trash");
             }
-            Ok(removed_names) if removed_names.len() == 1 => {
-                self.status = format!("deleted {}", removed_names[0]);
+            Ok(trashed_names) if trashed_names.len() == 1 => {
+                self.status = format!("trashed {}", trashed_names[0]);
             }
-            Ok(removed_names) => {
-                self.status = format!("deleted {} items", removed_names.len());
+            Ok(trashed_names) => {
+                self.status = format!("trashed {} items", trashed_names.len());
             }
-            Err(error) => self.status = format!("failed to delete {target_name}: {error}"),
+            Err(error) => self.status = format!("failed to trash {target_name}: {error}"),
         }
 
+        Ok(())
+    }
+
+    /// 還原最近一次放進 trash 的項目，並盡量在目前 pane 對焦到還原結果。
+    pub(crate) fn restore_latest_from_trash(&mut self) -> io::Result<()> {
+        match self.trash_store.restore_latest()? {
+            Some(result) => {
+                self.reload_all_panes()?;
+                if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
+                    let _ = pane.reveal_path(&result.restored_path);
+                }
+                self.status = format!("restored {}", result.display_name);
+            }
+            None => {
+                self.status = String::from("trash is empty");
+            }
+        }
+        Ok(())
+    }
+
+    /// 依照 trash 面板中目前選到的項目，執行還原。
+    fn restore_trash_entry(
+        &mut self,
+        entries: &[TrashListEntry],
+        selected: usize,
+    ) -> io::Result<()> {
+        let Some(entry) = entries.get(selected) else {
+            self.status = String::from("trash is empty");
+            return Ok(());
+        };
+
+        match self.trash_store.restore_by_id(&entry.id)? {
+            Some(result) => {
+                self.reload_all_panes()?;
+                if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
+                    let _ = pane.reveal_path(&result.restored_path);
+                }
+                self.pending_action = None;
+                self.status = format!("restored {}", result.display_name);
+            }
+            None => {
+                self.pending_action = Some(PendingAction::TrashPanel {
+                    pane_id: self.focused_pane,
+                    selected: selected.saturating_sub(1),
+                    search: PanelSearchState {
+                        buffer: String::new(),
+                        editing: false,
+                    },
+                });
+                self.status = String::from("trash item no longer exists");
+            }
+        }
+        Ok(())
+    }
+
+    /// 執行 help 面板中選到的功能，直接跳到對應模式或命令。
+    fn execute_help_entry(&mut self, entries: &[HelpEntry], selected: usize) -> io::Result<()> {
+        let Some(entry) = entries.get(selected) else {
+            self.status = String::from("help: no command selected");
+            return Ok(());
+        };
+
+        self.pending_action = None;
+        match entry.action {
+            HelpAction::Command(command) => self
+                .execute_command(command)
+                .map_err(|error| io::Error::other(error.to_string()))?,
+            HelpAction::Delete => self.start_delete_confirmation(),
+            HelpAction::Filter => self.open_filter_input(),
+            HelpAction::Sort => self.open_sort_picker(),
+            HelpAction::Hidden => {
+                self.toggle_hidden_files()?;
+            }
+            HelpAction::Visual => {
+                self.open_visual_selection()?;
+            }
+            HelpAction::QuitHint => {
+                self.status = String::from("use q in normal mode to quit");
+            }
+        }
         Ok(())
     }
 
@@ -1791,6 +2121,8 @@ impl App {
             .get(&pane_id)
             .map(|pane| pane.show_hidden)
             .unwrap_or(false);
+        let limit = self.config.search.global_search_limit;
+        let chunk_size = self.config.search.global_search_chunk_size;
 
         let (tx, rx) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1801,8 +2133,8 @@ impl App {
                 &root_dir,
                 show_hidden,
                 &query,
-                200,
-                24,
+                limit,
+                chunk_size,
                 worker_cancelled,
                 tx,
             );
@@ -2122,6 +2454,80 @@ impl App {
                     }),
                     _ => None,
                 };
+                let trash_lines = if let Some(PendingAction::TrashPanel {
+                    pane_id: action_pane_id,
+                    search,
+                    ..
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(
+                            trash_panel_lines(&self.trash_store, &search.buffer)
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let help_lines = if let Some(PendingAction::HelpPanel {
+                    pane_id: action_pane_id,
+                    search,
+                    ..
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(help_panel_lines(&search.buffer))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let panel_state = if let Some(search) = self.global_search.as_ref() {
+                    (search.pane_id == pane_id && (search.loading || search.searched)).then_some(
+                        PaneListState::Search(SearchListState {
+                            results: &search.results,
+                            selected: search.selected,
+                            loading: search.loading && self.config.search.show_loading,
+                        }),
+                    )
+                } else if let Some(PendingAction::TrashPanel {
+                    pane_id: action_pane_id,
+                    selected,
+                    search,
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(PaneListState::Trash {
+                            lines: trash_lines.as_deref().unwrap_or(&[]),
+                            selected: *selected,
+                            search: &search.buffer,
+                            editing: search.editing,
+                        })
+                    } else {
+                        None
+                    }
+                } else if let Some(PendingAction::HelpPanel {
+                    pane_id: action_pane_id,
+                    selected,
+                    search,
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(PaneListState::Help {
+                            lines: help_lines.as_deref().unwrap_or(&[]),
+                            selected: *selected,
+                            search: &search.buffer,
+                            editing: search.editing,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let pane_cursor = render_pane(
                     frame,
                     rect,
@@ -2133,15 +2539,9 @@ impl App {
                         (selection.pane_id == pane_id)
                             .then_some((selection.anchor, selection.current))
                     }),
-                    self.global_search.as_ref().and_then(|search| {
-                        (search.pane_id == pane_id && (search.loading || search.searched))
-                            .then_some(SearchListState {
-                                results: &search.results,
-                                selected: search.selected,
-                                loading: search.loading,
-                            })
-                    }),
+                    panel_state,
                     self.theme,
+                    &self.config,
                     rename_buffer,
                 );
                 if cursor_position.is_none() {
@@ -2168,7 +2568,7 @@ impl App {
             Span::styled("Ctrl-w h/j/k/l", self.theme.accent_style()),
             Span::raw(" focus  "),
             Span::styled("d", self.theme.accent_style()),
-            Span::raw(" delete  "),
+            Span::raw(" trash  "),
             Span::styled("r", self.theme.accent_style()),
             Span::raw(" rename  "),
             Span::styled("P", self.theme.accent_style()),
@@ -2188,6 +2588,8 @@ impl App {
             Span::styled(":rename", self.theme.accent_style()),
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
+            Span::raw("  "),
+            Span::styled(":restore", self.theme.accent_style()),
             Span::raw("  "),
             Span::styled(":preview-search", self.theme.accent_style()),
             Span::raw("  "),
@@ -2261,6 +2663,7 @@ impl App {
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
+            Some(PendingAction::TrashPanel { .. }) | Some(PendingAction::HelpPanel { .. }) => {}
             Some(PendingAction::Rename { .. }) | Some(PendingAction::CreateEntry { .. }) => {}
             None => {}
         }
@@ -2356,6 +2759,291 @@ impl App {
             self.cancel_global_search_worker();
         }
     }
+}
+
+/// 將設定檔中的啟動偏好套用到新建立的 pane。
+///
+/// 參數：
+/// - `config: &AppConfig`，目前啟動所使用的設定。
+/// - `pane: &mut PaneState`，要被套用預設值的 pane。
+///
+/// 回傳：`()`
+fn apply_config_to_pane(config: &AppConfig, pane: &mut PaneState) {
+    pane.set_show_hidden(config.pane.show_hidden);
+    pane.set_sort_mode(sort_mode_from_config(
+        config.pane.default_sort,
+        config.pane.default_sort_reverse,
+    ));
+}
+
+/// 將設定檔中的排序偏好轉成 pane 實際使用的排序模式。
+///
+/// 參數：
+/// - `sort: StartupSort`，設定檔指定的排序種類。
+/// - `reverse: bool`，是否使用反向排序。
+///
+/// 回傳：`SortMode`，可直接套用到 pane 的排序模式。
+fn sort_mode_from_config(sort: StartupSort, reverse: bool) -> SortMode {
+    match sort {
+        StartupSort::Alphabetical => SortMode::Alphabetical { reverse },
+        StartupSort::Natural => SortMode::Natural { reverse },
+        StartupSort::Size => SortMode::Size { reverse },
+        StartupSort::Modified => SortMode::Modified { reverse },
+        StartupSort::Created => SortMode::Created { reverse },
+        StartupSort::Extension => SortMode::Extension { reverse },
+        StartupSort::Random => SortMode::Random,
+    }
+}
+
+/// 描述 help 面板中某一列按下 Enter 後要執行的行為。
+#[derive(Clone, Copy)]
+enum HelpAction {
+    Command(&'static str),
+    Delete,
+    Filter,
+    Sort,
+    Hidden,
+    Visual,
+    QuitHint,
+}
+
+/// 描述 help 面板中完整的一筆資料。
+#[derive(Clone)]
+struct HelpEntry {
+    line: HelpPanelLine,
+    action: HelpAction,
+}
+
+/// 先依搜尋條件過濾 trash 原始資料，再提供給面板使用。
+fn trash_panel_entries(trash_store: &TrashStore, query: &str) -> io::Result<Vec<TrashListEntry>> {
+    let trimmed = query.trim().to_lowercase();
+    let entries = trash_store.list_entries()?;
+    if trimmed.is_empty() {
+        return Ok(entries);
+    }
+
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry.display_name.to_lowercase().contains(&trimmed)
+                || entry
+                    .original_path
+                    .display()
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&trimmed)
+        })
+        .collect())
+}
+
+/// 將目前 trash store 中的項目轉成面板可直接顯示的列內容。
+fn trash_panel_lines(trash_store: &TrashStore, query: &str) -> io::Result<Vec<TrashPanelLine>> {
+    Ok(trash_panel_entries(trash_store, query)?
+        .into_iter()
+        .map(|entry| TrashPanelLine {
+            name: entry.display_name,
+            original_path: entry.original_path.display().to_string(),
+            deleted_at: format_deleted_at(entry.deleted_at_unix_ms),
+        })
+        .collect())
+}
+
+/// 依照搜尋條件過濾 F1 功能面板的完整資料。
+fn help_entries(query: &str) -> Vec<HelpEntry> {
+    let entries = vec![
+        help_entry(
+            ":rename",
+            "r",
+            "重新命名目前選取的檔案或資料夾",
+            HelpAction::Command("rename"),
+        ),
+        help_entry(
+            ":create",
+            "a",
+            "建立新檔案、資料夾或巢狀路徑",
+            HelpAction::Command("create"),
+        ),
+        help_entry(
+            ":copy",
+            "yy",
+            "複製目前選取項目到內部剪貼簿",
+            HelpAction::Command("copy"),
+        ),
+        help_entry(
+            ":cut",
+            "x",
+            "剪下目前選取項目到內部剪貼簿",
+            HelpAction::Command("cut"),
+        ),
+        help_entry(
+            ":paste",
+            "p",
+            "貼上剪貼簿項目到目前目錄",
+            HelpAction::Command("paste"),
+        ),
+        help_entry(
+            ":delete",
+            "d",
+            "將目前選取項目移到 trash，並顯示確認提示",
+            HelpAction::Delete,
+        ),
+        help_entry(
+            ":trash",
+            "",
+            "打開 trash 面板，查看並還原已移入 trash 的項目",
+            HelpAction::Command("trash"),
+        ),
+        help_entry(
+            ":restore",
+            "",
+            "還原最近一次移到 trash 的項目",
+            HelpAction::Command("restore"),
+        ),
+        help_entry(
+            ":search",
+            "s",
+            "打開全域搜尋輸入框",
+            HelpAction::Command("search"),
+        ),
+        help_entry(
+            ":preview-search",
+            "/",
+            "在 preview 內容中搜尋文字",
+            HelpAction::Command("preview-search"),
+        ),
+        help_entry(
+            ":preview",
+            "P",
+            "切換到 preview focus 模式",
+            HelpAction::Command("preview"),
+        ),
+        help_entry(
+            ":split",
+            "Ctrl-w s",
+            "水平分割目前 pane",
+            HelpAction::Command("split"),
+        ),
+        help_entry(
+            ":vsplit",
+            "Ctrl-w v",
+            "垂直分割目前 pane",
+            HelpAction::Command("vsplit"),
+        ),
+        help_entry(
+            ":close",
+            "Ctrl-w c",
+            "關閉目前 pane",
+            HelpAction::Command("close"),
+        ),
+        help_entry(
+            ":only",
+            "Ctrl-w o",
+            "只保留目前 pane",
+            HelpAction::Command("only"),
+        ),
+        help_entry(
+            ":theme",
+            "",
+            "打開主題選擇面板",
+            HelpAction::Command("theme"),
+        ),
+        help_entry(
+            ":theme next",
+            "",
+            "直接切到下一個主題",
+            HelpAction::Command("theme next"),
+        ),
+        help_entry(
+            ":help",
+            "F1",
+            "打開這個功能說明面板",
+            HelpAction::Command("help"),
+        ),
+        help_entry(":filter", "f", "即時過濾目前列表內容", HelpAction::Filter),
+        help_entry(":sort", ",", "打開排序方式快捷鍵面板", HelpAction::Sort),
+        help_entry(":hidden", ".", "切換是否顯示隱藏檔", HelpAction::Hidden),
+        help_entry(":visual", "V", "進入視覺範圍標記模式", HelpAction::Visual),
+        help_entry(
+            ":quit",
+            "q",
+            "離開 terminal file manager",
+            HelpAction::QuitHint,
+        ),
+    ];
+
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return entries;
+    }
+
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry.line.command.to_lowercase().contains(&trimmed)
+                || entry.line.shortcut.to_lowercase().contains(&trimmed)
+                || entry.line.description.to_lowercase().contains(&trimmed)
+        })
+        .collect()
+}
+
+/// 只取出 help 面板渲染需要的列內容。
+fn help_panel_lines(query: &str) -> Vec<HelpPanelLine> {
+    help_entries(query)
+        .into_iter()
+        .map(|entry| entry.line)
+        .collect()
+}
+
+/// 建立單一功能說明列與其動作。
+fn help_entry(command: &str, shortcut: &str, description: &str, action: HelpAction) -> HelpEntry {
+    HelpEntry {
+        line: HelpPanelLine {
+            command: command.to_string(),
+            shortcut: shortcut.to_string(),
+            description: description.to_string(),
+        },
+        action,
+    }
+}
+
+/// 產生 trash 面板底部狀態列訊息。
+fn trash_panel_status(query: &str, count: usize, selected: usize, editing: bool) -> String {
+    if editing {
+        if query.is_empty() {
+            format!("trash search: all ({count})")
+        } else {
+            format!("trash search: {query} ({count})")
+        }
+    } else if count == 0 {
+        String::from("trash: empty")
+    } else {
+        format!(
+            "trash: {}/{} (Enter restore, f search)",
+            selected + 1,
+            count
+        )
+    }
+}
+
+/// 產生說明面板底部狀態列訊息。
+fn help_panel_status(query: &str, count: usize, editing: bool) -> String {
+    if editing {
+        format!(
+            "help search: {} ({count})",
+            if query.is_empty() { "all" } else { query }
+        )
+    } else if query.is_empty() {
+        format!("help: {count} commands (f to search)")
+    } else {
+        format!("help: {} ({count})", query)
+    }
+}
+
+/// 將 unix 毫秒時間轉成較容易閱讀的本地時間字串。
+fn format_deleted_at(unix_ms: u64) -> String {
+    DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_millis(unix_ms))
+        .format("%m/%d %H:%M")
+        .to_string()
 }
 
 /// 回傳建立流程的狀態列內容，讓使用者知道目前正處於哪一種編輯模式。
@@ -2602,11 +3290,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, ClipboardOperation, FilterState, PendingAction, RenameMode, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end,
+        App, ClipboardOperation, FilterState, PendingAction, RenameMode, help_entries,
+        rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
+        rename_word_end,
     };
     use crate::{
-        config::{AppConfig, LoadedConfig},
+        config::{AppConfig, LoadedConfig, StartupSort},
         file_manager::{
             layout::{LayoutNode, SplitDirection},
             pane::SortMode,
@@ -2656,6 +3345,55 @@ mod tests {
     }
 
     #[test]
+    /// 驗證啟動設定會正確套用到第一個 pane 的隱藏檔與排序偏好。
+    fn app_new_applies_startup_pane_preferences() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".hidden"), "secret").expect("hidden");
+        fs::write(dir.path().join("visible.txt"), "visible").expect("visible");
+
+        let loaded = LoadedConfig {
+            config: AppConfig {
+                pane: crate::config::PaneConfig {
+                    show_hidden: true,
+                    default_sort: StartupSort::Size,
+                    default_sort_reverse: true,
+                },
+                ..AppConfig::default()
+            },
+            source: None,
+        };
+
+        let app = App::new(dir.path().to_path_buf(), loaded).expect("app");
+        let pane = app.panes.get(&1).expect("pane");
+
+        assert!(pane.show_hidden);
+        assert_eq!(pane.sort_mode, SortMode::Size { reverse: true });
+        assert_eq!(pane.visible_indices.len(), 2);
+    }
+
+    #[test]
+    /// 驗證新分割出來的 pane 會繼承原 pane 的顯示隱藏檔與排序方式。
+    fn app_split_inherits_pane_preferences() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".hidden"), "secret").expect("hidden");
+        fs::write(dir.path().join("visible.txt"), "visible").expect("visible");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        {
+            let pane = app.panes.get_mut(&1).expect("pane");
+            pane.set_show_hidden(true);
+            pane.set_sort_mode(SortMode::Modified { reverse: true });
+        }
+
+        app.split_current(SplitDirection::Vertical).expect("split");
+
+        let pane = app.panes.get(&2).expect("new pane");
+        assert!(pane.show_hidden);
+        assert_eq!(pane.sort_mode, SortMode::Modified { reverse: true });
+        assert_eq!(pane.visible_indices.len(), 2);
+    }
+
+    #[test]
     /// 驗證刪除確認流程在確認後會真正刪除選取項目。
     fn app_delete_confirmation_removes_selected_entry() {
         let dir = tempdir().expect("tempdir");
@@ -2674,7 +3412,140 @@ mod tests {
 
         assert!(!file_path.exists());
         assert!(app.pending_action.is_none());
-        assert_eq!(app.status, "deleted delete-me.txt");
+        assert_eq!(app.status, "trashed delete-me.txt");
+    }
+
+    #[test]
+    /// 驗證移到 trash 的項目可以透過 restore 命令還原。
+    fn app_restore_latest_from_trash_recovers_file() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("restore-me.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_delete_confirmation();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm trash");
+        assert!(!file_path.exists());
+
+        app.restore_latest_from_trash().expect("restore");
+
+        assert!(file_path.exists());
+        assert_eq!(app.status, "restored restore-me.txt");
+    }
+
+    #[test]
+    /// 驗證 trash 面板可以列出項目，並透過 Enter 還原目前選到的檔案。
+    fn app_trash_panel_lists_and_restores_entry() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("panel-restore.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_delete_confirmation();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm trash");
+
+        app.open_trash_panel().expect("open trash panel");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel { selected: 0, .. })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("restore from panel");
+
+        assert!(file_path.exists());
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "restored panel-restore.txt");
+    }
+
+    #[test]
+    /// 驗證 F1 說明面板可以打開，並在面板內用 `f` 進行搜尋。
+    fn app_help_panel_supports_filtering() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+            .expect("open help");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel { .. })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start help search");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock help search");
+
+        match app.pending_action.as_ref() {
+            Some(PendingAction::HelpPanel { search, .. }) => {
+                assert_eq!(search.buffer, "res");
+                assert!(!search.editing);
+            }
+            other => panic!("unexpected pending action: {other:?}"),
+        }
+        assert_eq!(app.status, "help: res (1)");
+    }
+
+    #[test]
+    /// 驗證 help 面板按下 Enter 後，會直接切到對應的互動模式。
+    fn app_help_panel_enter_executes_selected_action() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_help_panel();
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute rename from help");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::Rename { .. })
+        ));
+    }
+
+    #[test]
+    /// 驗證 help 面板中的 `:delete` 會保留 `d` 快捷鍵，並透過 Enter 進入刪除確認。
+    fn app_help_panel_delete_entry_matches_delete_behavior() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("delete-from-help.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let entries = help_entries("");
+        let delete_entry = entries
+            .iter()
+            .find(|entry| entry.line.command == ":delete")
+            .expect("delete help entry");
+        let trash_entry = entries
+            .iter()
+            .find(|entry| entry.line.command == ":trash")
+            .expect("trash help entry");
+        assert_eq!(delete_entry.line.shortcut, "d");
+        assert!(trash_entry.line.shortcut.is_empty());
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_help_panel();
+
+        for _ in 0..5 {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .expect("move to delete entry");
+        }
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute delete from help");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmDelete { .. })
+        ));
     }
 
     #[test]
@@ -3629,7 +4500,7 @@ mod tests {
 
         assert!(!alpha.exists());
         assert!(!beta.exists());
-        assert_eq!(app.status, "deleted 2 items");
+        assert_eq!(app.status, "trashed 2 items");
     }
 
     #[test]

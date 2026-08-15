@@ -5,6 +5,7 @@
 ## 目前已完成的重點
 
 - 支援 `config.toml` 外部設定檔讀取。
+- `config.toml` 已改成分區式結構，可控制 UI、pane、search、behavior 設定。
 - 支援主題切換與 theme 架構整理。
 - 重新命名採用接近 mature-reference 的 inline 視窗。
 - rename 已支援較完整的 Vim 操作：
@@ -22,6 +23,10 @@
 - 預覽中已支援搜尋。
 - pane 已支援分割與關閉。
 - preview 現在已改成 pane 各自獨立的狀態，不再是全域共享。
+- `d` 現在會先把項目移到 internal trash，而不是直接永久刪除。
+- `:restore` 可還原最近一次移到 trash 的項目。
+- trash 面板已支援 pane-local 顯示與搜尋，不會再用全域 popup 蓋住畫面。
+- F1 help 面板已改成 pane-local 列表模式，支援搜尋、`Ctrl-d` / `Ctrl-u` 捲動、`Enter` 直接執行對應功能。
 - 已加入第一版 global search：
   `s` 先打開輸入框，按下 `Enter` 後背景搜尋，主列表會切成 loading / 搜尋結果。
 
@@ -42,14 +47,18 @@
 - preview 狀態只屬於原本那個 pane；切到其他 pane 不會被強制進入 preview。
 - global search 一開始只顯示輸入框，主列表維持原樣。
 - global search 真正開始搜尋後，主列表才切成 `Loading search results...` 與搜尋結果。
+- global search 已支援背景分批回傳結果，且可在離開搜尋時取消背景工作。
+- help 面板中的命令定義已重新對齊實際行為：
+  `d` 對應 `:delete`，`:trash` 沒有快捷鍵時就不顯示假的快捷鍵。
+- help 面板 `Enter` 已驗證會真的切到對應模式，不再只是顯示項目名稱。
 
 ## 已知待優化問題
 
 - global search 在超大目錄中的體感速度仍明顯落後 mature-reference。
 - 目前已改善成：
-  按下 `s` 不會立刻掃描、搜尋改成背景執行、主列表有 loading 提示。
+  按下 `s` 不會立刻掃描、搜尋改成背景執行、主列表有 loading 提示、結果會分批灌入。
 - 但仍未完成：
-  分批回傳結果、搜尋可取消、chunked loading、搜尋 task 調度優化。
+  真正接近 mature-reference 的大型目錄掃描效率、搜尋 task 調度優化、可能的索引/快取策略。
 - 這一塊之後要優先朝 mature-reference 類似方向優化，這不是小修，是需要花時間處理的效能工程。
 
 ## 建議下一步優先做的功能
@@ -61,9 +70,11 @@
 - 多 pane 專屬操作
   之後可以思考不同 pane 的獨立標記、獨立 clipboard 呈現、或 pane 間的操作提示。
 - 操作提示面板優化
-  目前 help 仍偏簡單，之後可以做更清楚的 mode 狀態提示。
+  目前 help 已可搜尋與執行，但之後仍可補更多分類、分頁與 mode 提示。
 - 設定檔擴充
   可以把主題、預覽比例、是否顯示 hidden、預設排序方式等都開放到 `config.toml`。
+- trash 工作流補強
+  例如批次 restore、永久刪除、依日期或路徑排序、清空 trash。
 
 ## 目前最近的 commit
 
@@ -77,6 +88,5 @@
 
 1. 先執行 `cargo test`，確認基線狀態正常。
 2. 打開這份筆記確認上次討論到哪裡。
-3. 先處理 global search 的效能優化：
-   背景搜尋分批回傳、loading 更細緻、可取消任務。
-4. 再回頭做 visual mode / open-edit / trash 這些功能補強。
+3. 下一步可以往 visual mode / trash / open-edit 這些高頻操作補強。
+4. global search 的更深層效能優化另外開一段來做，避免和一般功能開發混在一起。

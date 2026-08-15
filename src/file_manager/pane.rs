@@ -15,7 +15,7 @@ use ratatui::{
     widgets::ListState,
 };
 
-use super::entry::FileEntry;
+use super::{entry::FileEntry, trash::TrashStore};
 
 /// 表示單一 pane 的完整瀏覽狀態。
 ///
@@ -549,6 +549,7 @@ impl PaneState {
     /// - `Ok(vec![...])` 代表成功刪除的顯示名稱清單。
     /// - `Ok(vec![])` 代表目前沒有可刪除項目。
     /// - `Err(...)` 代表檔案系統操作失敗。
+    #[allow(dead_code)]
     pub(crate) fn delete_selected_or_marked(&mut self) -> io::Result<Vec<String>> {
         let entries = self.selected_or_marked_entries();
         if entries.is_empty() {
@@ -568,6 +569,33 @@ impl PaneState {
         self.marked_paths.clear();
         self.reload()?;
         Ok(removed_names)
+    }
+
+    /// 將目前選取項目，或是所有已標記項目移到 trash。
+    ///
+    /// 回傳：
+    /// - `Ok(vec![...])` 代表成功移入 trash 的顯示名稱清單。
+    /// - `Ok(vec![])` 代表目前沒有可處理項目。
+    /// - `Err(...)` 代表檔案系統或 trash 寫入操作失敗。
+    pub(crate) fn trash_selected_or_marked(
+        &mut self,
+        trash_store: &TrashStore,
+    ) -> io::Result<Vec<String>> {
+        let entries = self.selected_or_marked_entries();
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut trashed_names = Vec::new();
+        for entry in entries {
+            let display_name = entry.display_name();
+            trash_store.trash_path(&entry.path, &display_name)?;
+            trashed_names.push(display_name);
+        }
+
+        self.marked_paths.clear();
+        self.reload()?;
+        Ok(trashed_names)
     }
 
     /// 重新命名目前選取的檔案或資料夾。
@@ -784,6 +812,17 @@ impl PaneState {
     /// 切換目前 pane 是否顯示隱藏檔。
     pub(crate) fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
+        self.refresh_visible_entries();
+    }
+
+    /// 直接設定目前 pane 是否顯示隱藏檔，而不是做切換。
+    ///
+    /// 參數：
+    /// - `show_hidden: bool`，`true` 表示顯示隱藏檔，`false` 表示隱藏。
+    ///
+    /// 回傳：`()`
+    pub(crate) fn set_show_hidden(&mut self, show_hidden: bool) {
+        self.show_hidden = show_hidden;
         self.refresh_visible_entries();
     }
 

@@ -43,11 +43,12 @@ The app loads config from the first existing path in this order:
 - `Ctrl-w h j k l`: switch pane focus
 - `Ctrl-w c`: close current pane
 - `Ctrl-w o`: keep only current pane
-- `d`: delete selected file or directory with confirmation
+- `d`: move the selected file or directory to the internal trash
 - `r`: open rename dialog for the selected item
 - `:rename`: open rename dialog for the selected item
 - `:create`, `:create <path>`
 - `:copy`, `:cut`, `:paste`
+- `:restore`: restore the most recently trashed item
 - `:split`, `:vsplit`, `:close`, `:only`
 - `:theme`: open the theme picker
 - `:theme next`, `:theme default`, `:theme forest`, `:theme ocean`
@@ -78,9 +79,33 @@ Start from [config.toml.example](/Users/otto/Documents/terminal-file-manager/con
 
 Available keys:
 
-- `theme = "default" | "forest" | "ocean"`
-- `poll_rate_ms = 150`
-- `[confirm_dialog].width_percent`
-- `[confirm_dialog].height`
-- `[theme_picker].width_percent`
-- `[theme_picker].height`
+```toml
+[ui]
+theme = "default" # or forest / ocean
+poll_rate_ms = 150
+
+[ui.preview]
+height = 8
+focus_list_height = 6
+
+[ui.dialog.confirm]
+width_percent = 60
+height = 5
+
+[ui.dialog.theme_picker]
+width_percent = 42
+height = 8
+
+[pane]
+show_hidden = false
+default_sort = "natural" # alphabetical / natural / size / modified / created / extension / random
+default_sort_reverse = false
+
+[search]
+global_search_limit = 200
+global_search_chunk_size = 24
+show_loading = true
+
+[behavior]
+cancel_search_on_leave = true
+```

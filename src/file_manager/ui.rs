@@ -36,6 +36,40 @@ pub(crate) struct SearchListState<'a> {
     pub(crate) loading: bool,
 }
 
+/// 描述目前 pane 的列表區是否被某種特殊模式接管。
+#[derive(Clone, Copy)]
+pub(crate) enum PaneListState<'a> {
+    Search(SearchListState<'a>),
+    Trash {
+        lines: &'a [TrashPanelLine],
+        selected: usize,
+        search: &'a str,
+        editing: bool,
+    },
+    Help {
+        lines: &'a [HelpPanelLine],
+        selected: usize,
+        search: &'a str,
+        editing: bool,
+    },
+}
+
+/// 描述 trash 面板中單一列要顯示的內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrashPanelLine {
+    pub(crate) name: String,
+    pub(crate) original_path: String,
+    pub(crate) deleted_at: String,
+}
+
+/// 描述說明面板中單一列要顯示的內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HelpPanelLine {
+    pub(crate) command: String,
+    pub(crate) shortcut: String,
+    pub(crate) description: String,
+}
+
 /// 繪製單一 pane 的檔案列表與預覽區。
 ///
 /// 參數：
@@ -58,14 +92,25 @@ pub(crate) fn render_pane(
     focused: bool,
     preview_focused: bool,
     visual_range: Option<(usize, usize)>,
-    search_state: Option<SearchListState<'_>>,
+    panel_state: Option<PaneListState<'_>>,
     theme: Theme,
+    config: &AppConfig,
     editor_state: Option<InlineEditorState<'_>>,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
-    let preview_height = area.height.saturating_sub(8).clamp(5, 10);
-    let list_height = area.height.saturating_sub(8).clamp(4, 8);
+    let preview_height = config
+        .ui
+        .preview
+        .height
+        .min(area.height.saturating_sub(4))
+        .max(4);
+    let list_height = config
+        .ui
+        .preview
+        .focus_list_height
+        .min(area.height.saturating_sub(4))
+        .max(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(if preview_focused {
@@ -91,12 +136,19 @@ pub(crate) fn render_pane(
     } else {
         String::new()
     };
+    let panel_suffix = match panel_state {
+        Some(PaneListState::Search(_)) => "  [search]",
+        Some(PaneListState::Trash { .. }) => "  [trash]",
+        Some(PaneListState::Help { .. }) => "  [help]",
+        None => "",
+    };
     let title = format!(
-        " pane {}  {}{}{}  [sort: {}]",
+        " pane {}  {}{}{}{}  [sort: {}]",
         pane_id,
         pane.cwd.display(),
         filter_suffix,
         mark_suffix,
+        panel_suffix,
         pane.sort_mode.label()
     );
     let block = Block::default()
@@ -105,17 +157,47 @@ pub(crate) fn render_pane(
         .border_style(border_style);
 
     let content_width = chunks[0].width.saturating_sub(4) as usize;
-    let items: Vec<ListItem<'static>> = if let Some(search_state) = search_state {
-        if search_state.loading {
-            vec![ListItem::new(Line::from("Loading search results..."))]
-        } else if search_state.results.is_empty() {
-            vec![ListItem::new(Line::from("No matches"))]
-        } else {
-            search_state
+    let items: Vec<ListItem<'static>> = if let Some(panel_state) = panel_state {
+        match panel_state {
+            PaneListState::Search(search_state) if search_state.loading => {
+                vec![ListItem::new(Line::from("Loading search results..."))]
+            }
+            PaneListState::Search(search_state) if search_state.results.is_empty() => {
+                vec![ListItem::new(Line::from("No matches"))]
+            }
+            PaneListState::Search(search_state) => search_state
                 .results
                 .iter()
                 .map(|entry| ListItem::new(Line::from(entry.relative_path.clone())))
-                .collect()
+                .collect(),
+            PaneListState::Trash { lines, .. } if lines.is_empty() => {
+                vec![ListItem::new(Line::from("Trash is empty"))]
+            }
+            PaneListState::Trash { lines, .. } => lines
+                .iter()
+                .map(|line| {
+                    ListItem::new(Line::from(format!(
+                        "{:<20}  {:<16}  {}",
+                        truncate_text(&line.name, 20),
+                        line.deleted_at,
+                        line.original_path
+                    )))
+                })
+                .collect(),
+            PaneListState::Help { lines, .. } if lines.is_empty() => {
+                vec![ListItem::new(Line::from("沒有符合搜尋條件的功能"))]
+            }
+            PaneListState::Help { lines, .. } => lines
+                .iter()
+                .map(|line| {
+                    ListItem::new(Line::from(format!(
+                        "{:<18}  {:<16}  {}",
+                        truncate_text(&line.command, 18),
+                        truncate_text(&line.shortcut, 16),
+                        line.description
+                    )))
+                })
+                .collect(),
         }
     } else {
         let visible_entries = pane.visible_entries();
@@ -152,14 +234,29 @@ pub(crate) fn render_pane(
         .highlight_style(theme.selected_item_style())
         .highlight_symbol("> ");
 
-    if let Some(search_state) = search_state {
+    if let Some(panel_state) = panel_state {
         let mut list_state = ListState::default();
-        if !search_state.loading && !search_state.results.is_empty() {
-            list_state.select(Some(
-                search_state
-                    .selected
-                    .min(search_state.results.len().saturating_sub(1)),
-            ));
+        match panel_state {
+            PaneListState::Search(search_state)
+                if !search_state.loading && !search_state.results.is_empty() =>
+            {
+                list_state.select(Some(
+                    search_state
+                        .selected
+                        .min(search_state.results.len().saturating_sub(1)),
+                ));
+            }
+            PaneListState::Trash {
+                lines, selected, ..
+            } if !lines.is_empty() => {
+                list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+            }
+            PaneListState::Help {
+                lines, selected, ..
+            } if !lines.is_empty() => {
+                list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+            }
+            _ => {}
         }
         frame.render_stateful_widget(list, chunks[0], &mut list_state);
     } else {
@@ -170,6 +267,32 @@ pub(crate) fn render_pane(
     if let Some(state) = editor_state {
         editor_cursor = render_inline_editor(frame, chunks[0], pane, theme, state);
     }
+
+    let panel_cursor = match panel_state {
+        Some(PaneListState::Trash {
+            search,
+            editing: true,
+            ..
+        }) => Some(render_top_right_input(
+            frame,
+            chunks[0],
+            theme,
+            "Trash Search",
+            search,
+        )),
+        Some(PaneListState::Help {
+            search,
+            editing: true,
+            ..
+        }) => Some(render_top_right_input(
+            frame,
+            chunks[0],
+            theme,
+            "Help Search",
+            search,
+        )),
+        _ => None,
+    };
 
     let preview_title = pane
         .selected_entry()
@@ -200,7 +323,7 @@ pub(crate) fn render_pane(
     );
     frame.render_widget(preview, chunks[1]);
 
-    editor_cursor
+    editor_cursor.or(panel_cursor)
 }
 
 /// 在列表區域中繪製 inline 輸入視窗，供 rename / create 這類功能重用。
@@ -460,6 +583,19 @@ pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, the
     );
 }
 
+/// 將過長文字裁切成指定寬度，避免面板欄位爆掉。
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    chars
+        .into_iter()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
 /// 根據目前排序模式，產生單一列表列的顯示內容。
 fn render_entry_line(
     entry: &super::entry::FileEntry,
@@ -589,19 +725,19 @@ pub(crate) fn render_confirm_dialog(
 ) {
     let dialog_area = centered_rect(
         area,
-        config.confirm_dialog_width_percent,
-        config.confirm_dialog_height,
+        config.ui.dialogs.confirm.width_percent,
+        config.ui.dialogs.confirm.height,
     );
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!("Delete {target_name}?")),
+            Line::from(format!("Move {target_name} to trash?")),
             Line::from("Press y to confirm, n or Esc to cancel."),
         ])
         .block(
             Block::default()
                 .title(Line::from(Span::styled(
-                    " Confirm Delete ",
+                    " Confirm Trash ",
                     theme.danger_title_style(),
                 )))
                 .borders(Borders::ALL),
@@ -629,8 +765,8 @@ pub(crate) fn render_theme_picker(
 ) {
     let dialog_area = centered_rect(
         area,
-        config.theme_picker_width_percent,
-        config.theme_picker_height,
+        config.ui.dialogs.theme_picker.width_percent,
+        config.ui.dialogs.theme_picker.height,
     );
     frame.render_widget(Clear, dialog_area);
 

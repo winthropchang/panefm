@@ -3,6 +3,7 @@ mod entry;
 mod layout;
 mod pane;
 mod search;
+mod trash;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -77,7 +78,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let loaded_config = load_config(&cwd)?;
-    let poll_rate = loaded_config.config.poll_rate;
+    let poll_rate = loaded_config.config.ui.poll_rate;
     let mut app = App::new(cwd, loaded_config)?;
     let mut last_cursor_mode = None;
 
