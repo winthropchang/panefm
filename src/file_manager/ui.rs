@@ -11,7 +11,10 @@ use crate::{
     theme::{Theme, ThemePreset},
 };
 
-use super::pane::{PaneState, SortDetailKind};
+use super::{
+    pane::{PaneState, SortDetailKind},
+    search::GlobalSearchEntry,
+};
 
 /// 描述 inline 編輯器目前需要顯示的內容、標題與游標位置。
 ///
@@ -23,6 +26,14 @@ pub(crate) struct InlineEditorState<'a> {
     pub(crate) buffer: &'a str,
     pub(crate) cursor: usize,
     pub(crate) title: &'a str,
+}
+
+/// 描述目前 pane 是否要把主列表暫時切換成 global search 的結果畫面。
+#[derive(Clone, Copy)]
+pub(crate) struct SearchListState<'a> {
+    pub(crate) results: &'a [GlobalSearchEntry],
+    pub(crate) selected: usize,
+    pub(crate) loading: bool,
 }
 
 /// 繪製單一 pane 的檔案列表與預覽區。
@@ -47,6 +58,7 @@ pub(crate) fn render_pane(
     focused: bool,
     preview_focused: bool,
     visual_range: Option<(usize, usize)>,
+    search_state: Option<SearchListState<'_>>,
     theme: Theme,
     editor_state: Option<InlineEditorState<'_>>,
 ) -> Option<(u16, u16)> {
@@ -69,7 +81,11 @@ pub(crate) fn render_pane(
         theme.muted_style()
     };
 
-    let filter_suffix = if pane.has_active_filter() { "  [filter]" } else { "" };
+    let filter_suffix = if pane.has_active_filter() {
+        "  [filter]"
+    } else {
+        ""
+    };
     let mark_suffix = if pane.marked_count() > 0 {
         format!("  [mark: {}]", pane.marked_count())
     } else {
@@ -88,33 +104,47 @@ pub(crate) fn render_pane(
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let visible_entries = pane.visible_entries();
     let content_width = chunks[0].width.saturating_sub(4) as usize;
-    let detail_kind = pane.sort_mode.detail_kind();
-    let items: Vec<ListItem<'static>> = if visible_entries.is_empty() {
-        vec![ListItem::new(Line::from("empty directory"))]
+    let items: Vec<ListItem<'static>> = if let Some(search_state) = search_state {
+        if search_state.loading {
+            vec![ListItem::new(Line::from("Loading search results..."))]
+        } else if search_state.results.is_empty() {
+            vec![ListItem::new(Line::from("No matches"))]
+        } else {
+            search_state
+                .results
+                .iter()
+                .map(|entry| ListItem::new(Line::from(entry.relative_path.clone())))
+                .collect()
+        }
     } else {
-        visible_entries
-            .into_iter()
-            .enumerate()
-            .map(|entry| {
-                ListItem::new(render_entry_line(
-                    entry.1,
-                    pane.is_marked(entry.1),
-                    mark_column_active,
-                    visual_range
-                        .map(|(start, end)| {
-                            let range_start = start.min(end);
-                            let range_end = start.max(end);
-                            entry.0 >= range_start && entry.0 <= range_end
-                        })
-                        .unwrap_or(false),
-                    detail_kind,
-                    content_width,
-                    theme,
-                ))
-            })
-            .collect()
+        let visible_entries = pane.visible_entries();
+        let detail_kind = pane.sort_mode.detail_kind();
+        if visible_entries.is_empty() {
+            vec![ListItem::new(Line::from("empty directory"))]
+        } else {
+            visible_entries
+                .into_iter()
+                .enumerate()
+                .map(|entry| {
+                    ListItem::new(render_entry_line(
+                        entry.1,
+                        pane.is_marked(entry.1),
+                        mark_column_active,
+                        visual_range
+                            .map(|(start, end)| {
+                                let range_start = start.min(end);
+                                let range_end = start.max(end);
+                                entry.0 >= range_start && entry.0 <= range_end
+                            })
+                            .unwrap_or(false),
+                        detail_kind,
+                        content_width,
+                        theme,
+                    ))
+                })
+                .collect()
+        }
     };
 
     let list = List::new(items)
@@ -122,7 +152,19 @@ pub(crate) fn render_pane(
         .highlight_style(theme.selected_item_style())
         .highlight_symbol("> ");
 
-    frame.render_stateful_widget(list, chunks[0], &mut pane.list_state);
+    if let Some(search_state) = search_state {
+        let mut list_state = ListState::default();
+        if !search_state.loading && !search_state.results.is_empty() {
+            list_state.select(Some(
+                search_state
+                    .selected
+                    .min(search_state.results.len().saturating_sub(1)),
+            ));
+        }
+        frame.render_stateful_widget(list, chunks[0], &mut list_state);
+    } else {
+        frame.render_stateful_widget(list, chunks[0], &mut pane.list_state);
+    }
 
     let mut editor_cursor = None;
     if let Some(state) = editor_state {
@@ -150,8 +192,7 @@ pub(crate) fn render_pane(
         .unwrap_or_else(|| "Preview".to_string());
     let preview_viewport_height = chunks[1].height.saturating_sub(2).max(1) as usize;
     pane.set_preview_viewport_height(preview_viewport_height);
-    let preview = Paragraph::new(pane.preview_lines(preview_viewport_height))
-    .block(
+    let preview = Paragraph::new(pane.preview_lines(preview_viewport_height)).block(
         Block::default()
             .title(preview_title)
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
@@ -308,6 +349,57 @@ pub(crate) fn render_preview_search_input(
     render_top_right_input(frame, area, theme, " Preview Search ", buffer)
 }
 
+/// 在目前 pane 上方疊出 global search 輸入框，只顯示查詢文字。
+///
+/// 參數：
+/// - `frame: &mut ratatui::Frame<'_>`，目前畫面物件。
+/// - `area: Rect`，目前 pane 的可用區域。
+/// - `theme: Theme`，目前使用中的主題色盤。
+/// - `buffer: &str`，搜尋框中的查詢文字。
+/// - `editing: bool`，是否仍處於輸入模式。
+///
+/// 回傳：`(u16, u16)`，global search 輸入游標應停留的位置。
+pub(crate) fn render_global_search_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    buffer: &str,
+    editing: bool,
+) -> (u16, u16) {
+    let width = area.width.min(40).max(24);
+    let panel_area = Rect {
+        x: area.x + area.width.saturating_sub(width + 1),
+        y: area.y + 1,
+        width,
+        height: 3,
+    };
+
+    frame.render_widget(Clear, panel_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            if editing {
+                " Global Search (insert) "
+            } else {
+                " Global Search (normal) "
+            },
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+    let input_inner = block.inner(panel_area);
+    frame.render_widget(
+        Paragraph::new(buffer.to_string()).block(block),
+        panel_area,
+    );
+
+    (
+        input_inner
+            .x
+            .saturating_add(buffer.chars().count().min(input_inner.width as usize) as u16),
+        input_inner.y,
+    )
+}
+
 /// 在畫面底部繪製排序選單，模仿 mature-reference 的快捷鍵提示面板。
 pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
     let panel_height = 7;
@@ -382,7 +474,11 @@ fn render_entry_line(
     theme: Theme,
 ) -> Line<'static> {
     let marker = if mark_column_active {
-        if marked || visual_selected { "[*] " } else { "    " }
+        if marked || visual_selected {
+            "[*] "
+        } else {
+            "    "
+        }
     } else {
         ""
     };
@@ -420,7 +516,8 @@ fn format_sort_detail(entry: &super::entry::FileEntry, detail_kind: SortDetailKi
             if entry.is_dir {
                 String::from("dir")
             } else {
-                entry.path
+                entry
+                    .path
                     .extension()
                     .map(|value| value.to_string_lossy().into_owned())
                     .unwrap_or_default()

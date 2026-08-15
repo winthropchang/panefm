@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, io, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    io,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver},
+    thread,
+};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -16,8 +22,10 @@ use crate::{
 use super::{
     layout::{LayoutNode, SplitDirection},
     pane::{PaneState, SortMode},
+    search::{GlobalSearchEntry, collect_search_entries, filter_search_entries},
     ui::{
-        InlineEditorState, centered_rect, render_confirm_dialog, render_filter_input, render_pane,
+        InlineEditorState, SearchListState, centered_rect, render_confirm_dialog,
+        render_filter_input, render_global_search_panel, render_pane,
         render_preview_search_input, render_theme_picker,
     },
 };
@@ -72,6 +80,27 @@ pub(crate) struct PreviewSearchState {
     pub(crate) pane_id: usize,
     pub(crate) buffer: String,
     pub(crate) editing: bool,
+}
+
+/// 記錄目前 global search 的目標 pane、查詢文字與搜尋結果狀態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalSearchState {
+    pub(crate) pane_id: usize,
+    pub(crate) root_dir: PathBuf,
+    pub(crate) buffer: String,
+    pub(crate) editing: bool,
+    pub(crate) loading: bool,
+    pub(crate) searched: bool,
+    pub(crate) selected: usize,
+    pub(crate) results: Vec<GlobalSearchEntry>,
+}
+
+/// 背景 global search 完成後，回傳給主執行緒的結果訊息。
+#[derive(Debug)]
+pub(crate) struct GlobalSearchMessage {
+    pub(crate) pane_id: usize,
+    pub(crate) query: String,
+    pub(crate) results: io::Result<Vec<GlobalSearchEntry>>,
 }
 
 /// 記錄目前是否處於範圍標記模式，以及起點和目前游標位置。
@@ -135,6 +164,8 @@ pub(crate) struct App {
     pub(crate) clipboard: Option<ClipboardState>,
     pub(crate) filter: Option<FilterState>,
     pub(crate) preview_search: Option<PreviewSearchState>,
+    pub(crate) global_search: Option<GlobalSearchState>,
+    pub(crate) global_search_rx: Option<Receiver<GlobalSearchMessage>>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) preview_focus: Option<usize>,
@@ -177,6 +208,8 @@ impl App {
             clipboard: None,
             filter: None,
             preview_search: None,
+            global_search: None,
+            global_search_rx: None,
             visual_selection: None,
             pending_action: None,
             preview_focus: None,
@@ -191,8 +224,15 @@ impl App {
         if self.filter.as_ref().is_some_and(|filter| filter.editing) {
             return self.handle_filter_input_key(key);
         }
-        if self.preview_search.as_ref().is_some_and(|search| search.editing) {
+        if self
+            .preview_search
+            .as_ref()
+            .is_some_and(|search| search.editing)
+        {
             return self.handle_preview_search_input_key(key);
+        }
+        if self.global_search.is_some() {
+            return self.handle_global_search_key(key);
         }
         if self.visual_selection.is_some() {
             return self.handle_visual_selection_key(key);
@@ -295,6 +335,12 @@ impl App {
             }
             KeyCode::Char('f') => {
                 self.open_filter_input();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('s') => {
+                self.open_global_search()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -519,6 +565,142 @@ impl App {
         Ok(true)
     }
 
+    /// 處理 global search 面板中的輸入、結果瀏覽與跳轉。
+    pub(crate) fn handle_global_search_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(mut search) = self.global_search.take() else {
+            return Ok(true);
+        };
+
+        if search.editing {
+            match key.code {
+                KeyCode::Char(c) => {
+                    search.buffer.push(c);
+                    search.searched = false;
+                    search.loading = false;
+                    search.selected = 0;
+                    search.results.clear();
+                }
+                KeyCode::Backspace => {
+                    search.buffer.pop();
+                    search.searched = false;
+                    search.loading = false;
+                    search.selected = 0;
+                    search.results.clear();
+                }
+                KeyCode::Enter => {
+                    self.start_global_search(&mut search)?;
+                    search.editing = false;
+                }
+                KeyCode::Esc => {
+                    self.global_search_rx = None;
+                    self.status = String::from("normal mode");
+                }
+                _ => {}
+            }
+
+            if !matches!(key.code, KeyCode::Esc) {
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    search.editing,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            return Ok(true);
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                search.selected = (search.selected + 1).min(search.results.len().saturating_sub(1));
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                search.selected = search.selected.saturating_sub(1);
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            KeyCode::Char('g') => {
+                if self.pending_g {
+                    search.selected = 0;
+                    self.pending_g = false;
+                } else {
+                    self.pending_g = true;
+                }
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            KeyCode::Char('G') => {
+                if !search.results.is_empty() {
+                    search.selected = search.results.len() - 1;
+                }
+                self.pending_g = false;
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            KeyCode::Char('i') | KeyCode::Char('s') => {
+                search.editing = true;
+                self.pending_g = false;
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    true,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                self.pending_g = false;
+                self.open_global_search_result(search)?;
+            }
+            KeyCode::Esc => {
+                self.pending_g = false;
+                self.global_search_rx = None;
+                self.status = String::from("normal mode");
+            }
+            _ => {
+                self.pending_g = false;
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+        }
+
+        Ok(true)
+    }
+
     /// 處理 filter 輸入框中的鍵盤輸入，並在每次輸入後立即更新列表。
     pub(crate) fn handle_filter_input_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(mut filter) = self.filter.take() else {
@@ -589,18 +771,42 @@ impl App {
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
-                KeyCode::Char('m') => self.apply_sort_mode(pane_id, SortMode::Modified { reverse: false })?,
-                KeyCode::Char('M') => self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?,
-                KeyCode::Char('b') => self.apply_sort_mode(pane_id, SortMode::Created { reverse: false })?,
-                KeyCode::Char('B') => self.apply_sort_mode(pane_id, SortMode::Created { reverse: true })?,
-                KeyCode::Char('a') => self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: false })?,
-                KeyCode::Char('A') => self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: true })?,
-                KeyCode::Char('n') => self.apply_sort_mode(pane_id, SortMode::Natural { reverse: false })?,
-                KeyCode::Char('N') => self.apply_sort_mode(pane_id, SortMode::Natural { reverse: true })?,
-                KeyCode::Char('e') => self.apply_sort_mode(pane_id, SortMode::Extension { reverse: false })?,
-                KeyCode::Char('E') => self.apply_sort_mode(pane_id, SortMode::Extension { reverse: true })?,
-                KeyCode::Char('s') => self.apply_sort_mode(pane_id, SortMode::Size { reverse: false })?,
-                KeyCode::Char('S') => self.apply_sort_mode(pane_id, SortMode::Size { reverse: true })?,
+                KeyCode::Char('m') => {
+                    self.apply_sort_mode(pane_id, SortMode::Modified { reverse: false })?
+                }
+                KeyCode::Char('M') => {
+                    self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?
+                }
+                KeyCode::Char('b') => {
+                    self.apply_sort_mode(pane_id, SortMode::Created { reverse: false })?
+                }
+                KeyCode::Char('B') => {
+                    self.apply_sort_mode(pane_id, SortMode::Created { reverse: true })?
+                }
+                KeyCode::Char('a') => {
+                    self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: false })?
+                }
+                KeyCode::Char('A') => {
+                    self.apply_sort_mode(pane_id, SortMode::Alphabetical { reverse: true })?
+                }
+                KeyCode::Char('n') => {
+                    self.apply_sort_mode(pane_id, SortMode::Natural { reverse: false })?
+                }
+                KeyCode::Char('N') => {
+                    self.apply_sort_mode(pane_id, SortMode::Natural { reverse: true })?
+                }
+                KeyCode::Char('e') => {
+                    self.apply_sort_mode(pane_id, SortMode::Extension { reverse: false })?
+                }
+                KeyCode::Char('E') => {
+                    self.apply_sort_mode(pane_id, SortMode::Extension { reverse: true })?
+                }
+                KeyCode::Char('s') => {
+                    self.apply_sort_mode(pane_id, SortMode::Size { reverse: false })?
+                }
+                KeyCode::Char('S') => {
+                    self.apply_sort_mode(pane_id, SortMode::Size { reverse: true })?
+                }
                 KeyCode::Char('r') => self.apply_sort_mode(pane_id, SortMode::Random)?,
                 KeyCode::Esc => {
                     self.status = String::from("sort cancelled");
@@ -1085,6 +1291,7 @@ impl App {
             "unmark" | "unmark-all" => self.clear_marks_in_focused_pane()?,
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
+            "search" => self.open_global_search()?,
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -1182,6 +1389,13 @@ impl App {
                 if self.preview_focus == Some(old_focus) {
                     self.preview_focus = None;
                 }
+                if self
+                    .global_search
+                    .as_ref()
+                    .is_some_and(|search| search.pane_id == old_focus)
+                {
+                    self.global_search = None;
+                }
                 self.focused_pane = fallback;
                 self.status = format!("closed pane {old_focus}");
             }
@@ -1195,6 +1409,13 @@ impl App {
         self.layout = LayoutNode::Leaf { pane_id: focused };
         if self.preview_focus != Some(focused) {
             self.preview_focus = None;
+        }
+        if self
+            .global_search
+            .as_ref()
+            .is_some_and(|search| search.pane_id != focused)
+        {
+            self.global_search = None;
         }
         self.status = String::from("kept only focused pane");
     }
@@ -1296,6 +1517,29 @@ impl App {
         self.filter = Some(filter);
     }
 
+    /// 打開 global search 面板，遞迴建立目前目錄下的搜尋候選資料集。
+    pub(crate) fn open_global_search(&mut self) -> io::Result<()> {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        let search = GlobalSearchState {
+            pane_id: self.focused_pane,
+            root_dir: pane.cwd.clone(),
+            buffer: String::new(),
+            editing: true,
+            loading: false,
+            searched: false,
+            selected: 0,
+            results: Vec::new(),
+        };
+        self.status = String::from("global search (insert): type query and Enter");
+        self.global_search = Some(search);
+        self.global_search_rx = None;
+        Ok(())
+    }
+
     /// 進入 preview mode，讓目前焦點 pane 的預覽區放大並接手捲動按鍵。
     pub(crate) fn open_preview_focus(&mut self) {
         self.preview_focus = Some(self.focused_pane);
@@ -1318,7 +1562,8 @@ impl App {
             editing: true,
         };
         self.apply_preview_search_buffer(&search);
-        self.status = preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
+        self.status =
+            preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
         self.preview_search = Some(search);
     }
 
@@ -1491,11 +1736,7 @@ impl App {
     /// - `path: &str`，新項目的相對路徑。
     ///
     /// 回傳：`io::Result<()>`。
-    pub(crate) fn confirm_create_entry(
-        &mut self,
-        pane_id: usize,
-        path: &str,
-    ) -> io::Result<()> {
+    pub(crate) fn confirm_create_entry(&mut self, pane_id: usize, path: &str) -> io::Result<()> {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             self.status = String::from("pane no longer exists");
             return Ok(());
@@ -1540,6 +1781,36 @@ impl App {
         if let Some(pane) = self.panes.get_mut(&search.pane_id) {
             pane.set_preview_search_query(&search.buffer);
         }
+    }
+
+    /// 啟動一個背景 global search 工作，避免在大型目錄中阻塞主介面。
+    fn start_global_search(&mut self, search: &mut GlobalSearchState) -> io::Result<()> {
+        let pane_id = search.pane_id;
+        let root_dir = search.root_dir.clone();
+        let query = search.buffer.clone();
+        let show_hidden = self
+            .panes
+            .get(&pane_id)
+            .map(|pane| pane.show_hidden)
+            .unwrap_or(false);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let results = collect_search_entries(&root_dir, show_hidden)
+                .map(|entries| filter_search_entries(&entries, &query, 200));
+            let _ = tx.send(GlobalSearchMessage {
+                pane_id,
+                query,
+                results,
+            });
+        });
+
+        search.loading = true;
+        search.searched = false;
+        search.selected = 0;
+        search.results.clear();
+        self.global_search_rx = Some(rx);
+        Ok(())
     }
 
     /// 回傳指定 pane 目前 preview 搜尋命中的數量。
@@ -1598,6 +1869,26 @@ impl App {
         } else {
             format!("preview search: {query} (0)")
         })
+    }
+
+    /// 將目前 global search 選到的結果打開到原 pane 中，並把游標移到該項目。
+    fn open_global_search_result(&mut self, search: GlobalSearchState) -> io::Result<()> {
+        let Some(entry) = search.results.get(search.selected).cloned() else {
+            self.status = String::from("global search: no result selected");
+            self.global_search = Some(search);
+            return Ok(());
+        };
+
+        let Some(pane) = self.panes.get_mut(&search.pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        pane.reveal_path(&entry.path)?;
+        self.global_search = None;
+        self.global_search_rx = None;
+        self.status = format!("search opened: {}", entry.relative_path);
+        Ok(())
     }
 
     /// 切換目前焦點 pane 的隱藏檔顯示狀態。
@@ -1716,7 +2007,9 @@ impl App {
 
             let paste_result = match self.panes.get_mut(&self.focused_pane) {
                 Some(pane) => match clipboard.operation {
-                    ClipboardOperation::Copy => pane.copy_entry_into_current_dir(&entry.source_path),
+                    ClipboardOperation::Copy => {
+                        pane.copy_entry_into_current_dir(&entry.source_path)
+                    }
                     ClipboardOperation::Cut => pane.move_entry_into_current_dir(&entry.source_path),
                 },
                 None => {
@@ -1781,7 +2074,7 @@ impl App {
         let mut pane_rects = BTreeMap::new();
         self.layout.render_rects(outer[0], &mut pane_rects);
         let mut cursor_position = None;
-        for (pane_id, rect) in pane_rects {
+        for (&pane_id, &rect) in &pane_rects {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 let rename_buffer = match &self.pending_action {
                     Some(PendingAction::Rename {
@@ -1818,7 +2111,17 @@ impl App {
                     pane_id == self.focused_pane,
                     self.preview_focus == Some(pane_id),
                     self.visual_selection.as_ref().and_then(|selection| {
-                        (selection.pane_id == pane_id).then_some((selection.anchor, selection.current))
+                        (selection.pane_id == pane_id)
+                            .then_some((selection.anchor, selection.current))
+                    }),
+                    self.global_search.as_ref().and_then(|search| {
+                        (search.pane_id == pane_id && (search.loading || search.searched)).then_some(
+                            SearchListState {
+                                results: &search.results,
+                                selected: search.selected,
+                                loading: search.loading,
+                            },
+                        )
                     }),
                     self.theme,
                     rename_buffer,
@@ -1856,6 +2159,8 @@ impl App {
             Span::raw(" search  "),
             Span::styled("a", self.theme.accent_style()),
             Span::raw(" create  "),
+            Span::styled("s", self.theme.accent_style()),
+            Span::raw(" global search  "),
             Span::styled("f", self.theme.accent_style()),
             Span::raw(" filter  "),
             Span::styled(".", self.theme.accent_style()),
@@ -1913,6 +2218,21 @@ impl App {
             }
         }
 
+        if let Some(search) = &self.global_search
+            && let Some(area) = pane_rects.get(&search.pane_id)
+        {
+            let search_cursor = render_global_search_panel(
+                frame,
+                *area,
+                self.theme,
+                &search.buffer,
+                search.editing,
+            );
+            if search.editing && cursor_position.is_none() {
+                cursor_position = Some(search_cursor);
+            }
+        }
+
         match &self.pending_action {
             Some(PendingAction::ConfirmDelete { target_name, .. }) => {
                 render_confirm_dialog(frame, frame.area(), target_name, self.theme, &self.config);
@@ -1942,7 +2262,57 @@ impl App {
         match self.pending_action {
             Some(PendingAction::Rename { mode, .. })
             | Some(PendingAction::CreateEntry { mode, .. }) => Some(mode),
+            _ if self
+                .global_search
+                .as_ref()
+                .is_some_and(|search| search.editing) =>
+            {
+                Some(RenameMode::Insert)
+            }
             _ => None,
+        }
+    }
+
+    /// 在每一輪事件迴圈中檢查背景 global search 是否已完成。
+    pub(crate) fn poll_background_tasks(&mut self) {
+        let Some(receiver) = &self.global_search_rx else {
+            return;
+        };
+
+        let Ok(message) = receiver.try_recv() else {
+            return;
+        };
+        self.global_search_rx = None;
+
+        let Some(search) = &mut self.global_search else {
+            return;
+        };
+        if search.pane_id != message.pane_id || search.buffer != message.query {
+            return;
+        }
+
+        search.loading = false;
+        match message.results {
+            Ok(results) => {
+                search.results = results;
+                search.selected = search.selected.min(search.results.len().saturating_sub(1));
+                if search.results.is_empty() {
+                    search.selected = 0;
+                }
+                search.searched = true;
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    search.editing,
+                    search.searched,
+                    search.loading,
+                );
+            }
+            Err(error) => {
+                search.results.clear();
+                search.searched = false;
+                self.status = format!("global search failed: {error}");
+            }
         }
     }
 }
@@ -1958,6 +2328,30 @@ fn preview_search_status(buffer: &str, matches: usize) -> String {
         String::from("preview search: all")
     } else {
         format!("preview search: {buffer} ({matches})")
+    }
+}
+
+/// 依照目前 global search 文字、結果數與模式，產生狀態列訊息。
+fn global_search_status(
+    buffer: &str,
+    matches: usize,
+    editing: bool,
+    searched: bool,
+    loading: bool,
+) -> String {
+    let mode = if editing { "insert" } else { "normal" };
+    if loading {
+        format!("global search ({mode}): loading...")
+    } else if !searched {
+        if buffer.is_empty() {
+            format!("global search ({mode}): type query and Enter")
+        } else {
+            format!("global search ({mode}): {buffer} (press Enter to search)")
+        }
+    } else if buffer.is_empty() {
+        format!("global search ({mode}): all ({matches})")
+    } else {
+        format!("global search ({mode}): {buffer} ({matches})")
     }
 }
 
@@ -2165,8 +2559,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, ClipboardOperation, FilterState, PendingAction, RenameMode, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end,
+        App, ClipboardOperation, FilterState, PendingAction, RenameMode, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end,
     };
     use crate::{
         config::{AppConfig, LoadedConfig},
@@ -2177,13 +2571,28 @@ mod tests {
         theme::ThemePreset,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::fs;
+    use std::{fs, thread, time::Duration};
 
     fn default_loaded_config() -> LoadedConfig {
         LoadedConfig {
             config: AppConfig::default(),
             source: None,
         }
+    }
+
+    fn wait_for_global_search(app: &mut App) {
+        for _ in 0..50 {
+            app.poll_background_tasks();
+            if app
+                .global_search
+                .as_ref()
+                .is_some_and(|search| search.searched && !search.loading)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("global search did not complete in time");
     }
 
     #[test]
@@ -2478,8 +2887,7 @@ mod tests {
         let source_file = source_dir.join("alpha.txt");
         fs::write(&source_file, "hello").expect("file");
 
-        let mut app =
-            App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("pending copy");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
@@ -2489,10 +2897,16 @@ mod tests {
             app.clipboard.as_ref().map(|entry| entry.operation),
             Some(ClipboardOperation::Copy)
         );
-        assert_eq!(app.clipboard.as_ref().map(|entry| entry.entries.len()), Some(1));
+        assert_eq!(
+            app.clipboard.as_ref().map(|entry| entry.entries.len()),
+            Some(1)
+        );
 
         app.current_pane_mut().expect("pane").cwd = target_dir.clone();
-        app.current_pane_mut().expect("pane").reload().expect("reload");
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .expect("paste");
 
@@ -2512,8 +2926,7 @@ mod tests {
         let source_file = source_dir.join("beta.txt");
         fs::write(&source_file, "hello").expect("file");
 
-        let mut app =
-            App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
             .expect("cut");
 
@@ -2521,10 +2934,16 @@ mod tests {
             app.clipboard.as_ref().map(|entry| entry.operation),
             Some(ClipboardOperation::Cut)
         );
-        assert_eq!(app.clipboard.as_ref().map(|entry| entry.entries.len()), Some(1));
+        assert_eq!(
+            app.clipboard.as_ref().map(|entry| entry.entries.len()),
+            Some(1)
+        );
 
         app.current_pane_mut().expect("pane").cwd = target_dir.clone();
-        app.current_pane_mut().expect("pane").reload().expect("reload");
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .expect("paste");
 
@@ -2559,7 +2978,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
-        app.execute_command("create alpha.txt").expect("create file");
+        app.execute_command("create alpha.txt")
+            .expect("create file");
         assert!(dir.path().join("alpha.txt").exists());
         assert_eq!(app.status, "created file: alpha.txt");
 
@@ -2629,7 +3049,10 @@ mod tests {
             .map(|entry| entry.display_name())
             .collect();
 
-        assert_eq!(visible_names, vec![String::from("alpha.txt"), String::from("beta.txt")]);
+        assert_eq!(
+            visible_names,
+            vec![String::from("alpha.txt"), String::from("beta.txt")]
+        );
         assert!(app.filter.as_ref().is_some_and(|filter| !filter.editing));
         assert_eq!(app.status, "filter locked: a");
     }
@@ -2865,7 +3288,11 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
             .expect("open preview search");
-        assert!(app.preview_search.as_ref().is_some_and(|search| search.editing));
+        assert!(
+            app.preview_search
+                .as_ref()
+                .is_some_and(|search| search.editing)
+        );
 
         for ch in ['b', 'e', 't', 'a'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
@@ -2894,8 +3321,11 @@ mod tests {
         app.open_preview_focus();
         app.open_preview_search_input();
         for ch in ['m', 'a', 't', 'c', 'h'] {
-            app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .expect("type query");
+            app.handle_preview_search_input_key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            ))
+            .expect("type query");
         }
         app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("lock search");
@@ -2973,6 +3403,75 @@ mod tests {
 
         assert_eq!(app.panes.get(&1).expect("pane").selected, 1);
         assert_eq!(app.panes.get(&2).expect("pane").preview_scroll, 0);
+    }
+
+    #[test]
+    /// 驗證 global search 在輸入階段不會立即掃描，按下 Enter 後才真正執行搜尋。
+    fn app_global_search_filters_nested_entries() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("Readme.md"), "doc").expect("readme");
+        fs::create_dir(dir.path().join("src")).expect("src");
+        fs::write(dir.path().join("src").join("main.rs"), "fn main() {}").expect("main");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open search");
+
+        for ch in ['r', 'e', 'a', 'd'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        let search = app.global_search.as_ref().expect("search");
+        assert!(search.editing);
+        assert_eq!(search.results.len(), 0);
+        assert!(!search.searched);
+        assert_eq!(
+            app.status,
+            "global search (insert): read (press Enter to search)"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run search");
+        wait_for_global_search(&mut app);
+        let search = app.global_search.as_ref().expect("search after run");
+        assert!(!search.editing);
+        assert!(search.searched);
+        assert_eq!(search.results.len(), 1);
+        assert_eq!(search.results[0].relative_path, "docs/Readme.md");
+        assert_eq!(app.status, "global search (normal): read (1)");
+    }
+
+    #[test]
+    /// 驗證 global search 提交查詢後，再按一次 Enter 會跳到選中的搜尋結果。
+    fn app_global_search_enter_reveals_selected_file() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("guide.md"), "guide").expect("guide");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open search");
+        for ch in ['g', 'u', 'i', 'd'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock search");
+        wait_for_global_search(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open result");
+
+        assert!(app.global_search.is_none());
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.cwd, dir.path().join("docs"));
+        assert_eq!(
+            pane.selected_entry().map(|entry| entry.display_name()),
+            Some(String::from("guide.md"))
+        );
+        assert_eq!(app.status, "search opened: docs/guide.md");
     }
 
     #[test]

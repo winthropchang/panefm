@@ -2,8 +2,9 @@ use std::{
     cmp::Ordering,
     collections::BTreeSet,
     collections::hash_map::DefaultHasher,
+    fs,
     hash::{Hash, Hasher},
-    fs, io,
+    io,
     path::{Component, Path, PathBuf},
     time::SystemTime,
 };
@@ -247,7 +248,9 @@ impl PaneState {
         }
 
         let range_start = start.min(end);
-        let range_end = start.max(end).min(self.visible_indices.len().saturating_sub(1));
+        let range_end = start
+            .max(end)
+            .min(self.visible_indices.len().saturating_sub(1));
         let mut added = 0usize;
 
         for visible_index in range_start..=range_end {
@@ -594,16 +597,12 @@ impl PaneState {
         fs::rename(&entry.path, &new_path)?;
         self.reload()?;
 
-        if let Some(index) = self
-            .visible_indices
-            .iter()
-            .position(|visible_index| {
-                self.entries
-                    .get(*visible_index)
-                    .map(|candidate| candidate.path == new_path)
-                    .unwrap_or(false)
-            })
-        {
+        if let Some(index) = self.visible_indices.iter().position(|visible_index| {
+            self.entries
+                .get(*visible_index)
+                .map(|candidate| candidate.path == new_path)
+                .unwrap_or(false)
+        }) {
             self.selected = index;
             self.list_state.select(Some(index));
         }
@@ -630,16 +629,12 @@ impl PaneState {
         self.reload()?;
 
         let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
-        if let Some(index) = self
-            .visible_indices
-            .iter()
-            .position(|visible_index| {
-                self.entries
-                    .get(*visible_index)
-                    .map(|candidate| candidate.path == pasted_path)
-                    .unwrap_or(false)
-            })
-        {
+        if let Some(index) = self.visible_indices.iter().position(|visible_index| {
+            self.entries
+                .get(*visible_index)
+                .map(|candidate| candidate.path == pasted_path)
+                .unwrap_or(false)
+        }) {
             self.selected = index;
             self.list_state.select(Some(index));
         }
@@ -661,16 +656,12 @@ impl PaneState {
         self.reload()?;
 
         let moved_path = self.cwd.join(trimmed_display_name(&display_name));
-        if let Some(index) = self
-            .visible_indices
-            .iter()
-            .position(|visible_index| {
-                self.entries
-                    .get(*visible_index)
-                    .map(|candidate| candidate.path == moved_path)
-                    .unwrap_or(false)
-            })
-        {
+        if let Some(index) = self.visible_indices.iter().position(|visible_index| {
+            self.entries
+                .get(*visible_index)
+                .map(|candidate| candidate.path == moved_path)
+                .unwrap_or(false)
+        }) {
             self.selected = index;
             self.list_state.select(Some(index));
         }
@@ -765,6 +756,26 @@ impl PaneState {
         self.refresh_visible_entries();
     }
 
+    /// 將 pane 切換到指定路徑所在的目錄，並把游標聚焦到該項目。
+    ///
+    /// 參數：
+    /// - `path: &Path`，要在列表中顯示並選中的目標路徑。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表 pane 已切到正確目錄並聚焦項目。
+    /// - 失敗時代表重新載入目錄內容時發生 I/O 錯誤。
+    pub(crate) fn reveal_path(&mut self, path: &Path) -> io::Result<()> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+
+        self.cwd = parent.to_path_buf();
+        self.filter_query = None;
+        self.reload()?;
+        self.select_path(path);
+        Ok(())
+    }
+
     /// 判斷目前是否仍處於過濾後的列表狀態。
     pub(crate) fn has_active_filter(&self) -> bool {
         self.filter_query.is_some()
@@ -812,7 +823,9 @@ impl PaneState {
             self.selected = 0;
             self.list_state.select(None);
         } else {
-            self.selected = self.selected.min(self.visible_indices.len().saturating_sub(1));
+            self.selected = self
+                .selected
+                .min(self.visible_indices.len().saturating_sub(1));
             self.list_state.select(Some(self.selected));
         }
         self.preview_scroll = 0;
@@ -1012,7 +1025,10 @@ fn preview_directory(entry: &FileEntry, max_lines: usize) -> Vec<Line<'static>> 
                 lines.push(Line::from("empty directory"));
             } else {
                 lines.push(Line::from("contents:"));
-                for name in child_names.into_iter().take(max_lines.saturating_sub(lines.len())) {
+                for name in child_names
+                    .into_iter()
+                    .take(max_lines.saturating_sub(lines.len()))
+                {
                     lines.push(Line::from(format!("  {name}")));
                 }
             }
@@ -1098,7 +1114,10 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
             }
 
             let truncated = content_lines.len() > available_content_lines;
-            for (index, line) in content_lines.into_iter().take(available_content_lines).enumerate()
+            for (index, line) in content_lines
+                .into_iter()
+                .take(available_content_lines)
+                .enumerate()
             {
                 lines.push(Line::from(format!("{:>3} {}", index + 1, line)));
             }
@@ -1162,7 +1181,8 @@ fn highlight_preview_matches(lines: Vec<Line<'static>>, query: &str) -> Vec<Line
         return lines;
     }
 
-    lines.into_iter()
+    lines
+        .into_iter()
         .map(|line| highlight_preview_line(line.to_string(), &lower_query))
         .collect()
 }
@@ -1288,7 +1308,18 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
         if matches!(
             marker,
-            0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF
+            0xC0 | 0xC1
+                | 0xC2
+                | 0xC3
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xC9
+                | 0xCA
+                | 0xCB
+                | 0xCD
+                | 0xCE
+                | 0xCF
         ) && index + 7 < bytes.len()
         {
             let height = u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]) as u32;
@@ -1327,9 +1358,9 @@ fn format_system_time_preview(value: SystemTime) -> String {
 ///
 /// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
 fn copy_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
-    let file_name = source_path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name"))?;
+    let file_name = source_path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
+    })?;
     let target_path = unique_target_path(target_dir, file_name);
 
     if source_path.is_dir() {
@@ -1349,9 +1380,9 @@ fn copy_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<Strin
 ///
 /// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
 fn move_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
-    let file_name = source_path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name"))?;
+    let file_name = source_path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
+    })?;
     let target_path = unique_target_path(target_dir, file_name);
 
     fs::rename(source_path, &target_path)?;
@@ -1448,7 +1479,11 @@ fn split_name_for_duplicate(name: &str) -> (String, Option<String>) {
 /// - `duplicate_index: Option<usize>`，若有重複次數，會附加在 `copy` 後面。
 ///
 /// 回傳：`String`，可直接作為新檔名的字串。
-fn duplicate_name(base_name: &str, extension: Option<&str>, duplicate_index: Option<usize>) -> String {
+fn duplicate_name(
+    base_name: &str,
+    extension: Option<&str>,
+    duplicate_index: Option<usize>,
+) -> String {
     let mut candidate = String::from(base_name);
     candidate.push_str(" copy");
 
@@ -1754,9 +1789,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
 
-        let created = pane
-            .create_entry("workspace/")
-            .expect("create directory");
+        let created = pane.create_entry("workspace/").expect("create directory");
 
         assert_eq!(created, "workspace/");
         assert!(dir.path().join("workspace").is_dir());
@@ -1818,7 +1851,10 @@ mod tests {
     #[test]
     /// 驗證排序模式會提供對應的人類可讀標籤。
     fn sort_mode_labels_match_expected_names() {
-        assert_eq!(SortMode::Alphabetical { reverse: false }.label(), "alphabetical");
+        assert_eq!(
+            SortMode::Alphabetical { reverse: false }.label(),
+            "alphabetical"
+        );
         assert_eq!(SortMode::Size { reverse: true }.label(), "size (reverse)");
         assert_eq!(SortMode::Modified { reverse: false }.label(), "modified");
     }
@@ -1904,8 +1940,8 @@ mod tests {
     fn pane_state_image_preview_shows_format_and_dimensions() {
         let dir = tempdir().expect("tempdir");
         let png_bytes = vec![
-            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I',
-            b'H', b'D', b'R', 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x01, 0xE0,
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x01, 0xE0,
         ];
         fs::write(dir.path().join("wallpaper.png"), png_bytes).expect("png");
 
@@ -1938,6 +1974,10 @@ mod tests {
             .collect();
 
         assert!(preview.iter().any(|line| line == "kind: toml config"));
-        assert!(preview.iter().any(|line| line == "  1 theme = \"nightfox\""));
+        assert!(
+            preview
+                .iter()
+                .any(|line| line == "  1 theme = \"nightfox\"")
+        );
     }
 }

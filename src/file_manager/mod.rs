@@ -2,6 +2,7 @@ mod app;
 mod entry;
 mod layout;
 mod pane;
+mod search;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -81,6 +82,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut last_cursor_mode = None;
 
     loop {
+        app.poll_background_tasks();
         terminal.draw(|frame| app.render(frame))?;
         sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
 
