@@ -1,17 +1,22 @@
 mod app;
 mod entry;
 mod layout;
+mod open;
 mod pane;
 mod search;
 mod trash;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use crossterm::{
     cursor::SetCursorStyle,
-    event::{self, Event},
+    event::{
+        self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -20,6 +25,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::config::load_config;
 
 use self::app::{App, RenameMode};
+use self::open::{LaunchMode, LaunchSpec};
 
 /// 啟動檔案管理器模組的完整執行流程。
 ///
@@ -43,7 +49,15 @@ pub(crate) fn run() -> Result<()> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -61,6 +75,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     execute!(
         terminal.backend_mut(),
         SetCursorStyle::DefaultUserShape,
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -89,9 +104,66 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
         if event::poll(poll_rate)?
             && let Event::Key(key) = event::read()?
+            && should_handle_key_event(key.kind)
             && !app.handle_key(key)?
         {
             break;
+        }
+
+        if let Some(launch) = app.take_pending_launch() {
+            run_launch_spec(terminal, launch)?;
+            last_cursor_mode = None;
+        }
+    }
+
+    Ok(())
+}
+
+/// 執行外部開啟命令；若需要佔用目前終端，會先暫時離開 TUI。
+fn run_launch_spec(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    launch: LaunchSpec,
+) -> Result<()> {
+    match launch.mode {
+        LaunchMode::Detached => {
+            Command::new(&launch.program)
+                .args(&launch.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
+        LaunchMode::TerminalBlocking => {
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                SetCursorStyle::DefaultUserShape,
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen
+            )?;
+            terminal.show_cursor()?;
+
+            let status = Command::new(&launch.program).args(&launch.args).status()?;
+
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                )
+            )?;
+            enable_raw_mode()?;
+            terminal.clear()?;
+            terminal.show_cursor()?;
+
+            if !status.success() {
+                return Err(anyhow::anyhow!(
+                    "external command failed: {}",
+                    launch.program
+                ));
+            }
         }
     }
 
@@ -126,4 +198,34 @@ fn sync_cursor_style(
     execute!(terminal.backend_mut(), style)?;
     *last_mode = desired_mode;
     Ok(())
+}
+
+/// 判斷目前的鍵盤事件是否應該交給應用程式處理。
+///
+/// 參數：
+/// - `kind: KeyEventKind`，crossterm 回報的鍵盤事件種類。
+///
+/// 回傳：`bool`。
+/// - `true` 代表這是有效的按下或長按重複事件，應該交給應用程式。
+/// - `false` 代表這是放開事件，應忽略以避免同一組按鍵被處理兩次。
+fn should_handle_key_event(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyEventKind;
+
+    use super::should_handle_key_event;
+
+    /// 驗證主事件迴圈只會處理按下或長按重複事件，避免放開事件造成快捷鍵重複觸發。
+    ///
+    /// 參數：無。
+    /// 回傳：無。
+    #[test]
+    fn should_handle_only_press_and_repeat_key_events() {
+        assert!(should_handle_key_event(KeyEventKind::Press));
+        assert!(should_handle_key_event(KeyEventKind::Repeat));
+        assert!(!should_handle_key_event(KeyEventKind::Release));
+    }
 }

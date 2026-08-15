@@ -28,6 +28,14 @@ pub(crate) struct InlineEditorState<'a> {
     pub(crate) title: &'a str,
 }
 
+/// 描述 inline 選單目前需要顯示的標題、選項與游標位置。
+#[derive(Clone, Copy)]
+pub(crate) struct InlinePickerState<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) options: &'a [String],
+    pub(crate) selected: usize,
+}
+
 /// 描述目前 pane 是否要把主列表暫時切換成 global search 的結果畫面。
 #[derive(Clone, Copy)]
 pub(crate) struct SearchListState<'a> {
@@ -97,6 +105,7 @@ pub(crate) fn render_pane(
     theme: Theme,
     config: &AppConfig,
     editor_state: Option<InlineEditorState<'_>>,
+    picker_state: Option<InlinePickerState<'_>>,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
@@ -269,6 +278,9 @@ pub(crate) fn render_pane(
     if let Some(state) = editor_state {
         editor_cursor = render_inline_editor(frame, chunks[0], pane, theme, state);
     }
+    if let Some(state) = picker_state {
+        render_inline_picker(frame, chunks[0], pane, theme, state);
+    }
 
     let panel_cursor = match panel_state {
         Some(PaneListState::Trash {
@@ -386,6 +398,66 @@ fn render_inline_editor(
             .saturating_add(state.cursor.min(state.buffer.chars().count()) as u16),
         input_inner.y,
     ))
+}
+
+/// 在列表區域中繪製 inline 小型選單，供 `Open with` 這類操作重用。
+fn render_inline_picker(
+    frame: &mut ratatui::Frame<'_>,
+    list_area: Rect,
+    pane: &PaneState,
+    theme: Theme,
+    state: InlinePickerState<'_>,
+) {
+    let inner = Block::default().borders(Borders::ALL).inner(list_area);
+    let selected_row = if pane.entries.is_empty() {
+        inner.y
+    } else {
+        inner.y.saturating_add(pane.selected as u16)
+    };
+    let box_y = selected_row.saturating_add(1);
+    let height = state.options.len().min(6) as u16 + 2;
+
+    if box_y.saturating_add(height) >= inner.y.saturating_add(inner.height) {
+        return;
+    }
+
+    let picker_area = Rect {
+        x: inner.x,
+        y: box_y,
+        width: inner.width.saturating_sub(1),
+        height,
+    };
+
+    frame.render_widget(Clear, picker_area);
+    let picker_block = Block::default()
+        .title(Line::from(Span::styled(
+            state.title,
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+    let picker_inner = picker_block.inner(picker_area);
+    frame.render_widget(picker_block, picker_area);
+
+    let items = state
+        .options
+        .iter()
+        .map(|option| ListItem::new(Line::from(option.clone())))
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    if !state.options.is_empty() {
+        list_state.select(Some(
+            state.selected.min(state.options.len().saturating_sub(1)),
+        ));
+    }
+
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(theme.selected_item_style())
+            .highlight_symbol("▶ "),
+        picker_inner,
+        &mut list_state,
+    );
 }
 
 /// 在指定區域中計算一個置中的 popup 矩形。

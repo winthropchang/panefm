@@ -26,13 +26,17 @@ use crate::{
 
 use super::{
     layout::{LayoutNode, SplitDirection},
+    open::{
+        LaunchSpec, OpenAction, OpenTarget, build_launch_spec, default_open_action,
+        open_picker_options,
+    },
     pane::{PaneState, SortMode},
     search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
     trash::{TrashListEntry, TrashStore},
     ui::{
-        HelpPanelLine, InlineEditorState, PaneListState, SearchListState, TrashPanelLine,
-        centered_rect, render_confirm_dialog, render_filter_input, render_global_search_panel,
-        render_pane, render_preview_search_input, render_theme_picker,
+        HelpPanelLine, InlineEditorState, InlinePickerState, PaneListState, SearchListState,
+        TrashPanelLine, centered_rect, render_confirm_dialog, render_filter_input,
+        render_global_search_panel, render_pane, render_preview_search_input, render_theme_picker,
     },
 };
 
@@ -144,6 +148,11 @@ pub(crate) enum PendingAction {
         selected: usize,
         search: PanelSearchState,
     },
+    OpenPicker {
+        pane_id: usize,
+        target: OpenTarget,
+        selected: usize,
+    },
     Rename {
         pane_id: usize,
         original_name: String,
@@ -188,6 +197,7 @@ pub(crate) struct App {
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
+    pub(crate) pending_launch: Option<LaunchSpec>,
     pub(crate) preview_focus: Option<usize>,
 }
 
@@ -250,6 +260,7 @@ impl App {
             visual_selection: None,
             pending_action: None,
             help_return: None,
+            pending_launch: None,
             preview_focus: None,
         })
     }
@@ -294,6 +305,24 @@ impl App {
         if self.preview_focus == Some(self.focused_pane) {
             return self.handle_preview_key(key);
         }
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+            self.open_selected_with_picker()?;
+            self.pending_g = false;
+            self.pending_y = false;
+            return Ok(true);
+        }
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::SHIFT) {
+            self.open_selected_with_picker()?;
+            self.pending_g = false;
+            self.pending_y = false;
+            return Ok(true);
+        }
+        if key.code == KeyCode::Char('O') {
+            self.open_selected_with_picker()?;
+            self.pending_g = false;
+            self.pending_y = false;
+            return Ok(true);
+        }
 
         let should_continue = match key.code {
             KeyCode::Char('q') => false,
@@ -324,9 +353,15 @@ impl App {
                 self.pending_y = false;
                 true
             }
-            KeyCode::Char('l') | KeyCode::Enter => {
+            KeyCode::Char('l') => {
                 self.current_pane_mut()?.enter_selected()?;
                 self.status = String::from("opened directory");
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char('o') | KeyCode::Enter => {
+                self.open_selected_with_default()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -1190,6 +1225,53 @@ impl App {
                     self.status = status;
                 }
             }
+            PendingAction::OpenPicker {
+                pane_id,
+                target,
+                mut selected,
+            } => {
+                let options = open_picker_options(&target);
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !options.is_empty() {
+                            selected = (selected + 1).min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        if let Some(option) = options.get(selected) {
+                            self.queue_open_action(target.clone(), option.action)?;
+                        } else {
+                            self.status = String::from("open with: no option selected");
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                        self.status = String::from("normal mode");
+                    }
+                    _ => {
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                }
+            }
             PendingAction::Rename {
                 pane_id,
                 original_name,
@@ -1642,6 +1724,22 @@ impl App {
             "copy" => self.copy_selected(),
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
+            "open" => self.open_selected_with_default()?,
+            "open-picker" => self.open_selected_with_picker()?,
+            "vim" => {
+                let Some(target) = self.selected_open_target() else {
+                    self.status = String::from("nothing selected to open");
+                    return Ok(());
+                };
+                self.queue_open_action(target, OpenAction::Vim)?;
+            }
+            "reveal" => {
+                let Some(target) = self.selected_open_target() else {
+                    self.status = String::from("nothing selected to reveal");
+                    return Ok(());
+                };
+                self.queue_open_action(target, OpenAction::Reveal)?;
+            }
             "unmark" | "unmark-all" => self.clear_marks_in_focused_pane()?,
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
@@ -1838,6 +1936,60 @@ impl App {
         self.status = help_panel_status("", help_entries("").len(), false);
     }
 
+    /// 取得目前選取項目的外部開啟目標資訊。
+    fn selected_open_target(&self) -> Option<OpenTarget> {
+        let pane = self.panes.get(&self.focused_pane)?;
+        let entry = pane.selected_entry()?;
+        Some(OpenTarget {
+            path: entry.path.clone(),
+            display_name: entry.display_name(),
+            is_dir: entry.is_dir,
+        })
+    }
+
+    /// 使用預設動作開啟目前選取項目。
+    pub(crate) fn open_selected_with_default(&mut self) -> io::Result<()> {
+        let Some(target) = self.selected_open_target() else {
+            self.status = String::from("nothing selected to open");
+            return Ok(());
+        };
+        self.queue_open_action(target, default_open_action())
+    }
+
+    /// 打開 `Open with` 面板，讓使用者選擇外部開啟方式。
+    pub(crate) fn open_selected_with_picker(&mut self) -> io::Result<()> {
+        let Some(target) = self.selected_open_target() else {
+            self.status = String::from("nothing selected to open");
+            return Ok(());
+        };
+
+        self.pending_action = Some(PendingAction::OpenPicker {
+            pane_id: self.focused_pane,
+            target: target.clone(),
+            selected: 0,
+        });
+        self.status = format!("open with: {}", target.display_name);
+        Ok(())
+    }
+
+    /// 將外部開啟動作排入待執行佇列。
+    fn queue_open_action(&mut self, target: OpenTarget, action: OpenAction) -> io::Result<()> {
+        let launch = build_launch_spec(&target, action)?;
+        self.pending_launch = Some(launch);
+        self.status = match action {
+            OpenAction::Editor => format!("opening {} with editor", target.display_name),
+            OpenAction::Vim => format!("opening {} with vim", target.display_name),
+            OpenAction::Open => format!("opening {}", target.display_name),
+            OpenAction::Reveal => format!("revealing {}", target.display_name),
+        };
+        Ok(())
+    }
+
+    /// 取出目前排隊中的外部開啟請求，交給主事件迴圈處理。
+    pub(crate) fn take_pending_launch(&mut self) -> Option<LaunchSpec> {
+        self.pending_launch.take()
+    }
+
     /// 以目前正在操作的上下文為返回點，打開 help 面板。
     pub(crate) fn open_help_from_current(&mut self) {
         self.help_return = self.capture_help_return_state();
@@ -1984,6 +2136,9 @@ impl App {
                 help_entries(&search.buffer).len(),
                 search.editing,
             ),
+            PendingAction::OpenPicker { target, .. } => {
+                format!("open with: {}", target.display_name)
+            }
             PendingAction::Rename { mode, .. } => match mode {
                 RenameMode::Insert => String::from("rename: insert"),
                 RenameMode::Normal => String::from("rename: normal"),
@@ -2965,6 +3120,33 @@ impl App {
                     }),
                     _ => None,
                 };
+                let picker_options = match &self.pending_action {
+                    Some(PendingAction::OpenPicker {
+                        pane_id: open_pane_id,
+                        target,
+                        ..
+                    }) if *open_pane_id == pane_id => Some(
+                        open_picker_options(target)
+                            .into_iter()
+                            .map(|option| option.label.to_string())
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                };
+                let picker_state = match &self.pending_action {
+                    Some(PendingAction::OpenPicker {
+                        pane_id: open_pane_id,
+                        selected,
+                        ..
+                    }) if *open_pane_id == pane_id => {
+                        picker_options.as_ref().map(|options| InlinePickerState {
+                            title: " Open with: ",
+                            options,
+                            selected: *selected,
+                        })
+                    }
+                    _ => None,
+                };
                 let trash_lines = if let Some(PendingAction::TrashPanel {
                     pane_id: action_pane_id,
                     selected,
@@ -3063,6 +3245,7 @@ impl App {
                     self.theme,
                     &self.config,
                     rename_buffer,
+                    picker_state,
                 );
                 if cursor_position.is_none() {
                     cursor_position = pane_cursor;
@@ -3183,7 +3366,9 @@ impl App {
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
-            Some(PendingAction::TrashPanel { .. }) | Some(PendingAction::HelpPanel { .. }) => {}
+            Some(PendingAction::TrashPanel { .. })
+            | Some(PendingAction::HelpPanel { .. })
+            | Some(PendingAction::OpenPicker { .. }) => {}
             Some(PendingAction::Rename { .. }) | Some(PendingAction::CreateEntry { .. }) => {}
             None => {}
         }
@@ -3416,6 +3601,30 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "p",
             "貼上剪貼簿項目到目前目錄",
             HelpAction::Command("paste"),
+        ),
+        help_entry(
+            ":open",
+            "o / Enter",
+            "用預設外部方式打開目前選取項目；文字檔走 $EDITOR，其他交給系統",
+            HelpAction::Command("open"),
+        ),
+        help_entry(
+            ":open-picker",
+            "O / Shift-Enter",
+            "打開 Open with 小視窗，手動選擇 Editor、Vim、Open 或 Reveal",
+            HelpAction::Command("open-picker"),
+        ),
+        help_entry(
+            ":vim",
+            "",
+            "直接用 vim 打開目前選取的檔案或目錄",
+            HelpAction::Command("vim"),
+        ),
+        help_entry(
+            ":reveal",
+            "",
+            "在系統檔案管理器中顯示目前選取的檔案或目錄",
+            HelpAction::Command("reveal"),
         ),
         help_entry(
             ":delete",
@@ -3859,6 +4068,7 @@ mod tests {
         config::{AppConfig, LoadedConfig, StartupSort},
         file_manager::{
             layout::{LayoutNode, SplitDirection},
+            open::LaunchMode,
             pane::SortMode,
         },
         theme::ThemePreset,
@@ -4167,10 +4377,14 @@ mod tests {
         app.open_trash_panel().expect("open trash");
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
             .expect("open help from trash");
-        for _ in 0..9 {
-            app.handle_pending_action_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .expect("move help selection");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start help search");
+        for ch in ['c', 'l', 'e', 'a', 'r'] {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type help query");
         }
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock help search");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("execute trash clear from help");
 
@@ -4185,6 +4399,62 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(app.status, "cleared 1 trash items");
+    }
+
+    #[test]
+    /// 驗證在一般列表按下 Enter 會依預設外部開啟規則排入文字編輯器啟動。
+    fn app_enter_queues_default_open_for_text_file() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("default open");
+
+        let launch = app.take_pending_launch().expect("launch");
+        let expected = if std::env::var("EDITOR")
+            .ok()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            LaunchMode::TerminalBlocking
+        } else {
+            LaunchMode::Detached
+        };
+        assert_eq!(launch.mode, expected);
+        assert_eq!(app.status, "opening notes.txt with editor");
+    }
+
+    #[test]
+    /// 驗證按下 `O` 會打開 inline `Open with` 小視窗。
+    fn app_shift_o_opens_open_picker() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT))
+            .expect("open picker");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::OpenPicker { .. })
+        ));
+    }
+
+    #[test]
+    /// 驗證選到資料夾時，預設外部開啟會走系統開啟模式，而不是終端編輯器。
+    fn app_open_directory_uses_detached_system_open() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open directory");
+
+        let launch = app.take_pending_launch().expect("launch");
+        assert_eq!(launch.mode, LaunchMode::Detached);
     }
 
     #[test]
@@ -4309,10 +4579,14 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.open_help_panel();
 
-        for _ in 0..5 {
-            app.handle_pending_action_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .expect("move to delete entry");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start help search");
+        for ch in ['d', 'e', 'l'] {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type help query");
         }
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock help search");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("execute delete from help");
 
