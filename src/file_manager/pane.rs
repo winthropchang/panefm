@@ -804,6 +804,26 @@ impl PaneState {
         Ok(())
     }
 
+    /// 將 pane 直接切換到指定路徑；若是目錄就進入該目錄，若是檔案就聚焦其所在位置。
+    ///
+    /// 參數：
+    /// - `path: &Path`，要前往的目標路徑，可以是目錄或檔案。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表 pane 已切換到對應位置。
+    /// - 失敗時代表目錄不存在或重新載入內容時發生 I/O 錯誤。
+    pub(crate) fn go_to_path(&mut self, path: &Path) -> io::Result<()> {
+        if path.is_dir() {
+            self.cwd = path.to_path_buf();
+            self.filter_query = None;
+            self.reload()?;
+            self.move_top();
+            Ok(())
+        } else {
+            self.reveal_path(path)
+        }
+    }
+
     /// 判斷目前是否仍處於過濾後的列表狀態。
     pub(crate) fn has_active_filter(&self) -> bool {
         self.filter_query.is_some()

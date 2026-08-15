@@ -79,6 +79,13 @@ pub(crate) struct HelpPanelLine {
     pub(crate) description: String,
 }
 
+/// 描述書籤列表彈窗中單一列要顯示的內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BookmarkPanelLine {
+    pub(crate) key: String,
+    pub(crate) path: String,
+}
+
 /// 繪製單一 pane 的檔案列表與預覽區。
 ///
 /// 參數：
@@ -655,6 +662,93 @@ pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, the
         ),
         panel_area,
     );
+}
+
+/// 在畫面中央繪製書籤列表彈窗，供 `:bookmark list` 使用。
+pub(crate) fn render_bookmark_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    lines: &[BookmarkPanelLine],
+    selected: usize,
+) {
+    let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
+    let popup_area = centered_rect(area, 68, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Bookmarks ",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let items = if lines.is_empty() {
+        vec![ListItem::new(Line::from("沒有書籤，按 m{key} 新增"))]
+    } else {
+        lines
+            .iter()
+            .map(|line| {
+                ListItem::new(Line::from(format!(
+                    "{:<4} {}",
+                    truncate_text(&line.key, 4),
+                    line.path
+                )))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut list_state = ListState::default();
+    if !lines.is_empty() {
+        list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+    }
+
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(theme.selected_item_style())
+            .highlight_symbol("▶ "),
+        inner,
+        &mut list_state,
+    );
+}
+
+/// 在指定 pane 區域中央繪製命令輸入視窗，並回傳游標位置。
+pub(crate) fn render_command_palette(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    buffer: &str,
+) -> (u16, u16) {
+    let popup_area = centered_rect(area, 70, 3);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Command ",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+    let inner = block.inner(popup_area);
+    frame.render_widget(
+        Paragraph::new(format!(":{}", buffer)).block(block),
+        popup_area,
+    );
+
+    (
+        inner
+            .x
+            .saturating_add(
+                buffer
+                    .chars()
+                    .count()
+                    .min(inner.width.saturating_sub(1) as usize) as u16,
+            )
+            .saturating_add(1),
+        inner.y,
+    )
 }
 
 /// 將過長文字裁切成指定寬度，避免面板欄位爆掉。

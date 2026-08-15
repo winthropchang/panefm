@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use crate::{
@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::{
+    bookmark::{BookmarkEntry, BookmarkStore, bookmark_file_path},
     layout::{LayoutNode, SplitDirection},
     open::{
         LaunchSpec, OpenAction, OpenTarget, build_launch_spec, default_open_action,
@@ -34,9 +35,10 @@ use super::{
     search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
     trash::{TrashListEntry, TrashStore},
     ui::{
-        HelpPanelLine, InlineEditorState, InlinePickerState, PaneListState, SearchListState,
-        TrashPanelLine, centered_rect, render_confirm_dialog, render_filter_input,
-        render_global_search_panel, render_pane, render_preview_search_input, render_theme_picker,
+        BookmarkPanelLine, HelpPanelLine, InlineEditorState, InlinePickerState, PaneListState,
+        SearchListState, TrashPanelLine, render_bookmark_picker, render_command_palette,
+        render_confirm_dialog, render_filter_input, render_global_search_panel, render_pane,
+        render_preview_search_input, render_theme_picker,
     },
 };
 
@@ -113,6 +115,13 @@ pub(crate) struct VisualSelectionState {
     pub(crate) current: usize,
 }
 
+/// 表示目前是否正在等待使用者補上書籤按鍵。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BookmarkPrompt {
+    Set,
+    Jump,
+}
+
 /// 描述暫時面板中的搜尋輸入狀態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PanelSearchState {
@@ -148,6 +157,10 @@ pub(crate) enum PendingAction {
         selected: usize,
         search: PanelSearchState,
     },
+    BookmarkList {
+        pane_id: usize,
+        selected: usize,
+    },
     OpenPicker {
         pane_id: usize,
         target: OpenTarget,
@@ -178,6 +191,7 @@ pub(crate) struct App {
     pub(crate) theme: Theme,
     pub(crate) theme_preset: ThemePreset,
     pub(crate) trash_store: TrashStore,
+    pub(crate) bookmark_store: BookmarkStore,
     pub(crate) panes: BTreeMap<usize, PaneState>,
     pub(crate) layout: LayoutNode,
     pub(crate) focused_pane: usize,
@@ -188,6 +202,7 @@ pub(crate) struct App {
     pub(crate) awaiting_ctrl_w: bool,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
+    pub(crate) pending_bookmark: Option<BookmarkPrompt>,
     pub(crate) clipboard: Option<ClipboardState>,
     pub(crate) filter: Option<FilterState>,
     pub(crate) preview_search: Option<PreviewSearchState>,
@@ -211,6 +226,7 @@ pub(crate) enum HelpReturnState {
     VisualSelection(VisualSelectionState),
     CommandMode(String),
     AwaitingCtrlW,
+    PendingBookmark(BookmarkPrompt),
     PreviewFocus(usize),
 }
 
@@ -226,21 +242,25 @@ impl App {
     /// - 失敗時回傳建立第一個 pane 或載入目錄時的 I/O 錯誤。
     pub(crate) fn new(cwd: PathBuf, loaded_config: LoadedConfig) -> io::Result<Self> {
         let trash_store = TrashStore::new(&cwd)?;
+        let LoadedConfig { config, source } = loaded_config;
+        let bookmark_store = BookmarkStore::load(bookmark_file_path(&cwd, source.as_deref()))
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let mut pane = PaneState::new(cwd)?;
-        apply_config_to_pane(&loaded_config.config, &mut pane);
+        apply_config_to_pane(&config, &mut pane);
         let mut panes = BTreeMap::new();
         panes.insert(1, pane);
-        let theme_preset = loaded_config.config.ui.theme_preset;
-        let startup_status = match loaded_config.source {
+        let theme_preset = config.ui.theme_preset;
+        let startup_status = match source {
             Some(path) => format!("loaded config: {}", path.display()),
             None => String::from("normal mode"),
         };
 
         Ok(Self {
-            config: loaded_config.config,
+            config,
             theme: theme_preset.into(),
             theme_preset,
             trash_store,
+            bookmark_store,
             panes,
             layout: LayoutNode::Leaf { pane_id: 1 },
             focused_pane: 1,
@@ -251,6 +271,7 @@ impl App {
             awaiting_ctrl_w: false,
             pending_g: false,
             pending_y: false,
+            pending_bookmark: None,
             clipboard: None,
             filter: None,
             preview_search: None,
@@ -302,6 +323,9 @@ impl App {
             self.awaiting_ctrl_w = false;
             return self.handle_ctrl_w(key);
         }
+        if self.pending_bookmark.is_some() {
+            return self.handle_bookmark_key(key);
+        }
         if self.preview_focus == Some(self.focused_pane) {
             return self.handle_preview_key(key);
         }
@@ -326,12 +350,15 @@ impl App {
 
         let should_continue = match key.code {
             KeyCode::Char('q') => false,
-            KeyCode::Char(':') => {
+            KeyCode::Char(':') | KeyCode::Char(';')
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.command_mode = true;
                 self.command_buffer.clear();
                 self.status = String::from("command mode");
                 self.pending_g = false;
                 self.pending_y = false;
+                self.pending_bookmark = None;
                 true
             }
             KeyCode::Char('j') => {
@@ -453,6 +480,7 @@ impl App {
             }
             KeyCode::Char('y') => {
                 self.pending_g = false;
+                self.pending_bookmark = None;
                 if self.pending_y {
                     self.copy_selected();
                     self.pending_y = false;
@@ -462,22 +490,39 @@ impl App {
                 }
                 true
             }
+            KeyCode::Char('m') => {
+                self.pending_g = false;
+                self.pending_y = false;
+                self.pending_bookmark = Some(BookmarkPrompt::Set);
+                self.status = String::from("bookmark: press a key to save current directory");
+                true
+            }
+            KeyCode::Char('\'') => {
+                self.pending_g = false;
+                self.pending_y = false;
+                self.pending_bookmark = Some(BookmarkPrompt::Jump);
+                self.status = String::from("bookmark: press a key to jump");
+                true
+            }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
                 self.pending_y = false;
+                self.pending_bookmark = None;
                 self.status = String::from("Ctrl-w");
                 true
             }
             KeyCode::Esc => {
                 self.pending_g = false;
                 self.pending_y = false;
+                self.pending_bookmark = None;
                 self.handle_escape_in_normal_mode();
                 true
             }
             _ => {
                 self.pending_g = false;
                 self.pending_y = false;
+                self.pending_bookmark = None;
                 true
             }
         };
@@ -1225,6 +1270,54 @@ impl App {
                     self.status = status;
                 }
             }
+            PendingAction::BookmarkList {
+                pane_id,
+                mut selected,
+            } => {
+                let entries = self.bookmark_store.list();
+                let len = entries.len();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if len > 0 {
+                            selected = (selected + 1).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_g = false;
+                    }
+                    KeyCode::Char('g') => {
+                        if self.pending_g {
+                            selected = 0;
+                            self.pending_g = false;
+                        } else {
+                            self.pending_g = true;
+                        }
+                    }
+                    KeyCode::Char('G') => {
+                        if len > 0 {
+                            selected = len - 1;
+                        }
+                        self.pending_g = false;
+                    }
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        self.pending_g = false;
+                        self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                        return Ok(true);
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
+                    _ => {
+                        self.pending_g = false;
+                    }
+                }
+                self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
+                self.status = bookmark_list_status(len, selected);
+            }
             PendingAction::OpenPicker {
                 pane_id,
                 target,
@@ -1746,6 +1839,7 @@ impl App {
             "search" => self.open_global_search()?,
             "trash" => self.open_trash_panel()?,
             "help" => self.open_help_panel(),
+            "bookmark list" => self.open_bookmark_list(),
             "restore" => self.restore_latest_from_trash()?,
             "trash clear" => self.clear_trash()?,
             "trash restore-all" => self.restore_all_from_trash()?,
@@ -1761,6 +1855,10 @@ impl App {
                     self.set_theme_by_name(name.trim());
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;
+                } else if let Some(args) = other.strip_prefix("bookmark set ") {
+                    self.set_bookmark_from_command(args.trim())?;
+                } else if let Some(args) = other.strip_prefix("bookmark jump ") {
+                    self.jump_to_bookmark_from_command(args.trim())?;
                 } else {
                     self.status = format!("unknown command: {other}");
                 }
@@ -1936,6 +2034,123 @@ impl App {
         self.status = help_panel_status("", help_entries("").len(), false);
     }
 
+    /// 打開書籤列表彈窗，讓使用者可以用列表方式查看與跳轉書籤。
+    pub(crate) fn open_bookmark_list(&mut self) {
+        self.pending_action = Some(PendingAction::BookmarkList {
+            pane_id: self.focused_pane,
+            selected: 0,
+        });
+        self.status = bookmark_list_status(self.bookmark_store.list().len(), 0);
+    }
+
+    /// 處理等待書籤按鍵時的輸入。
+    pub(crate) fn handle_bookmark_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(prompt) = self.pending_bookmark.take() else {
+            return Ok(true);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.status = String::from("normal mode");
+            }
+            KeyCode::Char(bookmark) => match prompt {
+                BookmarkPrompt::Set => self.set_bookmark(bookmark)?,
+                BookmarkPrompt::Jump => self.jump_to_bookmark(bookmark)?,
+            },
+            _ => {
+                self.pending_bookmark = Some(prompt);
+                self.status = match prompt {
+                    BookmarkPrompt::Set => String::from("bookmark: use a single character key"),
+                    BookmarkPrompt::Jump => String::from("bookmark: choose an existing key"),
+                };
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// 將目前焦點 pane 的目錄存成書籤。
+    fn set_bookmark(&mut self, key: char) -> io::Result<()> {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        self.bookmark_store
+            .set(key, pane.cwd.clone())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.status = format!("bookmark [{key}] = {}", pane.cwd.display());
+        Ok(())
+    }
+
+    /// 跳到指定書籤對應的路徑。
+    fn jump_to_bookmark(&mut self, key: char) -> io::Result<()> {
+        let Some(path) = self.bookmark_store.get(key).cloned() else {
+            self.status = format!("bookmark [{key}] not found");
+            return Ok(());
+        };
+
+        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        if !path.exists() {
+            self.status = format!("bookmark [{key}] missing: {}", path.display());
+            return Ok(());
+        }
+
+        pane.go_to_path(&path)?;
+        self.status = format!("jumped to bookmark [{key}]");
+        Ok(())
+    }
+
+    /// 讓 `:bookmark set <key>` 可以直接把目前目錄存成指定書籤。
+    fn set_bookmark_from_command(&mut self, args: &str) -> io::Result<()> {
+        let Some(key) = parse_bookmark_argument(args) else {
+            self.status = String::from("usage: bookmark set <key>");
+            return Ok(());
+        };
+        self.set_bookmark(key)
+    }
+
+    /// 讓 `:bookmark jump <key>` 可以直接跳到指定書籤。
+    fn jump_to_bookmark_from_command(&mut self, args: &str) -> io::Result<()> {
+        let Some(key) = parse_bookmark_argument(args) else {
+            self.status = String::from("usage: bookmark jump <key>");
+            return Ok(());
+        };
+        self.jump_to_bookmark(key)
+    }
+
+    /// 從書籤列表彈窗中打開目前選取的書籤。
+    fn open_bookmark_from_list(
+        &mut self,
+        pane_id: usize,
+        entries: &[BookmarkEntry],
+        selected: usize,
+    ) -> io::Result<()> {
+        let Some(entry) = entries.get(selected) else {
+            self.status = String::from("bookmark list: empty");
+            return Ok(());
+        };
+        let Some(path) = self.bookmark_store.get(entry.key).cloned() else {
+            self.status = format!("bookmark [{}] not found", entry.key);
+            return Ok(());
+        };
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        if !path.exists() {
+            self.status = format!("bookmark [{}] missing: {}", entry.key, path.display());
+            return Ok(());
+        }
+        pane.go_to_path(&path)?;
+        self.focused_pane = pane_id;
+        self.status = format!("jumped to bookmark [{}]", entry.key);
+        Ok(())
+    }
+
     /// 取得目前選取項目的外部開啟目標資訊。
     fn selected_open_target(&self) -> Option<OpenTarget> {
         let pane = self.panes.get(&self.focused_pane)?;
@@ -2032,6 +2247,9 @@ impl App {
             self.awaiting_ctrl_w = false;
             return Some(HelpReturnState::AwaitingCtrlW);
         }
+        if let Some(prompt) = self.pending_bookmark.take() {
+            return Some(HelpReturnState::PendingBookmark(prompt));
+        }
         if let Some(pane_id) = self.preview_focus {
             return Some(HelpReturnState::PreviewFocus(pane_id));
         }
@@ -2093,6 +2311,15 @@ impl App {
                 self.awaiting_ctrl_w = true;
                 self.status = String::from("Ctrl-w");
             }
+            HelpReturnState::PendingBookmark(prompt) => {
+                self.pending_bookmark = Some(prompt);
+                self.status = match prompt {
+                    BookmarkPrompt::Set => {
+                        String::from("bookmark: press a key to save current directory")
+                    }
+                    BookmarkPrompt::Jump => String::from("bookmark: press a key to jump"),
+                };
+            }
             HelpReturnState::PreviewFocus(pane_id) => {
                 self.preview_focus = Some(pane_id);
                 self.status = String::from("preview mode");
@@ -2136,6 +2363,9 @@ impl App {
                 help_entries(&search.buffer).len(),
                 search.editing,
             ),
+            PendingAction::BookmarkList { selected, .. } => {
+                bookmark_list_status(self.bookmark_store.list().len(), *selected)
+            }
             PendingAction::OpenPicker { target, .. } => {
                 format!("open with: {}", target.display_name)
             }
@@ -3258,6 +3488,8 @@ impl App {
             Span::raw(" move  "),
             Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
+            Span::styled("m / '", self.theme.accent_style()),
+            Span::raw(" bookmark  "),
             Span::styled("V", self.theme.accent_style()),
             Span::raw(" visual mark  "),
             Span::styled("yy", self.theme.accent_style()),
@@ -3312,14 +3544,14 @@ impl App {
         };
         frame.render_widget(Paragraph::new(status_text), outer[2]);
 
-        if self.command_mode {
-            let area = centered_rect(frame.area(), 70, 3);
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(format!(":{}", self.command_buffer))
-                    .block(Block::default().title("Command").borders(Borders::ALL)),
-                area,
-            );
+        if self.command_mode
+            && let Some(area) = pane_rects.get(&self.focused_pane)
+        {
+            let command_cursor =
+                render_command_palette(frame, *area, self.theme, &self.command_buffer);
+            if cursor_position.is_none() {
+                cursor_position = Some(command_cursor);
+            }
         }
 
         if let Some(filter) = &self.filter
@@ -3365,6 +3597,12 @@ impl App {
             }
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
+            }
+            Some(PendingAction::BookmarkList { pane_id, selected }) => {
+                let lines = bookmark_panel_lines(self.bookmark_store.list());
+                if let Some(area) = pane_rects.get(pane_id) {
+                    render_bookmark_picker(frame, *area, self.theme, &lines, *selected);
+                }
             }
             Some(PendingAction::TrashPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
@@ -3500,6 +3738,48 @@ fn sort_mode_from_config(sort: StartupSort, reverse: bool) -> SortMode {
     }
 }
 
+/// 將書籤資料轉成彈窗可直接顯示的列內容。
+fn bookmark_panel_lines(entries: Vec<BookmarkEntry>) -> Vec<BookmarkPanelLine> {
+    entries
+        .into_iter()
+        .map(|entry| BookmarkPanelLine {
+            key: format!("[{}]", entry.key),
+            path: entry.path.display().to_string(),
+        })
+        .collect()
+}
+
+/// 從命令列參數中取出單一書籤按鍵。
+///
+/// 參數：
+/// - `args: &str`，使用者在 `:bookmark ...` 後輸入的內容。
+///
+/// 回傳：`Option<char>`。
+/// - `Some(char)` 代表成功解析出唯一按鍵。
+/// - `None` 代表輸入為空，或不是單一字元。
+fn parse_bookmark_argument(args: &str) -> Option<char> {
+    let trimmed = args.trim();
+    let mut chars = trimmed.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() || key.is_whitespace() {
+        return None;
+    }
+    Some(key)
+}
+
+/// 根據目前書籤彈窗的內容，產生適合顯示在狀態列的提示文字。
+fn bookmark_list_status(count: usize, selected: usize) -> String {
+    if count == 0 {
+        String::from("bookmark list: empty")
+    } else {
+        format!(
+            "bookmarks: {}/{} (j/k move, Enter open, Esc close)",
+            selected.saturating_add(1).min(count),
+            count
+        )
+    }
+}
+
 /// 描述 help 面板中某一列按下 Enter 後要執行的行為。
 #[derive(Clone, Copy)]
 enum HelpAction {
@@ -3583,6 +3863,24 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "a",
             "建立新檔案、資料夾或巢狀路徑",
             HelpAction::Command("create"),
+        ),
+        help_entry(
+            ":bookmark set",
+            "m{key}",
+            "把目前 pane 的目錄記成書籤，之後可快速跳回來",
+            HelpAction::Command("bookmark list"),
+        ),
+        help_entry(
+            ":bookmark jump",
+            "'{key}",
+            "跳到已記錄的書籤目錄；設定檔中的固定書籤也能直接使用",
+            HelpAction::Command("bookmark list"),
+        ),
+        help_entry(
+            ":bookmark list",
+            "",
+            "列出目前可用的書籤按鍵與對應路徑",
+            HelpAction::Command("bookmark list"),
         ),
         help_entry(
             ":copy",
@@ -4060,8 +4358,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, ClipboardOperation, FilterState, PendingAction, RenameMode, help_entries,
-        rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
+        App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RenameMode,
+        help_entries, rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
         rename_word_end,
     };
     use crate::{
@@ -4455,6 +4753,170 @@ mod tests {
 
         let launch = app.take_pending_launch().expect("launch");
         assert_eq!(launch.mode, LaunchMode::Detached);
+    }
+
+    #[test]
+    /// 驗證可以用 `m{key}` 記錄目前目錄，再用 `'{key}` 跳回該書籤。
+    fn app_bookmark_set_and_jump_with_keys() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        let src = dir.path().join("src");
+        fs::create_dir(&docs).expect("docs");
+        fs::create_dir(&src).expect("src");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .go_to_path(&docs)
+            .expect("go docs");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("start bookmark set");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("save bookmark");
+
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .go_to_path(&src)
+            .expect("go src");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('\''), KeyModifiers::NONE))
+            .expect("start bookmark jump");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("jump bookmark");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
+        assert_eq!(app.status, "jumped to bookmark [a]");
+        assert!(
+            fs::read_to_string(dir.path().join("bookmark.toml"))
+                .expect("bookmark file")
+                .contains("a =")
+        );
+    }
+
+    #[test]
+    /// 驗證 `bookmark.toml` 中既有的書籤可以在啟動後直接用命令跳轉。
+    fn app_bookmark_jump_command_uses_bookmark_file() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        fs::create_dir(&docs).expect("docs");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("d = \"{}\"\n", docs.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("bookmark jump d")
+            .expect("jump command");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
+        assert_eq!(app.status, "jumped to bookmark [d]");
+    }
+
+    #[test]
+    /// 驗證等待書籤按鍵時打開 F1，離開 help 後仍能回到原本的書籤等待狀態。
+    fn app_help_panel_restores_pending_bookmark_prompt() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("start bookmark set");
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close help");
+
+        assert_eq!(app.pending_bookmark, Some(BookmarkPrompt::Set));
+        assert_eq!(
+            app.status,
+            "bookmark: press a key to save current directory"
+        );
+    }
+
+    #[test]
+    /// 驗證 `:bookmark list` 會打開彈窗，並可用 Enter 跳到選中的書籤。
+    fn app_bookmark_list_popup_opens_and_jumps() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("bookmark list").expect("open list");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::BookmarkList {
+                pane_id: 1,
+                selected: 0
+            })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open bookmark");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, beta);
+        assert_eq!(app.status, "jumped to bookmark [b]");
+    }
+
+    #[test]
+    /// 驗證書籤列表會綁在開啟它的 pane 上，從第二個 pane 打開時也只影響第二個 pane。
+    fn app_bookmark_list_is_scoped_to_focused_pane() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+
+        app.execute_command("bookmark list").expect("open list");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::BookmarkList {
+                pane_id: 2,
+                selected: 0
+            })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open bookmark");
+
+        assert_eq!(app.panes.get(&2).expect("pane").cwd, beta);
+        assert_ne!(app.panes.get(&1).expect("pane").cwd, beta);
+    }
+
+    #[test]
+    /// 驗證 `Shift+;` 也能正確打開命令模式，避免不同終端的事件格式造成 `:` 失效。
+    fn app_shift_semicolon_opens_command_mode() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "");
+        assert_eq!(app.status, "command mode");
     }
 
     #[test]
