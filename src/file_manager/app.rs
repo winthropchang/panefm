@@ -1,6 +1,6 @@
 use std::{
-    collections::BTreeMap,
-    io,
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
     path::PathBuf,
     sync::{
         Arc,
@@ -13,6 +13,7 @@ use std::{
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use regex::Regex;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     text::{Line, Span},
@@ -36,9 +37,10 @@ use super::{
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, HelpPanelLine, InlineEditorState, InlinePickerState, PaneListState,
-        SearchListState, TrashPanelLine, render_bookmark_picker, render_command_palette,
-        render_confirm_dialog, render_filter_input, render_global_search_panel, render_pane,
-        render_preview_search_input, render_theme_picker,
+        RegexRenamePanelLine, SearchListState, TrashPanelLine, render_bookmark_picker,
+        render_command_palette, render_confirm_dialog, render_filter_input,
+        render_global_search_panel, render_pane, render_preview_search_input,
+        render_theme_picker,
     },
 };
 
@@ -129,6 +131,24 @@ pub(crate) struct PanelSearchState {
     pub(crate) editing: bool,
 }
 
+/// 描述 regex 批次改名預覽中每一列的運算結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegexRenamePreview {
+    pub(crate) source_path: PathBuf,
+    pub(crate) original_name: String,
+    pub(crate) new_name: String,
+    pub(crate) outcome: RegexRenameOutcome,
+}
+
+/// 表示 regex 批次改名預覽中這一列目前是可套用、無變化或有衝突。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegexRenameOutcome {
+    Ready,
+    Unchanged,
+    Conflict,
+    Invalid,
+}
+
 /// 表示目前正在等待使用者完成的暫時互動。
 ///
 /// 只要有 pending action，輸入會先被它攔截，
@@ -178,6 +198,13 @@ pub(crate) enum PendingAction {
         buffer: String,
         cursor: usize,
         mode: RenameMode,
+    },
+    RegexRename {
+        pane_id: usize,
+        pattern: String,
+        replacement: String,
+        selected: usize,
+        previews: Vec<RegexRenamePreview>,
     },
 }
 
@@ -668,8 +695,10 @@ impl App {
         };
 
         match key.code {
-            KeyCode::Char(c) => {
-                search.buffer.push(c);
+            KeyCode::Char(_) => {
+                if let Some(c) = typed_char_from_key(&key) {
+                    search.buffer.push(c);
+                }
                 self.apply_preview_search_buffer(&search);
                 self.status =
                     preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
@@ -711,8 +740,10 @@ impl App {
 
         if search.editing {
             match key.code {
-                KeyCode::Char(c) => {
-                    search.buffer.push(c);
+                KeyCode::Char(_) => {
+                    if let Some(c) = typed_char_from_key(&key) {
+                        search.buffer.push(c);
+                    }
                     search.searched = false;
                     search.loading = false;
                     search.selected = 0;
@@ -844,8 +875,10 @@ impl App {
         };
 
         match key.code {
-            KeyCode::Char(c) => {
-                filter.buffer.push(c);
+            KeyCode::Char(_) => {
+                if let Some(c) = typed_char_from_key(&key) {
+                    filter.buffer.push(c);
+                }
                 self.apply_filter_buffer(&filter);
                 self.status = if filter.buffer.is_empty() {
                     String::from("filter: all")
@@ -983,8 +1016,10 @@ impl App {
                 let len = entries.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(c) => {
-                            search.buffer.push(c);
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                search.buffer.push(c);
+                            }
                             selected = 0;
                         }
                         KeyCode::Backspace => {
@@ -1224,8 +1259,10 @@ impl App {
                 let filtered_len = filtered_entries.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(c) => {
-                            search.buffer.push(c);
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                search.buffer.push(c);
+                            }
                             selected = 0;
                         }
                         KeyCode::Backspace => {
@@ -1421,8 +1458,10 @@ impl App {
                 mut mode,
             } => match mode {
                 RenameMode::Insert => match key.code {
-                    KeyCode::Char(c) => {
-                        insert_char(&mut buffer, &mut cursor, c);
+                    KeyCode::Char(_) => {
+                        if let Some(c) = typed_char_from_key(&key) {
+                            insert_char(&mut buffer, &mut cursor, c);
+                        }
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
                             original_name,
@@ -1617,8 +1656,10 @@ impl App {
                 mut mode,
             } => match mode {
                 RenameMode::Insert => match key.code {
-                    KeyCode::Char(c) => {
-                        insert_char(&mut buffer, &mut cursor, c);
+                    KeyCode::Char(_) => {
+                        if let Some(c) = typed_char_from_key(&key) {
+                            insert_char(&mut buffer, &mut cursor, c);
+                        }
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
                             buffer,
@@ -1789,6 +1830,90 @@ impl App {
                     }
                 },
             },
+            PendingAction::RegexRename {
+                pane_id,
+                pattern,
+                replacement,
+                mut selected,
+                previews,
+            } => {
+                let len = previews.len();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if len > 0 {
+                            selected = (selected + 1).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    KeyCode::Char('g') => {
+                        if self.pending_g {
+                            selected = 0;
+                            self.pending_g = false;
+                        } else {
+                            self.pending_g = true;
+                        }
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    _ if key_matches_shifted_letter(&key, 'G') => {
+                        if len > 0 {
+                            selected = len - 1;
+                        }
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        self.pending_g = false;
+                        self.apply_regex_rename_preview(pane_id, &previews)?;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                        self.pending_g = false;
+                        self.status = String::from("regex rename cancelled");
+                    }
+                    _ => {
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                }
+                if let Some(action) = self.pending_action.as_ref() {
+                    self.status = self.status_for_pending_action(action)?;
+                }
+            }
         }
 
         Ok(true)
@@ -1810,7 +1935,11 @@ impl App {
                 self.command_mode = false;
                 self.execute_command(command.trim())?;
             }
-            KeyCode::Char(c) => self.command_buffer.push(c),
+            KeyCode::Char(_) => {
+                if let Some(c) = typed_char_from_key(&key) {
+                    self.command_buffer.push(c);
+                }
+            }
             _ => {}
         }
         Ok(true)
@@ -1897,12 +2026,17 @@ impl App {
             "vsplit" => self.split_current(SplitDirection::Vertical)?,
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
+            "rename-regex" => {
+                self.status = String::from("usage: rename-regex <pattern> <replace>");
+            }
             "" => self.status = String::from("normal mode"),
             other => {
                 if let Some(name) = other.strip_prefix("theme ") {
                     self.set_theme_by_name(name.trim());
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;
+                } else if let Some(args) = other.strip_prefix("rename-regex ") {
+                    self.start_regex_rename_from_command(args)?;
                 } else if let Some(args) = other.strip_prefix("move-panel ") {
                     self.move_selected_to_pane_id(args.trim())?;
                 } else if let Some(path) = other.strip_prefix("move ") {
@@ -2429,6 +2563,12 @@ impl App {
                 RenameMode::Insert => create_status_label("insert"),
                 RenameMode::Normal => create_status_label("normal"),
             },
+            PendingAction::RegexRename {
+                previews,
+                pattern,
+                replacement,
+                ..
+            } => regex_rename_status(pattern, replacement, previews),
         })
     }
 
@@ -2491,6 +2631,107 @@ impl App {
             mode: RenameMode::Insert,
         });
         self.status = create_status_label("insert");
+    }
+
+    /// 解析 `:rename-regex` 指令參數，並建立批次改名預覽。
+    ///
+    /// 參數：
+    /// - `args: &str`，使用者輸入在 `rename-regex` 後面的原始參數字串。
+    ///
+    /// 回傳：`io::Result<()>`。
+    pub(crate) fn start_regex_rename_from_command(&mut self, args: &str) -> io::Result<()> {
+        let parsed = shlex::split(args).unwrap_or_default();
+        if parsed.len() != 2 {
+            self.status = String::from("usage: rename-regex <pattern> <replace>");
+            return Ok(());
+        }
+        self.open_regex_rename_preview(&parsed[0], &parsed[1])
+    }
+
+    /// 依照 regex 規則建立目前選取項目的批次改名預覽。
+    ///
+    /// 參數：
+    /// - `pattern: &str`，要用來匹配檔名的 regex。
+    /// - `replacement: &str`，匹配後要替換成的新文字，支援 `$1` 這類群組語法。
+    ///
+    /// 回傳：`io::Result<()>`。
+    pub(crate) fn open_regex_rename_preview(
+        &mut self,
+        pattern: &str,
+        replacement: &str,
+    ) -> io::Result<()> {
+        let regex = match Regex::new(pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                self.status = format!("invalid regex: {error}");
+                return Ok(());
+            }
+        };
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        let entries = pane.selected_or_marked_entries();
+        if entries.is_empty() {
+            self.status = String::from("nothing selected to rename");
+            return Ok(());
+        }
+
+        let selected_paths = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<BTreeSet<_>>();
+        let existing_names = pane
+            .entries
+            .iter()
+            .filter(|entry| !selected_paths.contains(&entry.path))
+            .map(|entry| entry.name.clone())
+            .collect::<BTreeSet<_>>();
+
+        let mut previews = entries
+            .into_iter()
+            .map(|entry| {
+                let new_name = regex.replace_all(&entry.name, replacement).into_owned();
+                let outcome = classify_regex_rename_preview(&entry.name, &new_name);
+                RegexRenamePreview {
+                    source_path: entry.path,
+                    original_name: entry.name,
+                    new_name,
+                    outcome,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut target_counts = BTreeMap::new();
+        for preview in previews
+            .iter()
+            .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Ready))
+        {
+            *target_counts.entry(preview.new_name.clone()).or_insert(0usize) += 1;
+        }
+
+        for preview in &mut previews {
+            if !matches!(preview.outcome, RegexRenameOutcome::Ready) {
+                continue;
+            }
+            if target_counts.get(&preview.new_name).copied().unwrap_or(0) > 1
+                || existing_names.contains(&preview.new_name)
+            {
+                preview.outcome = RegexRenameOutcome::Conflict;
+            }
+        }
+
+        self.pending_action = Some(PendingAction::RegexRename {
+            pane_id: self.focused_pane,
+            pattern: pattern.to_string(),
+            replacement: replacement.to_string(),
+            selected: 0,
+            previews,
+        });
+        if let Some(action) = self.pending_action.as_ref() {
+            self.status = self.status_for_pending_action(action)?;
+        }
+        Ok(())
     }
 
     /// 打開 filter 輸入框，並以目前焦點 pane 作為過濾目標。
@@ -3000,6 +3241,81 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    /// 真正執行 regex 批次改名預覽中所有可套用的項目。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，發起這次批次改名的 pane。
+    /// - `previews: &[RegexRenamePreview]`，先前建立好的預覽結果。
+    ///
+    /// 回傳：`io::Result<()>`。
+    pub(crate) fn apply_regex_rename_preview(
+        &mut self,
+        pane_id: usize,
+        previews: &[RegexRenamePreview],
+    ) -> io::Result<()> {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        let cwd = pane.cwd.clone();
+        let ready = previews
+            .iter()
+            .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Ready))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if previews.iter().any(|preview| {
+            matches!(
+                preview.outcome,
+                RegexRenameOutcome::Conflict | RegexRenameOutcome::Invalid
+            )
+        }) {
+            self.status = String::from("rename-regex: resolve conflicts before apply");
+            return Ok(());
+        }
+        if ready.is_empty() {
+            self.status = String::from("rename-regex: nothing to apply");
+            return Ok(());
+        }
+
+        let staged = ready
+            .iter()
+            .enumerate()
+            .map(|(index, preview)| {
+                let temp_path = unique_regex_rename_temp_path(
+                    &cwd,
+                    &preview.original_name,
+                    index,
+                    &ready,
+                );
+                (
+                    preview.source_path.clone(),
+                    temp_path,
+                    cwd.join(&preview.new_name),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (source_path, temp_path, _) in &staged {
+            fs::rename(source_path, temp_path)?;
+        }
+
+        for (_, temp_path, final_path) in &staged {
+            if let Err(error) = fs::rename(temp_path, final_path) {
+                self.status = format!("rename-regex failed: {error}");
+                return Ok(());
+            }
+        }
+
+        self.reload_all_panes()?;
+        self.status = if ready.len() == 1 {
+            String::from("rename-regex: renamed 1 item")
+        } else {
+            format!("rename-regex: renamed {} items", ready.len())
+        };
         Ok(())
     }
 
@@ -3576,6 +3892,20 @@ impl App {
                 } else {
                     None
                 };
+                let regex_rename_lines = if let Some(PendingAction::RegexRename {
+                    pane_id: action_pane_id,
+                    previews,
+                    ..
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(regex_rename_panel_lines(previews))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let panel_state = if let Some(search) = self.global_search.as_ref() {
                     (search.pane_id == pane_id && (search.loading || search.searched)).then_some(
                         PaneListState::Search(SearchListState {
@@ -3613,6 +3943,20 @@ impl App {
                             selected: *selected,
                             search: &search.buffer,
                             editing: search.editing,
+                        })
+                    } else {
+                        None
+                    }
+                } else if let Some(PendingAction::RegexRename {
+                    pane_id: action_pane_id,
+                    selected,
+                    ..
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(PaneListState::RegexRename {
+                            lines: regex_rename_lines.as_deref().unwrap_or(&[]),
+                            selected: *selected,
                         })
                     } else {
                         None
@@ -3766,7 +4110,8 @@ impl App {
             }
             Some(PendingAction::TrashPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
-            | Some(PendingAction::OpenPicker { .. }) => {}
+            | Some(PendingAction::OpenPicker { .. })
+            | Some(PendingAction::RegexRename { .. }) => {}
             Some(PendingAction::Rename { .. }) | Some(PendingAction::CreateEntry { .. }) => {}
             None => {}
         }
@@ -3941,6 +4286,129 @@ fn parse_pane_id_argument(args: &str) -> Option<usize> {
     (id > 0).then_some(id)
 }
 
+/// 判斷 regex 批次改名某一列目前屬於可改名、無變化還是無效名稱。
+fn classify_regex_rename_preview(original_name: &str, new_name: &str) -> RegexRenameOutcome {
+    if new_name == original_name {
+        return RegexRenameOutcome::Unchanged;
+    }
+    if new_name.is_empty()
+        || new_name == "."
+        || new_name == ".."
+        || new_name.contains('/')
+        || new_name.contains('\\')
+    {
+        return RegexRenameOutcome::Invalid;
+    }
+    RegexRenameOutcome::Ready
+}
+
+/// 將 regex 批次改名預覽轉成 pane 可直接顯示的列表內容。
+fn regex_rename_panel_lines(previews: &[RegexRenamePreview]) -> Vec<RegexRenamePanelLine> {
+    previews
+        .iter()
+        .map(|preview| RegexRenamePanelLine {
+            original_name: preview.original_name.clone(),
+            new_name: preview.new_name.clone(),
+            status: match preview.outcome {
+                RegexRenameOutcome::Ready => String::from("ready"),
+                RegexRenameOutcome::Unchanged => String::from("unchanged"),
+                RegexRenameOutcome::Conflict => String::from("conflict"),
+                RegexRenameOutcome::Invalid => String::from("invalid"),
+            },
+        })
+        .collect()
+}
+
+/// 根據目前 preview 內容整理 regex 批次改名面板的狀態列文字。
+fn regex_rename_status(
+    pattern: &str,
+    replacement: &str,
+    previews: &[RegexRenamePreview],
+) -> String {
+    let ready = previews
+        .iter()
+        .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Ready))
+        .count();
+    let unchanged = previews
+        .iter()
+        .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Unchanged))
+        .count();
+    let conflicts = previews
+        .iter()
+        .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Conflict))
+        .count();
+    let invalid = previews
+        .iter()
+        .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Invalid))
+        .count();
+    format!(
+        "rename-regex /{pattern}/ -> {replacement}  [ready:{ready} unchanged:{unchanged} conflict:{conflicts} invalid:{invalid}]"
+    )
+}
+
+/// 產生一個不會和當前批次改名結果衝突的暫存路徑，供兩階段 rename 使用。
+fn unique_regex_rename_temp_path(
+    cwd: &std::path::Path,
+    original_name: &str,
+    index: usize,
+    previews: &[RegexRenamePreview],
+) -> PathBuf {
+    let mut attempt = 0usize;
+    loop {
+        let candidate = cwd.join(format!(
+            ".tfm-rename-regex-{index}-{attempt}-{original_name}"
+        ));
+        let used_as_target = previews
+            .iter()
+            .any(|preview| cwd.join(&preview.new_name) == candidate);
+        if !candidate.exists() && !used_as_target {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+/// 把終端送進來的按鍵事件轉成使用者真正想輸入的字元。
+///
+/// 這個 helper 主要用在命令列、rename、search 這類文字輸入框。
+/// 某些終端在 macOS 上會把 `Shift+6` 回報成 `Char('6') + Shift`，
+/// 若直接把底層字元寫進 buffer，就會得到 `6` 而不是 `^`。
+fn typed_char_from_key(key: &KeyEvent) -> Option<char> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return Some(c);
+    }
+
+    Some(match c {
+        'a'..='z' => c.to_ascii_uppercase(),
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '\\' => '|',
+        '`' => '~',
+        other => other,
+    })
+}
+
 /// 判斷某些終端送出的 `Shift+字母` 是否應視為大寫命令。
 ///
 /// 參數：
@@ -4046,6 +4514,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "r",
             "重新命名目前選取的檔案或資料夾",
             HelpAction::Command("rename"),
+        ),
+        help_entry(
+            ":rename-regex",
+            "",
+            "對目前選取或標記項目建立 regex 批次改名預覽，Enter 套用、Esc 取消",
+            HelpAction::Command("rename-regex"),
         ),
         help_entry(
             ":create",
@@ -4559,9 +5033,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RenameMode,
-        VisualSelectionState, help_entries, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end,
+        App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RegexRenameOutcome,
+        RenameMode, VisualSelectionState, help_entries, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end,
+        typed_char_from_key,
     };
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
@@ -4595,6 +5070,37 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("global search did not complete in time");
+    }
+
+    #[test]
+    /// 驗證文字輸入 helper 會把 `Shift+6` 這類終端事件正規化成真正的符號字元。
+    fn typed_char_from_key_normalizes_shifted_symbols() {
+        assert_eq!(
+            typed_char_from_key(&KeyEvent::new(KeyCode::Char('6'), KeyModifiers::SHIFT)),
+            Some('^')
+        );
+        assert_eq!(
+            typed_char_from_key(&KeyEvent::new(KeyCode::Char('-'), KeyModifiers::SHIFT)),
+            Some('_')
+        );
+        assert_eq!(
+            typed_char_from_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
+    }
+
+    #[test]
+    /// 驗證 command mode 也會把 `Shift+6` 正規化成 `^`，避免 regex 指令難以輸入。
+    fn app_command_mode_accepts_shifted_caret_symbol() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::SHIFT))
+            .expect("type caret");
+
+        assert_eq!(app.command_buffer, "^");
     }
 
     #[test]
@@ -5373,6 +5879,103 @@ mod tests {
         assert!(!old_path.exists());
         assert!(new_path.exists());
         assert_eq!(app.status, "renamed alpha.txt -> beta.txt");
+    }
+
+    #[test]
+    /// 驗證 `:rename-regex` 會打開預覽面板，並正確標示 ready / unchanged。
+    fn app_rename_regex_command_opens_preview_panel() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.md"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("mark second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+
+        app.execute_command("rename-regex '^(.*)\\.txt$' '$1.md'")
+            .expect("open regex rename");
+
+        match app.pending_action.as_ref() {
+            Some(PendingAction::RegexRename { previews, .. }) => {
+                assert_eq!(previews.len(), 2);
+                assert_eq!(previews[0].new_name, "alpha.md");
+                assert_eq!(previews[0].outcome, RegexRenameOutcome::Ready);
+                assert_eq!(previews[1].new_name, "beta.md");
+                assert_eq!(previews[1].outcome, RegexRenameOutcome::Unchanged);
+            }
+            other => panic!("unexpected pending action: {other:?}"),
+        }
+    }
+
+    #[test]
+    /// 驗證 regex 批次改名在按下 Enter 後會一次套用所有 ready 項目。
+    fn app_rename_regex_preview_applies_ready_entries() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha.txt");
+        let beta = dir.path().join("beta.txt");
+        fs::write(&alpha, "a").expect("alpha");
+        fs::write(&beta, "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("mark second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+        app.execute_command("rename-regex '^(.*)\\.txt$' 'file_$1.md'")
+            .expect("open regex rename");
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("apply regex rename");
+
+        assert!(!alpha.exists());
+        assert!(!beta.exists());
+        assert!(dir.path().join("file_alpha.md").exists());
+        assert!(dir.path().join("file_beta.md").exists());
+        assert_eq!(app.status, "rename-regex: renamed 2 items");
+    }
+
+    #[test]
+    /// 驗證 regex 批次改名若會撞名，會標示 conflict，且 Enter 不會直接套用。
+    fn app_rename_regex_preview_blocks_conflicts() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha.txt");
+        let beta = dir.path().join("beta.txt");
+        fs::write(&alpha, "a").expect("alpha");
+        fs::write(&beta, "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("mark second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("commit visual");
+        app.execute_command("rename-regex '^(.*)\\.txt$' 'same.txt'")
+            .expect("open regex rename");
+
+        match app.pending_action.as_ref() {
+            Some(PendingAction::RegexRename { previews, .. }) => {
+                assert!(
+                    previews
+                        .iter()
+                        .all(|preview| preview.outcome == RegexRenameOutcome::Conflict)
+                );
+            }
+            other => panic!("unexpected pending action: {other:?}"),
+        }
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("try apply conflicting rename");
+
+        assert!(alpha.exists());
+        assert!(beta.exists());
+        assert_eq!(app.status, "rename-regex: resolve conflicts before apply");
     }
 
     #[test]

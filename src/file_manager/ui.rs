@@ -60,6 +60,10 @@ pub(crate) enum PaneListState<'a> {
         search: &'a str,
         editing: bool,
     },
+    RegexRename {
+        lines: &'a [RegexRenamePanelLine],
+        selected: usize,
+    },
 }
 
 /// 描述 trash 面板中單一列要顯示的內容。
@@ -84,6 +88,14 @@ pub(crate) struct HelpPanelLine {
 pub(crate) struct BookmarkPanelLine {
     pub(crate) key: String,
     pub(crate) path: String,
+}
+
+/// 描述 regex 批次改名預覽面板中單一列要顯示的內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegexRenamePanelLine {
+    pub(crate) original_name: String,
+    pub(crate) new_name: String,
+    pub(crate) status: String,
 }
 
 /// 繪製單一 pane 的檔案列表與預覽區。
@@ -157,6 +169,7 @@ pub(crate) fn render_pane(
         Some(PaneListState::Search(_)) => "  [search]",
         Some(PaneListState::Trash { .. }) => "  [trash]",
         Some(PaneListState::Help { .. }) => "  [help]",
+        Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
     };
     let title = format!(
@@ -216,6 +229,20 @@ pub(crate) fn render_pane(
                     )))
                 })
                 .collect(),
+            PaneListState::RegexRename { lines, .. } if lines.is_empty() => {
+                vec![ListItem::new(Line::from("沒有可預覽的改名項目"))]
+            }
+            PaneListState::RegexRename { lines, .. } => lines
+                .iter()
+                .map(|line| {
+                    ListItem::new(Line::from(format!(
+                        "{:<22} -> {:<22}  {}",
+                        truncate_text(&line.original_name, 22),
+                        truncate_text(&line.new_name, 22),
+                        line.status
+                    )))
+                })
+                .collect(),
         }
     } else {
         let visible_entries = pane.visible_entries();
@@ -272,6 +299,9 @@ pub(crate) fn render_pane(
             PaneListState::Help {
                 lines, selected, ..
             } if !lines.is_empty() => {
+                list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+            }
+            PaneListState::RegexRename { lines, selected } if !lines.is_empty() => {
                 list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
             }
             _ => {}
