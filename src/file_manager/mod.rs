@@ -6,6 +6,7 @@ mod layout;
 mod open;
 mod pane;
 mod search;
+mod smb;
 mod trash;
 mod ui;
 

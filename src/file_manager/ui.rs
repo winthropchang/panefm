@@ -102,6 +102,7 @@ pub(crate) struct RegexRenamePanelLine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommandSuggestionLine {
     pub(crate) command: String,
+    pub(crate) display_command: String,
     pub(crate) description: String,
 }
 
@@ -789,7 +790,7 @@ pub(crate) fn render_command_palette(
             .map(|line| {
                 ListItem::new(Line::from(format!(
                     "{:<22}  {}",
-                    truncate_text(&line.command, 22),
+                    truncate_text(&line.display_command, 22),
                     line.description
                 )))
             })

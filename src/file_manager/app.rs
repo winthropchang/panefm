@@ -35,6 +35,7 @@ use super::{
     },
     pane::{PaneState, SortMode},
     search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
+    smb::{ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location, resolve_smb_location_with_mount_root},
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
@@ -44,6 +45,9 @@ use super::{
         render_preview_search_input, render_theme_picker,
     },
 };
+
+#[cfg(target_os = "windows")]
+use super::smb::resolve_smb_location;
 
 /// 表示 rename 輸入框目前採用的編輯模式。
 ///
@@ -2202,9 +2206,11 @@ impl App {
                     .get(self.command_suggestion_selected.min(suggestions.len().saturating_sub(1)))
                     .map(|entry| entry.command.trim_start_matches(':').to_string());
                 let current = self.command_buffer.trim();
+                let has_arguments = current.contains(char::is_whitespace);
                 if let Some(suggestion) = selected_suggestion
                     && !suggestion.is_empty()
                     && suggestion != current
+                    && !has_arguments
                 {
                     self.command_buffer = suggestion;
                 } else {
@@ -2304,6 +2310,11 @@ impl App {
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
             "search" => self.open_global_search()?,
+            "connect" => {
+                self.status = String::from(
+                    "SMB 連線需要完整位址：connect smb://host/share[/path]",
+                );
+            }
             "trash" => self.open_trash_panel()?,
             "help" => self.open_help_panel(),
             "bookmark list" => self.open_bookmark_list(),
@@ -2335,6 +2346,8 @@ impl App {
                     self.set_bookmark_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark jump ") {
                     self.jump_to_bookmark_from_command(args.trim())?;
+                } else if let Some(target) = other.strip_prefix("connect ") {
+                    self.connect_smb_location(target.trim())?;
                 } else {
                     self.status = format!("unknown command: {other}");
                 }
@@ -2596,6 +2609,55 @@ impl App {
             return Ok(());
         };
         self.jump_to_bookmark(key)
+    }
+
+    /// 讓目前焦點 pane 連到指定的 SMB share；若尚未掛載則先請求系統掛載。
+    fn connect_smb_location(&mut self, target: &str) -> io::Result<()> {
+        self.connect_smb_location_with_mount_root(target, std::path::Path::new("/Volumes"))
+    }
+
+    /// 用指定掛載根目錄測試或連接 SMB share，方便在測試中模擬 macOS 的掛載點。
+    fn connect_smb_location_with_mount_root(
+        &mut self,
+        target: &str,
+        mount_root: &std::path::Path,
+    ) -> io::Result<()> {
+        let location = match parse_smb_location(target) {
+            Ok(location) => location,
+            Err(error) => {
+                self.status = error.to_string();
+                return Ok(());
+            }
+        };
+
+        #[cfg(target_os = "windows")]
+        let resolved = resolve_smb_location(&location);
+
+        #[cfg(not(target_os = "windows"))]
+        let resolved = resolve_smb_location_with_mount_root(&location, mount_root);
+
+        match resolved {
+            ResolvedSmbLocation::Ready(path) => {
+                if !path.exists() {
+                    self.status = format!("smb path missing: {}", path.display());
+                    return Ok(());
+                }
+                let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
+                    self.status = String::from("pane no longer exists");
+                    return Ok(());
+                };
+                pane.go_to_path(&path)?;
+                self.status = format!("connected smb: {}", location.url);
+            }
+            ResolvedSmbLocation::NeedsMount { local_path } => {
+                self.pending_launch = Some(build_smb_mount_launch(&location));
+                self.status = format!(
+                    "已請求系統掛載 SMB：{}；若系統連線失敗，請檢查主機、share 名稱、網路與權限，成功後再重試。預期掛載位置：{}",
+                    location.url, local_path.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 從書籤列表彈窗中打開目前選取的書籤。
@@ -4974,13 +5036,13 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             ":bookmark set",
             "m{key}",
             "把目前 pane 的目錄記成書籤，之後可快速跳回來",
-            HelpAction::Command("bookmark list"),
+            HelpAction::Command("bookmark set "),
         ),
         help_entry(
             ":bookmark jump",
             "'{key}",
             "跳到已記錄的書籤目錄；設定檔中的固定書籤也能直接使用",
-            HelpAction::Command("bookmark list"),
+            HelpAction::Command("bookmark jump "),
         ),
         help_entry(
             ":bookmark list",
@@ -5004,19 +5066,25 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             ":move <path>",
             "",
             "直接把目前選取或標記的項目移動到指定目錄",
-            HelpAction::Command("move ."),
+            HelpAction::Command("move "),
         ),
         help_entry(
             ":move-panel",
             "",
             "把目前選取或標記的項目移動到指定 pane 編號目前所在的目錄",
-            HelpAction::Command("move-panel 2"),
+            HelpAction::Command("move-panel "),
         ),
         help_entry(
             ":paste",
             "p",
             "貼上剪貼簿項目到目前目錄",
             HelpAction::Command("paste"),
+        ),
+        help_entry(
+            ":connect smb://host/share",
+            "",
+            "讓目前 pane 連到 SMB share；mac 若尚未掛載會先請求系統掛載",
+            HelpAction::Command("connect "),
         ),
         help_entry(
             ":compress",
@@ -5228,7 +5296,8 @@ fn command_suggestions(query: &str) -> Vec<CommandSuggestionLine> {
             continue;
         }
         suggestions.push(CommandSuggestionLine {
-            command: entry.line.command,
+            command: command.to_string(),
+            display_command: entry.line.command,
             description: entry.line.description,
         });
         if suggestions.len() >= 8 {
@@ -5783,6 +5852,55 @@ mod tests {
             app.pending_action,
             Some(PendingAction::Rename { .. })
         ));
+    }
+
+    #[test]
+    /// 驗證 command mode 在使用者已輸入參數時，Enter 會直接執行而不覆蓋成預設模板。
+    fn app_command_mode_enter_executes_command_with_arguments() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        for ch in "connect smb://192.0.2.10/tfm-test-share/docs".chars() {
+            let modifiers = if ch.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), modifiers))
+                .expect("type command");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute command with args");
+
+        assert!(!app.command_mode);
+        assert!(app.pending_launch.is_some());
+        assert!(
+            app.status
+                .starts_with("已請求系統掛載 SMB：smb://192.0.2.10/tfm-test-share/docs")
+        );
+    }
+
+    #[test]
+    /// 驗證帶參數的指令提示只會補上命令前綴，不會把範例參數塞進輸入框。
+    fn app_command_mode_autocomplete_uses_connect_prefix_instead_of_example_arguments() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        for ch in "con".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type partial command");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("autocomplete connect");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "connect ");
     }
 
     #[test]
@@ -6980,6 +7098,45 @@ mod tests {
                 .expect("selected")
                 .name,
             "demo copy"
+        );
+    }
+
+    #[test]
+    /// 驗證已掛載的 SMB share 可以直接切進目前 pane。
+    fn app_connect_smb_location_enters_mounted_share() {
+        let dir = tempdir().expect("tempdir");
+        let mount_root = dir.path().join("mounts");
+        let share_root = mount_root.join("shared");
+        fs::create_dir_all(share_root.join("docs")).expect("share docs");
+        fs::write(share_root.join("docs").join("report.txt"), "hello").expect("report");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.connect_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+            .expect("connect smb");
+
+        let pane = app.current_pane_mut().expect("pane");
+        assert_eq!(pane.cwd, share_root.join("docs"));
+        assert_eq!(app.status, "connected smb: smb://192.0.2.10/shared/docs");
+    }
+
+    #[test]
+    /// 驗證尚未掛載的 SMB share 會先發出系統掛載請求。
+    fn app_connect_smb_location_requests_mount_when_share_missing() {
+        let dir = tempdir().expect("tempdir");
+        let mount_root = dir.path().join("mounts");
+        fs::create_dir_all(&mount_root).expect("mount root");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.connect_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+            .expect("connect smb");
+
+        assert!(app.pending_launch.is_some());
+        assert_eq!(
+            app.status,
+            format!(
+                "已請求系統掛載 SMB：smb://192.0.2.10/shared/docs；若系統連線失敗，請檢查主機、share 名稱、網路與權限，成功後再重試。預期掛載位置：{}",
+                mount_root.join("shared").join("docs").display()
+            )
         );
     }
 
