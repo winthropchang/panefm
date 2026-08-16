@@ -207,6 +207,10 @@
 
 - 列表導航 / 快速定位優化
   你已明確覺得目前在目錄內移動與找檔案太慢，這會直接影響日常使用體驗，優先度很高。
+- plugin / action 擴充系統
+  之後要支援使用者自行定義對檔案或目錄可執行的動作，例如：
+  Xcode 開目錄、`git log`、`git pull`、`svn update`、`svn log` 等。
+  第一版建議先做成設定檔驅動的 action plugin，而不是動態載入程式碼。
 - global search
   第一版已完成，下一步要把重點轉成效能優化與更像 mature-reference 的體感。
 - 更完整的 visual mode

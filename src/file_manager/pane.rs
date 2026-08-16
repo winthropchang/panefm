@@ -324,6 +324,30 @@ impl PaneState {
         added
     }
 
+    /// 將目前列表中所有可見項目全部加入標記集合，並回傳實際新增數量。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，目前要套用全選的 pane。
+    ///
+    /// 回傳：`usize`。
+    /// - 代表這次全選新加入了多少個標記項目。
+    pub(crate) fn mark_all_visible(&mut self) -> usize {
+        if self.visible_indices.is_empty() {
+            return 0;
+        }
+
+        let mut added = 0usize;
+        for visible_index in &self.visible_indices {
+            let Some(entry) = self.entries.get(*visible_index) else {
+                continue;
+            };
+            if self.marked_paths.insert(entry.path.clone()) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// 回傳目前應該參與批次操作的項目清單。
     ///
     /// 規則：

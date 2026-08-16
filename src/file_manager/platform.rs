@@ -1,4 +1,8 @@
-use std::{io, path::Path};
+use std::{
+    io::{self, Write},
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use super::open::{LaunchMode, LaunchSpec};
 
@@ -86,11 +90,60 @@ pub(crate) fn reveal_in_system_spec_for_platform(
     Ok(launch)
 }
 
+/// 將指定文字寫入系統剪貼簿。
+///
+/// 目前正式支援：
+/// - macOS：`pbcopy`
+/// - Windows：`clip.exe`
+///
+/// `LinuxLike` 先保留常見 `xclip` 路徑，方便未來擴充，但不是正式支援目標。
+pub(crate) fn write_text_to_system_clipboard_for_platform(
+    text: &str,
+    platform: PlatformKind,
+) -> io::Result<()> {
+    let mut child = match platform {
+        PlatformKind::MacOs => Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+        PlatformKind::Windows => Command::new("clip.exe")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+        PlatformKind::LinuxLike => Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("clipboard command failed"))
+    }
+}
+
+/// 用目前實際執行的平台把文字寫入系統剪貼簿。
+pub(crate) fn write_text_to_system_clipboard(text: &str) -> io::Result<()> {
+    write_text_to_system_clipboard_for_platform(text, current_platform())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{PlatformKind, reveal_in_system_spec_for_platform, system_open_spec_for_platform};
+    use super::{
+        PlatformKind, reveal_in_system_spec_for_platform, system_open_spec_for_platform,
+    };
     use crate::file_manager::open::LaunchMode;
 
     #[test]

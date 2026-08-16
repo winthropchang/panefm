@@ -29,6 +29,9 @@ use crate::{
 use super::{
     archive::{ExtractedArchive, compress_entries_to_zip, extract_entries},
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
+    copy::{
+        CopyAction, build_copy_text, copy_action_status_label, copy_picker_options,
+    },
     layout::{LayoutNode, SplitDirection},
     open::{
         LaunchSpec, OpenAction, OpenTarget, build_launch_spec, default_open_action,
@@ -40,6 +43,7 @@ use super::{
         ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location,
         resolve_smb_location_with_mount_root,
     },
+    platform::write_text_to_system_clipboard,
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
@@ -204,6 +208,11 @@ pub(crate) enum PendingAction {
     },
     BookmarkList {
         pane_id: usize,
+        selected: usize,
+    },
+    CopyPicker {
+        pane_id: usize,
+        target: OpenTarget,
         selected: usize,
     },
     OpenPicker {
@@ -497,6 +506,11 @@ impl App {
             self.pending_y = false;
             return Ok(true);
         }
+        if key_matches_plain_letter(&key, 'c') {
+            self.open_copy_picker()?;
+            self.reset_pending_motion_state();
+            return Ok(true);
+        }
 
         let should_continue = match key.code {
             _ if key_matches_plain_letter(&key, 'q') => false,
@@ -638,6 +652,20 @@ impl App {
             _ if key_matches_plain_letter(&key, 'z') => {
                 self.clear_pending_count();
                 self.open_fzf_jump();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_ctrl_shift_letter(&key, 'a') => {
+                self.clear_pending_count();
+                self.clear_marks_in_focused_pane()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'a') => {
+                self.clear_pending_count();
+                self.mark_all_in_focused_pane()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -2140,6 +2168,165 @@ impl App {
                 self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
                 self.status = bookmark_list_status(len, selected);
             }
+            PendingAction::CopyPicker {
+                pane_id,
+                target,
+                mut selected,
+            } => {
+                let options = copy_picker_options();
+                if self.capture_pending_count_digit(&key) {
+                    self.pending_action = Some(PendingAction::CopyPicker {
+                        pane_id,
+                        target: target.clone(),
+                        selected,
+                    });
+                    self.status = format!("copy to clipboard: {}", target.display_name);
+                    return Ok(true);
+                }
+                match key.code {
+                    _ if key_matches_plain_letter(&key, 'c') => {
+                        self.clear_pending_count();
+                        self.copy_target_to_system_clipboard(target.clone(), CopyAction::FileUrl)?;
+                    }
+                    _ if key_matches_plain_letter(&key, 'd') => {
+                        self.clear_pending_count();
+                        self.copy_target_to_system_clipboard(
+                            target.clone(),
+                            CopyAction::DirectoryUrl,
+                        )?;
+                    }
+                    _ if key_matches_plain_letter(&key, 'f') => {
+                        self.clear_pending_count();
+                        self.copy_target_to_system_clipboard(target.clone(), CopyAction::Filename)?;
+                    }
+                    _ if key_matches_plain_letter(&key, 'n') => {
+                        self.clear_pending_count();
+                        self.copy_target_to_system_clipboard(
+                            target.clone(),
+                            CopyAction::FilenameWithoutExtension,
+                        )?;
+                    }
+                    KeyCode::Down => {
+                        if !options.is_empty() {
+                            selected = (selected + self.take_count_or_one())
+                                .min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    _ if key_matches_plain_letter(&key, 'j') => {
+                        if !options.is_empty() {
+                            selected = (selected + self.take_count_or_one())
+                                .min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    _ if key_matches_plain_letter(&key, 'k') => {
+                        selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'd') => {
+                        if !options.is_empty() {
+                            selected = (selected + self.take_panel_page_step())
+                                .min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'u') => {
+                        selected = selected.saturating_sub(self.take_panel_page_step());
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    _ if key_matches_shifted_letter(&key, 'J') => {
+                        if !options.is_empty() {
+                            selected = (selected + self.take_large_move_step())
+                                .min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    _ if key_matches_shifted_letter(&key, 'K') => {
+                        selected = selected.saturating_sub(self.take_large_move_step());
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                    KeyCode::Enter => {
+                        self.clear_pending_count();
+                        if let Some(option) = options.get(selected) {
+                            self.copy_target_to_system_clipboard(target.clone(), option.action)?;
+                        } else {
+                            self.status = String::from("copy picker: no option selected");
+                        }
+                    }
+                    _ if key_matches_plain_letter(&key, 'l') => {
+                        self.clear_pending_count();
+                        if let Some(option) = options.get(selected) {
+                            self.copy_target_to_system_clipboard(target.clone(), option.action)?;
+                        } else {
+                            self.status = String::from("copy picker: no option selected");
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.clear_pending_count();
+                        self.status = String::from("normal mode");
+                    }
+                    _ if key_matches_plain_letter(&key, 'q')
+                        || key_matches_plain_letter(&key, 'h') =>
+                    {
+                        self.clear_pending_count();
+                        self.status = String::from("normal mode");
+                    }
+                    _ => {
+                        self.clear_pending_count();
+                        self.pending_action = Some(PendingAction::CopyPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("copy to clipboard: {}", target.display_name);
+                    }
+                }
+            }
             PendingAction::OpenPicker {
                 pane_id,
                 target,
@@ -3026,6 +3213,8 @@ impl App {
             "jump" => self.open_fzf_jump(),
             "open" => self.open_selected_with_default()?,
             "open-picker" => self.open_selected_with_picker()?,
+            "copy-picker" => self.open_copy_picker()?,
+            "mark-all" | "select-all" => self.mark_all_in_focused_pane()?,
             "vim" => {
                 let Some(target) = self.selected_open_target() else {
                     self.status = String::from("nothing selected to open");
@@ -3498,6 +3687,35 @@ impl App {
         Ok(())
     }
 
+    /// 打開 `Copy` 面板，讓使用者把不同格式的文字直接複製到系統剪貼簿。
+    pub(crate) fn open_copy_picker(&mut self) -> io::Result<()> {
+        let Some(target) = self.selected_open_target() else {
+            self.status = String::from("nothing selected to copy");
+            return Ok(());
+        };
+
+        self.pending_action = Some(PendingAction::CopyPicker {
+            pane_id: self.focused_pane,
+            target: target.clone(),
+            selected: 0,
+        });
+        self.status = format!("copy to clipboard: {}", target.display_name);
+        Ok(())
+    }
+
+    /// 根據選擇的複製動作，把文字寫進系統剪貼簿。
+    fn copy_target_to_system_clipboard(
+        &mut self,
+        target: OpenTarget,
+        action: CopyAction,
+    ) -> io::Result<()> {
+        let text = build_copy_text(&target, action)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        write_text_to_system_clipboard(&text)?;
+        self.status = format!("{}: {}", copy_action_status_label(action), target.display_name);
+        Ok(())
+    }
+
     /// 將外部開啟動作排入待執行佇列。
     fn queue_open_action(&mut self, target: OpenTarget, action: OpenAction) -> io::Result<()> {
         let launch = build_launch_spec(&target, action)?;
@@ -3720,6 +3938,9 @@ impl App {
             ),
             PendingAction::BookmarkList { selected, .. } => {
                 bookmark_list_status(self.bookmark_store.list().len(), *selected)
+            }
+            PendingAction::CopyPicker { target, .. } => {
+                format!("copy to clipboard: {}", target.display_name)
             }
             PendingAction::OpenPicker { target, .. } => {
                 format!("open with: {}", target.display_name)
@@ -4111,6 +4332,19 @@ impl App {
             String::from("no marks to clear")
         } else {
             format!("cleared {count} marks")
+        };
+        Ok(())
+    }
+
+    /// 將目前焦點 pane 中所有可見項目全部標記，方便後續做批次操作。
+    fn mark_all_in_focused_pane(&mut self) -> io::Result<()> {
+        let pane = self.current_pane_mut()?;
+        let added = pane.mark_all_visible();
+        let total = pane.marked_count();
+        self.status = if total == 0 {
+            String::from("nothing to mark")
+        } else {
+            format!("marked all visible items (+{added}, total {total})")
         };
         Ok(())
     }
@@ -5180,6 +5414,15 @@ impl App {
                     _ => None,
                 };
                 let picker_options = match &self.pending_action {
+                    Some(PendingAction::CopyPicker {
+                        pane_id: copy_pane_id,
+                        ..
+                    }) if *copy_pane_id == pane_id => Some(
+                        copy_picker_options()
+                            .into_iter()
+                            .map(|option| format!("{} -> {}", option.shortcut, option.label))
+                            .collect::<Vec<_>>(),
+                    ),
                     Some(PendingAction::OpenPicker {
                         pane_id: open_pane_id,
                         target,
@@ -5193,6 +5436,17 @@ impl App {
                     _ => None,
                 };
                 let picker_state = match &self.pending_action {
+                    Some(PendingAction::CopyPicker {
+                        pane_id: copy_pane_id,
+                        selected,
+                        ..
+                    }) if *copy_pane_id == pane_id => {
+                        picker_options.as_ref().map(|options| InlinePickerState {
+                            title: " Copy: ",
+                            options,
+                            selected: *selected,
+                        })
+                    }
                     Some(PendingAction::OpenPicker {
                         pane_id: open_pane_id,
                         selected,
@@ -5361,7 +5615,9 @@ impl App {
             Span::styled("V", self.theme.accent_style()),
             Span::raw(" visual mark  "),
             Span::styled("yy", self.theme.accent_style()),
-            Span::raw(" copy  "),
+            Span::raw(" file copy  "),
+            Span::styled("c", self.theme.accent_style()),
+            Span::raw(" text copy  "),
             Span::styled("x", self.theme.accent_style()),
             Span::raw(" cut  "),
             Span::styled("z", self.theme.accent_style()),
@@ -5482,6 +5738,7 @@ impl App {
             }
             Some(PendingAction::TrashPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
+            | Some(PendingAction::CopyPicker { .. })
             | Some(PendingAction::OpenPicker { .. })
             | Some(PendingAction::RegexRename { .. }) => {}
             Some(PendingAction::Rename { .. }) | Some(PendingAction::CreateEntry { .. }) => {}
@@ -5832,6 +6089,15 @@ fn key_matches_ctrl_letter(key: &KeyEvent, letter: char) -> bool {
         && matches!(key.code, KeyCode::Char(c) if c == lower || c == upper)
 }
 
+/// 判斷 `Ctrl+Shift+字母` 指令，支援不同終端可能送出的大小寫字元格式。
+fn key_matches_ctrl_shift_letter(key: &KeyEvent, letter: char) -> bool {
+    let lower = letter.to_ascii_lowercase();
+    let upper = letter.to_ascii_uppercase();
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c == lower || c == upper)
+}
+
 /// 描述 command mode 補全候選目前要往前還是往後切換。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuggestionNavigation {
@@ -6001,6 +6267,24 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "yy",
             "複製目前選取項目到內部剪貼簿",
             HelpAction::Command("copy"),
+        ),
+        help_entry(
+            ":copy-picker",
+            "c",
+            "打開文字複製小視窗，可快速複製檔案 URL、目錄 URL、檔名或無副檔名檔名",
+            HelpAction::Command("copy-picker"),
+        ),
+        help_entry(
+            ":mark-all",
+            "Ctrl-a",
+            "把目前 pane 中所有可見的檔案與資料夾全部標記起來，方便批次操作",
+            HelpAction::Command("mark-all"),
+        ),
+        help_entry(
+            ":unmark-all",
+            "Ctrl-Shift-a",
+            "清掉目前 pane 內所有已標記項目",
+            HelpAction::Command("unmark-all"),
         ),
         help_entry(
             ":cut",
@@ -6587,9 +6871,10 @@ mod tests {
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, ListFindState, PendingAction,
         RegexRenameOutcome, RenameMode, VisualSelectionState, command_suggestion_navigation,
-        command_suggestions, help_entries, key_matches_ctrl_letter, key_matches_letter_any_case,
-        key_matches_plain_letter, key_matches_shifted_letter, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
+        command_suggestions, help_entries, key_matches_ctrl_letter,
+        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
+        key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
@@ -6680,6 +6965,13 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT
             ),
             'p'
+        ));
+        assert!(key_matches_ctrl_shift_letter(
+            &KeyEvent::new(
+                KeyCode::Char('A'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            'a'
         ));
         assert!(key_matches_letter_any_case(
             &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
@@ -9510,6 +9802,95 @@ mod tests {
 
         assert_eq!(app.panes.get(&1).expect("pane").selected, original);
         assert_eq!(app.status, "jump cancelled");
+    }
+
+    #[test]
+    /// 驗證 normal mode 按下 `Ctrl-a` 會把目前 pane 的所有可見項目全部標記起來。
+    fn app_ctrl_a_marks_all_visible_entries() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+        fs::write(dir.path().join("gamma.txt"), "c").expect("gamma");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .expect("mark all");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.marked_count(), 3);
+        assert_eq!(app.status, "marked all visible items (+3, total 3)");
+    }
+
+    #[test]
+    /// 驗證 `:mark-all` 命令也能把目前 pane 的所有可見項目全部標記起來。
+    fn app_mark_all_command_marks_all_visible_entries() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("mark-all").expect("mark-all command");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.marked_count(), 2);
+        assert_eq!(app.status, "marked all visible items (+2, total 2)");
+    }
+
+    #[test]
+    /// 驗證 normal mode 按下 `c` 會打開文字複製小視窗。
+    fn app_c_key_opens_copy_picker() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .expect("open copy picker");
+
+        match app.pending_action {
+            Some(PendingAction::CopyPicker {
+                pane_id, selected, ..
+            }) => {
+                assert_eq!(pane_id, 1);
+                assert_eq!(selected, 0);
+            }
+            other => panic!("expected copy picker, got {other:?}"),
+        }
+        assert_eq!(app.status, "copy to clipboard: alpha.txt");
+    }
+
+    #[test]
+    /// 驗證文字複製小視窗按下 `h` 會關閉並回到一般模式。
+    fn app_copy_picker_h_closes_panel() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_copy_picker().expect("open copy picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("close copy picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 normal mode 按下 `Ctrl-Shift-A` 會清掉目前 pane 的所有標記。
+    fn app_ctrl_shift_a_clears_all_marks_in_focused_pane() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("mark-all").expect("mark-all command");
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .expect("clear marks");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.marked_count(), 0);
+        assert_eq!(app.status, "cleared 2 marks");
     }
 
     #[test]

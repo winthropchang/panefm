@@ -1,6 +1,7 @@
 mod app;
 mod archive;
 mod bookmark;
+mod copy;
 mod entry;
 mod fzf;
 mod layout;
