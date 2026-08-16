@@ -140,7 +140,10 @@ mod tests {
 
     #[test]
     fn copy_status_labels_are_human_readable() {
-        assert_eq!(copy_action_status_label(CopyAction::FileUrl), "copied file path");
+        assert_eq!(
+            copy_action_status_label(CopyAction::FileUrl),
+            "copied file path"
+        );
         assert_eq!(
             copy_action_status_label(CopyAction::FilenameWithoutExtension),
             "copied filename without extension"

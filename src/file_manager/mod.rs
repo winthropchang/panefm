@@ -152,8 +152,8 @@ fn run_fzf_jump(
     let root_dir = request.root_dir.clone();
     let show_hidden = request.show_hidden;
     let follow_links = request.follow_links;
-    let helper_command =
-        build_fzf_helper_command(&root_dir, show_hidden, follow_links).context("build jump helper command")?;
+    let helper_command = build_fzf_helper_command(&root_dir, show_hidden, follow_links)
+        .context("build jump helper command")?;
     let child = spawn_fzf_process(&fzf_command, &helper_command).context("spawn fzf")?;
     let fzf_wait_started_at = Instant::now();
     let output_result = child.wait_with_output().context("wait for fzf");
@@ -215,14 +215,8 @@ where
     let cancel = AtomicBool::new(false);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    stream_fzf_candidates(
-        &root_dir,
-        show_hidden,
-        follow_links,
-        &cancel,
-        &mut handle,
-    )
-    .context("stream jump candidates")?;
+    stream_fzf_candidates(&root_dir, show_hidden, follow_links, &cancel, &mut handle)
+        .context("stream jump candidates")?;
     Ok(())
 }
 
@@ -271,10 +265,7 @@ fn format_helper_bool_flag(value: bool) -> &'static str {
 }
 
 /// 解析 helper process CLI 傳入的布林旗標。
-fn parse_helper_bool_flag(
-    value: Option<std::ffi::OsString>,
-    field_name: &str,
-) -> Result<bool> {
+fn parse_helper_bool_flag(value: Option<std::ffi::OsString>, field_name: &str) -> Result<bool> {
     match value.as_deref() {
         Some(raw) if raw == std::ffi::OsStr::new("1") => Ok(true),
         Some(raw) if raw == std::ffi::OsStr::new("0") => Ok(false),
@@ -296,7 +287,10 @@ pub(super) fn debug_timing_enabled() -> bool {
 /// 若已啟用 debug timing，就把某段流程耗時寫到 stderr。
 pub(super) fn debug_timing_log(label: &str, started_at: Instant) {
     if debug_timing_enabled() {
-        eprintln!("[tfm-timing] {label}: {} ms", started_at.elapsed().as_millis());
+        eprintln!(
+            "[tfm-timing] {label}: {} ms",
+            started_at.elapsed().as_millis()
+        );
     }
 }
 
@@ -339,7 +333,9 @@ fn quote_windows_cmd_arg(arg: &std::ffi::OsString) -> String {
         return "\"\"".to_string();
     }
 
-    let needs_quotes = text.chars().any(|ch| ch.is_whitespace() || matches!(ch, '"' | '^' | '&' | '|' | '<' | '>'));
+    let needs_quotes = text
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '^' | '&' | '|' | '<' | '>'));
     if !needs_quotes {
         return text.into_owned();
     }

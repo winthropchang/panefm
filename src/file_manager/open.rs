@@ -150,7 +150,12 @@ pub(crate) fn build_custom_launch_spec_for_platform(
         PlatformKind::MacOs => action.mac_command.as_deref().or(action.command.as_deref()),
         PlatformKind::LinuxLike => action.command.as_deref(),
     }
-    .ok_or_else(|| io::Error::other(format!("action {} has no command for this platform", action.name)))?;
+    .ok_or_else(|| {
+        io::Error::other(format!(
+            "action {} has no command for this platform",
+            action.name
+        ))
+    })?;
 
     let command = expand_custom_action_template(template, target, platform);
     let mode = match action.mode {
@@ -374,8 +379,9 @@ mod tests {
     use crate::config::{ActionLaunchMode, ActionTargetScope, CustomOpenActionConfig};
 
     use super::{
-        LaunchMode, OpenAction, OpenPickerAction, OpenTarget, build_custom_launch_spec_for_platform,
-        build_launch_spec, is_text_like_path, open_picker_options, parse_command_line,
+        LaunchMode, OpenAction, OpenPickerAction, OpenTarget,
+        build_custom_launch_spec_for_platform, build_launch_spec, is_text_like_path,
+        open_picker_options, parse_command_line,
     };
     use crate::file_manager::platform::PlatformKind;
 
@@ -396,9 +402,18 @@ mod tests {
             is_dir: false,
         });
         assert_eq!(options.len(), 3);
-        assert_eq!(options[0].action, OpenPickerAction::Builtin(OpenAction::Editor));
-        assert_eq!(options[1].action, OpenPickerAction::Builtin(OpenAction::Vim));
-        assert_eq!(options[2].action, OpenPickerAction::Builtin(OpenAction::Reveal));
+        assert_eq!(
+            options[0].action,
+            OpenPickerAction::Builtin(OpenAction::Editor)
+        );
+        assert_eq!(
+            options[1].action,
+            OpenPickerAction::Builtin(OpenAction::Vim)
+        );
+        assert_eq!(
+            options[2].action,
+            OpenPickerAction::Builtin(OpenAction::Reveal)
+        );
     }
 
     #[test]

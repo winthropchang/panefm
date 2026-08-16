@@ -93,7 +93,7 @@ If you want to tune the current look:
 
 ## Config
 
-Start from [config.toml.example](/Users/otto/Documents/terminal-file-manager/config.toml.example).
+Start from [config.toml.example](/Users/otto/Documents/terminal-file-manager/config.toml.example) and [plugins.toml.example](/Users/otto/Documents/terminal-file-manager/plugins.toml.example).
 
 Available keys:
 
@@ -131,7 +131,11 @@ panel_page_step = 10
 
 [behavior]
 cancel_search_on_leave = true
+```
 
+Custom `Open with` actions belong in `plugins.toml` next to `config.toml`:
+
+```toml
 [actions]
 
 [[actions.open_with]]
@@ -148,7 +152,23 @@ command = "git -C {parent} log --oneline"
 windows_command = "git -C {parent} log --oneline"
 ```
 
-`actions.open_with` 目前會直接出現在 `Open with` 面板。
+`plugins.toml` 裡的 `actions.open_with` 目前會直接出現在 `Open with` 面板。
+`plugins.toml` 可以直接寫註解，TOML 的註解語法是 `#`。
+
+欄位定義：
+
+- `name`：面板中顯示給使用者看的名稱。
+- `scope`：這個動作要套用在什麼目標上，可用 `file`、`dir`、`both`。
+- `mode`：啟動方式，可用 `detached`、`terminal`。
+- `command`：所有平台共用的預設指令。
+- `mac_command`：只在 macOS 使用，優先於 `command`。
+- `windows_command`：只在 Windows 使用，優先於 `command`。
+
+模式建議：
+
+- `detached`：適合 VS Code、Xcode、Finder、Explorer 這類交給外部 App 處理的動作。
+- `terminal`：適合 Vim、git、svn 這類要直接佔用終端並顯示輸出的指令。
+
 可用佔位字串：
 
 - `{path}`：目前選取項目的完整路徑

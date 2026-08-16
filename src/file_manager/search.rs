@@ -634,11 +634,7 @@ fn flush_search_batch(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::{
-        Arc,
-        atomic::AtomicBool,
-        mpsc,
-    };
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
     use tempfile::tempdir;
 
@@ -709,7 +705,10 @@ mod tests {
         assert_eq!(results[0].relative_path, "notes.txt");
         assert_eq!(results[0].match_line_number, Some(1));
         assert_eq!(results[0].match_column, Some(7));
-        assert_eq!(results[0].match_preview.as_deref(), Some("hello rust world"));
+        assert_eq!(
+            results[0].match_preview.as_deref(),
+            Some("hello rust world")
+        );
     }
 
     #[test]
@@ -742,7 +741,10 @@ mod tests {
 
         assert!(!chunk_sizes.is_empty());
         assert_eq!(chunk_sizes.iter().sum::<usize>(), 2);
-        assert!(matches!(events.last(), Some(GlobalSearchEvent::Done { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(GlobalSearchEvent::Done { .. })
+        ));
     }
 
     #[test]
@@ -756,7 +758,10 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
-        let hidden_index = args.iter().position(|arg| arg == "--hidden").expect("hidden");
+        let hidden_index = args
+            .iter()
+            .position(|arg| arg == "--hidden")
+            .expect("hidden");
         let separator_index = args.iter().position(|arg| arg == "--").expect("separator");
         assert!(hidden_index < separator_index);
         assert_eq!(args[separator_index + 1], "needle");

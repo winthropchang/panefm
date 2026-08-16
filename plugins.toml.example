@@ -1,0 +1,105 @@
+# `plugins.toml` 可以寫註解。
+# TOML 使用 `#` 當作註解開頭，整行註解或行尾註解都可以。
+#
+# 這個檔案目前用來定義 `Open with` 面板中的自訂動作。
+# 你可以把常用的外部工具寫進來，例如：
+# - 用 VS Code / Xcode 開啟目錄
+# - 執行 git / svn 指令
+# - 呼叫系統工具 reveal 目前檔案
+#
+# 基本結構：
+# 1. `[actions]` 是動作設定群組。
+# 2. `[[actions.open_with]]` 代表一個可出現在 `Open with` 面板中的選項。
+# 3. 你可以寫很多個 `[[actions.open_with]]`，每一個都是獨立功能。
+
+[actions]
+
+# 範例 1：
+# 在選到「資料夾」時，顯示一個 `VSCode` 選項。
+# 選到之後會用 macOS 的 Visual Studio Code 開啟該目錄。
+#
+# 欄位說明：
+# - `name`
+#   顯示在面板中的名稱。
+#   例如 `VSCode`、`Git log`、`Open in Xcode`。
+#
+# - `scope`
+#   這個動作要套用在哪一種類型的目標。
+#   可用值：
+#   - `file`：只在檔案上顯示
+#   - `dir`：只在目錄上顯示
+#   - `both`：檔案和目錄都顯示
+#
+# - `mode`
+#   執行方式。
+#   可用值：
+#   - `detached`：背景執行，不佔用目前 TUI
+#   - `terminal`：在終端前景執行，適合 git / svn 這種要看輸出的指令
+#
+# - `command`
+#   所有平台共用的預設指令。
+#   如果你沒有寫 `mac_command` 或 `windows_command`，就會使用它。
+#
+# - `mac_command`
+#   只在 macOS 執行的指令，會優先於 `command`。
+#
+# - `windows_command`
+#   只在 Windows 執行的指令，會優先於 `command`。
+#
+# 可用佔位字串：
+# - `{path}`：目前選取項目的完整路徑
+# - `{parent}`：目前選取項目的父目錄
+# - `{name}`：目前列表中顯示的名稱，含副檔名
+# - `{stem}`：檔名去掉副檔名後的部分
+#
+# 例如：
+# - `/Users/otto/work/demo/main.rs`
+#   `{path}`   -> `/Users/otto/work/demo/main.rs`
+#   `{parent}` -> `/Users/otto/work/demo`
+#   `{name}`   -> `main.rs`
+#   `{stem}`   -> `main`
+
+[[actions.open_with]]
+name = "VSCode"
+scope = "dir"
+mode = "detached"
+mac_command = "open -a 'Visual Studio Code' {path}"
+windows_command = "code {path}"
+
+# 範例 2：
+# 用 Xcode 開啟資料夾。
+# 如果你平常做 Apple 平台開發，可以保留這個範例。
+[[actions.open_with]]
+name = "Xcode"
+scope = "dir"
+mode = "detached"
+mac_command = "open -a Xcode {path}"
+
+# 範例 3：
+# 在檔案或資料夾上執行 git log。
+# 因為這個指令通常需要看輸出，所以建議使用 `terminal`。
+# 這裡使用 `{parent}`，表示切到該項目的父目錄後再執行 git log。
+[[actions.open_with]]
+name = "Git log"
+scope = "both"
+mode = "terminal"
+command = "git -C {parent} log --oneline"
+windows_command = "git -C {parent} log --oneline"
+
+# 範例 4：
+# 只對檔案顯示，使用 Vim 開啟目前檔案。
+# 這類會接管終端的程式，建議使用 `terminal`。
+[[actions.open_with]]
+name = "Vim"
+scope = "file"
+mode = "terminal"
+command = "vim {path}"
+
+# 範例 5：
+# 在 macOS Finder 中顯示目前檔案或資料夾的位置。
+# 這種只需要丟給系統處理的動作，適合 `detached`。
+[[actions.open_with]]
+name = "Reveal"
+scope = "both"
+mode = "detached"
+mac_command = "open -R {path}"

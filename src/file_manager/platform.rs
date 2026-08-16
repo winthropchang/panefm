@@ -141,9 +141,7 @@ pub(crate) fn write_text_to_system_clipboard(text: &str) -> io::Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        PlatformKind, reveal_in_system_spec_for_platform, system_open_spec_for_platform,
-    };
+    use super::{PlatformKind, reveal_in_system_spec_for_platform, system_open_spec_for_platform};
     use crate::file_manager::open::LaunchMode;
 
     #[test]

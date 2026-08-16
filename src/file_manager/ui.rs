@@ -1157,7 +1157,10 @@ pub(crate) fn render_confirm_dialog(
     );
     frame.render_widget(Clear, dialog_area);
     let (title, question) = if permanent {
-        (" Confirm Delete ", format!("Delete {target_name} permanently?"))
+        (
+            " Confirm Delete ",
+            format!("Delete {target_name} permanently?"),
+        )
     } else {
         (" Confirm Trash ", format!("Move {target_name} to trash?"))
     };
@@ -1168,10 +1171,7 @@ pub(crate) fn render_confirm_dialog(
         ])
         .block(
             Block::default()
-                .title(Line::from(Span::styled(
-                    title,
-                    theme.danger_title_style(),
-                )))
+                .title(Line::from(Span::styled(title, theme.danger_title_style())))
                 .borders(Borders::ALL),
         ),
         dialog_area,

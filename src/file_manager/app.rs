@@ -29,9 +29,8 @@ use crate::{
 use super::{
     archive::{ExtractedArchive, compress_entries_to_zip, extract_entries},
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
-    copy::{
-        CopyAction, build_copy_text, copy_action_status_label, copy_picker_options,
-    },
+    copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
+    debug_timing_log, debug_timing_message,
     layout::{LayoutNode, SplitDirection},
     open::{
         LaunchSpec, OpenAction, OpenPickerAction, OpenPickerOption, OpenTarget,
@@ -39,6 +38,7 @@ use super::{
         default_open_action, open_picker_options,
     },
     pane::{PaneState, SortMode},
+    platform::write_text_to_system_clipboard,
     search::{
         GlobalSearchEntry, GlobalSearchEvent, stream_content_search_entries, stream_search_entries,
     },
@@ -46,16 +46,14 @@ use super::{
         ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location,
         resolve_smb_location_with_mount_root,
     },
-    platform::write_text_to_system_clipboard,
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
         InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TaskPanelLine,
         TrashPanelLine, render_bookmark_picker, render_command_palette, render_confirm_dialog,
-        render_filter_input, render_global_search_panel, render_pane,
-        render_preview_search_input, render_theme_picker,
+        render_filter_input, render_global_search_panel, render_pane, render_preview_search_input,
+        render_theme_picker,
     },
-    debug_timing_log, debug_timing_message,
 };
 
 #[cfg(target_os = "windows")]
@@ -1296,7 +1294,8 @@ impl App {
             return Ok(true);
         }
 
-        if self.preview_focus == Some(search.pane_id) && matches!(search.mode, SearchMode::Content) {
+        if self.preview_focus == Some(search.pane_id) && matches!(search.mode, SearchMode::Content)
+        {
             match key.code {
                 KeyCode::Esc => {
                     self.clear_pending_count();
@@ -1315,7 +1314,9 @@ impl App {
                     self.global_search = Some(search);
                     return Ok(true);
                 }
-                _ if key_matches_shifted_letter(&key, 'P') || key_matches_plain_letter(&key, 'h') => {
+                _ if key_matches_shifted_letter(&key, 'P')
+                    || key_matches_plain_letter(&key, 'h') =>
+                {
                     self.clear_pending_count();
                     self.pending_g = false;
                     self.preview_focus = None;
@@ -1351,7 +1352,8 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.clear_pending_count();
                     self.pending_g = false;
-                    search.preview_scroll = Some(search.preview_scroll.unwrap_or(0).saturating_add(1));
+                    search.preview_scroll =
+                        Some(search.preview_scroll.unwrap_or(0).saturating_add(1));
                     self.status = self.search_preview_status_for(&search);
                     self.global_search = Some(search);
                     return Ok(true);
@@ -1359,7 +1361,8 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.clear_pending_count();
                     self.pending_g = false;
-                    search.preview_scroll = Some(search.preview_scroll.unwrap_or(0).saturating_sub(1));
+                    search.preview_scroll =
+                        Some(search.preview_scroll.unwrap_or(0).saturating_sub(1));
                     self.status = self.search_preview_status_for(&search);
                     self.global_search = Some(search);
                     return Ok(true);
@@ -1580,7 +1583,9 @@ impl App {
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
-            _ if key_matches_shifted_letter(&key, 'P') && matches!(search.mode, SearchMode::Content) => {
+            _ if key_matches_shifted_letter(&key, 'P')
+                && matches!(search.mode, SearchMode::Content) =>
+            {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.preview_focus = Some(search.pane_id);
@@ -2408,7 +2413,8 @@ impl App {
                         if let Some(task) = tasks.get(selected) {
                             self.cancel_task_by_id(task.id);
                             let len = self.tasks_for_pane(pane_id).len();
-                            self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
+                            self.pending_action =
+                                Some(PendingAction::TaskPanel { pane_id, selected });
                             if self.status.is_empty() {
                                 self.status = task_panel_status(len, selected);
                             }
@@ -4165,7 +4171,11 @@ impl App {
         let text = build_copy_text(&target, action)
             .map_err(|error| io::Error::other(error.to_string()))?;
         write_text_to_system_clipboard(&text)?;
-        self.status = format!("{}: {}", copy_action_status_label(action), target.display_name);
+        self.status = format!(
+            "{}: {}",
+            copy_action_status_label(action),
+            target.display_name
+        );
         Ok(())
     }
 
@@ -4287,11 +4297,7 @@ impl App {
             }
             Err(error) => {
                 debug_timing_log("jump go_to_path (failed)", go_to_path_started_at);
-                self.finish_task(
-                    request.task_id,
-                    TaskState::Failed,
-                    error.to_string(),
-                );
+                self.finish_task(request.task_id, TaskState::Failed, error.to_string());
                 self.status = format!("jump failed for {line}: {error}");
             }
         }
@@ -5033,19 +5039,22 @@ impl App {
             == Some(task_id)
         {
             self.pending_fzf_jump = None;
-            self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled before fzf"));
+            self.finish_task(
+                task_id,
+                TaskState::Cancelled,
+                String::from("cancelled before fzf"),
+            );
             self.status = format!("cancelled task {task_id}");
             return;
         }
 
-        if self
-            .pending_launch
-            .as_ref()
-            .map(|queued| queued.task_id)
-            == Some(task_id)
-        {
+        if self.pending_launch.as_ref().map(|queued| queued.task_id) == Some(task_id) {
             self.pending_launch = None;
-            self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled before launch"));
+            self.finish_task(
+                task_id,
+                TaskState::Cancelled,
+                String::from("cancelled before launch"),
+            );
             self.status = format!("cancelled task {task_id}");
             return;
         }
@@ -5623,7 +5632,11 @@ impl App {
     /// 啟動一個背景 global search 工作，避免在大型目錄中阻塞主介面。
     fn start_global_search(&mut self, search: &mut GlobalSearchState) -> io::Result<()> {
         if let Some(task_id) = search.task_id.take() {
-            self.finish_task(task_id, TaskState::Cancelled, String::from("replaced by new query"));
+            self.finish_task(
+                task_id,
+                TaskState::Cancelled,
+                String::from("replaced by new query"),
+            );
         }
         self.cancel_global_search_worker();
 
@@ -5885,7 +5898,12 @@ impl App {
             .position(|line| *line == current_match)
             .map(|index| index + 1)
             .unwrap_or(matches.len());
-        format!("preview search: {} ({}/{})", search.buffer, current, matches.len())
+        format!(
+            "preview search: {} ({}/{})",
+            search.buffer,
+            current,
+            matches.len()
+        )
     }
 
     /// 在 global search 的 preview focus 模式中，跳到下一個或上一個命中位置。
@@ -6075,7 +6093,9 @@ impl App {
                     ClipboardOperation::Copy if overwrite => {
                         pane.copy_entry_into_current_dir_overwrite(&entry.source_path)
                     }
-                    ClipboardOperation::Copy => pane.copy_entry_into_current_dir(&entry.source_path),
+                    ClipboardOperation::Copy => {
+                        pane.copy_entry_into_current_dir(&entry.source_path)
+                    }
                     ClipboardOperation::Cut if overwrite => {
                         pane.move_entry_into_current_dir_overwrite(&entry.source_path)
                     }
@@ -6311,9 +6331,7 @@ impl App {
             } else {
                 None
             };
-            let task_lines = task_records
-                .as_deref()
-                .map(task_panel_lines);
+            let task_lines = task_records.as_deref().map(task_panel_lines);
             let help_lines = if let Some(PendingAction::HelpPanel {
                 pane_id: action_pane_id,
                 search,
@@ -6779,11 +6797,7 @@ impl App {
 
         if let Some((task_id, result_count)) = completed_search_task {
             self.active_global_search_task_id = None;
-            self.finish_task(
-                task_id,
-                TaskState::Done,
-                format!("{result_count} results"),
-            );
+            self.finish_task(task_id, TaskState::Done, format!("{result_count} results"));
         }
 
         if finished {
@@ -7597,13 +7611,18 @@ fn task_panel_status(count: usize, selected: usize) -> String {
     if count == 0 {
         String::from("tasks: empty")
     } else {
-        format!("tasks: {}/{} (j/k move, l detail, x cancel, h close)", selected + 1, count)
+        format!(
+            "tasks: {}/{} (j/k move, l detail, x cancel, h close)",
+            selected + 1,
+            count
+        )
     }
 }
 
 /// 將目前 task log 轉成面板可直接渲染的資料列。
 fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
-    tasks.iter()
+    tasks
+        .iter()
         .map(|task| TaskPanelLine {
             state: task_state_label(task.state).to_string(),
             time: format_task_time(task.started_at_unix_ms),
@@ -7915,18 +7934,18 @@ fn rename_basename_cursor(name: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use tempfile::tempdir;
 
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
-        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState,
-        VisualSelectionState, command_suggestion_navigation, command_suggestions, help_entries,
-        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
-        key_matches_plain_letter, key_matches_shifted_letter, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
+        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
+        command_suggestion_navigation, command_suggestions, help_entries, key_matches_ctrl_letter,
+        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
+        key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -8630,7 +8649,11 @@ mod tests {
         let task_id = queued.task_id;
         app.finish_launch_task(task_id, Ok(()));
 
-        let task = app.task_log.iter().find(|task| task.id == task_id).expect("task");
+        let task = app
+            .task_log
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("task");
         assert_eq!(task.state, TaskState::Done);
         assert_eq!(task.detail, "completed");
         assert!(task.finished_at_unix_ms.is_some());
@@ -8648,13 +8671,21 @@ mod tests {
         assert_eq!(app.task_log.len(), 1);
         let request = app.take_pending_fzf_jump().expect("fzf request");
         let task_id = request.task_id;
-        let task = app.task_log.iter().find(|task| task.id == task_id).expect("task");
+        let task = app
+            .task_log
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("task");
         assert_eq!(task.kind, "jump");
         assert_eq!(task.state, TaskState::Running);
 
         app.apply_fzf_jump_selection(request, None);
 
-        let task = app.task_log.iter().find(|task| task.id == task_id).expect("task");
+        let task = app
+            .task_log
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("task");
         assert_eq!(task.state, TaskState::Cancelled);
         assert_eq!(task.detail, "fzf cancelled");
     }
@@ -8702,6 +8733,23 @@ mod tests {
     }
 
     #[test]
+    /// 驗證按下 `Shift+Enter` 也會打開 inline `Open with` 小視窗。
+    fn app_shift_enter_opens_open_picker() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .expect("open picker");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::OpenPicker { .. })
+        ));
+    }
+
+    #[test]
     /// 驗證自訂 open action 會出現在 Open with 面板中，並能排入外部啟動佇列。
     fn app_open_picker_includes_custom_actions() {
         let dir = tempdir().expect("tempdir");
@@ -8709,14 +8757,18 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut loaded = default_loaded_config();
-        loaded.config.actions.open_with.push(CustomOpenActionConfig {
-            name: "Git log".to_string(),
-            scope: ActionTargetScope::Both,
-            mode: ActionLaunchMode::TerminalBlocking,
-            command: Some("git -C {parent} log --oneline".to_string()),
-            mac_command: None,
-            windows_command: Some("git -C {parent} log --oneline".to_string()),
-        });
+        loaded
+            .config
+            .actions
+            .open_with
+            .push(CustomOpenActionConfig {
+                name: "Git log".to_string(),
+                scope: ActionTargetScope::Both,
+                mode: ActionLaunchMode::TerminalBlocking,
+                command: Some("git -C {parent} log --oneline".to_string()),
+                mac_command: None,
+                windows_command: Some("git -C {parent} log --oneline".to_string()),
+            });
 
         let mut app = App::new(dir.path().to_path_buf(), loaded).expect("app");
         app.open_selected_with_picker().expect("open picker");
@@ -9698,19 +9750,13 @@ mod tests {
         fs::write(dir.path().join("beta.txt"), "b").expect("beta");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.handle_key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::CONTROL,
-        ))
-        .expect("invert marks");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .expect("invert marks");
         assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 2);
         assert_eq!(app.status, "inverted visible marks (+2, -0, total 2)");
 
-        app.handle_key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::CONTROL,
-        ))
-        .expect("invert marks again");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .expect("invert marks again");
         assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 0);
         assert_eq!(app.status, "inverted visible marks (+0, -2, total 0)");
     }
@@ -9796,7 +9842,12 @@ mod tests {
             .expect("confirm permanent delete");
 
         assert!(!file_path.exists());
-        assert!(app.trash_store.list_entries().expect("trash entries").is_empty());
+        assert!(
+            app.trash_store
+                .list_entries()
+                .expect("trash entries")
+                .is_empty()
+        );
         assert_eq!(app.status, "deleted permanently delete-me.txt");
     }
 
@@ -10389,11 +10440,7 @@ mod tests {
     /// 驗證 preview search 在同一行有多個命中時，`n/p` 仍會逐一輪詢每個命中位置。
     fn app_preview_search_cycles_each_match_occurrence() {
         let dir = tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join("notes.txt"),
-            "tt line\nonly t here\n",
-        )
-        .expect("notes");
+        fs::write(dir.path().join("notes.txt"), "tt line\nonly t here\n").expect("notes");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.panes
@@ -10408,31 +10455,52 @@ mod tests {
             .expect("lock search");
 
         assert_eq!(app.panes.get(&1).expect("pane").preview_match_count(), 3);
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(0));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(0)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .expect("next occurrence on same line");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(1));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(1)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .expect("move to next line occurrence");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(2));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(2)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .expect("wrap to first occurrence");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(0));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(0)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .expect("wrap back to last occurrence");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(2));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(2)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .expect("move back to same-line occurrence");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(1));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(1)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .expect("move back to first occurrence on same line");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(0));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_current_match,
+            Some(0)
+        );
     }
 
     #[test]
@@ -10854,7 +10922,8 @@ mod tests {
             task_id: Some(task_id),
         };
 
-        app.open_global_search_result(search).expect("open search result");
+        app.open_global_search_result(search)
+            .expect("open search result");
 
         let task = app
             .task_log

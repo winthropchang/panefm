@@ -239,7 +239,6 @@ struct AppConfigFile {
     search: Option<SearchConfigFile>,
     navigation: Option<NavigationConfigFile>,
     behavior: Option<BehaviorConfigFile>,
-    actions: Option<ActionsConfigFile>,
 }
 
 /// 表示舊版平鋪設定檔格式。
@@ -296,6 +295,12 @@ struct BehaviorConfigFile {
     cancel_search_on_leave: Option<bool>,
 }
 
+/// 表示 `plugins.toml` 的原始設定格式。
+#[derive(Debug, Default, Deserialize)]
+struct PluginsConfigFile {
+    actions: Option<ActionsConfigFile>,
+}
+
 /// 表示 `actions` 區塊的原始設定格式。
 #[derive(Debug, Default, Deserialize)]
 struct ActionsConfigFile {
@@ -343,34 +348,44 @@ struct PreviewConfigFile {
 /// - 成功時回傳可直接使用的設定與來源路徑。
 /// - 失敗時回傳讀檔、解析或驗證相關錯誤。
 pub fn load_config(base_dir: &Path) -> Result<LoadedConfig> {
-    let Some(path) = config_search_paths(base_dir)
+    let mut config = AppConfig::default();
+    let config_source = config_search_paths(base_dir)
+        .into_iter()
+        .find(|path| path.exists());
+
+    if let Some(path) = config_source.as_ref() {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+
+        apply_new_file(
+            &mut config,
+            toml::from_str::<AppConfigFile>(&contents)
+                .with_context(|| format!("failed to parse config file {}", path.display()))?,
+        )?;
+        apply_legacy_file(
+            &mut config,
+            toml::from_str::<LegacyAppConfigFile>(&contents).with_context(|| {
+                format!("failed to parse legacy config file {}", path.display())
+            })?,
+        )?;
+    }
+
+    if let Some(path) = plugins_search_paths(base_dir, config_source.as_deref())
         .into_iter()
         .find(|path| path.exists())
-    else {
-        return Ok(LoadedConfig {
-            config: AppConfig::default(),
-            source: None,
-        });
-    };
-
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read config file {}", path.display()))?;
-
-    let mut config = AppConfig::default();
-    apply_new_file(
-        &mut config,
-        toml::from_str::<AppConfigFile>(&contents)
-            .with_context(|| format!("failed to parse config file {}", path.display()))?,
-    )?;
-    apply_legacy_file(
-        &mut config,
-        toml::from_str::<LegacyAppConfigFile>(&contents)
-            .with_context(|| format!("failed to parse legacy config file {}", path.display()))?,
-    )?;
+    {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read plugins file {}", path.display()))?;
+        let plugins = toml::from_str::<PluginsConfigFile>(&contents)
+            .with_context(|| format!("failed to parse plugins file {}", path.display()))?;
+        if let Some(actions) = plugins.actions {
+            apply_actions_config(&mut config, actions)?;
+        }
+    }
 
     Ok(LoadedConfig {
         config,
-        source: Some(path),
+        source: config_source,
     })
 }
 
@@ -409,6 +424,48 @@ fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// 建立 `plugins.toml` 的搜尋路徑清單。
+///
+/// 參數：
+/// - `base_dir: &Path`，目前專案目錄。
+/// - `config_source: Option<&Path>`，已找到的 `config.toml` 路徑，用來推導同層的 `plugins.toml`。
+///
+/// 回傳：`Vec<PathBuf>`，依照優先順序排列的候選 plugins 檔案路徑。
+fn plugins_search_paths(base_dir: &Path, config_source: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(path) = env::var_os("TFM_PLUGINS") {
+        paths.push(PathBuf::from(path));
+    }
+
+    if let Some(config_path) = config_source {
+        if let Some(parent) = config_path.parent() {
+            paths.push(parent.join("plugins.toml"));
+        }
+    } else {
+        paths.push(base_dir.join("plugins.toml"));
+    }
+
+    if let Some(xdg_home) = env::var_os("XDG_CONFIG_HOME") {
+        paths.push(
+            PathBuf::from(xdg_home)
+                .join("terminal-file-manager")
+                .join("plugins.toml"),
+        );
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        paths.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("terminal-file-manager")
+                .join("plugins.toml"),
+        );
+    }
+
+    paths
+}
+
 /// 將新版分區設定套用到執行期設定。
 ///
 /// 參數：
@@ -431,9 +488,6 @@ fn apply_new_file(config: &mut AppConfig, file: AppConfigFile) -> Result<()> {
     }
     if let Some(behavior) = file.behavior {
         apply_behavior_config(config, behavior);
-    }
-    if let Some(actions) = file.actions {
-        apply_actions_config(config, actions)?;
     }
     Ok(())
 }
@@ -583,7 +637,11 @@ fn apply_actions_config(config: &mut AppConfig, actions: ActionsConfigFile) -> R
             );
         }
 
-        let scope = match raw.scope.as_deref().map(|value| value.trim().to_ascii_lowercase()) {
+        let scope = match raw
+            .scope
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+        {
             None => ActionTargetScope::Both,
             Some(value) if value == "both" => ActionTargetScope::Both,
             Some(value) if value == "file" => ActionTargetScope::File,
@@ -595,7 +653,11 @@ fn apply_actions_config(config: &mut AppConfig, actions: ActionsConfigFile) -> R
             }
         };
 
-        let mode = match raw.mode.as_deref().map(|value| value.trim().to_ascii_lowercase()) {
+        let mode = match raw
+            .mode
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+        {
             None => ActionLaunchMode::Detached,
             Some(value) if value == "detached" => ActionLaunchMode::Detached,
             Some(value) if value == "terminal" || value == "terminal_blocking" => {
@@ -815,11 +877,11 @@ height = 9
     }
 
     #[test]
-    /// 驗證 `actions.open_with` 會正確載入自訂外部動作設定。
-    fn load_config_reads_custom_open_actions() {
+    /// 驗證 `plugins.toml` 中的 `actions.open_with` 會正確載入自訂外部動作設定。
+    fn load_config_reads_custom_open_actions_from_plugins_file() {
         let dir = tempdir().expect("tempdir");
         fs::write(
-            dir.path().join("config.toml"),
+            dir.path().join("plugins.toml"),
             r#"
 [actions]
 
@@ -843,12 +905,43 @@ windows_command = "git -C {parent} log --oneline"
 
         assert_eq!(loaded.config.actions.open_with.len(), 2);
         assert_eq!(loaded.config.actions.open_with[0].name, "Xcode");
-        assert_eq!(loaded.config.actions.open_with[0].scope, ActionTargetScope::Directory);
-        assert_eq!(loaded.config.actions.open_with[1].mode, ActionLaunchMode::TerminalBlocking);
+        assert_eq!(
+            loaded.config.actions.open_with[0].scope,
+            ActionTargetScope::Directory
+        );
+        assert_eq!(
+            loaded.config.actions.open_with[1].mode,
+            ActionLaunchMode::TerminalBlocking
+        );
         assert_eq!(
             loaded.config.actions.open_with[1].command.as_deref(),
             Some("git -C {parent} log --oneline")
         );
+    }
+
+    #[test]
+    /// 驗證即使沒有 `config.toml`，只要有 `plugins.toml` 也能載入自訂動作。
+    fn load_config_reads_plugins_without_main_config() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("plugins.toml"),
+            r#"
+[actions]
+
+[[actions.open_with]]
+name = "Reveal in Finder"
+scope = "both"
+mode = "detached"
+mac_command = "open -R {path}"
+"#,
+        )
+        .expect("plugins file");
+
+        let loaded = load_config(dir.path()).expect("config");
+
+        assert_eq!(loaded.source, None);
+        assert_eq!(loaded.config.actions.open_with.len(), 1);
+        assert_eq!(loaded.config.actions.open_with[0].name, "Reveal in Finder");
     }
 
     #[test]

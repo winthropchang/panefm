@@ -18,10 +18,7 @@ use ratatui::{
 use crate::theme::Theme;
 
 use super::{
-    bookmark::BookmarkTarget,
-    entry::FileEntry,
-    search::GlobalSearchEntry,
-    trash::TrashStore,
+    bookmark::BookmarkTarget, entry::FileEntry, search::GlobalSearchEntry, trash::TrashStore,
 };
 
 /// 表示單一 pane 的完整瀏覽狀態。
@@ -631,7 +628,10 @@ impl PaneState {
         if effective_scroll > 1 {
             title.push_str("  ^");
         }
-        if match_positions.iter().any(|line| *line > current_match_line) {
+        if match_positions
+            .iter()
+            .any(|line| *line > current_match_line)
+        {
             title.push_str("  v");
         }
         SearchPreviewData {
@@ -1674,7 +1674,13 @@ fn build_search_preview_lines(
     current_match_line: usize,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    let snippet = read_search_snippet(path, query, current_match_line, viewport_height.max(1), theme);
+    let snippet = read_search_snippet(
+        path,
+        query,
+        current_match_line,
+        viewport_height.max(1),
+        theme,
+    );
     if snippet.is_empty() {
         vec![Line::from("no matching snippet available")]
     } else {
@@ -2030,7 +2036,11 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 /// - `target_dir: &Path`，貼上目標資料夾。
 ///
 /// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
-fn copy_path_into_dir(source_path: &Path, target_dir: &Path, overwrite: bool) -> io::Result<String> {
+fn copy_path_into_dir(
+    source_path: &Path,
+    target_dir: &Path,
+    overwrite: bool,
+) -> io::Result<String> {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
@@ -2052,7 +2062,11 @@ fn copy_path_into_dir(source_path: &Path, target_dir: &Path, overwrite: bool) ->
 /// - `target_dir: &Path`，貼上目標資料夾。
 ///
 /// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
-fn move_path_into_dir(source_path: &Path, target_dir: &Path, overwrite: bool) -> io::Result<String> {
+fn move_path_into_dir(
+    source_path: &Path,
+    target_dir: &Path,
+    overwrite: bool,
+) -> io::Result<String> {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
@@ -2728,10 +2742,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(preview_text.iter().any(|line| line == "  2 beta target"));
-        assert!(preview
-            .lines
-            .iter()
-            .any(|line| line.spans.iter().any(|span| span.content.as_ref() == "target")));
+        assert!(preview.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "target")
+        }));
 
         let title = PaneState::preview_title_for_path(&path, false, Some("target"));
         assert_eq!(title, "Preview: notes.txt  [/target]");
@@ -2756,10 +2771,12 @@ mod tests {
 
         assert!(!preview_text.iter().any(|line| line.contains("Information")));
         assert!(!preview_text.iter().any(|line| line.contains("path: ")));
-        assert!(preview
-            .iter()
-            .any(|line| line.spans.iter().any(|span| span.content.as_ref() == "t"
-                && span.style.fg == Some(Theme::default().preview_match_fg))));
+        assert!(preview.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content.as_ref() == "t"
+                    && span.style.fg == Some(Theme::default().preview_match_fg)
+            })
+        }));
     }
 
     #[test]
@@ -2845,8 +2862,10 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(text.iter().any(|line| line.contains("needle appears here")));
-        assert!(!text
-            .iter()
-            .any(|line| line.contains("preview skipped for files larger than 128 KiB")));
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.contains("preview skipped for files larger than 128 KiB"))
+        );
     }
 }
