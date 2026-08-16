@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
-    path::PathBuf,
+    env, fs, io,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -330,6 +330,7 @@ pub(crate) struct App {
     pub(crate) command_mode: bool,
     pub(crate) command_buffer: String,
     pub(crate) command_suggestion_selected: usize,
+    pub(crate) command_completion_cycle: Option<CommandCompletionCycle>,
     pub(crate) awaiting_ctrl_w: bool,
     pub(crate) pending_count: Option<usize>,
     pub(crate) pending_g: bool,
@@ -366,6 +367,12 @@ pub(crate) enum HelpReturnState {
     AwaitingCtrlW,
     PendingBookmark(BookmarkPrompt),
     PreviewFocus(usize),
+}
+
+/// 記錄 command mode 目前是否正拿同一組路徑候選做 Tab 輪詢補全。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandCompletionCycle {
+    pub(crate) suggestions: Vec<CommandSuggestionLine>,
 }
 
 impl App {
@@ -407,6 +414,7 @@ impl App {
             command_mode: false,
             command_buffer: String::new(),
             command_suggestion_selected: 0,
+            command_completion_cycle: None,
             awaiting_ctrl_w: false,
             pending_count: None,
             pending_g: false,
@@ -595,6 +603,7 @@ impl App {
                 self.command_mode = true;
                 self.command_buffer.clear();
                 self.command_suggestion_selected = 0;
+                self.command_completion_cycle = None;
                 self.status = String::from("command mode");
                 self.pending_g = false;
                 self.pending_y = false;
@@ -605,6 +614,7 @@ impl App {
                 self.command_mode = true;
                 self.command_buffer.clear();
                 self.command_suggestion_selected = 0;
+                self.command_completion_cycle = None;
                 self.status = String::from("command mode");
                 self.pending_g = false;
                 self.pending_y = false;
@@ -3516,7 +3526,17 @@ impl App {
 
     /// 處理 command mode 中的按鍵編輯、候選切換與送出行為。
     pub(crate) fn handle_command_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let suggestions = command_suggestions(&self.command_buffer);
+        let suggestions = self.command_suggestions();
+        let path_completion_active =
+            command_path_completion_context(self.current_pane_cwd(), &self.command_buffer)
+                .is_some();
+        if path_completion_active
+            && (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
+            && !suggestions.is_empty()
+        {
+            self.apply_path_completion_tab_cycle(key.code == KeyCode::BackTab, &suggestions);
+            return Ok(true);
+        }
         if let Some(direction) = command_suggestion_navigation(&key) {
             if !suggestions.is_empty() {
                 match direction {
@@ -3539,11 +3559,13 @@ impl App {
                 self.command_mode = false;
                 self.command_buffer.clear();
                 self.command_suggestion_selected = 0;
+                self.command_completion_cycle = None;
                 self.status = String::from("normal mode");
             }
             KeyCode::Backspace => {
                 self.command_buffer.pop();
                 self.command_suggestion_selected = 0;
+                self.command_completion_cycle = None;
             }
             KeyCode::Enter => {
                 let selected_suggestion = suggestions
@@ -3554,16 +3576,19 @@ impl App {
                     .map(|entry| entry.command.trim_start_matches(':').to_string());
                 let current = self.command_buffer.trim();
                 let has_arguments = current.contains(char::is_whitespace);
+                let path_like_input = looks_like_navigation_path(current);
                 if let Some(suggestion) = selected_suggestion
                     && !suggestion.is_empty()
                     && suggestion != current
                     && !has_arguments
+                    && !path_like_input
                 {
                     self.command_buffer = suggestion;
                 } else {
                     let command = std::mem::take(&mut self.command_buffer);
                     self.command_mode = false;
                     self.command_suggestion_selected = 0;
+                    self.command_completion_cycle = None;
                     self.execute_command(command.trim())?;
                 }
             }
@@ -3571,11 +3596,83 @@ impl App {
                 if let Some(c) = typed_char_from_key(&key) {
                     self.command_buffer.push(c);
                     self.command_suggestion_selected = 0;
+                    self.command_completion_cycle = None;
                 }
             }
             _ => {}
         }
         Ok(true)
+    }
+
+    /// 根據目前焦點 pane 與 command buffer，取得 command palette 應顯示的候選。
+    fn command_suggestions(&self) -> Vec<CommandSuggestionLine> {
+        self.command_completion_cycle.clone().map_or_else(
+            || command_suggestions_for_buffer(self.current_pane_cwd(), &self.command_buffer),
+            |cycle| cycle.suggestions,
+        )
+    }
+
+    /// 取得目前焦點 pane 的工作目錄，供 command palette 的路徑補全使用。
+    fn current_pane_cwd(&self) -> Option<&Path> {
+        self.panes
+            .get(&self.focused_pane)
+            .map(|pane| pane.cwd.as_path())
+    }
+
+    /// 在路徑補全模式下處理 `Tab` / `Shift+Tab`，提供共同前綴補齊與候選輪詢。
+    fn apply_path_completion_tab_cycle(
+        &mut self,
+        reverse: bool,
+        suggestions: &[CommandSuggestionLine],
+    ) {
+        if suggestions.is_empty() {
+            return;
+        }
+
+        if suggestions.len() == 1 {
+            self.command_buffer = suggestions[0].command.clone();
+            self.command_suggestion_selected = 0;
+            self.command_completion_cycle = None;
+            return;
+        }
+
+        let current = self.command_buffer.clone();
+        let common_prefix = longest_common_prefix(
+            &suggestions
+                .iter()
+                .map(|line| line.command.as_str())
+                .collect::<Vec<_>>(),
+        );
+        if common_prefix.chars().count() > current.chars().count() {
+            self.command_buffer = common_prefix;
+            self.command_suggestion_selected = 0;
+            self.command_completion_cycle = None;
+            return;
+        }
+
+        let len = suggestions.len();
+        let selected = match &self.command_completion_cycle {
+            Some(cycle) if cycle.suggestions == suggestions => {
+                if reverse {
+                    (self.command_suggestion_selected + len - 1) % len
+                } else {
+                    (self.command_suggestion_selected + 1) % len
+                }
+            }
+            _ => {
+                if reverse {
+                    len - 1
+                } else {
+                    0
+                }
+            }
+        };
+
+        self.command_suggestion_selected = selected;
+        self.command_buffer = suggestions[selected].command.clone();
+        self.command_completion_cycle = Some(CommandCompletionCycle {
+            suggestions: suggestions.to_vec(),
+        });
     }
 
     /// 在一般模式按下 `Esc` 時，優先處理 filter 的兩段式離開流程。
@@ -3634,6 +3731,7 @@ impl App {
     pub(crate) fn execute_command(&mut self, command: &str) -> Result<()> {
         match command {
             "q" => self.status = String::from("use q in normal mode to quit"),
+            "cd" => self.status = String::from("usage: cd <path>"),
             "rename" => self.start_rename(),
             "create" => self.start_create_entry(),
             "copy" => self.copy_selected(),
@@ -3695,6 +3793,8 @@ impl App {
             other => {
                 if let Some(name) = other.strip_prefix("theme ") {
                     self.set_theme_by_name(name.trim());
+                } else if let Some(path) = other.strip_prefix("cd ") {
+                    self.change_directory_from_command(path.trim())?;
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;
                 } else if let Some(args) = other.strip_prefix("rename-regex ") {
@@ -3709,6 +3809,8 @@ impl App {
                     self.jump_to_bookmark_from_command(args.trim())?;
                 } else if let Some(target) = other.strip_prefix("connect ") {
                     self.connect_smb_location(target.trim())?;
+                } else if looks_like_navigation_path(other) {
+                    self.change_directory_from_command(other)?;
                 } else {
                     self.status = format!("unknown command: {other}");
                 }
@@ -4340,6 +4442,7 @@ impl App {
         }
         if self.command_mode {
             self.command_mode = false;
+            self.command_completion_cycle = None;
             return Some(HelpReturnState::CommandMode(std::mem::take(
                 &mut self.command_buffer,
             )));
@@ -6154,11 +6257,36 @@ impl App {
     ///
     /// 回傳：`io::Result<()>`。
     pub(crate) fn move_selected_to_path(&mut self, target: &str) -> io::Result<()> {
-        let Some(target_dir) = self.resolve_move_target_dir(target) else {
+        let Some(target_dir) = self.resolve_path_argument(target) else {
             self.status = String::from("usage: move <target-dir>");
             return Ok(());
         };
         self.move_selected_entries_into_dir(&target_dir)
+    }
+
+    /// 讓目前焦點 pane 直接跳到指定路徑。
+    ///
+    /// 參數：
+    /// - `target: &str`，使用者在 command mode 輸入的目標路徑。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表目前 pane 已切到指定目錄，或定位到指定檔案。
+    pub(crate) fn change_directory_from_command(&mut self, target: &str) -> io::Result<()> {
+        let Some(target_path) = self.resolve_path_argument(target) else {
+            self.status = String::from("usage: cd <path>");
+            return Ok(());
+        };
+
+        let pane = self.current_pane_mut()?;
+        match pane.go_to_path(&target_path) {
+            Ok(()) => {
+                self.status = format!("jumped to path: {}", target_path.display());
+            }
+            Err(error) => {
+                self.status = format!("path jump failed: {} ({error})", target_path.display());
+            }
+        }
+        Ok(())
     }
 
     /// 將目前選取或已標記的項目移到指定 pane 目前所在的目錄。
@@ -6230,20 +6358,23 @@ impl App {
         Ok(())
     }
 
-    /// 將命令列中的 move 目標字串解析成實際目錄路徑。
-    fn resolve_move_target_dir(&self, target: &str) -> Option<PathBuf> {
+    /// 將命令列中的路徑字串解析成實際可用的目標路徑。
+    fn resolve_path_argument(&self, target: &str) -> Option<PathBuf> {
         let trimmed = target.trim();
         if trimmed.is_empty() {
             return None;
         }
 
         let base_dir = self.panes.get(&self.focused_pane)?.cwd.clone();
-        let path = PathBuf::from(trimmed);
-        Some(if path.is_absolute() {
-            path
-        } else {
-            base_dir.join(path)
-        })
+        let expanded = expand_tilde_path(trimmed).unwrap_or_else(|| trimmed.to_string());
+        let path = PathBuf::from(&expanded);
+        Some(
+            if path.is_absolute() || is_windows_drive_path(&expanded) || is_unc_path(&expanded) {
+                path
+            } else {
+                base_dir.join(path)
+            },
+        )
     }
 
     /// 將目前可用的 pane 編號整理成易讀字串，供錯誤訊息與提示使用。
@@ -6614,12 +6745,13 @@ impl App {
         if self.command_mode
             && let Some(area) = pane_rects.get(&self.focused_pane)
         {
+            let command_suggestions = self.command_suggestions();
             let command_cursor = render_command_palette(
                 frame,
                 *area,
                 self.theme,
                 &self.command_buffer,
-                &command_suggestions(&self.command_buffer),
+                &command_suggestions,
                 self.command_suggestion_selected,
             );
             if cursor_position.is_none() {
@@ -6881,6 +7013,62 @@ fn parse_pane_id_argument(args: &str) -> Option<usize> {
     let trimmed = args.trim();
     let id = trimmed.parse::<usize>().ok()?;
     (id > 0).then_some(id)
+}
+
+/// 判斷目前 command mode 輸入看起來是不是一條目錄或檔案路徑。
+fn looks_like_navigation_path(input: &str) -> bool {
+    let trimmed = input.trim();
+    !trimmed.is_empty()
+        && (trimmed.starts_with('/')
+            || trimmed.starts_with("~/")
+            || trimmed.starts_with("~\\")
+            || trimmed == "~"
+            || trimmed.starts_with("./")
+            || trimmed.starts_with(".\\")
+            || trimmed.starts_with("../")
+            || trimmed.starts_with("..\\")
+            || is_windows_drive_path(trimmed)
+            || is_unc_path(trimmed))
+}
+
+/// 判斷字串是否為 Windows 磁碟機開頭的絕對路徑，例如 `C:/work` 或 `D:\\repo`。
+fn is_windows_drive_path(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+/// 判斷字串是否為 UNC 路徑，例如 `\\\\server\\share` 或 `//server/share`。
+fn is_unc_path(input: &str) -> bool {
+    input.starts_with("\\\\") || input.starts_with("//")
+}
+
+/// 展開 `~` 開頭的家目錄路徑，讓 command mode 也能直接輸入家目錄捷徑。
+fn expand_tilde_path(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed == "~" {
+        return command_home_dir().map(|home| home.to_string_lossy().to_string());
+    }
+
+    let suffix = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))?;
+    let home = command_home_dir()?;
+    let mut path = home.to_string_lossy().to_string();
+    if !path.ends_with(std::path::MAIN_SEPARATOR) {
+        path.push(std::path::MAIN_SEPARATOR);
+    }
+    path.push_str(suffix);
+    Some(path)
+}
+
+/// 取得 command mode 需要用來展開 `~` 的使用者家目錄。
+fn command_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// 判斷 regex 批次改名某一列目前屬於可改名、無變化還是無效名稱。
@@ -7213,6 +7401,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("jump"),
         ),
         help_entry(
+            ":cd <path>",
+            "",
+            "讓目前 pane 直接跳到指定路徑，支援相對路徑、絕對路徑與 Windows 磁碟機路徑",
+            HelpAction::Command("cd "),
+        ),
+        help_entry(
             ":bookmark set",
             "m{key}",
             "把目前 pane 的目錄記成書籤，之後可快速跳回來",
@@ -7519,6 +7713,17 @@ fn extraction_status_label(extracted: &[ExtractedArchive], skipped: usize) -> St
     }
 }
 
+/// 根據目前 command mode 的輸入內容，整理出適合顯示的補全候選。
+fn command_suggestions_for_buffer(
+    base_dir: Option<&Path>,
+    query: &str,
+) -> Vec<CommandSuggestionLine> {
+    if let Some(context) = command_path_completion_context(base_dir, query) {
+        return path_completion_suggestions(&context);
+    }
+    command_suggestions(query)
+}
+
 /// 根據目前 command mode 的輸入內容，整理出適合顯示的命令補全候選。
 fn command_suggestions(query: &str) -> Vec<CommandSuggestionLine> {
     let trimmed = query.trim();
@@ -7552,6 +7757,146 @@ fn command_suggestions(query: &str) -> Vec<CommandSuggestionLine> {
     }
 
     suggestions
+}
+
+/// 找出多個候選字串的最長共同前綴，供路徑補全先延伸到共享部分。
+fn longest_common_prefix(values: &[&str]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+
+    let mut prefix = (*first).to_string();
+    for value in values.iter().skip(1) {
+        let mut shared = String::new();
+        for (left, right) in prefix.chars().zip(value.chars()) {
+            if left != right {
+                break;
+            }
+            shared.push(left);
+        }
+        prefix = shared;
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+/// 描述 command mode 中一次路徑補全需要的上下文資訊。
+struct CommandPathCompletionContext {
+    replacement_prefix: String,
+    typed_directory: String,
+    search_dir: PathBuf,
+    partial_name: String,
+    preferred_separator: char,
+}
+
+/// 若目前 command buffer 正在輸入路徑，整理出路徑補全所需的上下文。
+fn command_path_completion_context(
+    base_dir: Option<&Path>,
+    query: &str,
+) -> Option<CommandPathCompletionContext> {
+    let base_dir = base_dir?;
+    let (replacement_prefix, raw_path) = if let Some(path) = query.strip_prefix("cd ") {
+        (String::from("cd "), path)
+    } else if looks_like_navigation_path(query) {
+        (String::new(), query.trim())
+    } else {
+        return None;
+    };
+
+    let preferred_separator = if raw_path.contains('\\') { '\\' } else { '/' };
+    let (typed_directory, partial_name) = split_typed_path(raw_path);
+    let expanded_directory = expand_tilde_path(&typed_directory).unwrap_or(typed_directory.clone());
+    let search_dir = if expanded_directory.is_empty() {
+        base_dir.to_path_buf()
+    } else {
+        let expanded_path = PathBuf::from(&expanded_directory);
+        if expanded_path.is_absolute()
+            || is_windows_drive_path(&expanded_directory)
+            || is_unc_path(&expanded_directory)
+        {
+            expanded_path
+        } else {
+            base_dir.join(expanded_path)
+        }
+    };
+
+    Some(CommandPathCompletionContext {
+        replacement_prefix,
+        typed_directory,
+        search_dir,
+        partial_name,
+        preferred_separator,
+    })
+}
+
+/// 依照目前的路徑補全上下文，建立 command palette 要顯示的候選列表。
+fn path_completion_suggestions(
+    context: &CommandPathCompletionContext,
+) -> Vec<CommandSuggestionLine> {
+    let Ok(entries) = fs::read_dir(&context.search_dir) else {
+        return Vec::new();
+    };
+
+    let partial_lower = context.partial_name.to_ascii_lowercase();
+    let mut candidates = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !partial_lower.is_empty() && !name.to_ascii_lowercase().starts_with(&partial_lower) {
+                return None;
+            }
+
+            let mut completed = format!("{}{}", context.typed_directory, name);
+            if file_type.is_dir() {
+                completed.push(context.preferred_separator);
+            }
+            let mut display_name = name;
+            if file_type.is_dir() {
+                display_name.push(context.preferred_separator);
+            }
+
+            Some((
+                file_type.is_dir(),
+                display_name.to_ascii_lowercase(),
+                CommandSuggestionLine {
+                    command: format!("{}{}", context.replacement_prefix, completed),
+                    display_command: display_name,
+                    description: String::new(),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    candidates
+        .into_iter()
+        .map(|(_, _, suggestion)| suggestion)
+        .take(8)
+        .collect()
+}
+
+/// 將使用者目前輸入的路徑拆成「父目錄前綴」與「最後一段正在輸入的名稱」。
+fn split_typed_path(input: &str) -> (String, String) {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+    if trimmed.ends_with('/') || trimmed.ends_with('\\') {
+        return (trimmed.to_string(), String::new());
+    }
+
+    let slash_index = trimmed.rfind(['/', '\\']);
+    match slash_index {
+        Some(index) => (
+            trimmed[..=index].to_string(),
+            trimmed[index + 1..].to_string(),
+        ),
+        None => (String::new(), trimmed.to_string()),
+    }
 }
 
 /// 建立單一功能說明列與其動作。
@@ -7942,10 +8287,11 @@ mod tests {
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
         PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
-        command_suggestion_navigation, command_suggestions, help_entries, key_matches_ctrl_letter,
+        command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
+        help_entries, is_windows_drive_path, key_matches_ctrl_letter,
         key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end, typed_char_from_key,
+        key_matches_shifted_letter, looks_like_navigation_path, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -8098,6 +8444,143 @@ mod tests {
             .expect("type caret");
 
         assert_eq!(app.command_buffer, "^");
+    }
+
+    #[test]
+    /// 驗證 command mode 遇到看起來像路徑的輸入時，Enter 會直接執行，不會先套用補全建議。
+    fn app_command_mode_enter_executes_path_like_input_instead_of_autocomplete() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.command_mode = true;
+        app.command_buffer = String::from("C:/");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute path-like input");
+
+        assert!(!app.command_mode);
+        assert!(app.command_buffer.is_empty());
+        assert!(app.status.starts_with("path jump failed: C:/"));
+    }
+
+    #[test]
+    /// 驗證 `:cd <path>` 會讓目前 pane 跳到指定子目錄。
+    fn app_cd_command_changes_to_target_directory() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        fs::create_dir(&docs).expect("docs");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("cd docs").expect("cd command");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
+        assert_eq!(app.status, format!("jumped to path: {}", docs.display()));
+    }
+
+    #[test]
+    /// 驗證直接輸入絕對路徑也能跳到目標目錄，不必一定寫 `:cd`。
+    fn app_bare_path_command_changes_directory() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        fs::create_dir(&docs).expect("docs");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command(&docs.display().to_string())
+            .expect("bare path command");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
+    }
+
+    #[test]
+    /// 驗證 Windows 磁碟機路徑會被當成絕對路徑，而不是相對於目前目錄拼接。
+    fn windows_drive_path_is_recognized_as_absolute_like_path() {
+        assert!(is_windows_drive_path("C:/"));
+        assert!(is_windows_drive_path("D:\\work"));
+        assert!(looks_like_navigation_path("R:/repo"));
+        assert!(!is_windows_drive_path("docs/readme"));
+    }
+
+    #[test]
+    /// 驗證 command mode 在輸入路徑時，會改成列出目前目錄下的路徑候選。
+    fn command_suggestions_switch_to_path_completion_candidates() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("draft.md"), "draft").expect("draft");
+
+        let suggestions = command_suggestions_for_buffer(Some(dir.path()), "cd d");
+
+        assert!(!suggestions.is_empty());
+        assert_eq!(suggestions[0].command, "cd docs/");
+        assert_eq!(suggestions[0].display_command, "docs/");
+        assert!(suggestions[0].description.is_empty());
+    }
+
+    #[test]
+    /// 驗證 command mode 在路徑補全模式下按 Tab，會直接把目前候選補進輸入框。
+    fn app_command_mode_tab_autocompletes_path_candidate() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        for ch in "cd d".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type path command");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("autocomplete path");
+
+        assert_eq!(app.command_buffer, "cd docs/");
+    }
+
+    #[test]
+    /// 驗證多個路徑候選存在時，第一次 Tab 會先補到最長共同前綴。
+    fn app_command_mode_tab_completes_longest_common_path_prefix_first() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::create_dir(dir.path().join("downloads")).expect("downloads");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        for ch in "cd d".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type path command");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("complete common prefix");
+
+        assert_eq!(app.command_buffer, "cd do");
+    }
+
+    #[test]
+    /// 驗證共同前綴補滿後，連按 Tab 會在同一組路徑候選間輪流切換。
+    fn app_command_mode_tab_cycles_path_candidates_after_common_prefix() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::create_dir(dir.path().join("downloads")).expect("downloads");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        for ch in "cd do".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type path command");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("cycle to first candidate");
+        let first = app.command_buffer.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("cycle to second candidate");
+        let second = app.command_buffer.clone();
+
+        assert_eq!(first, "cd docs/");
+        assert_eq!(second, "cd downloads/");
     }
 
     #[test]

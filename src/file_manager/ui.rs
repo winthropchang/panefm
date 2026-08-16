@@ -886,11 +886,16 @@ pub(crate) fn render_command_palette(
         let items = suggestions
             .iter()
             .map(|line| {
-                ListItem::new(Line::from(format!(
-                    "{:<22}  {}",
-                    truncate_text(&line.display_command, 22),
-                    line.description
-                )))
+                let text = if line.description.trim().is_empty() {
+                    line.display_command.clone()
+                } else {
+                    format!(
+                        "{:<22}  {}",
+                        truncate_text(&line.display_command, 22),
+                        line.description
+                    )
+                };
+                ListItem::new(Line::from(text))
             })
             .collect::<Vec<_>>();
         let mut list_state = ListState::default();
