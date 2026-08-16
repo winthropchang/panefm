@@ -94,36 +94,99 @@
 ### 測試狀態
 
 - 今天整理後，本機測試結果為：
-  `cargo test` => `130 passed`
+  `cargo test` => `134 passed`
 - 另外有針對今天新增的 SMB / 書籤流程補測試：
   - SMB 書籤會正確寫進 `bookmark.toml`
   - SMB 連線成功後存書籤不會誤存成本機掛載路徑
   - 跳 SMB 書籤會自動進入對應目標
+- 外部開啟平台抽象也已補測試：
+  - Windows `Open`
+  - Windows `Reveal`
+  - macOS `Reveal`
+  - command line 解析
 
-## Windows 目前還沒完成的地方
+### 平台抽象
 
-- 現在不能說已完整支援 Windows。
-- 核心檔案操作、pane、filter、search、bookmark、rename、壓縮解壓縮這些大多是跨平台方向。
-- 但外部開啟流程目前仍偏 Unix / mac 寫法，這是明天要優先處理的重點。
-
-### 明確缺口
-
+- 目前正式支援目標以 `macOS + Windows` 為主。
+- 平台相關命令已抽到：
+  [src/file_manager/platform.rs](/Users/otto/Documents/terminal-file-manager/src/file_manager/platform.rs)
 - [src/file_manager/open.rs](/Users/otto/Documents/terminal-file-manager/src/file_manager/open.rs)
-  裡的 `$EDITOR` / `Vim` 目前仍寫死用 `/bin/sh` 啟動，Windows 一定不對。
-- `system_open_spec()` 目前只有 macOS 用 `open`，其他平台都走 `xdg-open`；
-  這代表 Windows 現在會錯用 `xdg-open`。
-- `Reveal` 在 Windows 也還沒做成 `explorer.exe /select,...` 這種比較合理的行為。
-- 雖然 SMB 已有 Windows UNC 路徑分支，但整體「連線成功後的外部整合」還沒有完成驗證。
+  現在只負責使用者意圖與命令組裝，不再自己混寫平台細節。
+- 目前結構設計已保留 `LinuxLike` 擴充點，但不把 Unix / Linux 視為當前正式支援目標。
+
+## Windows 目前的狀態
+
+- 核心檔案操作、pane、filter、search、bookmark、rename、壓縮解壓縮都已朝跨平台方向整理。
+- 外部開啟流程已改成平台分流：
+  - Windows `Open`：`cmd.exe /C start`
+  - Windows `Reveal`：`explorer.exe /select,...`
+  - macOS `Open`：`open`
+  - macOS `Reveal`：`open -R`
+- `$EDITOR` 與 `Vim` 已不再綁死 `/bin/sh`，改成先解析命令，再直接執行。
+- 目前真正還缺的是「Windows 真機驗證」，不是結構設計。
+
+## 2026-08-16 `fzf` 效能與互動修正
+
+- `z` 目前已改成使用外部 `fzf` 做遞迴 jump，且搜尋範圍會展開目前目錄下的所有子目錄與檔案。
+- `fzf` 整合方式已改成：
+  不是把候選資料直接 pipe 進 `fzf stdin`，而是讓 `fzf` 自己透過 `FZF_DEFAULT_COMMAND` 啟動內部 helper command 產生候選。
+- 這樣做的原因：
+  - `fzf` 可以保有自己的 TTY 輸入，`Esc` / `Enter` 互動比較穩定。
+  - 不容易再出現第一次快、第二次慢，或 `Esc` 無法返回 TUI 的問題。
+- `fzf` 的核心互動已固定指定：
+  - `Esc` => abort
+  - `Enter` => accept
+- 目前已知體感明顯比前一版快，使用者實測回報「現在快很多了」。
+
+### `fzf` 除錯方式
+
+- 若之後又出現某些路徑特別慢，可以先開啟：
+  - `TFM_DEBUG_TIMING=1 cargo run`
+- 目前會輸出到 `stderr` 的 timing 重點：
+  - `fzf wait`
+  - `fzf jump total`
+  - `jump go_to_path`
+- 先看哪一段慢，再決定要優化：
+  - `fzf` 候選生成
+  - pane `reload`
+  - preview
+
+### 明天到公司要驗證的項目
+
+1. 基本啟動
+   - Windows 上能正常啟動 TUI
+   - `hjkl`、`Enter`、`Esc`、`;`、`F1` 可正常使用
+2. 本機開啟流程
+   - 文字檔按 `Enter`
+   - 文字檔 `Shift+O` 選 `$EDITOR`
+   - 文字檔 `Shift+O` 選 `Vim`
+   - 任意檔案 `Shift+O` 選 `Reveal`
+   - 資料夾按 `Enter`
+   - 資料夾 `Shift+O` 選 `Open`
+   - 資料夾 `Shift+O` 選 `Reveal`
+3. 外部程式返回 TUI
+   - 離開 editor / vim 後畫面是否正常回來
+   - 是否會黑畫面或卡死
+4. SMB
+   - `connect smb://host/share`
+   - `connect smb://host/share/path`
+   - 成功後可否瀏覽
+   - 成功後可否存書籤
+   - `bookmark jump <key>` 是否會自動回到 SMB
+5. 錯誤訊息
+   - share 不存在
+   - 權限不足
+   - 網路不通
+   - editor / vim 未安裝
 
 ## 明天接手時的建議順序
 
 1. 先跑一次 `cargo test`，確認今天的基線還是乾淨的。
-2. 先處理 Windows 的外部開啟抽象層：
-   `Open`、`Reveal`、`$EDITOR`、`Vim`。
-3. 把 [src/file_manager/open.rs](/Users/otto/Documents/terminal-file-manager/src/file_manager/open.rs) 做成明確的平台分流，不要再用「非 mac 一律 xdg-open」。
-4. 補 Windows 專用測試：
-   至少要覆蓋 `system_open_spec`、`reveal_in_system_spec`、編輯器與 Vim 啟動命令。
-5. 如果還有時間，再檢查 SMB 在 Windows 實際使用時，是否需要把 UNC 路徑與 pane 導航再補一層保護。
+2. 到公司先做 Windows 真機測試，不要先急著改碼。
+3. 把真機測到的 bug 依序記錄成：
+   操作步驟、實際結果、預期結果。
+4. 若 SMB 在 Windows 實測有問題，再針對 UNC 路徑與 pane 導航補保護。
+5. Windows 基本可用後，下一個大方向就是列表導航與快速定位效能優化。
 
 ## 已知待優化問題
 
@@ -133,9 +196,17 @@
 - 但仍未完成：
   真正接近 mature-reference 的大型目錄掃描效率、搜尋 task 調度優化、可能的索引/快取策略。
 - 這一塊之後要優先朝 mature-reference 類似方向優化，這不是小修，是需要花時間處理的效能工程。
+- 目前在單一目錄中移動游標、快速找到想要的檔案或資料夾，體感仍偏慢。
+- 這個問題不只是 rendering，也包含操作模式本身不夠直接。
+- 下一階段要優先思考：
+  - 更快的列表跳轉方式
+  - 更快的單目錄內搜尋 / jump 模式
+  - 是否加入像 mature-reference / Vim 那種更高效率的定位互動
 
 ## 建議下一步優先做的功能
 
+- 列表導航 / 快速定位優化
+  你已明確覺得目前在目錄內移動與找檔案太慢，這會直接影響日常使用體驗，優先度很高。
 - global search
   第一版已完成，下一步要把重點轉成效能優化與更像 mature-reference 的體感。
 - 更完整的 visual mode
@@ -156,11 +227,12 @@
 - `2d9e0e4` `Add development notes`
 - `8532293` `Scope preview mode to each pane`
 - `1eada83` `Add global search workflow`
+- `117b37a` `Add cross-platform open integration and SMB bookmarks`
 
 ## 接續開發時建議先做的事
 
 1. 先執行 `cargo test`，確認基線狀態正常。
 2. 打開這份筆記確認上次討論到哪裡。
-3. 下一步先優先處理 Windows 相容層，特別是 `open.rs`。
-4. Windows 相容補完後，再回頭做 global search 的深層效能優化。
-5. visual mode / trash / open-edit 這些高頻操作仍可持續補強，但目前優先度低於 Windows。
+3. 明天先做 Windows 真機測試，把實際問題帶回來。
+4. Windows 若沒有大問題，下一步直接做列表導航 / 快速定位優化。
+5. global search 的深層效能優化依然重要，但可以排在單目錄導航體驗之後。

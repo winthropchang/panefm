@@ -408,17 +408,30 @@ impl PaneState {
     ///
     /// 回傳：`Vec<Line<'static>>`，可直接交給 `ratatui` 的 Paragraph 渲染。
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<Line<'static>> {
-        self.preview_content_lines()
+        let max_lines = max_lines.max(1);
+        if self.preview_search_query.is_some() {
+            return self
+                .preview_content_lines()
+                .into_iter()
+                .skip(self.preview_scroll)
+                .take(max_lines)
+                .collect();
+        }
+
+        let needed_lines = self.preview_scroll + max_lines;
+        self.raw_preview_content_lines_limited(needed_lines)
             .into_iter()
             .skip(self.preview_scroll)
-            .take(max_lines.max(1))
+            .take(max_lines)
             .collect()
     }
 
     /// 更新 preview 區目前實際可顯示的列數，供捲動行為使用。
     pub(crate) fn set_preview_viewport_height(&mut self, height: usize) {
         self.preview_viewport_height = height.max(1);
-        self.clamp_preview_scroll();
+        if self.preview_scroll > 0 || self.preview_search_query.is_some() {
+            self.clamp_preview_scroll();
+        }
     }
 
     /// 將 preview 向下捲動指定列數。
@@ -471,7 +484,14 @@ impl PaneState {
 
     /// 判斷目前 preview 是否還有更多內容可以往下捲動。
     pub(crate) fn preview_has_more_below(&self) -> bool {
-        self.preview_scroll < self.max_preview_scroll()
+        if self.preview_search_query.is_some() {
+            return self.preview_scroll < self.max_preview_scroll();
+        }
+
+        let viewport_height = self.preview_viewport_height.max(1);
+        let needed_lines = self.preview_scroll + viewport_height + 1;
+        let total_loaded_lines = self.raw_preview_content_lines_limited(needed_lines).len();
+        total_loaded_lines > self.preview_scroll + viewport_height
     }
 
     /// 回傳完整 preview 內容最多可以向下捲到哪一列。
@@ -492,9 +512,20 @@ impl PaneState {
 
     /// 產生目前選取項目的完整 preview 原始內容，不套用任何搜尋高亮。
     fn raw_preview_content_lines(&self) -> Vec<Line<'static>> {
+        self.raw_preview_content_lines_limited(usize::MAX)
+    }
+
+    /// 產生目前選取項目的 preview 原始內容，並限制最多只建立指定行數。
+    ///
+    /// 參數：
+    /// - `self: &PaneState`，目前的 pane 狀態。
+    /// - `max_lines: usize`，最多建立的 preview 行數。
+    ///
+    /// 回傳：`Vec<Line<'static>>`，未套用搜尋高亮的 preview 原始內容。
+    fn raw_preview_content_lines_limited(&self, max_lines: usize) -> Vec<Line<'static>> {
         match self.selected_entry() {
-            Some(entry) if entry.is_dir => preview_directory(entry, usize::MAX),
-            Some(entry) => preview_file(&entry.path, usize::MAX),
+            Some(entry) if entry.is_dir => preview_directory(entry, max_lines),
+            Some(entry) => preview_file(&entry.path, max_lines),
             None => vec![Line::from("empty directory")],
         }
     }

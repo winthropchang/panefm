@@ -8,6 +8,10 @@ Minimal terminal file manager prototype built with Rust, `ratatui`, and `crosste
 cargo run
 ```
 
+`z` / `:jump` 會呼叫外部 `fzf`，所以系統上需要先安裝 `fzf`。
+
+開發規範請參考 [DEVELOPMENT_GUIDELINES.md](/Users/otto/Documents/terminal-file-manager/DEVELOPMENT_GUIDELINES.md)。
+
 The app loads config from the first existing path in this order:
 
 1. `TFM_CONFIG=/absolute/path/to/config.toml`
@@ -29,6 +33,7 @@ The app loads config from the first existing path in this order:
 - `f`: open the filter box on the right side and filter results while typing
   - first `Esc`: hide the input box but keep the filtered result list
   - second `Esc`: clear the filter and return to the normal list
+- `z`: use `fzf` to quickly pick a file from the current pane's visible list
 - `.`: toggle hidden files and directories
 - `,`: open the sort panel
   - `,m` / `,M`: sort by modified time (forward / reverse)
@@ -105,6 +110,11 @@ default_sort_reverse = false
 global_search_limit = 200
 global_search_chunk_size = 24
 show_loading = true
+fzf_follow_links = true
+
+[navigation]
+fast_move_step = 5
+panel_page_step = 10
 
 [behavior]
 cancel_search_on_leave = true

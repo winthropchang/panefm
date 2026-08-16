@@ -8,6 +8,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -46,6 +47,7 @@ use super::{
         render_bookmark_picker, render_command_palette, render_confirm_dialog, render_filter_input,
         render_global_search_panel, render_pane, render_preview_search_input, render_theme_picker,
     },
+    debug_timing_log, debug_timing_message,
 };
 
 #[cfg(target_os = "windows")]
@@ -108,6 +110,15 @@ pub(crate) struct PreviewSearchState {
 pub(crate) struct ListFindState {
     pub(crate) pane_id: usize,
     pub(crate) buffer: String,
+}
+
+/// 描述目前 pane 已排隊、準備交給主事件迴圈執行的 `fzf` 跳轉請求。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FzfJumpRequest {
+    pub(crate) pane_id: usize,
+    pub(crate) root_dir: PathBuf,
+    pub(crate) show_hidden: bool,
+    pub(crate) follow_links: bool,
 }
 
 /// 記錄目前 global search 的目標 pane、查詢文字與搜尋結果狀態。
@@ -257,6 +268,7 @@ pub(crate) struct App {
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
     pub(crate) pending_launch: Option<LaunchSpec>,
+    pub(crate) pending_fzf_jump: Option<FzfJumpRequest>,
     pub(crate) preview_focus: Option<usize>,
 }
 
@@ -330,6 +342,7 @@ impl App {
             pending_action: None,
             help_return: None,
             pending_launch: None,
+            pending_fzf_jump: None,
             preview_focus: None,
         })
     }
@@ -378,12 +391,14 @@ impl App {
 
     /// 取出目前 count，並轉成固定大步長移動的實際步數。
     fn take_large_move_step(&mut self) -> usize {
-        self.take_count_or_one().saturating_mul(5)
+        self.take_count_or_one()
+            .saturating_mul(self.config.navigation.fast_move_step.max(1))
     }
 
     /// 取出目前 count，並轉成一般彈窗列表使用的 page 步長。
     fn take_panel_page_step(&mut self) -> usize {
-        self.take_count_or_one().saturating_mul(10)
+        self.take_count_or_one()
+            .saturating_mul(self.config.navigation.panel_page_step.max(1))
     }
 
     /// 清除目前暫存的 count prefix。
@@ -485,9 +500,19 @@ impl App {
 
         let should_continue = match key.code {
             _ if key_matches_plain_letter(&key, 'q') => false,
-            KeyCode::Char(':') | KeyCode::Char(';')
-                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            KeyCode::Char(':')
+                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
+                self.command_mode = true;
+                self.command_buffer.clear();
+                self.command_suggestion_selected = 0;
+                self.status = String::from("command mode");
+                self.pending_g = false;
+                self.pending_y = false;
+                self.pending_bookmark = None;
+                true
+            }
+            KeyCode::Char(';') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.command_mode = true;
                 self.command_buffer.clear();
                 self.command_suggestion_selected = 0;
@@ -606,6 +631,13 @@ impl App {
             _ if key_matches_plain_letter(&key, 'r') => {
                 self.clear_pending_count();
                 self.start_rename();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_plain_letter(&key, 'z') => {
+                self.clear_pending_count();
+                self.open_fzf_jump();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -2991,6 +3023,7 @@ impl App {
             "paste" => self.paste_into_focused_pane()?,
             "compress" => self.compress_selected_entries()?,
             "extract" => self.extract_selected_archives()?,
+            "jump" => self.open_fzf_jump(),
             "open" => self.open_selected_with_default()?,
             "open-picker" => self.open_selected_with_picker()?,
             "vim" => {
@@ -3483,6 +3516,42 @@ impl App {
         self.pending_launch.take()
     }
 
+    /// 取出目前排隊中的 `fzf` 跳轉請求，交給主事件迴圈處理。
+    pub(crate) fn take_pending_fzf_jump(&mut self) -> Option<FzfJumpRequest> {
+        self.pending_fzf_jump.take()
+    }
+
+    /// 套用 `fzf` 選取結果；取消時保留原本列表狀態。
+    pub(crate) fn apply_fzf_jump_selection(
+        &mut self,
+        request: FzfJumpRequest,
+        selected_line: Option<&str>,
+    ) {
+        let Some(line) = selected_line.map(str::trim).filter(|line| !line.is_empty()) else {
+            self.status = String::from("jump cancelled");
+            return;
+        };
+
+        let Some(pane) = self.panes.get_mut(&request.pane_id) else {
+            self.status = String::from("jump failed: pane no longer exists");
+            return;
+        };
+
+        let target_path = jump_selection_to_path(&request.root_dir, line);
+        let go_to_path_started_at = Instant::now();
+        match pane.go_to_path(&target_path) {
+            Ok(()) => {
+                debug_timing_message(&format!("jump target path: {}", target_path.display()));
+                debug_timing_log("jump go_to_path", go_to_path_started_at);
+                self.status = format!("jumped: {line}");
+            }
+            Err(error) => {
+                debug_timing_log("jump go_to_path (failed)", go_to_path_started_at);
+                self.status = format!("jump failed for {line}: {error}");
+            }
+        }
+    }
+
     /// 以目前正在操作的上下文為返回點，打開 help 面板。
     pub(crate) fn open_help_from_current(&mut self) {
         self.help_return = self.capture_help_return_state();
@@ -3879,17 +3948,11 @@ impl App {
         self.status = String::from("preview mode");
     }
 
-    /// 打開 preview search 輸入框，並沿用目前已存在的搜尋字串。
+    /// 打開 preview search 輸入框，並清空上一次的搜尋字串。
     pub(crate) fn open_preview_search_input(&mut self) {
-        let existing = self
-            .panes
-            .get(&self.focused_pane)
-            .and_then(|pane| pane.preview_search_query())
-            .unwrap_or_default()
-            .to_string();
         let search = PreviewSearchState {
             pane_id: self.focused_pane,
-            buffer: existing,
+            buffer: String::new(),
             editing: true,
         };
         self.apply_preview_search_buffer(&search);
@@ -3907,6 +3970,27 @@ impl App {
         self.apply_list_find_buffer(&search);
         self.status = list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
         self.list_find = Some(search);
+    }
+
+    /// 使用 `fzf` 遞迴掃描目前 pane 的目錄樹，快速挑選任意深度的目標。
+    pub(crate) fn open_fzf_jump(&mut self) {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("jump failed: pane not found");
+            return;
+        };
+
+        if !pane.cwd.is_dir() {
+            self.status = String::from("jump failed: current root is not a directory");
+            return;
+        }
+
+        self.pending_fzf_jump = Some(FzfJumpRequest {
+            pane_id: self.focused_pane,
+            root_dir: pane.cwd.clone(),
+            show_hidden: true,
+            follow_links: self.config.search.fzf_follow_links,
+        });
+        self.status = String::from("jump: fzf loading");
     }
 
     /// 進入 visual selection 模式，準備用移動游標的方式框選一段範圍。
@@ -5280,6 +5364,8 @@ impl App {
             Span::raw(" copy  "),
             Span::styled("x", self.theme.accent_style()),
             Span::raw(" cut  "),
+            Span::styled("z", self.theme.accent_style()),
+            Span::raw(" jump  "),
             Span::styled("p", self.theme.accent_style()),
             Span::raw(" paste  "),
             Span::styled("Ctrl-w s/v", self.theme.accent_style()),
@@ -5887,6 +5973,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("create"),
         ),
         help_entry(
+            ":jump",
+            "z",
+            "用 fzf 遞迴掃描目前 pane 的目錄樹，快速挑選檔案或資料夾後直接跳過去",
+            HelpAction::Command("jump"),
+        ),
+        help_entry(
             ":bookmark set",
             "m{key}",
             "把目前 pane 的目錄記成書籤，之後可快速跳回來",
@@ -6275,6 +6367,16 @@ fn global_search_status(
     } else {
         format!("global search ({mode}): {buffer} ({matches})")
     }
+}
+
+/// 把 `fzf` 回傳的相對路徑文字轉回實際檔案系統路徑。
+fn jump_selection_to_path(root_dir: &PathBuf, selection: &str) -> PathBuf {
+    let mut target = root_dir.clone();
+    let trimmed = selection.trim_end_matches('/');
+    for segment in trimmed.split('/').filter(|segment| !segment.is_empty()) {
+        target.push(segment);
+    }
+    target
 }
 
 /// 依照編輯模式決定建立輸入框的標題文字。
@@ -7410,6 +7512,20 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "");
+        assert_eq!(app.status, "command mode");
+    }
+
+    #[test]
+    /// 驗證某些終端直接回報 `:` 而不帶 Shift modifier 時，也能正確打開命令模式。
+    fn app_plain_colon_opens_command_mode() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE))
             .expect("open command mode");
 
         assert!(app.command_mode);
@@ -8679,6 +8795,43 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 preview search 重新打開時，不會殘留上一次輸入的查詢字串。
+    fn app_preview_search_reopen_starts_with_empty_buffer() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "alpha\nbeta\ngamma\n").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_preview_focus();
+        app.open_preview_search_input();
+        for ch in ['b', 'e', 't', 'a'] {
+            app.handle_preview_search_input_key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            ))
+            .expect("type query");
+        }
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock search");
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_search_query(),
+            Some("beta")
+        );
+
+        app.open_preview_search_input();
+
+        assert!(
+            app.preview_search
+                .as_ref()
+                .is_some_and(|search| search.buffer.is_empty() && search.editing)
+        );
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_search_query(),
+            None
+        );
+        assert_eq!(app.status, "preview search: all");
+    }
+
+    #[test]
     /// 驗證 preview mode 中按下 `Ctrl-w l` 可以切換到另一個 pane。
     fn app_preview_mode_supports_ctrl_w_pane_navigation() {
         let dir = tempdir().expect("tempdir");
@@ -9220,6 +9373,143 @@ mod tests {
             "alps.txt"
         );
         assert!(app.pending_count.is_none());
+    }
+
+    #[test]
+    /// 驗證按下 `z` 後會建立 `fzf` 跳轉請求，並記住目前 pane 的根目錄設定。
+    fn app_jump_key_queues_fzf_request() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("readme.md"), "b").expect("readme");
+        fs::write(dir.path().join("report.txt"), "c").expect("report");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .expect("open jump");
+
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+
+        assert_eq!(request.pane_id, 1);
+        assert_eq!(request.root_dir, dir.path());
+        assert!(request.show_hidden);
+        assert!(request.follow_links);
+        assert!(app.pending_fzf_jump.is_none());
+        assert_eq!(app.status, "jump: fzf loading");
+    }
+
+    #[test]
+    /// 驗證分割成多個 pane 後，在目前 focus 的 pane 按下 `z` 仍會建立 `fzf` 請求。
+    fn app_jump_key_works_from_focused_split_pane() {
+        let dir = tempdir().expect("tempdir");
+        let left_dir = dir.path().join("left");
+        let right_dir = dir.path().join("right");
+        fs::create_dir(&left_dir).expect("left");
+        fs::create_dir(&right_dir).expect("right");
+        fs::write(left_dir.join("alpha.txt"), "a").expect("alpha");
+        fs::write(right_dir.join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(left_dir.clone(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        app.current_pane_mut().expect("pane").cwd = right_dir.clone();
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
+
+        assert_eq!(app.focused_pane, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .expect("open jump");
+
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+
+        assert_eq!(request.pane_id, 2);
+        assert_eq!(request.root_dir, right_dir);
+        assert!(request.show_hidden);
+        assert!(request.follow_links);
+        assert_eq!(app.status, "jump: fzf loading");
+    }
+
+    #[test]
+    /// 驗證 `z` 使用的 `fzf` 搜尋會固定包含 hidden 內容，不受 pane 顯示設定影響。
+    fn app_jump_key_always_searches_hidden_entries() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".secret.txt"), "secret").expect("secret");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.current_pane_mut().expect("pane").show_hidden = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .expect("open jump");
+
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+        assert!(request.show_hidden);
+        assert!(request.follow_links);
+    }
+
+    #[test]
+    /// 驗證套用 `fzf` 選取結果後，游標會跳到對應的檔案。
+    fn app_apply_fzf_jump_selection_moves_cursor_to_match() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("readme.md"), "b").expect("readme");
+        fs::write(dir.path().join("report.txt"), "c").expect("report");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_fzf_jump();
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+        app.apply_fzf_jump_selection(request, Some("report.txt"));
+
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "report.txt"
+        );
+        assert_eq!(app.status, "jumped: report.txt");
+    }
+
+    #[test]
+    /// 驗證套用巢狀 `fzf` 結果後，pane 會切到檔案所在目錄並聚焦正確項目。
+    fn app_apply_fzf_jump_selection_reveals_nested_file() {
+        let dir = tempdir().expect("tempdir");
+        let nested_dir = dir.path().join("docs");
+        fs::create_dir(&nested_dir).expect("docs");
+        fs::write(nested_dir.join("guide.md"), "guide").expect("guide");
+        fs::write(dir.path().join("root.txt"), "root").expect("root");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_fzf_jump();
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+        app.apply_fzf_jump_selection(request, Some("docs/guide.md"));
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.cwd, nested_dir);
+        assert_eq!(pane.selected_entry().expect("selected").name, "guide.md");
+        assert_eq!(app.status, "jumped: docs/guide.md");
+    }
+
+    #[test]
+    /// 驗證取消 `fzf` 選擇時，不會改動目前游標位置。
+    fn app_apply_fzf_jump_selection_cancel_keeps_selection() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("readme.md"), "b").expect("readme");
+        fs::write(dir.path().join("report.txt"), "c").expect("report");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move to readme");
+        let original = app.panes.get(&1).expect("pane").selected;
+
+        app.open_fzf_jump();
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+        app.apply_fzf_jump_selection(request, None);
+
+        assert_eq!(app.panes.get(&1).expect("pane").selected, original);
+        assert_eq!(app.status, "jump cancelled");
     }
 
     #[test]

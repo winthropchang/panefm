@@ -23,6 +23,11 @@ default_sort_reverse = false
 global_search_limit = 200
 global_search_chunk_size = 24
 show_loading = true
+fzf_follow_links = true
+
+[navigation]
+fast_move_step = 5
+panel_page_step = 10
 
 [behavior]
 cancel_search_on_leave = true

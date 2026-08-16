@@ -72,6 +72,7 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub pane: PaneConfig,
     pub search: SearchConfig,
+    pub navigation: NavigationConfig,
     pub behavior: BehaviorConfig,
 }
 
@@ -98,6 +99,14 @@ pub struct SearchConfig {
     pub global_search_limit: usize,
     pub global_search_chunk_size: usize,
     pub show_loading: bool,
+    pub fzf_follow_links: bool,
+}
+
+/// 表示列表導航手感相關的設定群組。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationConfig {
+    pub fast_move_step: usize,
+    pub panel_page_step: usize,
 }
 
 /// 表示互動行為相關的設定群組。
@@ -161,6 +170,11 @@ impl Default for AppConfig {
                 global_search_limit: 200,
                 global_search_chunk_size: 24,
                 show_loading: true,
+                fzf_follow_links: true,
+            },
+            navigation: NavigationConfig {
+                fast_move_step: 5,
+                panel_page_step: 10,
             },
             behavior: BehaviorConfig {
                 cancel_search_on_leave: true,
@@ -187,6 +201,7 @@ struct AppConfigFile {
     ui: Option<UiConfigFile>,
     pane: Option<PaneConfigFile>,
     search: Option<SearchConfigFile>,
+    navigation: Option<NavigationConfigFile>,
     behavior: Option<BehaviorConfigFile>,
 }
 
@@ -228,6 +243,14 @@ struct SearchConfigFile {
     global_search_limit: Option<usize>,
     global_search_chunk_size: Option<usize>,
     show_loading: Option<bool>,
+    fzf_follow_links: Option<bool>,
+}
+
+/// 表示 `navigation` 區塊的原始設定格式。
+#[derive(Debug, Default, Deserialize)]
+struct NavigationConfigFile {
+    fast_move_step: Option<usize>,
+    panel_page_step: Option<usize>,
 }
 
 /// 表示 `behavior` 區塊的原始設定格式。
@@ -349,6 +372,9 @@ fn apply_new_file(config: &mut AppConfig, file: AppConfigFile) -> Result<()> {
     if let Some(search) = file.search {
         apply_search_config(config, search)?;
     }
+    if let Some(navigation) = file.navigation {
+        apply_navigation_config(config, navigation)?;
+    }
     if let Some(behavior) = file.behavior {
         apply_behavior_config(config, behavior);
     }
@@ -463,6 +489,10 @@ fn apply_search_config(config: &mut AppConfig, search: SearchConfigFile) -> Resu
         config.search.show_loading = show_loading;
     }
 
+    if let Some(fzf_follow_links) = search.fzf_follow_links {
+        config.search.fzf_follow_links = fzf_follow_links;
+    }
+
     Ok(())
 }
 
@@ -471,6 +501,25 @@ fn apply_behavior_config(config: &mut AppConfig, behavior: BehaviorConfigFile) {
     if let Some(cancel_search_on_leave) = behavior.cancel_search_on_leave {
         config.behavior.cancel_search_on_leave = cancel_search_on_leave;
     }
+}
+
+/// 套用並驗證 `navigation` 區塊設定。
+fn apply_navigation_config(config: &mut AppConfig, navigation: NavigationConfigFile) -> Result<()> {
+    if let Some(value) = navigation.fast_move_step {
+        if value == 0 {
+            bail!("navigation.fast_move_step must be greater than 0");
+        }
+        config.navigation.fast_move_step = value;
+    }
+
+    if let Some(value) = navigation.panel_page_step {
+        if value == 0 {
+            bail!("navigation.panel_page_step must be greater than 0");
+        }
+        config.navigation.panel_page_step = value;
+    }
+
+    Ok(())
 }
 
 /// 套用並驗證 preview 區塊的高度設定。
@@ -566,6 +615,11 @@ default_sort_reverse = true
 global_search_limit = 120
 global_search_chunk_size = 16
 show_loading = false
+fzf_follow_links = false
+
+[navigation]
+fast_move_step = 7
+panel_page_step = 14
 
 [behavior]
 cancel_search_on_leave = false
@@ -589,6 +643,9 @@ cancel_search_on_leave = false
         assert_eq!(loaded.config.search.global_search_limit, 120);
         assert_eq!(loaded.config.search.global_search_chunk_size, 16);
         assert!(!loaded.config.search.show_loading);
+        assert!(!loaded.config.search.fzf_follow_links);
+        assert_eq!(loaded.config.navigation.fast_move_step, 7);
+        assert_eq!(loaded.config.navigation.panel_page_step, 14);
         assert!(!loaded.config.behavior.cancel_search_on_leave);
         assert_eq!(loaded.source, Some(dir.path().join("config.toml")));
     }
@@ -634,5 +691,26 @@ height = 9
         assert_eq!(loaded.config.ui.dialogs.confirm.height, 6);
         assert_eq!(loaded.config.ui.dialogs.theme_picker.width_percent, 44);
         assert_eq!(loaded.config.ui.dialogs.theme_picker.height, 9);
+    }
+
+    #[test]
+    /// 驗證 navigation 設定值不可為 0，避免快捷移動完全失效。
+    fn load_config_rejects_zero_navigation_steps() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[navigation]
+fast_move_step = 0
+"#,
+        )
+        .expect("config file");
+
+        let error = load_config(dir.path()).expect_err("should reject zero step");
+        assert!(
+            error
+                .to_string()
+                .contains("navigation.fast_move_step must be greater than 0")
+        );
     }
 }
