@@ -297,6 +297,25 @@ impl PaneState {
         self.marked_paths.clear();
     }
 
+    /// 切換目前游標指向項目的標記狀態。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，目前要切換標記的 pane。
+    ///
+    /// 回傳：`Option<bool>`。
+    /// - `Some(true)` 代表原本未標記，這次已加入標記。
+    /// - `Some(false)` 代表原本已標記，這次已取消標記。
+    /// - `None` 代表目前沒有任何可切換的選取項目。
+    pub(crate) fn toggle_mark_selected(&mut self) -> Option<bool> {
+        let entry = self.selected_entry()?.clone();
+        if self.marked_paths.remove(&entry.path) {
+            Some(false)
+        } else {
+            self.marked_paths.insert(entry.path);
+            Some(true)
+        }
+    }
+
     /// 將索引範圍內的項目加入標記集合，並回傳實際新增了多少項目。
     pub(crate) fn mark_range(&mut self, start: usize, end: usize) -> usize {
         if self.visible_indices.is_empty() {
@@ -346,6 +365,35 @@ impl PaneState {
             }
         }
         added
+    }
+
+    /// 反轉目前所有可見項目的標記狀態。
+    ///
+    /// 規則：
+    /// - 原本已標記的可見項目會被取消。
+    /// - 原本未標記的可見項目會被加入標記。
+    /// - 不可見項目的標記狀態保持不變。
+    ///
+    /// 回傳：`(usize, usize)`。
+    /// - 第一個值是這次新增的標記數量。
+    /// - 第二個值是這次取消的標記數量。
+    pub(crate) fn invert_visible_marks(&mut self) -> (usize, usize) {
+        let mut added = 0usize;
+        let mut removed = 0usize;
+
+        for visible_index in &self.visible_indices {
+            let Some(entry) = self.entries.get(*visible_index) else {
+                continue;
+            };
+            if self.marked_paths.remove(&entry.path) {
+                removed += 1;
+            } else {
+                self.marked_paths.insert(entry.path.clone());
+                added += 1;
+            }
+        }
+
+        (added, removed)
     }
 
     /// 回傳目前應該參與批次操作的項目清單。
@@ -923,7 +971,7 @@ impl PaneState {
     /// - 成功時回傳貼上後的顯示名稱。
     /// - 失敗時回傳檔案系統操作錯誤，例如目標已存在或無法讀寫。
     pub(crate) fn copy_entry_into_current_dir(&mut self, source_path: &Path) -> io::Result<String> {
-        let display_name = copy_path_into_dir(source_path, &self.cwd)?;
+        let display_name = copy_path_into_dir(source_path, &self.cwd, false)?;
         self.reload()?;
 
         let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
@@ -950,7 +998,7 @@ impl PaneState {
     /// - 成功時回傳貼上後的顯示名稱。
     /// - 失敗時回傳檔案系統操作錯誤，例如目標已存在或來源不可用。
     pub(crate) fn move_entry_into_current_dir(&mut self, source_path: &Path) -> io::Result<String> {
-        let display_name = move_path_into_dir(source_path, &self.cwd)?;
+        let display_name = move_path_into_dir(source_path, &self.cwd, false)?;
         self.reload()?;
 
         let moved_path = self.cwd.join(trimmed_display_name(&display_name));
@@ -977,7 +1025,41 @@ impl PaneState {
     /// - 成功時回傳移動後可用於顯示的名稱。
     /// - 失敗時回傳檔案系統移動過程中的錯誤。
     pub(crate) fn move_path_to_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
-        move_path_into_dir(source_path, target_dir)
+        move_path_into_dir(source_path, target_dir, false)
+    }
+
+    /// 將外部來源的檔案或資料夾覆蓋貼到目前 pane 的目錄中。
+    ///
+    /// 規則：
+    /// - 若目標不存在，就和一般貼上一樣直接建立。
+    /// - 若目標已存在，會先刪除目標，再把來源複製進來。
+    /// - 若來源本來就在同一個目錄中，則退回一般複製，避免覆蓋自己。
+    pub(crate) fn copy_entry_into_current_dir_overwrite(
+        &mut self,
+        source_path: &Path,
+    ) -> io::Result<String> {
+        let display_name = copy_path_into_dir(source_path, &self.cwd, true)?;
+        self.reload()?;
+        let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
+        self.select_path(&pasted_path);
+        Ok(display_name)
+    }
+
+    /// 將外部來源的檔案或資料夾覆蓋移動到目前 pane 的目錄中。
+    ///
+    /// 規則：
+    /// - 若目標不存在，就和一般移動一樣直接搬移。
+    /// - 若目標已存在，會先刪除目標，再把來源搬移進來。
+    /// - 若來源本來就在同一個目錄中，則不做任何事。
+    pub(crate) fn move_entry_into_current_dir_overwrite(
+        &mut self,
+        source_path: &Path,
+    ) -> io::Result<String> {
+        let display_name = move_path_into_dir(source_path, &self.cwd, true)?;
+        self.reload()?;
+        let moved_path = self.cwd.join(trimmed_display_name(&display_name));
+        self.select_path(&moved_path);
+        Ok(display_name)
     }
 
     /// 依照輸入路徑建立新項目。
@@ -1743,11 +1825,11 @@ fn format_system_time_preview(value: SystemTime) -> String {
 /// - `target_dir: &Path`，貼上目標資料夾。
 ///
 /// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
-fn copy_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
+fn copy_path_into_dir(source_path: &Path, target_dir: &Path, overwrite: bool) -> io::Result<String> {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
-    let target_path = unique_target_path(target_dir, file_name);
+    let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
 
     if source_path.is_dir() {
         copy_dir_recursive(source_path, &target_path)?;
@@ -1765,11 +1847,11 @@ fn copy_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<Strin
 /// - `target_dir: &Path`，貼上目標資料夾。
 ///
 /// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
-fn move_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
+fn move_path_into_dir(source_path: &Path, target_dir: &Path, overwrite: bool) -> io::Result<String> {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
-    let target_path = unique_target_path(target_dir, file_name);
+    let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
 
     fs::rename(source_path, &target_path)?;
 
@@ -1777,6 +1859,52 @@ fn move_path_into_dir(source_path: &Path, target_dir: &Path) -> io::Result<Strin
         Ok(format!("{}/", target_path_file_name(&target_path)))
     } else {
         Ok(target_path_file_name(&target_path))
+    }
+}
+
+/// 依照是否允許覆蓋，決定貼上時真正要使用的目標路徑。
+///
+/// 規則：
+/// - `overwrite = false` 時，沿用原本的 `copy`, `copy 2` 命名策略。
+/// - `overwrite = true` 且來源與目標不是同一個實體時，若目標存在就先刪掉它。
+/// - 若來源本來就在同一個目錄，為了避免覆蓋自己，會退回不覆蓋策略。
+fn target_path_for_paste(
+    source_path: &Path,
+    target_dir: &Path,
+    original_name: &std::ffi::OsStr,
+    overwrite: bool,
+) -> io::Result<PathBuf> {
+    let original_name = original_name.to_string_lossy();
+    let direct_target = target_dir.join(original_name.as_ref());
+
+    let same_location = source_path.parent() == Some(target_dir) && direct_target == source_path;
+    if !overwrite || same_location {
+        return Ok(unique_target_path(
+            target_dir,
+            std::ffi::OsStr::new(original_name.as_ref()),
+        ));
+    }
+
+    if direct_target.exists() {
+        remove_existing_target(&direct_target)?;
+    }
+
+    Ok(direct_target)
+}
+
+/// 刪除貼上覆蓋前已存在的目標路徑。
+///
+/// 參數：
+/// - `target_path: &Path`，即將被覆蓋的既有檔案或資料夾。
+///
+/// 回傳：`io::Result<()>`。
+/// - 成功時代表既有目標已被安全移除。
+/// - 失敗時代表沒有權限、目標正被使用或刪除過程出錯。
+fn remove_existing_target(target_path: &Path) -> io::Result<()> {
+    if target_path.is_dir() {
+        fs::remove_dir_all(target_path)
+    } else {
+        fs::remove_file(target_path)
     }
 }
 

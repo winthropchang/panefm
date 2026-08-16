@@ -1059,6 +1059,7 @@ pub(crate) fn render_confirm_dialog(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     target_name: &str,
+    permanent: bool,
     theme: Theme,
     config: &AppConfig,
 ) {
@@ -1068,15 +1069,20 @@ pub(crate) fn render_confirm_dialog(
         config.ui.dialogs.confirm.height,
     );
     frame.render_widget(Clear, dialog_area);
+    let (title, question) = if permanent {
+        (" Confirm Delete ", format!("Delete {target_name} permanently?"))
+    } else {
+        (" Confirm Trash ", format!("Move {target_name} to trash?"))
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!("Move {target_name} to trash?")),
+            Line::from(question),
             Line::from("Press y to confirm, n or Esc to cancel."),
         ])
         .block(
             Block::default()
                 .title(Line::from(Span::styled(
-                    " Confirm Trash ",
+                    title,
                     theme.danger_title_style(),
                 )))
                 .borders(Borders::ALL),

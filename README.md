@@ -32,8 +32,12 @@ The app loads config from the first existing path in this order:
 - `h j k l`: move / parent / up / enter
 - `gg` / `G`: jump to top or bottom
 - `yy`: copy the selected file or directory into the internal clipboard
+- `Space`: toggle mark on the selected file or directory
+- `Ctrl-r`: invert marks for all visible entries in the current pane
+- `Y` / `X`: clear copied / cut clipboard state
 - `x`: cut the selected file or directory into the internal clipboard
 - `p`: paste the clipboard item into the current directory
+- `P`: paste with overwrite if the destination name already exists
 - `a`: create a new entry in the current directory
   - end the path with `/` to create a directory
   - omit the trailing `/` to create a file
@@ -57,6 +61,7 @@ The app loads config from the first existing path in this order:
 - `Ctrl-w c`: close current pane
 - `Ctrl-w o`: keep only current pane
 - `d`: move the selected file or directory to the internal trash
+- `D`: permanently delete the selected or marked entries after confirmation
 - `r`: open rename dialog for the selected item
 - `:rename`: open rename dialog for the selected item
 - `:create`, `:create <path>`

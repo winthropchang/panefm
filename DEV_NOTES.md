@@ -224,6 +224,39 @@
 - trash 工作流補強
   例如批次 restore、永久刪除、依日期或路徑排序、清空 trash。
 
+## 和 mature-reference 對齊的核心補強清單
+
+這份清單刻意排除圖片 / 影片預覽、花式主題與生態插件展示，只保留「快速找檔案」與「快速操作檔案」最重要的能力差距。
+
+1. 選取與高頻檔案操作補齊
+   - `Space` 單項切換選取
+   - `Ctrl-r` 反向 / 反轉目前可見項目選取
+   - `Y / X` 取消目前 yank / cut 狀態
+   - `P` 覆蓋貼上
+   - `D` 永久刪除
+2. task manager
+   - 把 copy / move / search / extract / compress / SMB / 未來 plugin action 都整合成同一個任務面板
+3. 內容搜尋
+   - 補上像 mature-reference `S` 那樣的全文搜尋，而不是只有檔名搜尋
+4. action / plugin 系統
+   - 先做設定檔驅動版本，支援 Xcode、git、svn、自訂 opener / action
+5. 設定拆分
+   - 把一般設定、快捷鍵、主題拆成更好維護的多檔案結構
+6. 列表資訊模式
+   - 補 `linemode`、`dir first`、`scrolloff`、symlink 顯示等直接影響閱讀效率的細節
+7. shell / cwd 整合
+   - 離開程式後把 shell 工作目錄同步回去，做成真正可日用的 wrapper workflow
+
+## 2026-08-16 第一項進度
+
+- 已補上 `Space` 單項標記切換。
+- 已補上 `Ctrl-r` 反轉目前 pane 所有可見項目的標記狀態。
+- 已補上 `Y / X` 清掉目前 copy / cut 剪貼簿狀態。
+- 已補上 `P` 覆蓋貼上：
+  若目標同名已存在，會直接覆蓋；若其實是同一路徑，則退回原本的安全貼上策略，避免覆蓋自己。
+- 已補上 `D` 永久刪除，並保留確認提示，避免手滑直接刪除。
+- 已同步更新 help / command / README 與自動化測試，避免之後改壞。
+
 ## 目前最近的 commit
 
 - `de4873b` `Add visual selection workflow`

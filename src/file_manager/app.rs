@@ -187,6 +187,7 @@ pub(crate) enum PendingAction {
     ConfirmDelete {
         pane_id: usize,
         target_name: String,
+        permanent: bool,
     },
     SortPicker {
         pane_id: usize,
@@ -500,7 +501,7 @@ impl App {
             self.pending_y = false;
             return Ok(true);
         }
-        if key_matches_shifted_letter(&key, 'P') {
+        if key_matches_shifted_letter(&key, 'P') && self.clipboard.is_none() {
             self.open_preview_focus();
             self.pending_g = false;
             self.pending_y = false;
@@ -637,7 +638,14 @@ impl App {
             }
             _ if key_matches_plain_letter(&key, 'd') => {
                 self.clear_pending_count();
-                self.start_delete_confirmation();
+                self.start_delete_confirmation(false);
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'D') => {
+                self.clear_pending_count();
+                self.start_delete_confirmation(true);
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -666,6 +674,20 @@ impl App {
             _ if key_matches_ctrl_letter(&key, 'a') => {
                 self.clear_pending_count();
                 self.mark_all_in_focused_pane()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'r') => {
+                self.clear_pending_count();
+                self.invert_marks_in_focused_pane()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            KeyCode::Char(' ') => {
+                self.clear_pending_count();
+                self.toggle_mark_selected_in_focused_pane()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -719,6 +741,13 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            _ if key_matches_shifted_letter(&key, 'X') => {
+                self.clear_pending_count();
+                self.clear_clipboard(ClipboardOperation::Cut);
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             _ if key_matches_plain_letter(&key, 'p') => {
                 if self
                     .panes
@@ -731,6 +760,13 @@ impl App {
                     self.clear_pending_count();
                     self.paste_into_focused_pane()?;
                 }
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'P') => {
+                self.clear_pending_count();
+                self.paste_into_focused_pane_with_overwrite()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -761,6 +797,14 @@ impl App {
                     self.pending_y = true;
                     self.status = String::from("pending: y");
                 }
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'Y') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_bookmark = None;
+                self.pending_y = false;
+                self.clear_clipboard(ClipboardOperation::Copy);
                 true
             }
             _ if key_matches_plain_letter(&key, 'm') => {
@@ -1456,22 +1500,36 @@ impl App {
             PendingAction::ConfirmDelete {
                 pane_id,
                 target_name,
+                permanent,
             } => match key.code {
                 _ if key_matches_letter_any_case(&key, 'y') => {
-                    self.confirm_delete(pane_id, &target_name)?;
+                    self.confirm_delete(pane_id, &target_name, permanent)?;
                 }
                 KeyCode::Esc => {
-                    self.status = format!("trash cancelled: {target_name}");
+                    self.status = if permanent {
+                        format!("delete cancelled: {target_name}")
+                    } else {
+                        format!("trash cancelled: {target_name}")
+                    };
                 }
                 _ if key_matches_letter_any_case(&key, 'n') => {
-                    self.status = format!("trash cancelled: {target_name}");
+                    self.status = if permanent {
+                        format!("delete cancelled: {target_name}")
+                    } else {
+                        format!("trash cancelled: {target_name}")
+                    };
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::ConfirmDelete {
                         pane_id,
                         target_name: target_name.clone(),
+                        permanent,
                     });
-                    self.status = format!("confirm trash {target_name}: y/n");
+                    self.status = if permanent {
+                        format!("confirm delete {target_name}: y/n")
+                    } else {
+                        format!("confirm trash {target_name}: y/n")
+                    };
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
@@ -3206,8 +3264,12 @@ impl App {
             "rename" => self.start_rename(),
             "create" => self.start_create_entry(),
             "copy" => self.copy_selected(),
+            "mark-toggle" => self.toggle_mark_selected_in_focused_pane()?,
+            "cancel-copy" => self.clear_clipboard(ClipboardOperation::Copy),
+            "cancel-cut" => self.clear_clipboard(ClipboardOperation::Cut),
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
+            "paste!" => self.paste_into_focused_pane_with_overwrite()?,
             "compress" => self.compress_selected_entries()?,
             "extract" => self.extract_selected_archives()?,
             "jump" => self.open_fzf_jump(),
@@ -3215,6 +3277,7 @@ impl App {
             "open-picker" => self.open_selected_with_picker()?,
             "copy-picker" => self.open_copy_picker()?,
             "mark-all" | "select-all" => self.mark_all_in_focused_pane()?,
+            "mark-invert" | "invert-selection" => self.invert_marks_in_focused_pane()?,
             "vim" => {
                 let Some(target) = self.selected_open_target() else {
                     self.status = String::from("nothing selected to open");
@@ -3242,6 +3305,8 @@ impl App {
             "restore" => self.restore_latest_from_trash()?,
             "trash clear" => self.clear_trash()?,
             "trash restore-all" => self.restore_all_from_trash()?,
+            "delete" => self.start_delete_confirmation(false),
+            "delete!" | "delete-permanently" => self.start_delete_confirmation(true),
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
@@ -3909,8 +3974,16 @@ impl App {
     /// 依 pending action 類型回傳適合顯示的狀態文字。
     fn status_for_pending_action(&self, action: &PendingAction) -> io::Result<String> {
         Ok(match action {
-            PendingAction::ConfirmDelete { target_name, .. } => {
-                format!("confirm trash {target_name}: y/n")
+            PendingAction::ConfirmDelete {
+                target_name,
+                permanent,
+                ..
+            } => {
+                if *permanent {
+                    format!("confirm delete {target_name}: y/n")
+                } else {
+                    format!("confirm trash {target_name}: y/n")
+                }
             }
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::ThemePicker { selected } => {
@@ -4349,6 +4422,39 @@ impl App {
         Ok(())
     }
 
+    /// 切換目前焦點項目的標記狀態，讓單項多選操作更直接。
+    fn toggle_mark_selected_in_focused_pane(&mut self) -> io::Result<()> {
+        let pane = self.current_pane_mut()?;
+        let selected_name = pane.selected_entry().map(|entry| entry.display_name());
+        match pane.toggle_mark_selected() {
+            Some(true) => {
+                let name = selected_name.unwrap_or_else(|| String::from("item"));
+                self.status = format!("marked {name}");
+            }
+            Some(false) => {
+                let name = selected_name.unwrap_or_else(|| String::from("item"));
+                self.status = format!("unmarked {name}");
+            }
+            None => {
+                self.status = String::from("nothing selected to mark");
+            }
+        }
+        Ok(())
+    }
+
+    /// 反轉目前焦點 pane 所有可見項目的標記狀態。
+    fn invert_marks_in_focused_pane(&mut self) -> io::Result<()> {
+        let pane = self.current_pane_mut()?;
+        let (added, removed) = pane.invert_visible_marks();
+        let total = pane.marked_count();
+        self.status = if added == 0 && removed == 0 {
+            String::from("nothing to invert")
+        } else {
+            format!("inverted visible marks (+{added}, -{removed}, total {total})")
+        };
+        Ok(())
+    }
+
     /// 判斷目前是否仍有任何 pane 保留已提交的標記。
     fn has_any_marks(&self) -> bool {
         self.panes.values().any(|pane| pane.marked_count() > 0)
@@ -4445,15 +4551,23 @@ impl App {
     }
 
     /// 開始刪除確認流程，建立一個待確認的刪除互動。
-    pub(crate) fn start_delete_confirmation(&mut self) {
+    pub(crate) fn start_delete_confirmation(&mut self, permanent: bool) {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("nothing selected to trash");
+            self.status = if permanent {
+                String::from("nothing selected to delete")
+            } else {
+                String::from("nothing selected to trash")
+            };
             return;
         };
 
         let entries = pane.selected_or_marked_entries();
         if entries.is_empty() {
-            self.status = String::from("nothing selected to trash");
+            self.status = if permanent {
+                String::from("nothing selected to delete")
+            } else {
+                String::from("nothing selected to trash")
+            };
             return;
         }
 
@@ -4466,29 +4580,54 @@ impl App {
         self.pending_action = Some(PendingAction::ConfirmDelete {
             pane_id: self.focused_pane,
             target_name: target_name.clone(),
+            permanent,
         });
-        self.status = format!("confirm trash {target_name}: y/n");
+        self.status = if permanent {
+            format!("confirm delete {target_name}: y/n")
+        } else {
+            format!("confirm trash {target_name}: y/n")
+        };
     }
 
     /// 真正執行將目前待確認項目移到 trash 的檔案系統操作。
-    pub(crate) fn confirm_delete(&mut self, pane_id: usize, target_name: &str) -> io::Result<()> {
+    pub(crate) fn confirm_delete(
+        &mut self,
+        pane_id: usize,
+        target_name: &str,
+        permanent: bool,
+    ) -> io::Result<()> {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             self.status = String::from("pane no longer exists");
             return Ok(());
         };
 
-        let trash_store = self.trash_store.clone();
-        match pane.trash_selected_or_marked(&trash_store) {
-            Ok(trashed_names) if trashed_names.is_empty() => {
-                self.status = String::from("nothing selected to trash");
+        if permanent {
+            match pane.delete_selected_or_marked() {
+                Ok(deleted_names) if deleted_names.is_empty() => {
+                    self.status = String::from("nothing selected to delete");
+                }
+                Ok(deleted_names) if deleted_names.len() == 1 => {
+                    self.status = format!("deleted permanently {}", deleted_names[0]);
+                }
+                Ok(deleted_names) => {
+                    self.status = format!("deleted permanently {} items", deleted_names.len());
+                }
+                Err(error) => self.status = format!("failed to delete {target_name}: {error}"),
             }
-            Ok(trashed_names) if trashed_names.len() == 1 => {
-                self.status = format!("trashed {}", trashed_names[0]);
+        } else {
+            let trash_store = self.trash_store.clone();
+            match pane.trash_selected_or_marked(&trash_store) {
+                Ok(trashed_names) if trashed_names.is_empty() => {
+                    self.status = String::from("nothing selected to trash");
+                }
+                Ok(trashed_names) if trashed_names.len() == 1 => {
+                    self.status = format!("trashed {}", trashed_names[0]);
+                }
+                Ok(trashed_names) => {
+                    self.status = format!("trashed {} items", trashed_names.len());
+                }
+                Err(error) => self.status = format!("failed to trash {target_name}: {error}"),
             }
-            Ok(trashed_names) => {
-                self.status = format!("trashed {} items", trashed_names.len());
-            }
-            Err(error) => self.status = format!("failed to trash {target_name}: {error}"),
         }
 
         Ok(())
@@ -4701,7 +4840,7 @@ impl App {
             HelpAction::Command(command) => self
                 .execute_command(command)
                 .map_err(|error| io::Error::other(error.to_string()))?,
-            HelpAction::Delete => self.start_delete_confirmation(),
+            HelpAction::Delete => self.start_delete_confirmation(false),
             HelpAction::Filter => self.open_filter_input(),
             HelpAction::Sort => self.open_sort_picker(),
             HelpAction::Hidden => {
@@ -5121,6 +5260,29 @@ impl App {
         self.store_selected_in_clipboard(ClipboardOperation::Cut);
     }
 
+    /// 清除目前內部剪貼簿中指定類型的 yank 狀態。
+    ///
+    /// 規則：
+    /// - 若目前剪貼簿剛好就是指定操作類型，就清掉它。
+    /// - 若目前不是該類型，則只更新狀態列，不動既有內容。
+    fn clear_clipboard(&mut self, operation: ClipboardOperation) {
+        match self.clipboard.as_ref() {
+            Some(clipboard) if clipboard.operation == operation => {
+                self.clipboard = None;
+                self.status = match operation {
+                    ClipboardOperation::Copy => String::from("cleared copied items"),
+                    ClipboardOperation::Cut => String::from("cleared cut items"),
+                };
+            }
+            _ => {
+                self.status = match operation {
+                    ClipboardOperation::Copy => String::from("no copied items to clear"),
+                    ClipboardOperation::Cut => String::from("no cut items to clear"),
+                };
+            }
+        }
+    }
+
     /// 把目前焦點 pane 的選取項目寫入剪貼簿。
     ///
     /// 參數：
@@ -5175,6 +5337,20 @@ impl App {
     /// - 成功時代表貼上流程已完成，並同步更新所有 pane。
     /// - 失敗時代表目標目錄或檔案系統操作失敗。
     pub(crate) fn paste_into_focused_pane(&mut self) -> io::Result<()> {
+        self.paste_into_focused_pane_impl(false)
+    }
+
+    /// 將內部剪貼簿中的項目以覆蓋模式貼到目前有焦點的 pane 目錄。
+    ///
+    /// 規則：
+    /// - 若目標名稱已存在，會直接覆蓋目標。
+    /// - 若來源與目標本來就在同一路徑，會退回一般不覆蓋的行為避免覆寫自己。
+    pub(crate) fn paste_into_focused_pane_with_overwrite(&mut self) -> io::Result<()> {
+        self.paste_into_focused_pane_impl(true)
+    }
+
+    /// 負責實作一般貼上與覆蓋貼上的共用流程。
+    fn paste_into_focused_pane_impl(&mut self, overwrite: bool) -> io::Result<()> {
         let Some(clipboard) = self.clipboard.clone() else {
             self.status = String::from("clipboard is empty");
             return Ok(());
@@ -5198,8 +5374,12 @@ impl App {
 
             let paste_result = match self.panes.get_mut(&self.focused_pane) {
                 Some(pane) => match clipboard.operation {
-                    ClipboardOperation::Copy => {
-                        pane.copy_entry_into_current_dir(&entry.source_path)
+                    ClipboardOperation::Copy if overwrite => {
+                        pane.copy_entry_into_current_dir_overwrite(&entry.source_path)
+                    }
+                    ClipboardOperation::Copy => pane.copy_entry_into_current_dir(&entry.source_path),
+                    ClipboardOperation::Cut if overwrite => {
+                        pane.move_entry_into_current_dir_overwrite(&entry.source_path)
                     }
                     ClipboardOperation::Cut => pane.move_entry_into_current_dir(&entry.source_path),
                 },
@@ -5224,8 +5404,20 @@ impl App {
 
         self.reload_all_panes()?;
         self.status = match clipboard.operation {
+            ClipboardOperation::Copy if overwrite && pasted_count == 1 => {
+                String::from("pasted copy with overwrite: 1 item")
+            }
+            ClipboardOperation::Copy if overwrite => {
+                format!("pasted copy with overwrite: {pasted_count} items")
+            }
             ClipboardOperation::Copy if pasted_count == 1 => String::from("pasted copy: 1 item"),
             ClipboardOperation::Copy => format!("pasted copy: {pasted_count} items"),
+            ClipboardOperation::Cut if overwrite && pasted_count == 1 => {
+                String::from("moved with overwrite: 1 item")
+            }
+            ClipboardOperation::Cut if overwrite => {
+                format!("moved with overwrite: {pasted_count} items")
+            }
             ClipboardOperation::Cut if pasted_count == 1 => String::from("moved: 1 item"),
             ClipboardOperation::Cut => format!("moved: {pasted_count} items"),
         };
@@ -5721,8 +5913,19 @@ impl App {
         }
 
         match &self.pending_action {
-            Some(PendingAction::ConfirmDelete { target_name, .. }) => {
-                render_confirm_dialog(frame, frame.area(), target_name, self.theme, &self.config);
+            Some(PendingAction::ConfirmDelete {
+                target_name,
+                permanent,
+                ..
+            }) => {
+                render_confirm_dialog(
+                    frame,
+                    frame.area(),
+                    target_name,
+                    *permanent,
+                    self.theme,
+                    &self.config,
+                );
             }
             Some(PendingAction::SortPicker { .. }) => {
                 super::ui::render_sort_picker(frame, frame.area(), self.theme);
@@ -6271,14 +6474,26 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":copy-picker",
             "c",
-            "打開文字複製小視窗，可快速複製檔案 URL、目錄 URL、檔名或無副檔名檔名",
+            "打開文字複製小視窗，可快速複製檔案路徑、目錄路徑、檔名或無副檔名檔名",
             HelpAction::Command("copy-picker"),
+        ),
+        help_entry(
+            ":mark toggle",
+            "Space",
+            "切換目前游標所在項目的標記狀態，方便逐項多選",
+            HelpAction::Command("mark-toggle"),
         ),
         help_entry(
             ":mark-all",
             "Ctrl-a",
             "把目前 pane 中所有可見的檔案與資料夾全部標記起來，方便批次操作",
             HelpAction::Command("mark-all"),
+        ),
+        help_entry(
+            ":mark-invert",
+            "Ctrl-r",
+            "反轉目前 pane 所有可見項目的標記狀態",
+            HelpAction::Command("mark-invert"),
         ),
         help_entry(
             ":unmark-all",
@@ -6309,6 +6524,24 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "p",
             "貼上剪貼簿項目到目前目錄",
             HelpAction::Command("paste"),
+        ),
+        help_entry(
+            ":paste!",
+            "P",
+            "貼上剪貼簿項目到目前目錄；若同名已存在就直接覆蓋",
+            HelpAction::Command("paste!"),
+        ),
+        help_entry(
+            ":cancel copied",
+            "Y",
+            "清掉目前內部剪貼簿中的 copy 狀態，不影響檔案本身",
+            HelpAction::Command("cancel-copy"),
+        ),
+        help_entry(
+            ":cancel cut",
+            "X",
+            "清掉目前內部剪貼簿中的 cut 狀態，不影響檔案本身",
+            HelpAction::Command("cancel-cut"),
         ),
         help_entry(
             ":connect smb://host/share",
@@ -6357,6 +6590,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "d",
             "將目前選取項目移到 trash，並顯示確認提示",
             HelpAction::Delete,
+        ),
+        help_entry(
+            ":delete!",
+            "D",
+            "永久刪除目前選取或標記項目，會先顯示確認提示",
+            HelpAction::Command("delete!"),
         ),
         help_entry(
             ":trash",
@@ -7308,7 +7547,7 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         assert!(matches!(
             app.pending_action,
             Some(PendingAction::ConfirmDelete { .. })
@@ -7330,7 +7569,7 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm trash");
         assert!(!file_path.exists());
@@ -7349,7 +7588,7 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm trash");
 
@@ -7375,7 +7614,7 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm trash");
 
@@ -7401,10 +7640,10 @@ mod tests {
         fs::write(&beta, "beta").expect("beta");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm alpha");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm beta");
 
@@ -7446,10 +7685,10 @@ mod tests {
         fs::write(&beta, "beta").expect("beta");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm first");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm second");
 
@@ -7477,7 +7716,7 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm trash");
 
@@ -7506,7 +7745,7 @@ mod tests {
         fs::write(&file_path, "hello").expect("file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm trash");
 
@@ -7835,10 +8074,10 @@ mod tests {
         fs::write(&beta, "beta").expect("beta");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm alpha");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm beta");
 
@@ -7859,10 +8098,10 @@ mod tests {
         fs::write(&beta, "beta").expect("beta");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm alpha");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm beta");
 
@@ -8507,6 +8746,134 @@ mod tests {
         assert!(target_dir.join("beta.txt").exists());
         assert!(app.clipboard.is_none());
         assert_eq!(app.status, "moved: 1 item");
+    }
+
+    #[test]
+    /// 驗證按下 `Space` 會切換目前選取項目的標記狀態。
+    fn app_space_toggles_mark_on_selected_entry() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("mark selected");
+        assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 1);
+        assert_eq!(app.status, "marked alpha.txt");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("unmark selected");
+        assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 0);
+        assert_eq!(app.status, "unmarked alpha.txt");
+    }
+
+    #[test]
+    /// 驗證按下 `Ctrl-r` 會反轉目前所有可見項目的標記狀態。
+    fn app_ctrl_r_inverts_visible_marks() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("invert marks");
+        assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 2);
+        assert_eq!(app.status, "inverted visible marks (+2, -0, total 2)");
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("invert marks again");
+        assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 0);
+        assert_eq!(app.status, "inverted visible marks (+0, -2, total 0)");
+    }
+
+    #[test]
+    /// 驗證按下 `Y` / `X` 可以清掉目前內部剪貼簿中的 copy / cut 狀態。
+    fn app_shift_y_and_shift_x_clear_clipboard_state() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("pending copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT))
+            .expect("clear copied items");
+        assert!(app.clipboard.is_none());
+        assert_eq!(app.status, "cleared copied items");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("cut");
+        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .expect("clear cut items");
+        assert!(app.clipboard.is_none());
+        assert_eq!(app.status, "cleared cut items");
+    }
+
+    #[test]
+    /// 驗證按下 `P` 會以覆蓋模式貼上，而不是自動產生 `copy` 檔名。
+    fn app_shift_p_pastes_with_overwrite_when_clipboard_exists() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source");
+        fs::create_dir(&target_dir).expect("target");
+        let source_file = source_dir.join("alpha.txt");
+        let target_file = target_dir.join("alpha.txt");
+        fs::write(&source_file, "from source").expect("source file");
+        fs::write(&target_file, "from target").expect("target file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("pending copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy");
+
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload target");
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT))
+            .expect("overwrite paste");
+
+        assert_eq!(
+            fs::read_to_string(&target_file).expect("target content"),
+            "from source"
+        );
+        assert!(!target_dir.join("alpha copy.txt").exists());
+        assert_eq!(app.status, "pasted copy with overwrite: 1 item");
+    }
+
+    #[test]
+    /// 驗證按下 `D` 後確認，會直接永久刪除目前選取項目而不是丟進 trash。
+    fn app_shift_d_deletes_selected_entry_permanently() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("delete-me.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+            .expect("start permanent delete");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmDelete {
+                permanent: true,
+                ..
+            })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm permanent delete");
+
+        assert!(!file_path.exists());
+        assert!(app.trash_store.list_entries().expect("trash entries").is_empty());
+        assert_eq!(app.status, "deleted permanently delete-me.txt");
     }
 
     #[test]
@@ -9345,7 +9712,7 @@ mod tests {
             .expect("move down");
         app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
             .expect("commit visual");
-        app.start_delete_confirmation();
+        app.start_delete_confirmation(false);
 
         assert!(matches!(
             app.pending_action,
