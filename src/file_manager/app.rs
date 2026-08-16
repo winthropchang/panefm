@@ -340,6 +340,7 @@ pub(crate) struct App {
     pub(crate) global_search: Option<GlobalSearchState>,
     pub(crate) global_search_rx: Option<Receiver<GlobalSearchEvent>>,
     pub(crate) global_search_cancelled: Option<Arc<AtomicBool>>,
+    pub(crate) active_global_search_task_id: Option<usize>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
@@ -416,6 +417,7 @@ impl App {
             global_search: None,
             global_search_rx: None,
             global_search_cancelled: None,
+            active_global_search_task_id: None,
             visual_selection: None,
             pending_action: None,
             help_return: None,
@@ -2283,6 +2285,21 @@ impl App {
                         selected = selected.saturating_sub(self.take_large_move_step());
                         self.pending_g = false;
                     }
+                    _ if key_matches_plain_letter(&key, 'x')
+                        || key_matches_plain_letter(&key, 'c') =>
+                    {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        if let Some(task) = tasks.get(selected) {
+                            self.cancel_task_by_id(task.id);
+                            let len = self.tasks_for_pane(pane_id).len();
+                            self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
+                            if self.status.is_empty() {
+                                self.status = task_panel_status(len, selected);
+                            }
+                            return Ok(true);
+                        }
+                    }
                     _ if key_matches_plain_letter(&key, 'g') => {
                         if self.pending_g {
                             if let Some(count) = self.take_pending_count() {
@@ -2297,24 +2314,16 @@ impl App {
                     }
                     KeyCode::Enter | KeyCode::Right => {
                         if let Some(task) = tasks.get(selected) {
-                            self.status = format!(
-                                "task {} [{}] {}",
-                                task.id,
-                                task.kind,
-                                task.detail
-                            );
+                            self.status =
+                                format!("task {} [{}] {}", task.id, task.kind, task.detail);
                         } else {
                             self.status = String::from("tasks: empty");
                         }
                     }
                     _ if key_matches_plain_letter(&key, 'l') => {
                         if let Some(task) = tasks.get(selected) {
-                            self.status = format!(
-                                "task {} [{}] {}",
-                                task.id,
-                                task.kind,
-                                task.detail
-                            );
+                            self.status =
+                                format!("task {} [{}] {}", task.id, task.kind, task.detail);
                         } else {
                             self.status = String::from("tasks: empty");
                         }
@@ -4840,6 +4849,49 @@ impl App {
         }
     }
 
+    /// 取消指定 task；目前支援 search worker 與尚未執行的 queued open / fzf jump。
+    fn cancel_task_by_id(&mut self, task_id: usize) {
+        if self.active_global_search_task_id == Some(task_id) {
+            self.cancel_global_search();
+            self.status = format!("cancelled task {task_id}");
+            return;
+        }
+
+        if self
+            .pending_fzf_jump
+            .as_ref()
+            .map(|request| request.task_id)
+            == Some(task_id)
+        {
+            self.pending_fzf_jump = None;
+            self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled before fzf"));
+            self.status = format!("cancelled task {task_id}");
+            return;
+        }
+
+        if self
+            .pending_launch
+            .as_ref()
+            .map(|queued| queued.task_id)
+            == Some(task_id)
+        {
+            self.pending_launch = None;
+            self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled before launch"));
+            self.status = format!("cancelled task {task_id}");
+            return;
+        }
+
+        if let Some(task) = self.task_log.iter().find(|task| task.id == task_id) {
+            if matches!(task.state, TaskState::Running) {
+                self.status = format!("task {task_id} cannot be cancelled now");
+            } else {
+                self.status = format!("task {task_id} is already {}", task_state_label(task.state));
+            }
+        } else {
+            self.status = format!("task {task_id} not found");
+        }
+    }
+
     /// 取得目前 pane 對應的任務清單，最新的排在最上面。
     fn tasks_for_pane(&self, pane_id: usize) -> Vec<TaskRecord> {
         self.task_log
@@ -5463,6 +5515,7 @@ impl App {
         search.task_id = Some(task_id);
         self.global_search_rx = Some(rx);
         self.global_search_cancelled = Some(cancelled);
+        self.active_global_search_task_id = Some(task_id);
         Ok(())
     }
 
@@ -5476,8 +5529,15 @@ impl App {
 
     /// 關閉 global search 畫面，並同步停止正在進行中的背景搜尋。
     fn cancel_global_search(&mut self) {
+        let mut cancelled_task_id = None;
         if let Some(search) = &mut self.global_search
             && let Some(task_id) = search.task_id.take()
+        {
+            cancelled_task_id = Some(task_id);
+            self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled"));
+        }
+        if let Some(task_id) = self.active_global_search_task_id.take()
+            && cancelled_task_id != Some(task_id)
         {
             self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled"));
         }
@@ -5620,6 +5680,13 @@ impl App {
         };
 
         pane.reveal_path(&entry.path)?;
+        if let Some(task_id) = search.task_id.or(self.active_global_search_task_id.take()) {
+            self.finish_task(
+                task_id,
+                TaskState::Cancelled,
+                String::from("stopped after opening a result"),
+            );
+        }
         self.cancel_global_search_worker();
         self.global_search = None;
         self.status = format!("search opened: {}", entry.relative_path);
@@ -6415,7 +6482,7 @@ impl App {
         let Some(receiver) = &self.global_search_rx else {
             return;
         };
-        let messages: Vec<GlobalSearchEvent> = receiver.try_iter().collect();
+        let messages: Vec<GlobalSearchEvent> = receiver.try_iter().take(8).collect();
         if messages.is_empty() {
             return;
         }
@@ -6423,16 +6490,15 @@ impl App {
         let mut finished = false;
         let mut completed_search_task = None;
         for message in messages {
-            let Some(search) = &mut self.global_search else {
-                break;
-            };
-
             match message {
                 GlobalSearchEvent::Chunk {
                     pane_id,
                     query,
                     mut entries,
                 } => {
+                    let Some(search) = &mut self.global_search else {
+                        continue;
+                    };
                     if search.pane_id != pane_id || search.buffer != query {
                         continue;
                     }
@@ -6456,28 +6522,33 @@ impl App {
                     );
                 }
                 GlobalSearchEvent::Done { pane_id, query } => {
-                    if search.pane_id != pane_id || search.buffer != query {
-                        continue;
+                    if let Some(search) = &mut self.global_search {
+                        if search.pane_id != pane_id || search.buffer != query {
+                            continue;
+                        }
+                        search.loading = false;
+                        search.searched = true;
+                        if let Some(task_id) = search.task_id.take() {
+                            completed_search_task = Some((task_id, search.results.len()));
+                        }
+                        self.status = global_search_status(
+                            search.mode,
+                            &search.buffer,
+                            search.results.len(),
+                            search.editing,
+                            search.searched,
+                            search.loading,
+                        );
+                    } else if let Some(task_id) = self.active_global_search_task_id {
+                        completed_search_task = Some((task_id, 0));
                     }
-                    search.loading = false;
-                    search.searched = true;
-                    if let Some(task_id) = search.task_id.take() {
-                        completed_search_task = Some((task_id, search.results.len()));
-                    }
-                    self.status = global_search_status(
-                        search.mode,
-                        &search.buffer,
-                        search.results.len(),
-                        search.editing,
-                        search.searched,
-                        search.loading,
-                    );
                     finished = true;
                 }
             }
         }
 
         if let Some((task_id, result_count)) = completed_search_task {
+            self.active_global_search_task_id = None;
             self.finish_task(
                 task_id,
                 TaskState::Done,
@@ -7296,7 +7367,7 @@ fn task_panel_status(count: usize, selected: usize) -> String {
     if count == 0 {
         String::from("tasks: empty")
     } else {
-        format!("tasks: {}/{} (j/k move, l detail, h close)", selected + 1, count)
+        format!("tasks: {}/{} (j/k move, l detail, x cancel, h close)", selected + 1, count)
     }
 }
 
@@ -7613,14 +7684,16 @@ fn rename_basename_cursor(name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::atomic::AtomicBool;
 
     use tempfile::tempdir;
 
     use super::{
-        App, BookmarkPrompt, ClipboardOperation, FilterState, ListFindState, PendingAction,
-        RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
-        command_suggestion_navigation, command_suggestions, help_entries,
+        App, BookmarkPrompt, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
+        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState,
+        VisualSelectionState, command_suggestion_navigation, command_suggestions, help_entries,
         key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
         key_matches_plain_letter, key_matches_shifted_letter, rename_basename_cursor,
         rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
@@ -7632,6 +7705,7 @@ mod tests {
             layout::{LayoutNode, SplitDirection},
             open::LaunchMode,
             pane::SortMode,
+            search::GlobalSearchEntry,
         },
         theme::ThemePreset,
     };
@@ -10289,6 +10363,104 @@ mod tests {
         assert_eq!(search.results.len(), 1);
         assert_eq!(search.results[0].relative_path, "docs/guide.md");
         assert_eq!(app.status, "content search (normal): release (1)");
+        let task = app
+            .task_log
+            .iter()
+            .find(|task| task.kind == "search")
+            .expect("search task");
+        assert_eq!(task.state, TaskState::Done);
+    }
+
+    #[test]
+    /// 驗證 task 面板中的 `x` 可以取消目前正在進行的 search task。
+    fn app_task_panel_x_cancels_running_search_task() {
+        let dir = tempdir().expect("tempdir");
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let task_id = app.push_task(
+            1,
+            "search",
+            String::from("content search: needle"),
+            format!("root: {}", dir.path().display()),
+        );
+        app.global_search = Some(GlobalSearchState {
+            pane_id: 1,
+            root_dir: dir.path().to_path_buf(),
+            mode: SearchMode::Content,
+            buffer: String::from("needle"),
+            editing: false,
+            loading: true,
+            searched: false,
+            selected: 0,
+            results: Vec::new(),
+            task_id: Some(task_id),
+        });
+        app.active_global_search_task_id = Some(task_id);
+        app.global_search_cancelled = Some(cancelled.clone());
+        app.open_task_panel();
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("cancel task");
+
+        let task = app
+            .task_log
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("task");
+        assert_eq!(task.state, TaskState::Cancelled);
+        assert!(app.global_search.is_none());
+        assert!(app.global_search_rx.is_none());
+        assert!(app.global_search_cancelled.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(app.status, format!("cancelled task {task_id}"));
+    }
+
+    #[test]
+    /// 驗證在搜尋尚未完成前直接開啟結果，背景 search task 會被正確標記為取消。
+    fn app_opening_search_result_cancels_running_search_task() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("target.txt"), "target").expect("target");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let task_id = app.push_task(
+            1,
+            "search",
+            String::from("content search: target"),
+            format!("root: {}", dir.path().display()),
+        );
+        app.active_global_search_task_id = Some(task_id);
+
+        let search = GlobalSearchState {
+            pane_id: 1,
+            root_dir: dir.path().to_path_buf(),
+            mode: SearchMode::Content,
+            buffer: String::from("target"),
+            editing: false,
+            loading: true,
+            searched: true,
+            selected: 0,
+            results: vec![GlobalSearchEntry {
+                path: dir.path().join("target.txt"),
+                relative_path: String::from("target.txt"),
+                is_dir: false,
+            }],
+            task_id: Some(task_id),
+        };
+
+        app.open_global_search_result(search).expect("open search result");
+
+        let task = app
+            .task_log
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("task");
+        assert_eq!(task.state, TaskState::Cancelled);
+        assert_eq!(task.detail, "stopped after opening a result");
+        assert!(app.global_search.is_none());
+        assert!(app.global_search_rx.is_none());
+        assert!(app.active_global_search_task_id.is_none());
+        assert_eq!(app.status, "search opened: target.txt");
     }
 
     #[test]

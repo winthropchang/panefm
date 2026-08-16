@@ -6,6 +6,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use super::bundled::{ensure_executable_permissions, tfm_cache_root_dir};
+
 /// 目前內建的 `fzf` 版本字串。
 pub(crate) const BUNDLED_FZF_VERSION: &str = "0.74.2";
 
@@ -84,53 +86,6 @@ fn ensure_bundled_fzf_ready(asset: BundledFzfAsset, target_path: &Path) -> Resul
     fs::write(target_path, asset.bytes).context("write bundled fzf binary")?;
     ensure_executable_permissions(target_path)?;
     Ok(())
-}
-
-/// 在 Unix-like 平台上補上可執行權限。
-fn ensure_executable_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let permissions = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(path, permissions).context("set bundled fzf executable permissions")?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-
-    Ok(())
-}
-
-/// 回傳 terminal-file-manager 使用的本機快取根目錄。
-///
-/// 設計原則：
-/// - macOS 使用 `~/Library/Caches`
-/// - Windows 使用 `%LOCALAPPDATA%`
-/// - 其他平台先退回系統 temp dir，方便未來擴充
-fn tfm_cache_root_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-        return Ok(PathBuf::from(home)
-            .join("Library")
-            .join("Caches")
-            .join("terminal-file-manager"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let local_app_data = std::env::var_os("LOCALAPPDATA")
-            .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is not set"))?;
-        return Ok(PathBuf::from(local_app_data).join("terminal-file-manager"));
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Ok(std::env::temp_dir().join("terminal-file-manager"))
-    }
 }
 
 const BUNDLED_DARWIN_ARM64: BundledFzfAsset = BundledFzfAsset {

@@ -1,6 +1,7 @@
 mod app;
 mod archive;
 mod bookmark;
+mod bundled;
 mod copy;
 mod entry;
 mod fzf;
@@ -8,6 +9,7 @@ mod layout;
 mod open;
 mod pane;
 mod platform;
+mod rg;
 mod search;
 mod smb;
 mod trash;
