@@ -79,6 +79,10 @@ pub struct Theme {
     pub muted: Color,
     pub selection_bg: Color,
     pub selection_fg: Color,
+    pub preview_match_bg: Color,
+    pub preview_match_fg: Color,
+    pub preview_current_line_bg: Color,
+    pub preview_current_line_fg: Color,
     pub danger: Color,
 }
 
@@ -99,6 +103,10 @@ impl Theme {
         muted: Color,
         selection_bg: Color,
         selection_fg: Color,
+        preview_match_bg: Color,
+        preview_match_fg: Color,
+        preview_current_line_bg: Color,
+        preview_current_line_fg: Color,
         danger: Color,
     ) -> Self {
         Self {
@@ -107,6 +115,10 @@ impl Theme {
             muted,
             selection_bg,
             selection_fg,
+            preview_match_bg,
+            preview_match_fg,
+            preview_current_line_bg,
+            preview_current_line_fg,
             danger,
         }
     }
@@ -121,6 +133,10 @@ impl Theme {
             Color::Green,
             Color::DarkGray,
             Color::Gray,
+            Color::Black,
+            Color::Yellow,
+            Color::Rgb(255, 0, 0),
+            Color::Rgb(90, 84, 28),
             Color::Black,
             Color::LightRed,
         )
@@ -137,6 +153,10 @@ impl Theme {
             Color::Gray,
             Color::Rgb(90, 90, 90),
             Color::White,
+            Color::Yellow,
+            Color::Rgb(255, 0, 0),
+            Color::Rgb(82, 92, 44),
+            Color::Black,
             Color::LightRed,
         )
     }
@@ -152,6 +172,10 @@ impl Theme {
             Color::Gray,
             Color::Rgb(70, 80, 95),
             Color::White,
+            Color::Yellow,
+            Color::Rgb(255, 0, 0),
+            Color::Rgb(88, 88, 42),
+            Color::Black,
             Color::LightRed,
         )
     }
@@ -196,6 +220,18 @@ impl Theme {
     /// 回傳：`Style`，用來表示目前游標所在的項目。
     pub fn selected_item_style(self) -> Style {
         Style::default().bg(self.selection_bg).fg(self.selection_fg)
+    }
+
+    /// 產生 preview 中一般命中文字的樣式。
+    pub fn preview_match_style(self) -> Style {
+        Style::default().fg(self.preview_match_fg)
+    }
+
+    /// 產生 preview 中目前焦點命中的樣式。
+    pub fn preview_current_line_style(self) -> Style {
+        Style::default()
+            .bg(self.preview_current_line_bg)
+            .fg(self.preview_current_line_fg)
     }
 
     /// 產生危險操作標題的文字樣式。

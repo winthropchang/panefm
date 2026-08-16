@@ -42,6 +42,9 @@ pub(crate) struct SearchListState<'a> {
     pub(crate) results: &'a [GlobalSearchEntry],
     pub(crate) selected: usize,
     pub(crate) loading: bool,
+    pub(crate) preview_query: Option<&'a str>,
+    pub(crate) preview_scroll: Option<usize>,
+    pub(crate) preview_current_match: Option<usize>,
 }
 
 /// 描述目前 pane 的列表區是否被某種特殊模式接管。
@@ -399,7 +402,7 @@ pub(crate) fn render_pane(
         _ => None,
     };
 
-    let preview_title = pane
+    let default_preview_title = pane
         .selected_entry()
         .map(|entry| {
             let mut title = format!("Preview: {}", entry.name);
@@ -420,7 +423,35 @@ pub(crate) fn render_pane(
         .unwrap_or_else(|| "Preview".to_string());
     let preview_viewport_height = chunks[1].height.saturating_sub(2).max(1) as usize;
     pane.set_preview_viewport_height(preview_viewport_height);
-    let preview = Paragraph::new(pane.preview_lines(preview_viewport_height)).block(
+    let (preview_title, preview_lines) = match panel_state {
+        Some(PaneListState::Search(search_state))
+            if !search_state.loading
+                && !search_state.results.is_empty()
+                && search_state.preview_query.is_some() =>
+        {
+            let selected = search_state
+                .selected
+                .min(search_state.results.len().saturating_sub(1));
+            let entry = &search_state.results[selected];
+            let preview = PaneState::search_preview_for_entry(
+                entry,
+                preview_viewport_height,
+                search_state.preview_query.unwrap_or_default(),
+                search_state.preview_scroll,
+                search_state.preview_current_match,
+                preview_focused,
+                theme,
+            );
+            (preview.title, preview.lines)
+        }
+        _ => (
+            default_preview_title,
+            pane.preview_lines(preview_viewport_height, theme),
+        ),
+    };
+    let preview_content_width = chunks[1].width.saturating_sub(2) as usize;
+    let preview_lines = pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
+    let preview = Paragraph::new(preview_lines).block(
         Block::default()
             .title(preview_title)
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
@@ -429,6 +460,33 @@ pub(crate) fn render_pane(
     frame.render_widget(preview, chunks[1]);
 
     editor_cursor.or(panel_cursor)
+}
+
+/// 將 preview 行內容依照可見寬度補齊，讓目前命中列的背景可以延伸到整行右側。
+fn pad_preview_lines_for_render(
+    mut lines: Vec<Line<'static>>,
+    content_width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    for line in &mut lines {
+        let is_current_line = line
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg));
+        if !is_current_line {
+            continue;
+        }
+
+        let current_width = line.to_string().chars().count();
+        if current_width >= content_width {
+            continue;
+        }
+
+        let padding = " ".repeat(content_width - current_width);
+        line.spans
+            .push(Span::styled(padding, theme.preview_current_line_style()));
+    }
+    lines
 }
 
 /// 在列表區域中繪製 inline 輸入視窗，供 rename / create 這類功能重用。

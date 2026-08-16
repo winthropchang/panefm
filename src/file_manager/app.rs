@@ -141,6 +141,8 @@ pub(crate) struct GlobalSearchState {
     pub(crate) searched: bool,
     pub(crate) selected: usize,
     pub(crate) results: Vec<GlobalSearchEntry>,
+    pub(crate) preview_scroll: Option<usize>,
+    pub(crate) preview_current_match: Option<usize>,
     pub(crate) task_id: Option<usize>,
 }
 
@@ -997,6 +999,11 @@ impl App {
                 self.pending_g = false;
                 self.status = self.jump_preview_match(true, count)?;
             }
+            _ if key_matches_plain_letter(&key, 'p') => {
+                let count = self.take_count_or_one();
+                self.pending_g = false;
+                self.status = self.jump_preview_match(false, count)?;
+            }
             KeyCode::Down => {
                 let count = self.take_count_or_one();
                 self.current_pane_mut()?.scroll_preview_down(count);
@@ -1287,6 +1294,78 @@ impl App {
             return Ok(true);
         }
 
+        if self.preview_focus == Some(search.pane_id) && matches!(search.mode, SearchMode::Content) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.preview_focus = None;
+                    self.status = global_search_status(
+                        search.mode,
+                        &search.buffer,
+                        search.results.len(),
+                        false,
+                        search.searched,
+                        search.loading,
+                    );
+                    search.preview_scroll = None;
+                    search.preview_current_match = None;
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
+                _ if key_matches_shifted_letter(&key, 'P') || key_matches_plain_letter(&key, 'h') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.preview_focus = None;
+                    self.status = global_search_status(
+                        search.mode,
+                        &search.buffer,
+                        search.results.len(),
+                        false,
+                        search.searched,
+                        search.loading,
+                    );
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
+                _ if key_matches_plain_letter(&key, 'n') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.move_search_preview_match(&mut search, true);
+                    self.status = self.search_preview_status_for(&search);
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
+                _ if key_matches_plain_letter(&key, 'p')
+                    || key_matches_shifted_letter(&key, 'N') =>
+                {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.move_search_preview_match(&mut search, false);
+                    self.status = self.search_preview_status_for(&search);
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    search.preview_scroll = Some(search.preview_scroll.unwrap_or(0).saturating_add(1));
+                    self.status = self.search_preview_status_for(&search);
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    search.preview_scroll = Some(search.preview_scroll.unwrap_or(0).saturating_sub(1));
+                    self.status = self.search_preview_status_for(&search);
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
         if self.capture_pending_count_digit(&key) {
             self.global_search = Some(search);
             return Ok(true);
@@ -1297,6 +1376,8 @@ impl App {
                 let count = self.take_count_or_one();
                 search.selected =
                     (search.selected + count).min(search.results.len().saturating_sub(1));
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1311,6 +1392,8 @@ impl App {
                 let count = self.take_count_or_one();
                 search.selected =
                     (search.selected + count).min(search.results.len().saturating_sub(1));
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1325,6 +1408,8 @@ impl App {
                 let step = self.take_large_move_step();
                 search.selected =
                     (search.selected + step).min(search.results.len().saturating_sub(1));
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1338,6 +1423,8 @@ impl App {
             KeyCode::Up => {
                 let count = self.take_count_or_one();
                 search.selected = search.selected.saturating_sub(count);
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1351,6 +1438,8 @@ impl App {
             _ if key_matches_shifted_letter(&key, 'K') => {
                 let step = self.take_large_move_step();
                 search.selected = search.selected.saturating_sub(step);
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1365,6 +1454,8 @@ impl App {
                 let step = self.take_panel_page_step();
                 search.selected =
                     (search.selected + step).min(search.results.len().saturating_sub(1));
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1378,6 +1469,8 @@ impl App {
             _ if key_matches_ctrl_letter(&key, 'u') => {
                 let step = self.take_panel_page_step();
                 search.selected = search.selected.saturating_sub(step);
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1391,6 +1484,8 @@ impl App {
             _ if key_matches_plain_letter(&key, 'k') => {
                 let count = self.take_count_or_one();
                 search.selected = search.selected.saturating_sub(count);
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1411,6 +1506,8 @@ impl App {
                     } else {
                         search.selected = 0;
                     }
+                    search.preview_scroll = None;
+                    search.preview_current_match = None;
                     self.pending_g = false;
                 } else {
                     self.pending_g = true;
@@ -1442,6 +1539,8 @@ impl App {
                 } else if !search.results.is_empty() {
                     search.selected = search.results.len() - 1;
                 }
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.pending_g = false;
                 self.status = global_search_status(
                     search.mode,
@@ -1456,6 +1555,8 @@ impl App {
             _ if key_matches_plain_letter(&key, 'i') || key_matches_plain_letter(&key, 's') => {
                 self.clear_pending_count();
                 search.editing = true;
+                search.preview_scroll = None;
+                search.preview_current_match = None;
                 self.pending_g = false;
                 self.status = global_search_status(
                     search.mode,
@@ -1471,6 +1572,18 @@ impl App {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
+            }
+            KeyCode::Right => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.open_global_search_result(search)?;
+            }
+            _ if key_matches_shifted_letter(&key, 'P') && matches!(search.mode, SearchMode::Content) => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.preview_focus = Some(search.pane_id);
+                self.status = self.search_preview_status_for(&search);
+                self.global_search = Some(search);
             }
             _ if key_matches_plain_letter(&key, 'l') => {
                 self.clear_pending_count();
@@ -4529,6 +4642,8 @@ impl App {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            preview_scroll: None,
+            preview_current_match: None,
             task_id: None,
         };
         self.status = global_search_status(search.mode, "", 0, true, false, false);
@@ -4554,6 +4669,8 @@ impl App {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            preview_scroll: None,
+            preview_current_match: None,
             task_id: None,
         };
         self.status = global_search_status(search.mode, "", 0, true, false, false);
@@ -5689,8 +5806,65 @@ impl App {
         }
         self.cancel_global_search_worker();
         self.global_search = None;
+        self.preview_focus = None;
         self.status = format!("search opened: {}", entry.relative_path);
         Ok(())
+    }
+
+    /// 依照目前內容搜尋選到的檔案，計算搜尋 preview 的狀態列文字。
+    fn search_preview_status_for(&self, search: &GlobalSearchState) -> String {
+        let Some(entry) = search.results.get(search.selected) else {
+            return global_search_status(
+                search.mode,
+                &search.buffer,
+                search.results.len(),
+                false,
+                search.searched,
+                search.loading,
+            );
+        };
+        let matches = PaneState::search_preview_match_positions(&entry.path, &search.buffer);
+        if matches.is_empty() {
+            return format!("preview search: {} (0)", search.buffer);
+        }
+        let current_match = search.preview_current_match.unwrap_or(matches[0]);
+        let current = matches
+            .iter()
+            .position(|line| *line == current_match)
+            .map(|index| index + 1)
+            .unwrap_or(matches.len());
+        format!("preview search: {} ({}/{})", search.buffer, current, matches.len())
+    }
+
+    /// 在 global search 的 preview focus 模式中，跳到下一個或上一個命中位置。
+    fn move_search_preview_match(&self, search: &mut GlobalSearchState, forward: bool) {
+        let Some(entry) = search.results.get(search.selected) else {
+            search.preview_scroll = None;
+            return;
+        };
+        let matches = PaneState::search_preview_match_positions(&entry.path, &search.buffer);
+        if matches.is_empty() {
+            search.preview_current_match = None;
+            search.preview_scroll = Some(0);
+            return;
+        }
+        let current = search.preview_current_match.unwrap_or(matches[0]);
+        let target = if forward {
+            matches
+                .iter()
+                .copied()
+                .find(|line| *line > current)
+                .unwrap_or(matches[0])
+        } else {
+            matches
+                .iter()
+                .rev()
+                .copied()
+                .find(|line| *line < current)
+                .unwrap_or(*matches.last().unwrap_or(&matches[0]))
+        };
+        search.preview_current_match = Some(target);
+        search.preview_scroll = Some(target);
     }
 
     /// 切換目前焦點 pane 的隱藏檔顯示狀態。
@@ -6197,6 +6371,10 @@ impl App {
                             results: &search.results,
                             selected: search.selected,
                             loading: search.loading && self.config.search.show_loading,
+                            preview_query: matches!(search.mode, SearchMode::Content)
+                                .then_some(search.buffer.as_str()),
+                            preview_scroll: search.preview_scroll,
+                            preview_current_match: search.preview_current_match,
                         }),
                     )
                 } else if let Some(PendingAction::TrashPanel {
@@ -10050,7 +10228,7 @@ mod tests {
                 .expect("type search");
         }
         assert_eq!(app.panes.get(&1).expect("pane").preview_match_count(), 2);
-        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 6);
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 1);
         assert_eq!(app.status, "preview search: beta (2)");
     }
 
@@ -10081,15 +10259,23 @@ mod tests {
         app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("lock search");
 
-        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 6);
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .expect("next match");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 7);
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("previous match by p");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("wrap to last match");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 2);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE))
-            .expect("previous match");
-        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 6);
+            .expect("previous match by N");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("clear search");
@@ -10101,6 +10287,56 @@ mod tests {
             .expect("leave preview");
         assert_eq!(app.preview_focus, None);
         assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 preview search 在同一行有多個命中時，`n/p` 仍會逐一輪詢每個命中位置。
+    fn app_preview_search_cycles_each_match_occurrence() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("notes.txt"),
+            "tt line\nonly t here\n",
+        )
+        .expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_preview_viewport_height(4);
+        app.open_preview_focus();
+        app.open_preview_search_input();
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock search");
+
+        assert_eq!(app.panes.get(&1).expect("pane").preview_match_count(), 3);
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next occurrence on same line");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("move to next line occurrence");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("wrap to first occurrence");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("wrap back to last occurrence");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("move back to same-line occurrence");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("move back to first occurrence on same line");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_current_match, Some(0));
     }
 
     #[test]
@@ -10372,6 +10608,73 @@ mod tests {
     }
 
     #[test]
+    /// 驗證內容搜尋按下 Enter 只會跳到檔案，不會強制切進 preview。
+    fn app_content_search_enter_reveals_selected_file() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(
+            dir.path().join("docs").join("notes.txt"),
+            "zero\nmatch one\nmiddle\nmatch two\nend\n",
+        )
+        .expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE))
+            .expect("open content search");
+        for ch in ['m', 'a', 't', 'c', 'h'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run content search");
+        wait_for_global_search(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open search result");
+
+        assert!(app.global_search.is_none());
+        assert_eq!(app.preview_focus, None);
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(
+            pane.selected_entry().map(|entry| entry.display_name()),
+            Some(String::from("notes.txt"))
+        );
+        assert_eq!(pane.cwd, dir.path().join("docs"));
+        assert_eq!(app.status, "search opened: docs/notes.txt");
+    }
+
+    #[test]
+    /// 驗證內容搜尋按下 Right 也只會跳到檔案，與 Enter / l 行為一致。
+    fn app_content_search_right_reveals_selected_file() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("notes.txt"), "alpha\nbeta\n").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_content_search().expect("open content search");
+        for ch in ['b', 'e', 't', 'a'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run content search");
+        wait_for_global_search(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .expect("open by right");
+
+        assert!(app.global_search.is_none());
+        assert_eq!(app.preview_focus, None);
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(
+            pane.selected_entry().map(|entry| entry.display_name()),
+            Some(String::from("notes.txt"))
+        );
+        assert_eq!(pane.cwd, dir.path().join("docs"));
+        assert_eq!(app.status, "search opened: docs/notes.txt");
+    }
+
+    #[test]
     /// 驗證 task 面板中的 `x` 可以取消目前正在進行的 search task。
     fn app_task_panel_x_cancels_running_search_task() {
         let dir = tempdir().expect("tempdir");
@@ -10394,6 +10697,8 @@ mod tests {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            preview_scroll: None,
+            preview_current_match: None,
             task_id: Some(task_id),
         });
         app.active_global_search_task_id = Some(task_id);
@@ -10420,7 +10725,7 @@ mod tests {
     /// 驗證在搜尋尚未完成前直接開啟結果，背景 search task 會被正確標記為取消。
     fn app_opening_search_result_cancels_running_search_task() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("target.txt"), "target").expect("target");
+        fs::write(dir.path().join("target.txt"), "target\n").expect("target");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         let task_id = app.push_task(
@@ -10444,7 +10749,12 @@ mod tests {
                 path: dir.path().join("target.txt"),
                 relative_path: String::from("target.txt"),
                 is_dir: false,
+                match_line_number: Some(1),
+                match_column: Some(1),
+                match_preview: Some(String::from("target")),
             }],
+            preview_scroll: None,
+            preview_current_match: None,
             task_id: Some(task_id),
         };
 
@@ -10460,6 +10770,15 @@ mod tests {
         assert!(app.global_search.is_none());
         assert!(app.global_search_rx.is_none());
         assert!(app.active_global_search_task_id.is_none());
+        assert_eq!(app.preview_focus, None);
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .expect("pane")
+                .selected_entry()
+                .map(|entry| entry.display_name()),
+            Some(String::from("target.txt"))
+        );
         assert_eq!(app.status, "search opened: target.txt");
     }
 

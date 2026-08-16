@@ -15,6 +15,7 @@ use std::{
 use std::io;
 
 use ignore::WalkBuilder;
+use serde::Deserialize;
 
 use super::rg::bundled_rg_command;
 
@@ -27,6 +28,34 @@ pub(crate) struct GlobalSearchEntry {
     pub(crate) path: PathBuf,
     pub(crate) relative_path: String,
     pub(crate) is_dir: bool,
+    pub(crate) match_line_number: Option<usize>,
+    pub(crate) match_column: Option<usize>,
+    pub(crate) match_preview: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RgJsonEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    data: RgJsonMatchData,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RgJsonMatchData {
+    path: Option<RgJsonTextField>,
+    lines: Option<RgJsonTextField>,
+    line_number: Option<usize>,
+    submatches: Option<Vec<RgJsonSubmatch>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RgJsonTextField {
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RgJsonSubmatch {
+    start: usize,
 }
 
 /// 描述背景 global search 分批回傳給主執行緒的訊息類型。
@@ -88,6 +117,9 @@ pub(crate) fn collect_search_entries(
             path: path.to_path_buf(),
             relative_path,
             is_dir,
+            match_line_number: None,
+            match_column: None,
+            match_preview: None,
         });
     }
 
@@ -197,6 +229,9 @@ pub(crate) fn stream_search_entries(
             path: path.to_path_buf(),
             relative_path,
             is_dir,
+            match_line_number: None,
+            match_column: None,
+            match_preview: None,
         });
         matched += 1;
 
@@ -287,9 +322,11 @@ pub(crate) fn stream_content_search_entries(
             continue;
         }
 
-        if !file_contains_query(path, &query_lower, &cancelled) {
+        let Some((match_line_number, match_column, match_preview)) =
+            find_query_match_in_file(path, &query_lower, &cancelled)
+        else {
             continue;
-        }
+        };
 
         let relative_path = path
             .strip_prefix(root)
@@ -301,6 +338,9 @@ pub(crate) fn stream_content_search_entries(
             path: path.to_path_buf(),
             relative_path,
             is_dir: false,
+            match_line_number: Some(match_line_number),
+            match_column: Some(match_column),
+            match_preview: Some(match_preview),
         });
         matched += 1;
 
@@ -381,17 +421,49 @@ fn stream_content_search_entries_with_rg(
             continue;
         }
 
-        let path = PathBuf::from(trimmed);
+        let Ok(event) = serde_json::from_str::<RgJsonEvent>(trimmed) else {
+            continue;
+        };
+        if event.event_type != "match" {
+            continue;
+        }
+
+        let Some(path_text) = event
+            .data
+            .path
+            .as_ref()
+            .and_then(|path| path.text.as_ref())
+            .cloned()
+        else {
+            continue;
+        };
+
+        let path = PathBuf::from(path_text);
         let relative_path = path
             .strip_prefix(root)
             .unwrap_or(path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
+        let match_preview = event
+            .data
+            .lines
+            .as_ref()
+            .and_then(|lines| lines.text.as_deref())
+            .map(normalize_match_preview);
+        let match_column = event
+            .data
+            .submatches
+            .as_ref()
+            .and_then(|submatches| submatches.first())
+            .map(|submatch| submatch.start.saturating_add(1));
 
         batch.push(GlobalSearchEntry {
             path,
             relative_path,
             is_dir: false,
+            match_line_number: event.data.line_number,
+            match_column,
+            match_preview,
         });
         sent_anything = true;
         matched += 1;
@@ -439,8 +511,7 @@ fn build_rg_content_search_command(
     let program = bundled_rg_command().unwrap_or_else(|_| "rg".into());
     let mut command = Command::new(program);
     command
-        .arg("--files-with-matches")
-        .arg("--line-buffered")
+        .arg("--json")
         .arg("--no-messages")
         .arg("--fixed-strings")
         .arg("--ignore-case")
@@ -461,32 +532,56 @@ fn build_rg_content_search_command(
     Ok(command)
 }
 
-/// 檢查單一檔案內容是否包含指定查詢字串。
-fn file_contains_query(path: &Path, query_lower: &str, cancelled: &AtomicBool) -> bool {
+/// 將 rg 回傳的命中行文字整理成適合列表顯示的摘要。
+fn normalize_match_preview(raw: &str) -> String {
+    let single_line = raw
+        .trim_end_matches(['\r', '\n'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let max_chars = 120usize;
+    let mut preview = single_line.chars().take(max_chars).collect::<String>();
+    if single_line.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+/// 在單一檔案中找出第一個命中位置，並回傳行號、欄位與摘要。
+fn find_query_match_in_file(
+    path: &Path,
+    query_lower: &str,
+    cancelled: &AtomicBool,
+) -> Option<(usize, usize, String)> {
     let Ok(file) = File::open(path) else {
-        return false;
+        return None;
     };
     let mut reader = BufReader::new(file);
     let mut buffer = Vec::new();
+    let mut line_number = 0usize;
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
-            return false;
+            return None;
         }
 
         buffer.clear();
         let Ok(read) = reader.read_until(b'\n', &mut buffer) else {
-            return false;
+            return None;
         };
         if read == 0 {
-            return false;
+            return None;
         }
+        line_number += 1;
         if buffer.contains(&0) {
-            return false;
+            return None;
         }
         let line = String::from_utf8_lossy(&buffer);
-        if line.to_lowercase().contains(query_lower) {
-            return true;
+        let line_lower = line.to_lowercase();
+        if let Some(byte_index) = line_lower.find(query_lower) {
+            let column = line[..byte_index].chars().count().saturating_add(1);
+            return Some((line_number, column, normalize_match_preview(&line)));
         }
     }
 }
@@ -551,6 +646,7 @@ mod tests {
         GlobalSearchEvent, build_rg_content_search_command, collect_search_entries,
         filter_search_entries, stream_content_search_entries,
     };
+    use crate::file_manager::search::normalize_match_preview;
 
     #[test]
     /// 驗證 global search 會遞迴收集巢狀目錄中的檔案與資料夾。
@@ -611,6 +707,9 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].relative_path, "notes.txt");
+        assert_eq!(results[0].match_line_number, Some(1));
+        assert_eq!(results[0].match_column, Some(7));
+        assert_eq!(results[0].match_preview.as_deref(), Some("hello rust world"));
     }
 
     #[test]
@@ -661,5 +760,13 @@ mod tests {
         let separator_index = args.iter().position(|arg| arg == "--").expect("separator");
         assert!(hidden_index < separator_index);
         assert_eq!(args[separator_index + 1], "needle");
+        assert!(args.iter().any(|arg| arg == "--json"));
+    }
+
+    #[test]
+    /// 驗證命中行摘要會被整理成單行文字，避免把換行直接帶進結果列表。
+    fn normalize_match_preview_collapses_whitespace() {
+        let preview = normalize_match_preview(" hello   rust \n  world \r\n");
+        assert_eq!(preview, "hello rust world");
     }
 }

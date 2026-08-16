@@ -2,9 +2,9 @@ use std::{
     cmp::Ordering,
     collections::BTreeSet,
     collections::hash_map::DefaultHasher,
-    fs,
+    fs::{self, File},
     hash::{Hash, Hasher},
-    io,
+    io::{self, BufRead, BufReader},
     path::{Component, Path, PathBuf},
     time::SystemTime,
 };
@@ -15,7 +15,14 @@ use ratatui::{
     widgets::ListState,
 };
 
-use super::{bookmark::BookmarkTarget, entry::FileEntry, trash::TrashStore};
+use crate::theme::Theme;
+
+use super::{
+    bookmark::BookmarkTarget,
+    entry::FileEntry,
+    search::GlobalSearchEntry,
+    trash::TrashStore,
+};
 
 /// 表示單一 pane 的完整瀏覽狀態。
 ///
@@ -51,6 +58,8 @@ pub(crate) struct PaneState {
     pub(crate) preview_viewport_height: usize,
     /// 目前 preview 內搜尋使用的查詢字串。
     pub(crate) preview_search_query: Option<String>,
+    /// 目前 preview 搜尋命中的定位列，用來標示 n/p 目前停在哪一個結果。
+    pub(crate) preview_current_match: Option<usize>,
     /// 目前列表內 find-next 使用的查詢字串。
     pub(crate) list_find_query: Option<String>,
     /// 目前在這個 pane 中已被標記的項目路徑。
@@ -111,6 +120,13 @@ pub(crate) enum SortDetailKind {
     Extension,
 }
 
+/// 描述搜尋列表下方 preview 區塊需要繪製的內容與捲動資訊。
+#[derive(Debug, Clone)]
+pub(crate) struct SearchPreviewData {
+    pub(crate) title: String,
+    pub(crate) lines: Vec<Line<'static>>,
+}
+
 impl PaneState {
     /// 建立一個新的 pane 狀態，並立即載入指定目錄內容。
     ///
@@ -137,6 +153,7 @@ impl PaneState {
             preview_scroll: 0,
             preview_viewport_height: 4,
             preview_search_query: None,
+            preview_current_match: None,
             list_find_query: None,
             marked_paths: BTreeSet::new(),
         };
@@ -479,11 +496,11 @@ impl PaneState {
     /// - `max_lines: usize`，預覽區最多顯示的行數。
     ///
     /// 回傳：`Vec<Line<'static>>`，可直接交給 `ratatui` 的 Paragraph 渲染。
-    pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<Line<'static>> {
+    pub(crate) fn preview_lines(&self, max_lines: usize, theme: Theme) -> Vec<Line<'static>> {
         let max_lines = max_lines.max(1);
         if self.preview_search_query.is_some() {
             return self
-                .preview_content_lines()
+                .preview_content_lines(theme)
                 .into_iter()
                 .skip(self.preview_scroll)
                 .take(max_lines)
@@ -573,10 +590,10 @@ impl PaneState {
     }
 
     /// 產生目前選取項目的完整 preview 內容，供捲動切片與上下界計算使用。
-    fn preview_content_lines(&self) -> Vec<Line<'static>> {
+    fn preview_content_lines(&self, theme: Theme) -> Vec<Line<'static>> {
         let lines = self.raw_preview_content_lines();
         if let Some(query) = self.preview_search_query.as_deref() {
-            highlight_preview_matches(lines, query)
+            highlight_preview_matches(lines, query, theme, self.preview_current_match)
         } else {
             lines
         }
@@ -585,6 +602,86 @@ impl PaneState {
     /// 產生目前選取項目的完整 preview 原始內容，不套用任何搜尋高亮。
     fn raw_preview_content_lines(&self) -> Vec<Line<'static>> {
         self.raw_preview_content_lines_limited(usize::MAX)
+    }
+
+    /// 針對搜尋列表中的某個結果建立 preview，並自動跳到第一個命中位置。
+    pub(crate) fn search_preview_for_entry(
+        entry: &GlobalSearchEntry,
+        viewport_height: usize,
+        query: &str,
+        requested_scroll: Option<usize>,
+        current_match_line: Option<usize>,
+        preview_focused: bool,
+        theme: Theme,
+    ) -> SearchPreviewData {
+        let viewport_height = viewport_height.max(1);
+        let match_positions = Self::search_preview_match_positions(&entry.path, query);
+        let current_match_line = current_match_line
+            .or(entry.match_line_number)
+            .unwrap_or_else(|| match_positions.first().copied().unwrap_or(1));
+        let effective_scroll = requested_scroll.unwrap_or(current_match_line);
+        let visible_lines = build_search_preview_lines(
+            &entry.path,
+            viewport_height,
+            query,
+            current_match_line,
+            theme,
+        );
+        let mut title = Self::preview_title_for_path(&entry.path, preview_focused, Some(query));
+        if effective_scroll > 1 {
+            title.push_str("  ^");
+        }
+        if match_positions.iter().any(|line| *line > current_match_line) {
+            title.push_str("  v");
+        }
+        SearchPreviewData {
+            title,
+            lines: visible_lines,
+        }
+    }
+
+    /// 回傳指定檔案 preview 中所有命中的列位置，供搜尋 preview 導航使用。
+    pub(crate) fn search_preview_match_positions(path: &Path, query: &str) -> Vec<usize> {
+        let trimmed = query.trim().to_lowercase();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(file) = File::open(path) else {
+            return Vec::new();
+        };
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let Ok(line) = line else {
+                    return None;
+                };
+                line.to_lowercase().contains(&trimmed).then_some(index + 1)
+            })
+            .collect()
+    }
+
+    /// 依照指定路徑建立 preview 區塊標題。
+    pub(crate) fn preview_title_for_path(
+        path: &Path,
+        preview_focused: bool,
+        query: Option<&str>,
+    ) -> String {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let mut title = format!("Preview: {name}");
+        if preview_focused {
+            title.push_str("  [preview]");
+        }
+        if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
+            title.push_str(&format!("  [/{query}]"));
+        }
+        title
     }
 
     /// 產生目前選取項目的 preview 原始內容，並限制最多只建立指定行數。
@@ -618,15 +715,18 @@ impl PaneState {
 
         if self.preview_search_query.is_some() {
             self.preview_scroll = 0;
+            self.preview_current_match = None;
             self.jump_to_preview_match(true);
         } else {
             self.preview_scroll = 0;
+            self.preview_current_match = None;
         }
     }
 
     /// 清除 preview 搜尋條件與其高亮狀態。
     pub(crate) fn clear_preview_search(&mut self) {
         self.preview_search_query = None;
+        self.preview_current_match = None;
     }
 
     /// 判斷目前列表是否有啟用 find-next 搜尋。
@@ -792,10 +892,7 @@ impl PaneState {
             return 0;
         };
         let query = query.to_lowercase();
-        self.raw_preview_content_lines()
-            .into_iter()
-            .filter(|line| line.to_string().to_lowercase().contains(&query))
-            .count()
+        preview_match_positions(&self.raw_preview_content_lines(), &query).len()
     }
 
     /// 依照方向跳到 preview 搜尋的下一個或上一個命中位置。
@@ -805,33 +902,27 @@ impl PaneState {
         };
 
         let query = query.to_lowercase();
-        let matches: Vec<usize> = self
-            .raw_preview_content_lines()
-            .into_iter()
-            .enumerate()
-            .filter(|(_, line)| line.to_string().to_lowercase().contains(&query))
-            .map(|(index, _)| index)
-            .collect();
+        let matches = preview_match_positions(&self.raw_preview_content_lines(), &query);
 
         let target = if forward {
-            matches
-                .iter()
-                .copied()
-                .find(|index| *index > self.preview_scroll)
-                .or_else(|| matches.first().copied())
+            self.preview_current_match
+                .and_then(|current| current.checked_add(1))
+                .filter(|next| *next < matches.len())
+                .or(Some(0))
         } else {
-            matches
-                .iter()
-                .rev()
-                .copied()
-                .find(|index| *index < self.preview_scroll)
-                .or_else(|| matches.last().copied())
+            self.preview_current_match
+                .and_then(|current| current.checked_sub(1))
+                .or_else(|| matches.len().checked_sub(1))
         };
         let Some(target) = target else {
             return false;
         };
+        let Some((line_index, _)) = matches.get(target).copied() else {
+            return false;
+        };
 
-        self.preview_scroll = target.min(self.max_preview_scroll());
+        self.preview_current_match = Some(target);
+        self.preview_scroll = line_index.min(self.max_preview_scroll());
         true
     }
 
@@ -1526,40 +1617,17 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
         .extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_lowercase());
-    let mut lines = vec![
-        Line::from(format!("path: {}", path.display())),
-        Line::from(format!("size: {}", format_size_preview(metadata.len()))),
-    ];
-
-    if let Ok(modified) = metadata.modified() {
-        lines.push(Line::from(format!(
-            "modified: {}",
-            format_system_time_preview(modified)
-        )));
-    }
-
-    if max_lines <= lines.len() {
-        lines.truncate(max_lines);
-        return lines;
-    }
-
-    if let Some(kind_label) = preview_kind_label(extension.as_deref()) {
-        lines.push(Line::from(format!("kind: {kind_label}")));
-    }
 
     if metadata.len() > 128 * 1024 {
-        lines.push(Line::from("preview skipped for files larger than 128 KiB"));
-        lines.truncate(max_lines);
-        return lines;
+        return vec![Line::from("preview skipped for files larger than 128 KiB")];
     }
 
     let Ok(bytes) = fs::read(path) else {
-        lines.push(Line::from("unable to read file contents"));
-        lines.truncate(max_lines);
-        return lines;
+        return vec![Line::from("unable to read file contents")];
     };
 
     if let Some(image_summary) = preview_image_summary(&bytes, extension.as_deref()) {
+        let mut lines = Vec::new();
         lines.extend(image_summary.into_iter().map(Line::from));
         lines.truncate(max_lines);
         return lines;
@@ -1567,26 +1635,14 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
 
     match String::from_utf8(bytes) {
         Ok(contents) => {
-            lines.push(Line::from(""));
-
-            let available_content_lines = max_lines.saturating_sub(lines.len());
-            if available_content_lines == 0 {
-                return lines;
-            }
-
             let content_lines: Vec<&str> = contents.lines().collect();
             if content_lines.is_empty() {
-                lines.push(Line::from("[empty file]"));
-                lines.truncate(max_lines);
-                return lines;
+                return vec![Line::from("[empty file]")];
             }
 
-            let truncated = content_lines.len() > available_content_lines;
-            for (index, line) in content_lines
-                .into_iter()
-                .take(available_content_lines)
-                .enumerate()
-            {
+            let mut lines = Vec::new();
+            let truncated = content_lines.len() > max_lines;
+            for (index, line) in content_lines.into_iter().take(max_lines).enumerate() {
                 lines.push(Line::from(format!("{:>3} {}", index + 1, line)));
             }
 
@@ -1599,6 +1655,7 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
             lines
         }
         Err(_) => {
+            let mut lines = Vec::new();
             if let Some(binary_label) = preview_binary_label(extension.as_deref()) {
                 lines.push(Line::from(format!("format: {binary_label}")));
             }
@@ -1609,24 +1666,65 @@ fn preview_file(path: &Path, max_lines: usize) -> Vec<Line<'static>> {
     }
 }
 
-/// 依照副檔名回傳較適合顯示在 preview 的檔案類型標籤。
-fn preview_kind_label(extension: Option<&str>) -> Option<&'static str> {
-    match extension.unwrap_or_default() {
-        "rs" => Some("rust source"),
-        "toml" => Some("toml config"),
-        "json" => Some("json data"),
-        "md" | "markdown" => Some("markdown document"),
-        "yml" | "yaml" => Some("yaml config"),
-        "txt" | "log" => Some("text file"),
-        "sh" | "bash" | "zsh" => Some("shell script"),
-        "js" => Some("javascript source"),
-        "ts" => Some("typescript source"),
-        "py" => Some("python source"),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" => Some("image"),
-        "zip" => Some("archive"),
-        "pdf" => Some("pdf document"),
-        _ => None,
+/// 專門為搜尋結果建立 preview 片段，即使檔案很大也能直接看到命中附近內容。
+fn build_search_preview_lines(
+    path: &Path,
+    viewport_height: usize,
+    query: &str,
+    current_match_line: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let snippet = read_search_snippet(path, query, current_match_line, viewport_height.max(1), theme);
+    if snippet.is_empty() {
+        vec![Line::from("no matching snippet available")]
+    } else {
+        snippet
     }
+}
+
+/// 讀取命中行附近的片段內容，讓搜尋 preview 能直接顯示上下文。
+fn read_search_snippet(
+    path: &Path,
+    query: &str,
+    current_match_line: usize,
+    snippet_height: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let reader = BufReader::new(file);
+    let context_before = snippet_height.saturating_sub(1) / 2;
+    let context_after = snippet_height.saturating_sub(context_before + 1);
+    let start_line = current_match_line.saturating_sub(context_before).max(1);
+    let end_line = current_match_line.saturating_add(context_after);
+
+    reader
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = index + 1;
+            if line_number < start_line || line_number > end_line {
+                return None;
+            }
+            let Ok(line) = line else {
+                return None;
+            };
+            let numbered = format!("{:>3} {}", line_number, line);
+            let current_match_start = if line_number == current_match_line {
+                numbered.to_lowercase().find(&query.to_lowercase())
+            } else {
+                None
+            };
+            Some(highlight_preview_line(
+                numbered,
+                &query.to_lowercase(),
+                theme,
+                line_number == current_match_line,
+                current_match_start,
+            ))
+        })
+        .collect()
 }
 
 /// 為常見圖片檔案產生摘要資訊，顯示格式與尺寸。
@@ -1643,35 +1741,159 @@ fn preview_image_summary(bytes: &[u8], extension: Option<&str>) -> Option<Vec<St
 }
 
 /// 將命中的搜尋字串套用到 preview 行內容上，讓目前查詢結果更容易辨識。
-fn highlight_preview_matches(lines: Vec<Line<'static>>, query: &str) -> Vec<Line<'static>> {
+fn highlight_preview_matches(
+    lines: Vec<Line<'static>>,
+    query: &str,
+    theme: Theme,
+    current_match_index: Option<usize>,
+) -> Vec<Line<'static>> {
     let lower_query = query.to_lowercase();
     if lower_query.is_empty() {
         return lines;
     }
 
+    let match_positions = preview_match_positions(&lines, &lower_query);
+    let current_match = current_match_index.and_then(|index| match_positions.get(index).copied());
+
     lines
         .into_iter()
-        .map(|line| highlight_preview_line(line.to_string(), &lower_query))
+        .enumerate()
+        .map(|(index, line)| {
+            let text = line.to_string();
+            if !is_preview_searchable_line(&text) {
+                return Line::from(text);
+            }
+            highlight_preview_line(
+                text,
+                &lower_query,
+                theme,
+                current_match
+                    .map(|(line_index, _)| line_index == index)
+                    .unwrap_or(false),
+                current_match
+                    .filter(|(line_index, _)| *line_index == index)
+                    .map(|(_, start)| start),
+            )
+        })
         .collect()
 }
 
+/// 計算 preview 中每一個搜尋命中的實際位置。
+fn preview_match_positions(lines: &[Line<'static>], lower_query: &str) -> Vec<(usize, usize)> {
+    if lower_query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut positions = Vec::new();
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let text = line.to_string();
+        if !is_preview_searchable_line(&text) {
+            continue;
+        }
+        let lower_text = text.to_lowercase();
+        let mut cursor = 0usize;
+
+        while cursor <= lower_text.len() {
+            let Some(found) = lower_text
+                .get(cursor..)
+                .and_then(|segment| segment.find(lower_query))
+            else {
+                break;
+            };
+            let start = cursor + found;
+            positions.push((line_index, start));
+            cursor = start.saturating_add(lower_query.len().max(1));
+        }
+    }
+
+    positions
+}
+
+/// 判斷這一行是否屬於 preview 中真正可搜尋的內容區。
+fn is_preview_searchable_line(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+
+    digit_count > 0
+        && trimmed
+            .chars()
+            .nth(digit_count)
+            .is_some_and(char::is_whitespace)
+}
+
 /// 將單一 preview 文字行轉成帶高亮的 `Line`。
-fn highlight_preview_line(text: String, lower_query: &str) -> Line<'static> {
+fn highlight_preview_line(
+    text: String,
+    lower_query: &str,
+    theme: Theme,
+    is_current_line: bool,
+    current_match_start: Option<usize>,
+) -> Line<'static> {
     let lower_text = text.to_lowercase();
-    let Some(start) = lower_text.find(lower_query) else {
-        return Line::from(text);
+    if !lower_text.contains(lower_query) {
+        return if is_current_line {
+            Line::styled(text, theme.preview_current_line_style())
+        } else {
+            Line::from(text)
+        };
+    }
+
+    let line_style = if is_current_line {
+        theme.preview_current_line_style()
+    } else {
+        Style::default()
     };
-    let end = start + lower_query.len();
+    let match_style = if is_current_line {
+        Style::default()
+            .bg(theme.preview_current_line_bg)
+            .fg(theme.preview_match_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.preview_match_style().add_modifier(Modifier::BOLD)
+    };
+    let current_match_style = Style::default()
+        .bg(theme.preview_match_bg)
+        .fg(theme.preview_match_fg)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
 
-    let head = text.get(..start).unwrap_or_default().to_string();
-    let body = text.get(start..end).unwrap_or_default().to_string();
-    let tail = text.get(end..).unwrap_or_default().to_string();
+    while cursor <= lower_text.len() {
+        let Some(found) = lower_text
+            .get(cursor..)
+            .and_then(|segment| segment.find(lower_query))
+        else {
+            break;
+        };
+        let start = cursor + found;
+        let end = start.saturating_add(lower_query.len());
 
-    Line::from(vec![
-        Span::styled(head, Style::default()),
-        Span::styled(body, Style::default().add_modifier(Modifier::REVERSED)),
-        Span::styled(tail, Style::default()),
-    ])
+        if let Some(head) = text.get(cursor..start) {
+            if !head.is_empty() {
+                spans.push(Span::styled(head.to_string(), line_style));
+            }
+        }
+
+        if let Some(body) = text.get(start..end) {
+            let style = if current_match_start == Some(start) {
+                current_match_style
+            } else {
+                match_style
+            };
+            spans.push(Span::styled(body.to_string(), style));
+        }
+
+        cursor = end;
+    }
+
+    if let Some(tail) = text.get(cursor..) {
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail.to_string(), line_style));
+        }
+    }
+
+    Line::from(spans)
 }
 
 /// 依照副檔名為常見二進位檔案補上格式描述。
@@ -1799,23 +2021,6 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 
     None
-}
-
-/// 將檔案大小格式化成適合 preview 區閱讀的字串。
-fn format_size_preview(size: u64) -> String {
-    match size {
-        0..=1023 => format!("{size} b"),
-        1024..=1_048_575 => format!("{:.1} kb", size as f64 / 1024.0),
-        1_048_576..=1_073_741_823 => format!("{:.1} mb", size as f64 / 1_048_576.0),
-        _ => format!("{:.1} G", size as f64 / 1_073_741_824.0),
-    }
-}
-
-/// 將系統時間格式化成 preview 區較容易閱讀的時間字串。
-fn format_system_time_preview(value: SystemTime) -> String {
-    chrono::DateTime::<chrono::Local>::from(value)
-        .format("%Y-%m-%d %H:%M")
-        .to_string()
 }
 
 /// 將單一路徑複製到目標資料夾，支援檔案與整個資料夾樹。
@@ -2138,6 +2343,8 @@ mod tests {
 
     use super::{PaneState, SortMode};
     use crate::file_manager::entry::FileEntry;
+    use crate::file_manager::search::GlobalSearchEntry;
+    use crate::theme::Theme;
 
     #[test]
     /// 驗證 pane 重新載入目錄時，資料夾會排在檔案前面。
@@ -2408,19 +2615,19 @@ mod tests {
 
         let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
         let preview: Vec<String> = pane
-            .preview_lines(6)
+            .preview_lines(6, Theme::default())
             .into_iter()
             .map(|line| line.to_string())
             .collect();
 
-        assert!(preview.iter().any(|line| line.starts_with("path: ")));
-        assert!(preview.iter().any(|line| line == "items: 2"));
+        assert!(preview.iter().any(|line| line.contains("path: ")));
+        assert!(preview.iter().any(|line| line.contains("items: 2")));
         assert!(preview.iter().any(|line| line == "contents:"));
         assert!(preview.iter().any(|line| line.contains("alpha.txt")));
     }
 
     #[test]
-    /// 驗證文字檔 preview 會顯示檔案資訊與帶有行號的內容。
+    /// 驗證文字檔 preview 會直接顯示帶有行號的檔案內容，不再插入額外資訊區。
     ///
     /// 參數：無。
     /// 回傳：無；若 preview 沒有顯示 metadata 或內容行號則測試失敗。
@@ -2434,16 +2641,14 @@ mod tests {
 
         let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
         let preview: Vec<String> = pane
-            .preview_lines(8)
+            .preview_lines(4, Theme::default())
             .into_iter()
             .map(|line| line.to_string())
             .collect();
 
-        assert!(preview.iter().any(|line| line.starts_with("path: ")));
-        assert!(preview.iter().any(|line| line.starts_with("size: ")));
-        assert!(preview.iter().any(|line| line.starts_with("modified: ")));
         assert!(preview.iter().any(|line| line == "  1 first line"));
         assert!(preview.iter().any(|line| line == "  2 second line"));
+        assert!(!preview.iter().any(|line| line.contains("path: ")));
     }
 
     #[test]
@@ -2461,12 +2666,11 @@ mod tests {
 
         let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
         let preview: Vec<String> = pane
-            .preview_lines(8)
+            .preview_lines(8, Theme::default())
             .into_iter()
             .map(|line| line.to_string())
             .collect();
 
-        assert!(preview.iter().any(|line| line == "kind: image"));
         assert!(preview.iter().any(|line| line == "format: png image"));
         assert!(preview.iter().any(|line| line == "dimensions: 640 x 480"));
     }
@@ -2482,16 +2686,167 @@ mod tests {
 
         let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
         let preview: Vec<String> = pane
-            .preview_lines(6)
+            .preview_lines(4, Theme::default())
             .into_iter()
             .map(|line| line.to_string())
             .collect();
 
-        assert!(preview.iter().any(|line| line == "kind: toml config"));
         assert!(
             preview
                 .iter()
                 .any(|line| line == "  1 theme = \"nightfox\"")
         );
+    }
+
+    #[test]
+    /// 驗證可針對指定路徑建立 preview，並套用搜尋高亮，供搜尋列表下方預覽使用。
+    fn pane_state_search_preview_for_path_supports_search_highlight() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, "alpha\nbeta target\ngamma\n").expect("notes");
+
+        let preview = PaneState::search_preview_for_entry(
+            &GlobalSearchEntry {
+                path: path.clone(),
+                relative_path: String::from("notes.txt"),
+                is_dir: false,
+                match_line_number: Some(2),
+                match_column: Some(6),
+                match_preview: Some(String::from("beta target")),
+            },
+            8,
+            "target",
+            None,
+            None,
+            false,
+            Theme::default(),
+        );
+        let preview_text = preview
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(preview_text.iter().any(|line| line == "  2 beta target"));
+        assert!(preview
+            .lines
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.content.as_ref() == "target")));
+
+        let title = PaneState::preview_title_for_path(&path, false, Some("target"));
+        assert_eq!(title, "Preview: notes.txt  [/target]");
+    }
+
+    #[test]
+    /// 驗證一般 preview 不會再顯示舊的資訊區，搜尋也只會針對檔案內容運作。
+    fn pane_state_preview_search_ignores_metadata_lines() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("test copy.md"), "this is body text\n").expect("notes");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        pane.set_preview_viewport_height(6);
+        pane.set_preview_search_query("t");
+        pane.preview_scroll = 0;
+
+        let preview = pane.preview_lines(12, Theme::default());
+        let preview_text = preview
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(!preview_text.iter().any(|line| line.contains("Information")));
+        assert!(!preview_text.iter().any(|line| line.contains("path: ")));
+        assert!(preview
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.content.as_ref() == "t"
+                && span.style.fg == Some(Theme::default().preview_match_fg))));
+    }
+
+    #[test]
+    /// 驗證搜尋 preview 會讓所有命中維持紅字，只有目前焦點命中帶黃色背景。
+    fn pane_state_search_preview_marks_current_match_line() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, "alpha\nbeta target\ngamma target\n").expect("notes");
+
+        let theme = Theme::default();
+        let preview = PaneState::search_preview_for_entry(
+            &GlobalSearchEntry {
+                path: path.clone(),
+                relative_path: String::from("notes.txt"),
+                is_dir: false,
+                match_line_number: Some(2),
+                match_column: Some(6),
+                match_preview: Some(String::from("beta target")),
+            },
+            10,
+            "target",
+            Some(0),
+            Some(3),
+            false,
+            theme,
+        );
+
+        let target_spans = preview
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.content.as_ref() == "target")
+            .collect::<Vec<_>>();
+
+        assert_eq!(target_spans.len(), 2);
+        assert!(target_spans.iter().any(|span| {
+            span.style.bg == Some(theme.preview_match_bg)
+                && span.style.fg == Some(theme.preview_match_fg)
+        }));
+        assert!(target_spans.iter().any(|span| {
+            span.style.bg != Some(theme.preview_match_bg)
+                && span.style.fg == Some(theme.preview_match_fg)
+        }));
+        assert!(preview.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+        }));
+    }
+
+    #[test]
+    /// 驗證搜尋 preview 即使遇到大檔案，也會顯示命中片段而不是只顯示 skipped 訊息。
+    fn pane_state_search_preview_for_large_file_shows_match_snippet() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("large.txt");
+        let mut content = String::new();
+        for _ in 0..9000 {
+            content.push_str("padding padding padding padding\n");
+        }
+        content.push_str("needle appears here\n");
+        fs::write(&path, content).expect("large");
+
+        let preview = PaneState::search_preview_for_entry(
+            &GlobalSearchEntry {
+                path: path.clone(),
+                relative_path: String::from("large.txt"),
+                is_dir: false,
+                match_line_number: Some(9001),
+                match_column: Some(1),
+                match_preview: Some(String::from("needle appears here")),
+            },
+            8,
+            "needle",
+            None,
+            None,
+            false,
+            Theme::default(),
+        );
+
+        let text = preview
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(text.iter().any(|line| line.contains("needle appears here")));
+        assert!(!text
+            .iter()
+            .any(|line| line.contains("preview skipped for files larger than 128 KiB")));
     }
 }
