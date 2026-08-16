@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
@@ -133,6 +133,8 @@ pub(crate) fn render_pane(
     config: &AppConfig,
     editor_state: Option<InlineEditorState<'_>>,
     picker_state: Option<InlinePickerState<'_>>,
+    list_find_buffer: Option<&str>,
+    list_find_editing: bool,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
@@ -255,6 +257,7 @@ pub(crate) fn render_pane(
     } else {
         let visible_entries = pane.visible_entries();
         let detail_kind = pane.sort_mode.detail_kind();
+        let find_match_position = pane.list_find_match_position();
         if visible_entries.is_empty() {
             vec![ListItem::new(Line::from("empty directory"))]
         } else {
@@ -276,6 +279,8 @@ pub(crate) fn render_pane(
                         detail_kind,
                         content_width,
                         theme,
+                        pane.list_find_query(),
+                        find_match_position.filter(|_| entry.0 == pane.selected),
                     ))
                 })
                 .collect()
@@ -349,6 +354,13 @@ pub(crate) fn render_pane(
             theme,
             "Help Search",
             search,
+        )),
+        _ if list_find_editing => Some(render_top_right_input(
+            frame,
+            chunks[0],
+            theme,
+            "Find next",
+            list_find_buffer.unwrap_or_default(),
         )),
         _ => None,
     };
@@ -839,6 +851,8 @@ fn render_entry_line(
     detail_kind: SortDetailKind,
     width: usize,
     theme: Theme,
+    list_find_query: Option<&str>,
+    list_find_position: Option<(usize, usize)>,
 ) -> Line<'static> {
     let marker = if mark_column_active {
         if marked || visual_selected {
@@ -849,21 +863,110 @@ fn render_entry_line(
     } else {
         ""
     };
-    let name = format!("{marker}{}", entry.display_name());
+    let name = entry.display_name();
+    let badge = list_find_position.map(|(current, total)| format!("[{current}/{total}]"));
     let detail = format_sort_detail(entry, detail_kind);
+    let badge_len = badge
+        .as_ref()
+        .map(|value| value.chars().count() + 1)
+        .unwrap_or(0);
+    let name_len = marker.chars().count() + name.chars().count() + badge_len;
+
     if detail.is_empty() || width < 8 {
-        return Line::from(name);
+        let mut spans = Vec::new();
+        if !marker.is_empty() {
+            spans.push(Span::raw(marker.to_string()));
+        }
+        spans.extend(highlight_name_spans(&name, list_find_query, theme));
+        if let Some(badge) = badge {
+            spans.push(Span::raw(" ".to_string()));
+            spans.push(Span::styled(
+                badge,
+                theme
+                    .accent_style()
+                    .bg(theme.selection_bg)
+                    .fg(theme.selection_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        return Line::from(spans);
     }
 
-    let name_len = name.chars().count();
     let detail_len = detail.chars().count();
     let spacer_len = width.saturating_sub(name_len + detail_len).max(1);
 
-    Line::from(vec![
-        Span::raw(name),
-        Span::raw(" ".repeat(spacer_len)),
-        Span::styled(detail, theme.muted_style()),
-    ])
+    let mut spans = Vec::new();
+    if !marker.is_empty() {
+        spans.push(Span::raw(marker.to_string()));
+    }
+    spans.extend(highlight_name_spans(&name, list_find_query, theme));
+    if let Some(badge) = badge {
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            badge,
+            theme
+                .accent_style()
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::raw(" ".repeat(spacer_len)));
+    spans.push(Span::styled(detail, theme.muted_style()));
+
+    Line::from(spans)
+}
+
+/// 依照目前的 list find 查詢，把檔名切成一般片段與高亮片段。
+fn highlight_name_spans(name: &str, query: Option<&str>, theme: Theme) -> Vec<Span<'static>> {
+    let Some(query) = query.filter(|value| !value.is_empty()) else {
+        return vec![Span::raw(name.to_string())];
+    };
+
+    let lower_name = name.to_lowercase();
+    let lower_query = query.to_lowercase();
+    let mut spans = Vec::new();
+    let mut search_start = 0usize;
+    let mut byte_start = 0usize;
+
+    while let Some(relative_match) = lower_name[search_start..].find(&lower_query) {
+        let match_start = search_start + relative_match;
+        let match_end = match_start + lower_query.len();
+
+        if let Some(prefix) = name.get(byte_start..match_start)
+            && !prefix.is_empty()
+        {
+            spans.push(Span::raw(prefix.to_string()));
+        }
+        if let Some(matched) = name.get(match_start..match_end) {
+            spans.push(Span::styled(
+                matched.to_string(),
+                highlight_match_style(theme),
+            ));
+        }
+
+        search_start = match_end;
+        byte_start = match_end;
+    }
+
+    if let Some(suffix) = name.get(byte_start..)
+        && !suffix.is_empty()
+    {
+        spans.push(Span::raw(suffix.to_string()));
+    }
+
+    if spans.is_empty() {
+        vec![Span::raw(name.to_string())]
+    } else {
+        spans
+    }
+}
+
+/// 回傳列表內 find-next 命中文字使用的高亮樣式。
+fn highlight_match_style(theme: Theme) -> Style {
+    theme
+        .accent_style()
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
 }
 
 /// 依照目前排序依據，決定右側欄位要顯示的文字。

@@ -103,6 +103,13 @@ pub(crate) struct PreviewSearchState {
     pub(crate) editing: bool,
 }
 
+/// 記錄目前列表內 find-next 的目標 pane 與輸入中的查詢字串。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListFindState {
+    pub(crate) pane_id: usize,
+    pub(crate) buffer: String,
+}
+
 /// 記錄目前 global search 的目標 pane、查詢文字與搜尋結果狀態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalSearchState {
@@ -241,6 +248,7 @@ pub(crate) struct App {
     pub(crate) clipboard: Option<ClipboardState>,
     pub(crate) filter: Option<FilterState>,
     pub(crate) preview_search: Option<PreviewSearchState>,
+    pub(crate) list_find: Option<ListFindState>,
     pub(crate) global_search: Option<GlobalSearchState>,
     pub(crate) global_search_rx: Option<Receiver<GlobalSearchEvent>>,
     pub(crate) global_search_cancelled: Option<Arc<AtomicBool>>,
@@ -257,6 +265,7 @@ pub(crate) enum HelpReturnState {
     Pending(PendingAction),
     Filter(FilterState),
     PreviewSearch(PreviewSearchState),
+    ListFind(ListFindState),
     GlobalSearch(GlobalSearchState),
     VisualSelection(VisualSelectionState),
     CommandMode(String),
@@ -311,6 +320,7 @@ impl App {
             clipboard: None,
             filter: None,
             preview_search: None,
+            list_find: None,
             global_search: None,
             global_search_rx: None,
             global_search_cancelled: None,
@@ -345,6 +355,9 @@ impl App {
             .is_some_and(|search| search.editing)
         {
             return self.handle_preview_search_input_key(key);
+        }
+        if self.list_find.is_some() {
+            return self.handle_list_find_input_key(key);
         }
         if self.global_search.is_some() {
             return self.handle_global_search_key(key);
@@ -473,6 +486,12 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            KeyCode::Char('/') => {
+                self.open_list_find_input();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             KeyCode::Char(',') => {
                 self.open_sort_picker();
                 self.pending_g = false;
@@ -510,7 +529,27 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'p') => {
-                self.paste_into_focused_pane()?;
+                if self
+                    .panes
+                    .get(&self.focused_pane)
+                    .is_some_and(|pane| pane.has_list_find())
+                {
+                    self.status = self.jump_list_find_match(false)?;
+                } else {
+                    self.paste_into_focused_pane()?;
+                }
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_plain_letter(&key, 'n') => {
+                if self
+                    .panes
+                    .get(&self.focused_pane)
+                    .is_some_and(|pane| pane.has_list_find())
+                {
+                    self.status = self.jump_list_find_match(true)?;
+                }
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -934,6 +973,50 @@ impl App {
         Ok(true)
     }
 
+    /// 處理列表內 find-next 輸入框的鍵盤輸入，並在每次輸入後立即更新高亮結果。
+    pub(crate) fn handle_list_find_input_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(mut search) = self.list_find.take() else {
+            return Ok(true);
+        };
+
+        match key.code {
+            KeyCode::Char(_) => {
+                if let Some(c) = typed_char_from_key(&key) {
+                    search.buffer.push(c);
+                }
+                self.apply_list_find_buffer(&search);
+                self.status =
+                    list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
+                self.list_find = Some(search);
+            }
+            KeyCode::Backspace => {
+                search.buffer.pop();
+                self.apply_list_find_buffer(&search);
+                self.status =
+                    list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
+                self.list_find = Some(search);
+            }
+            KeyCode::Enter => {
+                self.apply_list_find_buffer(&search);
+                self.status = list_find_locked_status(
+                    &search.buffer,
+                    self.list_find_match_count(search.pane_id),
+                );
+            }
+            KeyCode::Esc => {
+                if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                    pane.clear_list_find();
+                }
+                self.status = String::from("normal mode");
+            }
+            _ => {
+                self.list_find = Some(search);
+            }
+        }
+
+        Ok(true)
+    }
+
     /// 處理 filter 輸入框中的鍵盤輸入，並在每次輸入後立即更新列表。
     pub(crate) fn handle_filter_input_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(mut filter) = self.filter.take() else {
@@ -1051,9 +1134,7 @@ impl App {
                 KeyCode::Esc => {
                     self.status = String::from("sort cancelled");
                 }
-                _ if key_matches_plain_letter(&key, 'q')
-                    || key_matches_plain_letter(&key, 'h') =>
-                {
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
                     self.status = String::from("sort cancelled");
                 }
                 _ => {
@@ -1089,9 +1170,7 @@ impl App {
                 KeyCode::Esc => {
                     self.status = String::from("theme picker cancelled");
                 }
-                _ if key_matches_plain_letter(&key, 'q')
-                    || key_matches_plain_letter(&key, 'h') =>
-                {
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
                     self.status = String::from("theme picker cancelled");
                 }
                 _ => {
@@ -2269,6 +2348,10 @@ impl App {
             return;
         }
 
+        if self.clear_list_find_if_active() {
+            return;
+        }
+
         if self.has_any_marks() {
             self.clear_all_marks();
             return;
@@ -2827,6 +2910,9 @@ impl App {
         if let Some(search) = self.preview_search.take() {
             return Some(HelpReturnState::PreviewSearch(search));
         }
+        if let Some(search) = self.list_find.take() {
+            return Some(HelpReturnState::ListFind(search));
+        }
         if let Some(search) = self.global_search.take() {
             self.cancel_global_search();
             return Some(HelpReturnState::GlobalSearch(search));
@@ -2884,6 +2970,11 @@ impl App {
                 self.status =
                     preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
                 self.preview_search = Some(search);
+            }
+            HelpReturnState::ListFind(search) => {
+                self.status =
+                    list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
+                self.list_find = Some(search);
             }
             HelpReturnState::GlobalSearch(search) => {
                 self.status = global_search_status(
@@ -3207,6 +3298,17 @@ impl App {
         self.status =
             preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
         self.preview_search = Some(search);
+    }
+
+    /// 打開目前 pane 的列表內 find-next 輸入框，並沿用目前已存在的查詢字串。
+    pub(crate) fn open_list_find_input(&mut self) {
+        let search = ListFindState {
+            pane_id: self.focused_pane,
+            buffer: String::new(),
+        };
+        self.apply_list_find_buffer(&search);
+        self.status = list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
+        self.list_find = Some(search);
     }
 
     /// 進入 visual selection 模式，準備用移動游標的方式框選一段範圍。
@@ -3855,6 +3957,20 @@ impl App {
         }
     }
 
+    /// 將列表內 find-next 文字套用到指定 pane，並把游標移到第一個命中項目。
+    fn apply_list_find_buffer(&mut self, search: &ListFindState) {
+        if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+            pane.set_list_find_query(&search.buffer);
+            if pane.has_list_find() {
+                if let Some(target) = pane.list_find_match_indices().first().copied() {
+                    pane.selected = target;
+                    pane.list_state.select(Some(target));
+                    pane.preview_scroll = 0;
+                }
+            }
+        }
+    }
+
     /// 啟動一個背景 global search 工作，避免在大型目錄中阻塞主介面。
     fn start_global_search(&mut self, search: &mut GlobalSearchState) -> io::Result<()> {
         self.cancel_global_search_worker();
@@ -3939,6 +4055,56 @@ impl App {
         }
 
         false
+    }
+
+    /// 清除目前焦點 pane 上的列表內 find-next 結果；若有清除任何內容則回傳 `true`。
+    fn clear_list_find_if_active(&mut self) -> bool {
+        if let Some(search) = self.list_find.take() {
+            if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                pane.clear_list_find();
+            }
+            self.status = String::from("normal mode");
+            return true;
+        }
+
+        if let Some(pane) = self.panes.get_mut(&self.focused_pane)
+            && pane.has_list_find()
+        {
+            pane.clear_list_find();
+            self.status = String::from("normal mode");
+            return true;
+        }
+
+        false
+    }
+
+    /// 計算指定 pane 目前列表內 find-next 的命中數量。
+    fn list_find_match_count(&self, pane_id: usize) -> usize {
+        self.panes
+            .get(&pane_id)
+            .map(|pane| pane.list_find_match_indices().len())
+            .unwrap_or(0)
+    }
+
+    /// 在目前焦點 pane 中跳到下一個或上一個列表內 find-next 命中結果。
+    fn jump_list_find_match(&mut self, forward: bool) -> io::Result<String> {
+        let pane = self.current_pane_mut()?;
+        let Some(query) = pane.list_find_query().map(str::to_string) else {
+            return Ok(String::from("normal mode"));
+        };
+
+        let found = if forward {
+            pane.jump_to_next_list_find_match()
+        } else {
+            pane.jump_to_previous_list_find_match()
+        };
+        let count = pane.list_find_match_indices().len();
+
+        Ok(if found {
+            list_find_locked_status(&query, count)
+        } else {
+            format!("find next: {query} (0)")
+        })
     }
 
     /// 在 preview mode 中跳到下一個或上一個搜尋結果，並回傳狀態訊息。
@@ -4473,6 +4639,13 @@ impl App {
                     &self.config,
                     rename_buffer,
                     picker_state,
+                    self.list_find
+                        .as_ref()
+                        .filter(|search| search.pane_id == pane_id)
+                        .map(|search| search.buffer.as_str()),
+                    self.list_find
+                        .as_ref()
+                        .is_some_and(|search| search.pane_id == pane_id),
                 );
                 if cursor_position.is_none() {
                     cursor_position = pane_cursor;
@@ -4505,7 +4678,7 @@ impl App {
             Span::raw(" rename  "),
             Span::styled("P", self.theme.accent_style()),
             Span::raw(" preview  "),
-            Span::styled("/ n N", self.theme.accent_style()),
+            Span::styled("/ n p", self.theme.accent_style()),
             Span::raw(" search  "),
             Span::styled("a", self.theme.accent_style()),
             Span::raw(" create  "),
@@ -4923,10 +5096,7 @@ fn key_matches_plain_letter(key: &KeyEvent, lowercase: char) -> bool {
 
     matches!(
         (lowercase, key.code),
-        ('h', KeyCode::Left)
-            | ('j', KeyCode::Down)
-            | ('k', KeyCode::Up)
-            | ('l', KeyCode::Right)
+        ('h', KeyCode::Left) | ('j', KeyCode::Down) | ('k', KeyCode::Up) | ('l', KeyCode::Right)
     )
 }
 
@@ -5451,6 +5621,24 @@ fn preview_search_status(buffer: &str, matches: usize) -> String {
     }
 }
 
+/// 依照目前列表內 find-next 文字與命中數量產生狀態列訊息。
+fn list_find_status(buffer: &str, matches: usize) -> String {
+    if buffer.is_empty() {
+        String::from("find next: type query")
+    } else {
+        format!("find next: {buffer} ({matches})")
+    }
+}
+
+/// 依照目前列表內 find-next 文字與命中數量產生鎖定後的狀態列訊息。
+fn list_find_locked_status(buffer: &str, matches: usize) -> String {
+    if buffer.is_empty() {
+        String::from("find next: empty")
+    } else {
+        format!("find next locked: {buffer} ({matches})")
+    }
+}
+
 /// 依照目前 global search 文字、結果數與模式，產生狀態列訊息。
 fn global_search_status(
     buffer: &str,
@@ -5681,12 +5869,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RegexRenameOutcome,
-        RenameMode, VisualSelectionState, command_suggestion_navigation, command_suggestions,
-        help_entries, key_matches_ctrl_letter, key_matches_letter_any_case,
-        key_matches_plain_letter,
-        key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end, typed_char_from_key,
+        App, BookmarkPrompt, ClipboardOperation, FilterState, ListFindState, PendingAction,
+        RegexRenameOutcome, RenameMode, VisualSelectionState, command_suggestion_navigation,
+        command_suggestions, help_entries, key_matches_ctrl_letter, key_matches_letter_any_case,
+        key_matches_plain_letter, key_matches_shifted_letter, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
@@ -8145,5 +8332,110 @@ mod tests {
         assert!(app.visual_selection.is_none());
         assert_eq!(pane.marked_count(), 0);
         assert_eq!(app.status, "cleared 2 marks");
+    }
+
+    #[test]
+    /// 驗證列表模式按下 `/` 後會即時套用 find-next，並可在 Enter 後用 `n/p` 跳轉命中項目。
+    fn app_list_find_supports_lock_and_navigation() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("alps.txt"), "b").expect("alps");
+        fs::write(dir.path().join("beta.txt"), "c").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open list find");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type a");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("type l");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.selected_entry().expect("selected").name, "alpha.txt");
+        assert_eq!(pane.list_find_match_indices(), vec![0, 1]);
+        assert_eq!(app.status, "find next: al (2)");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock list find");
+        assert!(app.list_find.is_none());
+        assert_eq!(app.status, "find next locked: al (2)");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next match");
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "alps.txt"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("previous match");
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "alpha.txt"
+        );
+    }
+
+    #[test]
+    /// 驗證列表模式的 find-next 在鎖定後按下 `Esc`，會清除目前 pane 的高亮結果。
+    fn app_list_find_escape_clears_active_query() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open list find");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock list find");
+        assert!(app.panes.get(&1).expect("pane").list_find_query().is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear list find");
+        assert!(app.panes.get(&1).expect("pane").list_find_query().is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證重新按下 `/` 打開 list find 時，不會沿用上一輪輸入的查詢文字。
+    fn app_reopening_list_find_starts_with_empty_buffer() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open list find");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock query");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear query");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("reopen list find");
+
+        assert_eq!(
+            app.list_find,
+            Some(ListFindState {
+                pane_id: 1,
+                buffer: String::new(),
+            })
+        );
+        assert!(app.panes.get(&1).expect("pane").list_find_query().is_none());
+        assert_eq!(app.status, "find next: type query");
     }
 }
