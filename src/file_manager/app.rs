@@ -1051,6 +1051,11 @@ impl App {
                 KeyCode::Esc => {
                     self.status = String::from("sort cancelled");
                 }
+                _ if key_matches_plain_letter(&key, 'q')
+                    || key_matches_plain_letter(&key, 'h') =>
+                {
+                    self.status = String::from("sort cancelled");
+                }
                 _ => {
                     self.pending_action = Some(PendingAction::SortPicker { pane_id });
                     self.status = String::from("sort: choose a key from the panel");
@@ -1078,12 +1083,20 @@ impl App {
                     self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
                 }
                 KeyCode::Enter => self.apply_theme(ThemePreset::ALL[selected]),
+                _ if key_matches_plain_letter(&key, 'l') => {
+                    self.apply_theme(ThemePreset::ALL[selected])
+                }
                 KeyCode::Esc => {
+                    self.status = String::from("theme picker cancelled");
+                }
+                _ if key_matches_plain_letter(&key, 'q')
+                    || key_matches_plain_letter(&key, 'h') =>
+                {
                     self.status = String::from("theme picker cancelled");
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = String::from("theme picker: use j/k and Enter");
+                    self.status = String::from("theme picker: use j/k move, l apply, h close");
                 }
             },
             PendingAction::TrashPanel {
@@ -1460,7 +1473,9 @@ impl App {
                             self.restore_help_return_state(false)?;
                             return Ok(true);
                         }
-                        _ if key_matches_plain_letter(&key, 'q') => {
+                        _ if key_matches_plain_letter(&key, 'q')
+                            || key_matches_plain_letter(&key, 'h') =>
+                        {
                             self.pending_g = false;
                             self.restore_help_return_state(false)?;
                             return Ok(true);
@@ -2484,7 +2499,7 @@ impl App {
             .position(|preset| *preset == self.theme_preset)
             .unwrap_or(0);
         self.pending_action = Some(PendingAction::ThemePicker { selected });
-        self.status = String::from("theme picker: use j/k and Enter");
+        self.status = String::from("theme picker: use j/k move, l apply, h close");
     }
 
     /// 打開底部排序面板，等待使用者輸入排序快捷鍵。
@@ -6702,6 +6717,20 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 help 面板在列表模式下按 `h` 會和 `Esc` 一樣關閉，保持與 `l` 的左右對稱操作。
+    fn app_help_panel_h_closes_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_help_panel();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("close help with h");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
     /// 驗證 help 面板中的 `:delete` 會保留 `d` 快捷鍵，並透過 Enter 進入刪除確認。
     fn app_help_panel_delete_entry_matches_delete_behavior() {
         let dir = tempdir().expect("tempdir");
@@ -6793,6 +6822,39 @@ mod tests {
         assert_eq!(app.theme_preset, ThemePreset::Ocean);
         assert_eq!(app.theme, ThemePreset::Ocean.into());
         assert_eq!(app.status, "theme: ocean");
+    }
+
+    #[test]
+    /// 驗證主題選擇視窗也遵守核心 `h/l` 規則：`l` 套用、`h` 關閉。
+    fn app_theme_picker_supports_h_and_l_core_navigation() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("close theme picker");
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "theme picker cancelled");
+
+        app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("apply theme with l");
+        assert_eq!(app.theme_preset, ThemePreset::Ocean);
+        assert_eq!(app.status, "theme: ocean");
+    }
+
+    #[test]
+    /// 驗證排序面板可用 `h` 關閉，避免和整體核心操作規則不一致。
+    fn app_sort_picker_h_closes_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_sort_picker();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("close sort picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "sort cancelled");
     }
 
     #[test]
