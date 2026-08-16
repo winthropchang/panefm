@@ -242,6 +242,7 @@ pub(crate) struct App {
     pub(crate) command_buffer: String,
     pub(crate) command_suggestion_selected: usize,
     pub(crate) awaiting_ctrl_w: bool,
+    pub(crate) pending_count: Option<usize>,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
     pub(crate) pending_bookmark: Option<BookmarkPrompt>,
@@ -314,6 +315,7 @@ impl App {
             command_buffer: String::new(),
             command_suggestion_selected: 0,
             awaiting_ctrl_w: false,
+            pending_count: None,
             pending_g: false,
             pending_y: false,
             pending_bookmark: None,
@@ -330,6 +332,60 @@ impl App {
             pending_launch: None,
             preview_focus: None,
         })
+    }
+
+    /// 嘗試把目前按鍵視為 count prefix 的下一個數字。
+    ///
+    /// 規則：
+    /// - `1..=9` 永遠可以開始或延續 count。
+    /// - `0` 只有在已經有 count 時，才會被視為後續位數。
+    fn capture_pending_count_digit(&mut self, key: &KeyEvent) -> bool {
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+
+        let KeyCode::Char(ch) = key.code else {
+            return false;
+        };
+
+        if !ch.is_ascii_digit() {
+            return false;
+        }
+        if ch == '0' && self.pending_count.is_none() {
+            return false;
+        }
+
+        let digit = ch.to_digit(10).unwrap_or(0) as usize;
+        let next = self
+            .pending_count
+            .unwrap_or(0)
+            .saturating_mul(10)
+            .saturating_add(digit);
+        self.pending_count = Some(next);
+        self.status = format!("count: {next}");
+        true
+    }
+
+    /// 取出目前暫存的 count prefix。
+    fn take_pending_count(&mut self) -> Option<usize> {
+        self.pending_count.take()
+    }
+
+    /// 取出目前暫存的 count；若沒有則回傳 1。
+    fn take_count_or_one(&mut self) -> usize {
+        self.take_pending_count().unwrap_or(1).max(1)
+    }
+
+    /// 清除目前暫存的 count prefix。
+    fn clear_pending_count(&mut self) {
+        self.pending_count = None;
+    }
+
+    /// 清除和一般移動相關的暫存狀態，例如 count、pending g、pending y。
+    fn reset_pending_motion_state(&mut self) {
+        self.clear_pending_count();
+        self.pending_g = false;
+        self.pending_y = false;
     }
 
     /// 處理一般輸入事件的總入口。
@@ -378,23 +434,30 @@ impl App {
         if self.preview_focus == Some(self.focused_pane) {
             return self.handle_preview_key(key);
         }
+        if self.capture_pending_count_digit(&key) {
+            return Ok(true);
+        }
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.open_selected_with_picker()?;
-            self.pending_g = false;
-            self.pending_y = false;
+            self.reset_pending_motion_state();
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'O') {
             self.open_selected_with_picker()?;
-            self.pending_g = false;
-            self.pending_y = false;
+            self.reset_pending_motion_state();
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'G') {
-            self.current_pane_mut()?.move_bottom();
+            if let Some(count) = self.take_pending_count() {
+                self.current_pane_mut()?
+                    .move_to_visible_index(count.saturating_sub(1));
+                self.status = format!("jumped to item {count}");
+            } else {
+                self.current_pane_mut()?.move_bottom();
+                self.status = String::from("jumped to bottom");
+            }
             self.pending_g = false;
             self.pending_y = false;
-            self.status = String::from("jumped to bottom");
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'V') {
@@ -425,18 +488,21 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'j') => {
-                self.current_pane_mut()?.move_down();
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.move_down_by(count);
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'k') => {
-                self.current_pane_mut()?.move_up();
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.move_up_by(count);
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'h') => {
+                self.clear_pending_count();
                 self.current_pane_mut()?.go_parent()?;
                 self.status = String::from("moved to parent directory");
                 self.pending_g = false;
@@ -444,6 +510,7 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'l') => {
+                self.clear_pending_count();
                 self.current_pane_mut()?.enter_selected()?;
                 self.status = String::from("opened directory");
                 self.pending_g = false;
@@ -451,78 +518,100 @@ impl App {
                 true
             }
             KeyCode::Enter => {
+                self.clear_pending_count();
                 self.open_selected_with_default()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'o') => {
+                self.clear_pending_count();
                 self.open_selected_with_default()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'g') => {
+                let pending_line = self.pending_count;
                 self.pending_y = false;
                 if self.pending_g {
-                    self.current_pane_mut()?.move_top();
+                    if let Some(count) = self.take_pending_count() {
+                        self.current_pane_mut()?
+                            .move_to_visible_index(count.saturating_sub(1));
+                        self.status = format!("jumped to item {count}");
+                    } else {
+                        self.current_pane_mut()?.move_top();
+                        self.status = String::from("jumped to top");
+                    }
                     self.pending_g = false;
-                    self.status = String::from("jumped to top");
                 } else {
                     self.pending_g = true;
-                    self.status = String::from("pending: g");
+                    self.status = if let Some(count) = pending_line {
+                        format!("pending: {count}g")
+                    } else {
+                        String::from("pending: g")
+                    };
                 }
                 true
             }
             _ if key_matches_plain_letter(&key, 'd') => {
+                self.clear_pending_count();
                 self.start_delete_confirmation();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'r') => {
+                self.clear_pending_count();
                 self.start_rename();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             KeyCode::Char('/') => {
+                self.clear_pending_count();
                 self.open_list_find_input();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             KeyCode::Char(',') => {
+                self.clear_pending_count();
                 self.open_sort_picker();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'f') => {
+                self.clear_pending_count();
                 self.open_filter_input();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 's') => {
+                self.clear_pending_count();
                 self.open_global_search()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             KeyCode::Char('.') => {
+                self.clear_pending_count();
                 self.toggle_hidden_files()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'a') => {
+                self.clear_pending_count();
                 self.start_create_entry();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'x') => {
+                self.clear_pending_count();
                 self.cut_selected();
                 self.pending_g = false;
                 self.pending_y = false;
@@ -534,8 +623,10 @@ impl App {
                     .get(&self.focused_pane)
                     .is_some_and(|pane| pane.has_list_find())
                 {
-                    self.status = self.jump_list_find_match(false)?;
+                    let count = self.take_count_or_one();
+                    self.status = self.jump_list_find_match(false, count)?;
                 } else {
+                    self.clear_pending_count();
                     self.paste_into_focused_pane()?;
                 }
                 self.pending_g = false;
@@ -548,13 +639,17 @@ impl App {
                     .get(&self.focused_pane)
                     .is_some_and(|pane| pane.has_list_find())
                 {
-                    self.status = self.jump_list_find_match(true)?;
+                    let count = self.take_count_or_one();
+                    self.status = self.jump_list_find_match(true, count)?;
+                } else {
+                    self.clear_pending_count();
                 }
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
             _ if key_matches_plain_letter(&key, 'y') => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_bookmark = None;
                 if self.pending_y {
@@ -567,6 +662,7 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'm') => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_y = false;
                 self.pending_bookmark = Some(BookmarkPrompt::Set);
@@ -574,6 +670,7 @@ impl App {
                 true
             }
             KeyCode::Char('\'') => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_y = false;
                 self.pending_bookmark = Some(BookmarkPrompt::Jump);
@@ -581,6 +678,7 @@ impl App {
                 true
             }
             _ if key_matches_ctrl_letter(&key, 'w') => {
+                self.clear_pending_count();
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
                 self.pending_y = false;
@@ -589,15 +687,13 @@ impl App {
                 true
             }
             KeyCode::Esc => {
-                self.pending_g = false;
-                self.pending_y = false;
+                self.reset_pending_motion_state();
                 self.pending_bookmark = None;
                 self.handle_escape_in_normal_mode();
                 true
             }
             _ => {
-                self.pending_g = false;
-                self.pending_y = false;
+                self.reset_pending_motion_state();
                 self.pending_bookmark = None;
                 true
             }
@@ -608,95 +704,126 @@ impl App {
 
     /// 處理 preview mode 的鍵盤輸入，讓使用者可以專心在預覽區捲動內容。
     pub(crate) fn handle_preview_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.capture_pending_count_digit(&key) {
+            return Ok(true);
+        }
         if key_matches_shifted_letter(&key, 'P') {
             if self.clear_preview_search_if_active() {
+                self.clear_pending_count();
                 self.pending_g = false;
                 return Ok(true);
             }
             self.preview_focus = None;
-            self.pending_g = false;
-            self.pending_y = false;
+            self.reset_pending_motion_state();
             self.status = String::from("normal mode");
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'N') {
+            let count = self.take_count_or_one();
             self.pending_g = false;
-            self.status = self.jump_preview_match(false)?;
+            self.status = self.jump_preview_match(false, count)?;
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'G') {
-            self.current_pane_mut()?.scroll_preview_bottom();
+            if let Some(count) = self.take_pending_count() {
+                self.current_pane_mut()?
+                    .scroll_preview_down(count.saturating_sub(1));
+                self.status = format!("preview: moved {count}");
+            } else {
+                self.current_pane_mut()?.scroll_preview_bottom();
+                self.status = String::from("preview: bottom");
+            }
             self.pending_g = false;
-            self.status = String::from("preview: bottom");
             return Ok(true);
         }
 
         match key.code {
             KeyCode::Esc => {
                 if self.clear_preview_search_if_active() {
+                    self.clear_pending_count();
                     self.pending_g = false;
                     return Ok(true);
                 }
                 self.preview_focus = None;
-                self.pending_g = false;
-                self.pending_y = false;
+                self.reset_pending_motion_state();
                 self.status = String::from("normal mode");
             }
             KeyCode::Char('/') => {
+                self.clear_pending_count();
                 self.open_preview_search_input();
                 self.pending_g = false;
             }
             _ if key_matches_plain_letter(&key, 'n') => {
+                let count = self.take_count_or_one();
                 self.pending_g = false;
-                self.status = self.jump_preview_match(true)?;
+                self.status = self.jump_preview_match(true, count)?;
             }
             KeyCode::Down => {
-                self.current_pane_mut()?.scroll_preview_down(1);
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.scroll_preview_down(count);
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
             _ if key_matches_plain_letter(&key, 'j') => {
-                self.current_pane_mut()?.scroll_preview_down(1);
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.scroll_preview_down(count);
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
             KeyCode::Up => {
-                self.current_pane_mut()?.scroll_preview_up(1);
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.scroll_preview_up(count);
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
             _ if key_matches_plain_letter(&key, 'k') => {
-                self.current_pane_mut()?.scroll_preview_up(1);
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.scroll_preview_up(count);
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
             _ if key_matches_plain_letter(&key, 'g') => {
+                let pending_line = self.pending_count;
                 if self.pending_g {
-                    self.current_pane_mut()?.scroll_preview_top();
+                    if let Some(count) = self.take_pending_count() {
+                        self.current_pane_mut()?
+                            .scroll_preview_down(count.saturating_sub(1));
+                        self.status = format!("preview: moved {count}");
+                    } else {
+                        self.current_pane_mut()?.scroll_preview_top();
+                        self.status = String::from("preview: top");
+                    }
                     self.pending_g = false;
-                    self.status = String::from("preview: top");
                 } else {
                     self.pending_g = true;
-                    self.status = String::from("preview: pending g");
+                    self.status = if let Some(count) = pending_line {
+                        format!("preview: pending {count}g")
+                    } else {
+                        String::from("preview: pending g")
+                    };
                 }
             }
             _ if key_matches_ctrl_letter(&key, 'd') => {
+                self.clear_pending_count();
                 self.current_pane_mut()?.page_preview_down();
                 self.pending_g = false;
                 self.status = String::from("preview: page down");
             }
             _ if key_matches_ctrl_letter(&key, 'u') => {
+                self.clear_pending_count();
                 self.current_pane_mut()?.page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
             }
             _ if key_matches_ctrl_letter(&key, 'w') => {
+                self.clear_pending_count();
                 self.awaiting_ctrl_w = true;
                 self.pending_g = false;
                 self.pending_y = false;
                 self.status = String::from("Ctrl-w");
             }
             _ => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.status = String::from("preview mode");
             }
@@ -707,12 +834,21 @@ impl App {
 
     /// 處理 visual selection 模式下的鍵盤輸入。
     pub(crate) fn handle_visual_selection_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.capture_pending_count_digit(&key) {
+            return Ok(true);
+        }
         if key_matches_shifted_letter(&key, 'V') {
+            self.clear_pending_count();
             self.commit_visual_selection()?;
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'G') {
-            self.current_pane_mut()?.move_bottom();
+            if let Some(count) = self.take_pending_count() {
+                self.current_pane_mut()?
+                    .move_to_visible_index(count.saturating_sub(1));
+            } else {
+                self.current_pane_mut()?.move_bottom();
+            }
             self.sync_visual_selection_cursor();
             self.pending_g = false;
             self.status = self.visual_status_label();
@@ -721,40 +857,56 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
+                self.clear_pending_count();
                 self.commit_visual_selection()?;
             }
             KeyCode::Down => {
-                self.current_pane_mut()?.move_down();
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.move_down_by(count);
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
             _ if key_matches_plain_letter(&key, 'j') => {
-                self.current_pane_mut()?.move_down();
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.move_down_by(count);
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
             KeyCode::Up => {
-                self.current_pane_mut()?.move_up();
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.move_up_by(count);
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
             _ if key_matches_plain_letter(&key, 'k') => {
-                self.current_pane_mut()?.move_up();
+                let count = self.take_count_or_one();
+                self.current_pane_mut()?.move_up_by(count);
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
             _ if key_matches_plain_letter(&key, 'g') => {
+                let pending_line = self.pending_count;
                 if self.pending_g {
-                    self.current_pane_mut()?.move_top();
+                    if let Some(count) = self.take_pending_count() {
+                        self.current_pane_mut()?
+                            .move_to_visible_index(count.saturating_sub(1));
+                    } else {
+                        self.current_pane_mut()?.move_top();
+                    }
                     self.sync_visual_selection_cursor();
                     self.pending_g = false;
                     self.status = self.visual_status_label();
                 } else {
                     self.pending_g = true;
-                    self.status = String::from("visual: pending g");
+                    self.status = if let Some(count) = pending_line {
+                        format!("visual: pending {count}g")
+                    } else {
+                        String::from("visual: pending g")
+                    };
                 }
             }
             _ => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.status = self.visual_status_label();
             }
@@ -854,9 +1006,16 @@ impl App {
             return Ok(true);
         }
 
+        if self.capture_pending_count_digit(&key) {
+            self.global_search = Some(search);
+            return Ok(true);
+        }
+
         match key.code {
             KeyCode::Down => {
-                search.selected = (search.selected + 1).min(search.results.len().saturating_sub(1));
+                let count = self.take_count_or_one();
+                search.selected =
+                    (search.selected + count).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
                     &search.buffer,
                     search.results.len(),
@@ -867,7 +1026,9 @@ impl App {
                 self.global_search = Some(search);
             }
             _ if key_matches_plain_letter(&key, 'j') => {
-                search.selected = (search.selected + 1).min(search.results.len().saturating_sub(1));
+                let count = self.take_count_or_one();
+                search.selected =
+                    (search.selected + count).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
                     &search.buffer,
                     search.results.len(),
@@ -878,7 +1039,8 @@ impl App {
                 self.global_search = Some(search);
             }
             KeyCode::Up => {
-                search.selected = search.selected.saturating_sub(1);
+                let count = self.take_count_or_one();
+                search.selected = search.selected.saturating_sub(count);
                 self.status = global_search_status(
                     &search.buffer,
                     search.results.len(),
@@ -889,7 +1051,8 @@ impl App {
                 self.global_search = Some(search);
             }
             _ if key_matches_plain_letter(&key, 'k') => {
-                search.selected = search.selected.saturating_sub(1);
+                let count = self.take_count_or_one();
+                search.selected = search.selected.saturating_sub(count);
                 self.status = global_search_status(
                     &search.buffer,
                     search.results.len(),
@@ -900,8 +1063,15 @@ impl App {
                 self.global_search = Some(search);
             }
             _ if key_matches_plain_letter(&key, 'g') => {
+                let pending_line = self.pending_count;
                 if self.pending_g {
-                    search.selected = 0;
+                    if let Some(count) = self.take_pending_count() {
+                        search.selected = count
+                            .saturating_sub(1)
+                            .min(search.results.len().saturating_sub(1));
+                    } else {
+                        search.selected = 0;
+                    }
                     self.pending_g = false;
                 } else {
                     self.pending_g = true;
@@ -913,10 +1083,23 @@ impl App {
                     search.searched,
                     search.loading,
                 );
+                if self.pending_g {
+                    self.status = if let Some(count) = pending_line {
+                        format!("global search (normal): pending {count}g")
+                    } else {
+                        String::from("global search (normal): pending g")
+                    };
+                }
                 self.global_search = Some(search);
             }
             _ if key_matches_shifted_letter(&key, 'G') => {
-                if !search.results.is_empty() {
+                if let Some(count) = self.take_pending_count() {
+                    if !search.results.is_empty() {
+                        search.selected = count
+                            .saturating_sub(1)
+                            .min(search.results.len().saturating_sub(1));
+                    }
+                } else if !search.results.is_empty() {
                     search.selected = search.results.len() - 1;
                 }
                 self.pending_g = false;
@@ -930,6 +1113,7 @@ impl App {
                 self.global_search = Some(search);
             }
             _ if key_matches_plain_letter(&key, 'i') || key_matches_plain_letter(&key, 's') => {
+                self.clear_pending_count();
                 search.editing = true;
                 self.pending_g = false;
                 self.status = global_search_status(
@@ -942,22 +1126,27 @@ impl App {
                 self.global_search = Some(search);
             }
             KeyCode::Enter => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
             _ if key_matches_plain_letter(&key, 'l') => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
             KeyCode::Esc => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.cancel_global_search();
             }
             _ if key_matches_plain_letter(&key, 'h') => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.cancel_global_search();
             }
             _ => {
+                self.clear_pending_count();
                 self.pending_g = false;
                 self.status = global_search_status(
                     &search.buffer,
@@ -1221,8 +1410,22 @@ impl App {
                     });
                     self.status = status;
                 } else {
+                    if self.capture_pending_count_digit(&key) {
+                        self.pending_action = Some(PendingAction::TrashPanel {
+                            pane_id,
+                            selected,
+                            search,
+                            marked_ids,
+                            visual_anchor,
+                        });
+                        return Ok(true);
+                    }
                     if key_matches_shifted_letter(&key, 'G') {
-                        if len > 0 {
+                        if let Some(count) = self.take_pending_count() {
+                            if len > 0 {
+                                selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                            }
+                        } else if len > 0 {
                             selected = len - 1;
                         }
                         self.pending_g = false;
@@ -1324,33 +1527,40 @@ impl App {
                     match key.code {
                         KeyCode::Down => {
                             if len > 0 {
-                                selected = (selected + 1).min(len.saturating_sub(1));
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
                         _ if key_matches_plain_letter(&key, 'j') => {
                             if len > 0 {
-                                selected = (selected + 1).min(len.saturating_sub(1));
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
                         KeyCode::Up => {
-                            selected = selected.saturating_sub(1);
+                            selected = selected.saturating_sub(self.take_count_or_one());
                             self.pending_g = false;
                         }
                         _ if key_matches_plain_letter(&key, 'k') => {
-                            selected = selected.saturating_sub(1);
+                            selected = selected.saturating_sub(self.take_count_or_one());
                             self.pending_g = false;
                         }
                         _ if key_matches_plain_letter(&key, 'g') => {
                             if self.pending_g {
-                                selected = 0;
+                                if let Some(count) = self.take_pending_count() {
+                                    selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                                } else {
+                                    selected = 0;
+                                }
                                 self.pending_g = false;
                             } else {
                                 self.pending_g = true;
                             }
                         }
                         _ if key_matches_plain_letter(&key, 'f') => {
+                            self.clear_pending_count();
                             search.editing = true;
                             self.pending_g = false;
                         }
@@ -1365,6 +1575,7 @@ impl App {
                             self.pending_g = false;
                         }
                         KeyCode::Enter => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             let target_ids =
                                 self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
@@ -1381,6 +1592,7 @@ impl App {
                             return Ok(true);
                         }
                         _ if key_matches_plain_letter(&key, 'l') => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             let target_ids =
                                 self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
@@ -1397,6 +1609,7 @@ impl App {
                             return Ok(true);
                         }
                         KeyCode::Esc => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             if let Some(anchor) = visual_anchor.take() {
                                 let added = self.commit_trash_visual_selection(
@@ -1422,11 +1635,13 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'q')
                             || key_matches_plain_letter(&key, 'h') =>
                         {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             self.status = String::from("normal mode");
                             return Ok(true);
                         }
                         _ => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                         }
                     }
@@ -1484,8 +1699,21 @@ impl App {
                     });
                     self.status = status;
                 } else {
+                    if self.capture_pending_count_digit(&key) {
+                        self.pending_action = Some(PendingAction::HelpPanel {
+                            pane_id,
+                            selected,
+                            search,
+                        });
+                        return Ok(true);
+                    }
                     if key_matches_shifted_letter(&key, 'G') {
-                        if filtered_len > 0 {
+                        if let Some(count) = self.take_pending_count() {
+                            if filtered_len > 0 {
+                                selected =
+                                    count.saturating_sub(1).min(filtered_len.saturating_sub(1));
+                            }
+                        } else if filtered_len > 0 {
                             selected = filtered_len - 1;
                         }
                         self.pending_g = false;
@@ -1501,29 +1729,37 @@ impl App {
                     match key.code {
                         KeyCode::Down => {
                             if filtered_len > 0 {
-                                selected = (selected + 1).min(filtered_len.saturating_sub(1));
+                                selected = (selected + self.take_count_or_one())
+                                    .min(filtered_len.saturating_sub(1));
                             }
                         }
                         _ if key_matches_plain_letter(&key, 'j') => {
                             if filtered_len > 0 {
-                                selected = (selected + 1).min(filtered_len.saturating_sub(1));
+                                selected = (selected + self.take_count_or_one())
+                                    .min(filtered_len.saturating_sub(1));
                             }
                         }
                         KeyCode::Up => {
-                            selected = selected.saturating_sub(1);
+                            selected = selected.saturating_sub(self.take_count_or_one());
                         }
                         _ if key_matches_plain_letter(&key, 'k') => {
-                            selected = selected.saturating_sub(1);
+                            selected = selected.saturating_sub(self.take_count_or_one());
                         }
                         _ if key_matches_plain_letter(&key, 'g') => {
                             if self.pending_g {
-                                selected = 0;
+                                if let Some(count) = self.take_pending_count() {
+                                    selected =
+                                        count.saturating_sub(1).min(filtered_len.saturating_sub(1));
+                                } else {
+                                    selected = 0;
+                                }
                                 self.pending_g = false;
                             } else {
                                 self.pending_g = true;
                             }
                         }
                         _ if key_matches_plain_letter(&key, 'f') => {
+                            self.clear_pending_count();
                             search.editing = true;
                             self.pending_g = false;
                         }
@@ -1538,16 +1774,19 @@ impl App {
                             self.pending_g = false;
                         }
                         KeyCode::Enter => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             self.execute_help_entry(&filtered_entries, selected)?;
                             return Ok(true);
                         }
                         _ if key_matches_plain_letter(&key, 'l') => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             self.execute_help_entry(&filtered_entries, selected)?;
                             return Ok(true);
                         }
                         KeyCode::Esc | KeyCode::F(1) => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             self.restore_help_return_state(false)?;
                             return Ok(true);
@@ -1555,11 +1794,13 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'q')
                             || key_matches_plain_letter(&key, 'h') =>
                         {
+                            self.clear_pending_count();
                             self.pending_g = false;
                             self.restore_help_return_state(false)?;
                             return Ok(true);
                         }
                         _ => {
+                            self.clear_pending_count();
                             self.pending_g = false;
                         }
                     }
@@ -1579,8 +1820,16 @@ impl App {
             } => {
                 let entries = self.bookmark_store.list();
                 let len = entries.len();
+                if self.capture_pending_count_digit(&key) {
+                    self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
+                    return Ok(true);
+                }
                 if key_matches_shifted_letter(&key, 'G') {
-                    if len > 0 {
+                    if let Some(count) = self.take_pending_count() {
+                        if len > 0 {
+                            selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                        }
+                    } else if len > 0 {
                         selected = len - 1;
                     }
                     self.pending_g = false;
@@ -1591,43 +1840,52 @@ impl App {
                 match key.code {
                     KeyCode::Down => {
                         if len > 0 {
-                            selected = (selected + 1).min(len.saturating_sub(1));
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
                         }
                         self.pending_g = false;
                     }
                     _ if key_matches_plain_letter(&key, 'j') => {
                         if len > 0 {
-                            selected = (selected + 1).min(len.saturating_sub(1));
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
                         }
                         self.pending_g = false;
                     }
                     KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.saturating_sub(self.take_count_or_one());
                         self.pending_g = false;
                     }
                     _ if key_matches_plain_letter(&key, 'k') => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.saturating_sub(self.take_count_or_one());
                         self.pending_g = false;
                     }
                     _ if key_matches_plain_letter(&key, 'g') => {
                         if self.pending_g {
-                            selected = 0;
+                            if let Some(count) = self.take_pending_count() {
+                                selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                            } else {
+                                selected = 0;
+                            }
                             self.pending_g = false;
                         } else {
                             self.pending_g = true;
                         }
                     }
                     KeyCode::Enter => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.open_bookmark_from_list(pane_id, &entries, selected)?;
                         return Ok(true);
                     }
                     _ if key_matches_plain_letter(&key, 'l') => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.open_bookmark_from_list(pane_id, &entries, selected)?;
                         return Ok(true);
                     }
                     KeyCode::Esc => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.status = String::from("normal mode");
                         return Ok(true);
@@ -1635,11 +1893,13 @@ impl App {
                     _ if key_matches_plain_letter(&key, 'q')
                         || key_matches_plain_letter(&key, 'h') =>
                     {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.status = String::from("normal mode");
                         return Ok(true);
                     }
                     _ => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                     }
                 }
@@ -1652,10 +1912,20 @@ impl App {
                 mut selected,
             } => {
                 let options = open_picker_options(&target);
+                if self.capture_pending_count_digit(&key) {
+                    self.pending_action = Some(PendingAction::OpenPicker {
+                        pane_id,
+                        target: target.clone(),
+                        selected,
+                    });
+                    self.status = format!("open with: {}", target.display_name);
+                    return Ok(true);
+                }
                 match key.code {
                     KeyCode::Down => {
                         if !options.is_empty() {
-                            selected = (selected + 1).min(options.len().saturating_sub(1));
+                            selected = (selected + self.take_count_or_one())
+                                .min(options.len().saturating_sub(1));
                         }
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
@@ -1666,7 +1936,8 @@ impl App {
                     }
                     _ if key_matches_plain_letter(&key, 'j') => {
                         if !options.is_empty() {
-                            selected = (selected + 1).min(options.len().saturating_sub(1));
+                            selected = (selected + self.take_count_or_one())
+                                .min(options.len().saturating_sub(1));
                         }
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
@@ -1676,7 +1947,7 @@ impl App {
                         self.status = format!("open with: {}", target.display_name);
                     }
                     KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.saturating_sub(self.take_count_or_one());
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
                             target: target.clone(),
@@ -1685,7 +1956,7 @@ impl App {
                         self.status = format!("open with: {}", target.display_name);
                     }
                     _ if key_matches_plain_letter(&key, 'k') => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.saturating_sub(self.take_count_or_one());
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
                             target: target.clone(),
@@ -1694,6 +1965,7 @@ impl App {
                         self.status = format!("open with: {}", target.display_name);
                     }
                     KeyCode::Enter => {
+                        self.clear_pending_count();
                         if let Some(option) = options.get(selected) {
                             self.queue_open_action(target.clone(), option.action)?;
                         } else {
@@ -1701,6 +1973,7 @@ impl App {
                         }
                     }
                     _ if key_matches_plain_letter(&key, 'l') => {
+                        self.clear_pending_count();
                         if let Some(option) = options.get(selected) {
                             self.queue_open_action(target.clone(), option.action)?;
                         } else {
@@ -1708,14 +1981,17 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
+                        self.clear_pending_count();
                         self.status = String::from("normal mode");
                     }
                     _ if key_matches_plain_letter(&key, 'q')
                         || key_matches_plain_letter(&key, 'h') =>
                     {
+                        self.clear_pending_count();
                         self.status = String::from("normal mode");
                     }
                     _ => {
+                        self.clear_pending_count();
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
                             target: target.clone(),
@@ -2151,10 +2427,24 @@ impl App {
                 previews,
             } => {
                 let len = previews.len();
+                if self.capture_pending_count_digit(&key) {
+                    self.pending_action = Some(PendingAction::RegexRename {
+                        pane_id,
+                        pattern,
+                        replacement,
+                        selected,
+                        previews,
+                    });
+                    if let Some(action) = self.pending_action.as_ref() {
+                        self.status = self.status_for_pending_action(action)?;
+                    }
+                    return Ok(true);
+                }
                 match key.code {
                     KeyCode::Down => {
                         if len > 0 {
-                            selected = (selected + 1).min(len.saturating_sub(1));
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
                         }
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
@@ -2167,7 +2457,8 @@ impl App {
                     }
                     _ if key_matches_plain_letter(&key, 'j') => {
                         if len > 0 {
-                            selected = (selected + 1).min(len.saturating_sub(1));
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
                         }
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
@@ -2179,7 +2470,7 @@ impl App {
                         });
                     }
                     KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.saturating_sub(self.take_count_or_one());
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
                             pane_id,
@@ -2190,7 +2481,7 @@ impl App {
                         });
                     }
                     _ if key_matches_plain_letter(&key, 'k') => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.saturating_sub(self.take_count_or_one());
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
                             pane_id,
@@ -2202,7 +2493,11 @@ impl App {
                     }
                     _ if key_matches_plain_letter(&key, 'g') => {
                         if self.pending_g {
-                            selected = 0;
+                            if let Some(count) = self.take_pending_count() {
+                                selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                            } else {
+                                selected = 0;
+                            }
                             self.pending_g = false;
                         } else {
                             self.pending_g = true;
@@ -2216,7 +2511,11 @@ impl App {
                         });
                     }
                     _ if key_matches_shifted_letter(&key, 'G') => {
-                        if len > 0 {
+                        if let Some(count) = self.take_pending_count() {
+                            if len > 0 {
+                                selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                            }
+                        } else if len > 0 {
                             selected = len - 1;
                         }
                         self.pending_g = false;
@@ -2229,24 +2528,29 @@ impl App {
                         });
                     }
                     KeyCode::Enter => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.apply_regex_rename_preview(pane_id, &previews)?;
                     }
                     _ if key_matches_plain_letter(&key, 'l') => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.apply_regex_rename_preview(pane_id, &previews)?;
                     }
                     KeyCode::Esc => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.status = String::from("regex rename cancelled");
                     }
                     _ if key_matches_plain_letter(&key, 'q')
                         || key_matches_plain_letter(&key, 'h') =>
                     {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.status = String::from("regex rename cancelled");
                     }
                     _ => {
+                        self.clear_pending_count();
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
                             pane_id,
@@ -4087,17 +4391,23 @@ impl App {
     }
 
     /// 在目前焦點 pane 中跳到下一個或上一個列表內 find-next 命中結果。
-    fn jump_list_find_match(&mut self, forward: bool) -> io::Result<String> {
+    fn jump_list_find_match(&mut self, forward: bool, count: usize) -> io::Result<String> {
         let pane = self.current_pane_mut()?;
         let Some(query) = pane.list_find_query().map(str::to_string) else {
             return Ok(String::from("normal mode"));
         };
 
-        let found = if forward {
-            pane.jump_to_next_list_find_match()
-        } else {
-            pane.jump_to_previous_list_find_match()
-        };
+        let mut found = false;
+        for _ in 0..count.max(1) {
+            found = if forward {
+                pane.jump_to_next_list_find_match()
+            } else {
+                pane.jump_to_previous_list_find_match()
+            };
+            if !found {
+                break;
+            }
+        }
         let count = pane.list_find_match_indices().len();
 
         Ok(if found {
@@ -4108,7 +4418,7 @@ impl App {
     }
 
     /// 在 preview mode 中跳到下一個或上一個搜尋結果，並回傳狀態訊息。
-    fn jump_preview_match(&mut self, forward: bool) -> io::Result<String> {
+    fn jump_preview_match(&mut self, forward: bool, count: usize) -> io::Result<String> {
         let Some(pane) = self
             .preview_focus
             .and_then(|pane_id| self.panes.get_mut(&pane_id))
@@ -4120,11 +4430,17 @@ impl App {
             return Ok(String::from("preview search is empty"));
         };
 
-        let found = if forward {
-            pane.jump_to_next_preview_match()
-        } else {
-            pane.jump_to_previous_preview_match()
-        };
+        let mut found = false;
+        for _ in 0..count.max(1) {
+            found = if forward {
+                pane.jump_to_next_preview_match()
+            } else {
+                pane.jump_to_previous_preview_match()
+            };
+            if !found {
+                break;
+            }
+        }
         let count = pane.preview_match_count();
 
         Ok(if found {
@@ -8437,5 +8753,92 @@ mod tests {
         );
         assert!(app.panes.get(&1).expect("pane").list_find_query().is_none());
         assert_eq!(app.status, "find next: type query");
+    }
+
+    #[test]
+    /// 驗證 normal mode 支援像 Vim 一樣用數字前綴配合 `j` 一次移動多格。
+    fn app_count_prefix_moves_list_cursor_by_multiple_rows() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..8 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").expect("file");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE))
+            .expect("count");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 5);
+        assert!(app.pending_count.is_none());
+    }
+
+    #[test]
+    /// 驗證 count prefix 可以搭配 `gg` 與 `G` 跳到指定列表位置。
+    fn app_count_prefix_supports_absolute_jumps() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..8 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").expect("file");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE))
+            .expect("count for gg");
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("first g");
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("second g");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("count for G");
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE))
+            .expect("shift g");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 1);
+    }
+
+    #[test]
+    /// 驗證 count prefix 可以搭配 list find 的 `n` 一次跳過多個命中結果。
+    fn app_count_prefix_supports_list_find_navigation() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("alps.txt"), "b").expect("alps");
+        fs::write(dir.path().join("algae.txt"), "c").expect("algae");
+        fs::write(dir.path().join("beta.txt"), "d").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open list find");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type a");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("type l");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock find");
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "algae.txt"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("count");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("jump matches");
+
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .expect("pane")
+                .selected_entry()
+                .expect("selected")
+                .name,
+            "alps.txt"
+        );
+        assert!(app.pending_count.is_none());
     }
 }

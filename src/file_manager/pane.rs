@@ -158,32 +158,35 @@ impl PaneState {
         Ok(())
     }
 
-    /// 將列表選取游標向上移動一格。
+    /// 將列表選取游標向上移動指定格數。
     ///
     /// 參數：
     /// - `self: &mut PaneState`，要被移動游標的 pane。
+    /// - `count: usize`，要往上移動的格數。
     ///
     /// 回傳：`()`
-    pub(crate) fn move_up(&mut self) {
+    pub(crate) fn move_up_by(&mut self, count: usize) {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = self.selected.saturating_sub(1);
+        self.selected = self.selected.saturating_sub(count.max(1));
         self.list_state.select(Some(self.selected));
         self.preview_scroll = 0;
     }
 
-    /// 將列表選取游標向下移動一格。
+    /// 將列表選取游標向下移動指定格數。
     ///
     /// 參數：
     /// - `self: &mut PaneState`，要被移動游標的 pane。
+    /// - `count: usize`，要往下移動的格數。
     ///
     /// 回傳：`()`
-    pub(crate) fn move_down(&mut self) {
+    pub(crate) fn move_down_by(&mut self, count: usize) {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(self.visible_indices.len().saturating_sub(1));
+        self.selected =
+            (self.selected + count.max(1)).min(self.visible_indices.len().saturating_sub(1));
         self.list_state.select(Some(self.selected));
         self.preview_scroll = 0;
     }
@@ -214,6 +217,22 @@ impl PaneState {
             return;
         }
         self.selected = self.visible_indices.len() - 1;
+        self.list_state.select(Some(self.selected));
+        self.preview_scroll = 0;
+    }
+
+    /// 將列表選取游標跳到指定的可見索引位置。
+    ///
+    /// 參數：
+    /// - `self: &mut PaneState`，要被更新的 pane。
+    /// - `index: usize`，目標可見索引，超出範圍時會自動夾住。
+    ///
+    /// 回傳：`()`
+    pub(crate) fn move_to_visible_index(&mut self, index: usize) {
+        if self.visible_indices.is_empty() {
+            return;
+        }
+        self.selected = index.min(self.visible_indices.len().saturating_sub(1));
         self.list_state.select(Some(self.selected));
         self.preview_scroll = 0;
     }
@@ -1938,7 +1957,7 @@ mod tests {
         fs::write(child.join("note.txt"), "hello").expect("note");
 
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
-        pane.move_down();
+        pane.move_down_by(1);
         pane.enter_selected().expect("enter child");
         assert_eq!(pane.cwd, child);
 
