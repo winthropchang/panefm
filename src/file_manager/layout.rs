@@ -11,6 +11,16 @@ pub(crate) enum SplitDirection {
     Vertical,
 }
 
+/// 表示新 split 出來的 pane 要放在目前 pane 的哪一側。
+///
+/// `Before` 代表新 pane 會出現在左側或上方，
+/// `After` 代表新 pane 會出現在右側或下方。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplitPlacement {
+    Before,
+    After,
+}
+
 /// 表示整個多視窗布局的樹狀結構。
 ///
 /// 葉節點代表單一 pane，中間節點代表一次分割行為，
@@ -34,6 +44,7 @@ impl LayoutNode {
     /// - `self: LayoutNode`，目前的布局樹。
     /// - `target: usize`，要被分割的 pane id。
     /// - `direction: SplitDirection`，新的分割方向。
+    /// - `placement: SplitPlacement`，新 pane 要放在目前 pane 前面還是後面。
     /// - `new_pane_id: usize`，新建立 pane 的 id。
     ///
     /// 回傳：`LayoutNode`，套用分割後的新布局樹。
@@ -41,16 +52,26 @@ impl LayoutNode {
         self,
         target: usize,
         direction: SplitDirection,
+        placement: SplitPlacement,
         new_pane_id: usize,
     ) -> Self {
         match self {
-            LayoutNode::Leaf { pane_id } if pane_id == target => LayoutNode::Split {
-                direction,
-                first: Box::new(LayoutNode::Leaf { pane_id }),
-                second: Box::new(LayoutNode::Leaf {
+            LayoutNode::Leaf { pane_id } if pane_id == target => {
+                let current_leaf = Box::new(LayoutNode::Leaf { pane_id });
+                let new_leaf = Box::new(LayoutNode::Leaf {
                     pane_id: new_pane_id,
-                }),
-            },
+                });
+                let (first, second) = match placement {
+                    SplitPlacement::Before => (new_leaf, current_leaf),
+                    SplitPlacement::After => (current_leaf, new_leaf),
+                };
+
+                LayoutNode::Split {
+                    direction,
+                    first,
+                    second,
+                }
+            }
             LayoutNode::Leaf { pane_id } => LayoutNode::Leaf { pane_id },
             LayoutNode::Split {
                 direction: split_direction,
@@ -58,8 +79,8 @@ impl LayoutNode {
                 second,
             } => LayoutNode::Split {
                 direction: split_direction,
-                first: Box::new(first.split_leaf(target, direction, new_pane_id)),
-                second: Box::new(second.split_leaf(target, direction, new_pane_id)),
+                first: Box::new(first.split_leaf(target, direction, placement, new_pane_id)),
+                second: Box::new(second.split_leaf(target, direction, placement, new_pane_id)),
             },
         }
     }
@@ -153,7 +174,7 @@ impl LayoutNode {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutNode, SplitDirection};
+    use super::{LayoutNode, SplitDirection, SplitPlacement};
 
     #[test]
     /// 驗證 split 操作會將目標葉節點替換成新的分割節點。
@@ -162,7 +183,7 @@ mod tests {
     /// 回傳：無；若布局結果不正確則測試失敗。
     fn split_leaf_replaces_target_with_split_node() {
         let layout = LayoutNode::Leaf { pane_id: 1 };
-        let updated = layout.split_leaf(1, SplitDirection::Vertical, 2);
+        let updated = layout.split_leaf(1, SplitDirection::Vertical, SplitPlacement::After, 2);
 
         assert_eq!(
             updated,
@@ -170,6 +191,22 @@ mod tests {
                 direction: SplitDirection::Vertical,
                 first: Box::new(LayoutNode::Leaf { pane_id: 1 }),
                 second: Box::new(LayoutNode::Leaf { pane_id: 2 }),
+            }
+        );
+    }
+
+    #[test]
+    /// 驗證當指定 `Before` 時，新 pane 會出現在目前 pane 的前面。
+    fn split_leaf_can_insert_new_pane_before_current_one() {
+        let layout = LayoutNode::Leaf { pane_id: 1 };
+        let updated = layout.split_leaf(1, SplitDirection::Horizontal, SplitPlacement::Before, 2);
+
+        assert_eq!(
+            updated,
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                first: Box::new(LayoutNode::Leaf { pane_id: 2 }),
+                second: Box::new(LayoutNode::Leaf { pane_id: 1 }),
             }
         );
     }

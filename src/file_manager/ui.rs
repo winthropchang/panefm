@@ -213,6 +213,7 @@ pub(crate) fn render_pane(
         &mark_suffix,
         panel_suffix,
         pane.sort_mode.label(),
+        area.width.saturating_sub(3) as usize,
     );
     let block = Block::default()
         .title(title)
@@ -476,14 +477,180 @@ fn format_pane_title(
     mark_suffix: &str,
     panel_suffix: &str,
     sort_label: &str,
+    max_width: usize,
 ) -> String {
-    format!(
-        " pane #{pane_id}  {}{}{}{}  [sort: {sort_label}]",
-        cwd.display(),
-        filter_suffix,
-        mark_suffix,
-        panel_suffix,
+    let prefix = format!("pane #{pane_id}");
+    let full_path = cwd.display().to_string();
+    let status_suffix = normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
+    let suffix_candidates = [
+        if status_suffix.is_empty() {
+            format!("[sort: {sort_label}]")
+        } else {
+            format!("{status_suffix} [sort: {sort_label}]")
+        },
+        if status_suffix.is_empty() {
+            format!("[{sort_label}]")
+        } else {
+            format!("{status_suffix} [{sort_label}]")
+        },
+        status_suffix.clone(),
+        String::new(),
+    ];
+
+    for suffix in suffix_candidates {
+        let full_title = join_title_parts(&prefix, &full_path, &suffix);
+        if full_title.chars().count() <= max_width {
+            return full_title;
+        }
+
+        let separator_width = title_separator_width(true, !suffix.is_empty());
+        let fixed_width = prefix.chars().count() + suffix.chars().count() + separator_width;
+        let path_width = max_width.saturating_sub(fixed_width).max(1);
+        let compact_path = compact_path_for_title(&full_path, path_width);
+        let compact_title = join_title_parts(&prefix, &compact_path, &suffix);
+        if compact_title.chars().count() <= max_width {
+            return compact_title;
+        }
+    }
+
+    let fallback_path_width = max_width
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(1)
+        .max(1);
+    join_title_parts(
+        &prefix,
+        &compact_path_for_title(&full_path, fallback_path_width),
+        "",
     )
+}
+
+/// 將多個標題狀態片段去掉前後空白後重新用單一空格組合，避免出現多餘空隙。
+fn normalize_title_status_segments(segments: &[&str]) -> String {
+    segments
+        .iter()
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 將 pane 標題的 prefix / path / suffix 以最少必要空格拼接，避免浪費可用寬度。
+fn join_title_parts(prefix: &str, path: &str, suffix: &str) -> String {
+    let mut parts = vec![prefix.to_string()];
+    if !path.is_empty() {
+        parts.push(path.to_string());
+    }
+    if !suffix.is_empty() {
+        parts.push(suffix.to_string());
+    }
+    parts.join(" ")
+}
+
+/// 計算 prefix / path / suffix 三段之間實際需要的空格數，供路徑可用寬度估算使用。
+fn title_separator_width(has_path: bool, has_suffix: bool) -> usize {
+    let mut spaces = 0;
+    if has_path {
+        spaces += 1;
+    }
+    if has_suffix {
+        spaces += 1;
+    }
+    spaces
+}
+
+/// 專門為 pane 標題壓縮過長路徑，優先保留最後幾層目錄名稱與檔名尾端。
+fn compact_path_for_title(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    if max_chars <= 1 {
+        return String::from("…");
+    }
+
+    let separator = if path.contains('\\') && !path.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let separator_text = separator.to_string();
+
+    let (path_prefix, remainder) = if path.starts_with('/') {
+        (String::from("/"), &path[1..])
+    } else if path.len() >= 3
+        && path.as_bytes().get(1) == Some(&b':')
+        && matches!(path.as_bytes().get(2), Some(b'/') | Some(b'\\'))
+    {
+        (path[..3].to_string(), &path[3..])
+    } else {
+        (String::new(), path)
+    };
+
+    let parts = remainder
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return truncate_text_end_preserving_tail(path, max_chars);
+    }
+
+    let last_part = parts.last().copied().unwrap_or(path);
+    let last_part_only = compact_last_segment_only(last_part, max_chars);
+
+    if parts.len() == 1 {
+        return last_part_only;
+    }
+
+    let mut best = if path_prefix.is_empty() {
+        last_part_only.clone()
+    } else {
+        let rooted = format!("{path_prefix}{last_part}");
+        if rooted.chars().count() <= max_chars {
+            rooted
+        } else {
+            last_part_only.clone()
+        }
+    };
+
+    for start in (0..parts.len()).rev() {
+        let tail = parts[start..].join(&separator_text);
+        let candidate = if start == parts.len() - 1 {
+            format!("…{tail}")
+        } else {
+            format!("…{separator}{tail}")
+        };
+        if candidate.chars().count() <= max_chars && candidate.chars().count() >= best.chars().count() {
+            best = candidate;
+        }
+    }
+
+    best
+}
+
+/// 優先保留字串尾端，只在前方放上 `…` 表示前面內容被省略。
+fn truncate_text_end_preserving_tail(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return String::from("…");
+    }
+    let tail = chars
+        .iter()
+        .skip(chars.len().saturating_sub(max_chars - 1))
+        .collect::<String>();
+    format!("…{tail}")
+}
+
+/// 在放不下整層目錄時，直接退化成 `…最後目錄尾端` 的顯示形式。
+fn compact_last_segment_only(last_part: &str, max_chars: usize) -> String {
+    if last_part.chars().count() <= max_chars {
+        last_part.to_string()
+    } else if max_chars <= 1 {
+        String::from("…")
+    } else {
+        truncate_text_end_preserving_tail(last_part, max_chars)
+    }
 }
 
 /// 將 preview 行內容依照可見寬度補齊，讓目前命中列的背景可以延伸到整行右側。
@@ -1218,12 +1385,72 @@ mod tests {
             "  [mark: 2]",
             "  [help]",
             "natural",
+            80,
         );
 
         assert_eq!(
             title,
-            " pane #3  /tmp/demo  [filter]  [mark: 2]  [help]  [sort: natural]"
+            "pane #3 /tmp/demo [filter] [mark: 2] [help] [sort: natural]"
         );
+    }
+
+    #[test]
+    /// 驗證 pane 寬度足夠時，標題會完整顯示，不會過早縮短路徑。
+    fn format_pane_title_keeps_full_path_when_it_fits() {
+        let title = format_pane_title(
+            2,
+            Path::new("/Users/otto/Documents/terminal-file-manager"),
+            "",
+            "",
+            "",
+            "natural",
+            120,
+        );
+
+        assert_eq!(
+            title,
+            "pane #2 /Users/otto/Documents/terminal-file-manager [sort: natural]"
+        );
+    }
+
+    #[test]
+    /// 驗證 pane 很窄時，標題仍會自動縮短，不會超出可用寬度。
+    fn format_pane_title_compacts_long_path_for_narrow_panes() {
+        let title = format_pane_title(
+            12,
+            Path::new("/Users/otto/GitHub/cocos-tutorial-happy-path/dev/library/very/deep/path"),
+            "",
+            "",
+            "",
+            "natural",
+            32,
+        );
+
+        assert!(title.chars().count() <= 32);
+        assert!(title.starts_with("pane #12"));
+        assert!(title.contains("natural"));
+        assert!(title.contains("path"));
+        assert!(!title.contains("happy-path/dev"));
+        assert!(!title.contains("/…/…"));
+    }
+
+    #[test]
+    /// 驗證路徑放不下時，會優先保留最後目錄名稱，而不是在前面留下多餘根路徑。
+    fn format_pane_title_prefers_last_directory_tail() {
+        let title = format_pane_title(
+            4,
+            Path::new("/Users/otto/Documents/terminal-file-manager"),
+            "",
+            "",
+            "",
+            "natural",
+            40,
+        );
+
+        assert!(title.contains("…"));
+        assert!(title.contains("file-manager"));
+        assert!(title.contains("[sort: natural]"));
+        assert!(!title.contains("/…/…"));
     }
 }
 

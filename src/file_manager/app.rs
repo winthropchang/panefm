@@ -31,7 +31,7 @@ use super::{
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
     debug_timing_log, debug_timing_message,
-    layout::{LayoutNode, SplitDirection},
+    layout::{LayoutNode, SplitDirection, SplitPlacement},
     open::{
         LaunchSpec, OpenAction, OpenPickerAction, OpenPickerOption, OpenTarget,
         build_custom_launch_spec, build_launch_spec, custom_action_applies_to_target,
@@ -336,6 +336,7 @@ pub(crate) struct App {
     pub(crate) command_suggestion_selected: usize,
     pub(crate) command_completion_cycle: Option<CommandCompletionCycle>,
     pub(crate) awaiting_ctrl_w: bool,
+    pub(crate) awaiting_w_leader: bool,
     pub(crate) pending_count: Option<usize>,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
@@ -420,6 +421,7 @@ impl App {
             command_suggestion_selected: 0,
             command_completion_cycle: None,
             awaiting_ctrl_w: false,
+            awaiting_w_leader: false,
             pending_count: None,
             pending_g: false,
             pending_y: false,
@@ -557,6 +559,10 @@ impl App {
         if self.command_mode {
             return self.handle_command_key(key);
         }
+        if self.awaiting_w_leader {
+            self.awaiting_w_leader = false;
+            return self.handle_w_leader(key);
+        }
         if self.awaiting_ctrl_w {
             self.awaiting_ctrl_w = false;
             return self.handle_ctrl_w(key);
@@ -569,6 +575,20 @@ impl App {
             self.pending_g = false;
             self.pending_y = false;
             self.focus_pane_by_id(target_pane_id);
+            return Ok(true);
+        }
+        if key_matches_ctrl_letter(&key, 's') {
+            self.clear_pending_count();
+            self.pending_g = false;
+            self.pending_y = false;
+            self.split_current(SplitDirection::Horizontal)?;
+            return Ok(true);
+        }
+        if key_matches_ctrl_letter(&key, 'v') {
+            self.clear_pending_count();
+            self.pending_g = false;
+            self.pending_y = false;
+            self.split_current(SplitDirection::Vertical)?;
             return Ok(true);
         }
         if self.preview_focus == Some(self.focused_pane) {
@@ -801,6 +821,11 @@ impl App {
                 self.open_sort_picker();
                 self.pending_g = false;
                 self.pending_y = false;
+                true
+            }
+            _ if key_matches_plain_letter(&key, 'w') => {
+                self.awaiting_w_leader = true;
+                self.status = String::from("w");
                 true
             }
             _ if key_matches_plain_letter(&key, 'f') => {
@@ -3892,6 +3917,41 @@ impl App {
         Ok(true)
     }
 
+    /// 處理 `w` 前綴後的 pane split 操作命令。
+    pub(crate) fn handle_w_leader(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = String::from("normal mode");
+            }
+            _ if key_matches_plain_letter(&key, 'h') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.split_current_at(SplitDirection::Vertical, SplitPlacement::Before)?;
+            }
+            _ if key_matches_plain_letter(&key, 'j') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.split_current_at(SplitDirection::Horizontal, SplitPlacement::After)?;
+            }
+            _ if key_matches_plain_letter(&key, 'k') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.split_current_at(SplitDirection::Horizontal, SplitPlacement::Before)?;
+            }
+            _ if key_matches_plain_letter(&key, 'l') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.split_current_at(SplitDirection::Vertical, SplitPlacement::After)?;
+            }
+            _ => self.status = String::from("unknown w command"),
+        }
+        Ok(true)
+    }
+
     /// 執行 command mode 送出的命令字串。
     pub(crate) fn execute_command(&mut self, command: &str) -> Result<()> {
         match command {
@@ -3914,6 +3974,12 @@ impl App {
             "copy-picker" => self.open_copy_picker()?,
             "mark-all" | "select-all" => self.mark_all_in_focused_pane()?,
             "mark-invert" | "invert-selection" => self.invert_marks_in_focused_pane()?,
+            "split" => self.split_current(SplitDirection::Horizontal)?,
+            "vsplit" => self.split_current(SplitDirection::Vertical)?,
+            "split-up" => {
+                self.split_current_at(SplitDirection::Horizontal, SplitPlacement::Before)?
+            }
+            "split-left" => self.split_current_at(SplitDirection::Vertical, SplitPlacement::Before)?,
             "vim" => {
                 let Some(target) = self.selected_open_target() else {
                     self.status = String::from("nothing selected to open");
@@ -3948,8 +4014,6 @@ impl App {
             "delete!" | "delete-permanently" => self.start_delete_confirmation(true),
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
-            "split" => self.split_current(SplitDirection::Horizontal)?,
-            "vsplit" => self.split_current(SplitDirection::Vertical)?,
             "pane" => {
                 self.status = format!("usage: pane <pane-id>. available: {}", self.available_pane_ids_label());
             }
@@ -3999,6 +4063,15 @@ impl App {
 
     /// 將目前焦點 pane 依指定方向分割成兩個 pane。
     pub(crate) fn split_current(&mut self, direction: SplitDirection) -> io::Result<()> {
+        self.split_current_at(direction, SplitPlacement::After)
+    }
+
+    /// 將目前焦點 pane 依指定方向與位置分割成兩個 pane。
+    pub(crate) fn split_current_at(
+        &mut self,
+        direction: SplitDirection,
+        placement: SplitPlacement,
+    ) -> io::Result<()> {
         let source_pane = self
             .panes
             .get(&self.focused_pane)
@@ -4016,11 +4089,13 @@ impl App {
         self.layout = self
             .layout
             .clone()
-            .split_leaf(self.focused_pane, direction, new_id);
+            .split_leaf(self.focused_pane, direction, placement, new_id);
         self.focused_pane = new_id;
-        self.status = match direction {
-            SplitDirection::Horizontal => String::from("horizontal split"),
-            SplitDirection::Vertical => String::from("vertical split"),
+        self.status = match (direction, placement) {
+            (SplitDirection::Horizontal, SplitPlacement::Before) => String::from("split up"),
+            (SplitDirection::Horizontal, SplitPlacement::After) => String::from("split down"),
+            (SplitDirection::Vertical, SplitPlacement::Before) => String::from("split left"),
+            (SplitDirection::Vertical, SplitPlacement::After) => String::from("split right"),
         };
         Ok(())
     }
@@ -7933,15 +8008,27 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":split",
-            "Ctrl-w s",
-            "水平分割目前 pane",
+            "w j / Ctrl-w s",
+            "在目前 pane 下方建立新的 pane",
             HelpAction::Command("split"),
         ),
         help_entry(
             ":vsplit",
-            "Ctrl-w v",
-            "垂直分割目前 pane",
+            "w l / Ctrl-w v",
+            "在目前 pane 右側建立新的 pane",
             HelpAction::Command("vsplit"),
+        ),
+        help_entry(
+            ":split-up",
+            "w k",
+            "在目前 pane 上方建立新的 pane",
+            HelpAction::Command("split-up"),
+        ),
+        help_entry(
+            ":split-left",
+            "w h",
+            "在目前 pane 左側建立新的 pane",
+            HelpAction::Command("split-left"),
         ),
         help_entry(
             ":close",
@@ -10786,6 +10873,48 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 `w h/j/k/l` 會依方向在左下上右建立新的 pane。
+    fn app_w_leader_splits_in_four_directions() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("open w leader");
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("split left");
+        assert_eq!(app.ordered_pane_ids(), vec![2, 1]);
+        assert_eq!(app.focused_pane, 2);
+        assert_eq!(app.status, "split left");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("open w leader");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("split down");
+        assert_eq!(app.focused_pane, 3);
+        assert_eq!(app.status, "split down");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("open w leader");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("split up");
+        assert_eq!(app.ordered_pane_ids(), vec![2, 1]);
+        assert_eq!(app.focused_pane, 2);
+        assert_eq!(app.status, "split up");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("open w leader");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("split right");
+        assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
+        assert_eq!(app.focused_pane, 2);
+        assert_eq!(app.status, "split right");
+    }
+
+    #[test]
     /// 驗證按下 `Ctrl-r` 會反轉目前所有可見項目的標記狀態。
     fn app_ctrl_r_inverts_visible_marks() {
         let dir = tempdir().expect("tempdir");
@@ -11658,6 +11787,25 @@ mod tests {
             .expect("focus previous pane");
         assert_eq!(app.focused_pane, 1);
         assert_eq!(app.preview_focus, Some(2));
+    }
+
+    #[test]
+    /// 驗證 `Ctrl+s` / `Ctrl+v` 會分別建立水平與垂直 pane 分割，作為 `Ctrl-w s/v` 的快捷別名。
+    fn app_ctrl_split_shortcuts_create_expected_panes() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .expect("ctrl-s split");
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.focused_pane, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .expect("ctrl-v split");
+        assert_eq!(app.panes.len(), 3);
+        assert_eq!(app.focused_pane, 3);
     }
 
     #[test]
