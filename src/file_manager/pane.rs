@@ -15,7 +15,7 @@ use ratatui::{
     widgets::ListState,
 };
 
-use super::{entry::FileEntry, trash::TrashStore};
+use super::{bookmark::BookmarkTarget, entry::FileEntry, trash::TrashStore};
 
 /// 表示單一 pane 的完整瀏覽狀態。
 ///
@@ -25,6 +25,8 @@ use super::{entry::FileEntry, trash::TrashStore};
 pub(crate) struct PaneState {
     /// 目前 pane 正在瀏覽的目錄。
     pub(crate) cwd: PathBuf,
+    /// 目前這個 pane 對外應該被視為哪一個可書籤化目標。
+    pub(crate) bookmark_target: BookmarkTarget,
     /// 目前目錄下的檔案與資料夾清單。
     pub(crate) entries: Vec<FileEntry>,
     /// 目前選取項目的索引位置。
@@ -117,6 +119,7 @@ impl PaneState {
     pub(crate) fn new(cwd: PathBuf) -> io::Result<Self> {
         let random_seed = seed_from_path(&cwd);
         let mut pane = Self {
+            bookmark_target: BookmarkTarget::LocalPath(cwd.clone()),
             cwd,
             entries: Vec::new(),
             selected: 0,
@@ -302,10 +305,16 @@ impl PaneState {
     /// - 成功時代表已完成目錄切換或目前選項不是資料夾。
     /// - 失敗時代表進入目錄或重新載入內容時發生錯誤。
     pub(crate) fn enter_selected(&mut self) -> io::Result<()> {
-        if let Some(entry) = self.selected_entry()
+        if let Some(entry) = self.selected_entry().cloned()
             && entry.is_dir
         {
             self.cwd = entry.path.clone();
+            self.bookmark_target = match &self.bookmark_target {
+                BookmarkTarget::SmbLocation(current_url) => {
+                    BookmarkTarget::SmbLocation(append_smb_url_segment(current_url, &entry.name))
+                }
+                BookmarkTarget::LocalPath(_) => BookmarkTarget::LocalPath(self.cwd.clone()),
+            };
             self.selected = 0;
             self.filter_query = None;
             self.reload()?;
@@ -325,6 +334,12 @@ impl PaneState {
         let current_dir = self.cwd.clone();
         if let Some(parent) = self.cwd.parent() {
             self.cwd = parent.to_path_buf();
+            self.bookmark_target = match &self.bookmark_target {
+                BookmarkTarget::SmbLocation(current_url) => smb_parent_url(current_url)
+                    .map(BookmarkTarget::SmbLocation)
+                    .unwrap_or_else(|| BookmarkTarget::LocalPath(self.cwd.clone())),
+                BookmarkTarget::LocalPath(_) => BookmarkTarget::LocalPath(self.cwd.clone()),
+            };
             self.filter_query = None;
             self.reload()?;
             self.select_path(&current_dir);
@@ -811,6 +826,7 @@ impl PaneState {
         };
 
         self.cwd = parent.to_path_buf();
+        self.bookmark_target = BookmarkTarget::LocalPath(self.cwd.clone());
         self.filter_query = None;
         self.reload()?;
         self.select_path(path);
@@ -828,6 +844,7 @@ impl PaneState {
     pub(crate) fn go_to_path(&mut self, path: &Path) -> io::Result<()> {
         if path.is_dir() {
             self.cwd = path.to_path_buf();
+            self.bookmark_target = BookmarkTarget::LocalPath(self.cwd.clone());
             self.filter_query = None;
             self.reload()?;
             self.move_top();
@@ -835,6 +852,11 @@ impl PaneState {
         } else {
             self.reveal_path(path)
         }
+    }
+
+    /// 直接覆蓋目前 pane 的可書籤化目標，供 SMB 這類非本機來源在切換完成後回填。
+    pub(crate) fn set_bookmark_target(&mut self, target: BookmarkTarget) {
+        self.bookmark_target = target;
     }
 
     /// 判斷目前是否仍處於過濾後的列表狀態。
@@ -919,6 +941,43 @@ impl PaneState {
             }
         });
     }
+}
+
+/// 將子目錄名稱接到現有 `smb://host/share[/path]` URL 後方，供 pane 在 SMB 內導航時更新書籤目標。
+fn append_smb_url_segment(base: &str, segment: &str) -> String {
+    let encoded = percent_encode_path_segment(segment);
+    if base.ends_with('/') {
+        format!("{base}{encoded}")
+    } else {
+        format!("{base}/{encoded}")
+    }
+}
+
+/// 從 `smb://host/share[/path]` URL 回推上一層；若已在 share 根目錄則回傳 `None`。
+fn smb_parent_url(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/');
+    let prefix = "smb://";
+    let rest = trimmed.strip_prefix(prefix)?;
+    let mut segments = rest.split('/').collect::<Vec<_>>();
+    if segments.len() <= 2 {
+        return None;
+    }
+    segments.pop();
+    Some(format!("{prefix}{}", segments.join("/")))
+}
+
+/// 將路徑片段轉成能安全放進 SMB URL 的最小百分比編碼格式。
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::new();
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
 }
 
 /// 判斷檔名是否屬於隱藏檔或隱藏資料夾。

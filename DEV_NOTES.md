@@ -52,6 +52,79 @@
   `d` 對應 `:delete`，`:trash` 沒有快捷鍵時就不顯示假的快捷鍵。
 - help 面板 `Enter` 已驗證會真的切到對應模式，不再只是顯示項目名稱。
 
+## 2026-08-15 最新進度
+
+### Command / 鍵盤輸入
+
+- command palette 已支援命令提示與自動補齊。
+- 原本 `Ctrl-n` / `Ctrl-p` 在部分 terminal 會被吃成大寫字母，已改成更穩定的按鍵正規化處理。
+- 目前 command palette 可使用：
+  `Shift-n` / `Shift-p`、`Ctrl-n` / `Ctrl-p`、`Tab` / `BackTab`、`Up` / `Down` 來切換提示項目。
+- `Enter` 在 command palette 中已修正：
+  如果使用者已經輸入命令參數，不會再把提示範例覆蓋回輸入框。
+- 像 `connect` 這種需要參數的命令，提示顯示與實際補齊內容已拆開：
+  畫面上仍可顯示範例，但補齊時只會插入命令前綴，不會硬塞測試用參數。
+
+### 壓縮 / 解壓縮
+
+- 已加入跨平台方向的 `:compress` / `:extract` 第一版。
+- 目前支援：
+  `zip`、`tar`、`tar.gz`、`gz`。
+- 壓縮與解壓縮都有處理同名衝突，避免直接覆蓋原檔。
+- 這一塊核心邏輯主要走 Rust crate，本身比直接依賴平台 shell 指令更容易維持跨平台。
+
+### SMB / 書籤
+
+- 已加入 `:connect smb://host/share[/path]`。
+- macOS / Linux 目前的設計是：
+  先檢查本機掛載點，再視情況請求系統掛載。
+- Windows 目前已加入 UNC 路徑方向的解析邏輯：
+  `smb://host/share/path` 會轉成 `\\\\host\\share\\path`。
+- `connect` 的錯誤訊息已改好，不再只是生硬的 `usage`。
+  如果只輸入 IP、少了 share 名稱，現在會顯示明確的格式錯誤說明。
+- 已支援把 SMB 位置存進 `bookmark.toml`。
+- 書籤現在不只支援本機路徑，也支援 `smb://...` 目標。
+- 在 SMB 位置下存書籤時，會寫入原始 `smb://...`，不是只存 `/Volumes/...` 這種掛載後路徑。
+- 之後使用：
+  `bookmark jump <key>` 或書籤列表按 `Enter`，
+  都會自動判斷是本機還是 SMB，必要時自動走 SMB 連線流程。
+- pane 現在會記住自己的書籤來源目標；
+  如果目前是在 SMB share 內繼續進出子目錄，書籤目標也會同步更新，不會很快退回成本機掛載路徑。
+
+### 測試狀態
+
+- 今天整理後，本機測試結果為：
+  `cargo test` => `130 passed`
+- 另外有針對今天新增的 SMB / 書籤流程補測試：
+  - SMB 書籤會正確寫進 `bookmark.toml`
+  - SMB 連線成功後存書籤不會誤存成本機掛載路徑
+  - 跳 SMB 書籤會自動進入對應目標
+
+## Windows 目前還沒完成的地方
+
+- 現在不能說已完整支援 Windows。
+- 核心檔案操作、pane、filter、search、bookmark、rename、壓縮解壓縮這些大多是跨平台方向。
+- 但外部開啟流程目前仍偏 Unix / mac 寫法，這是明天要優先處理的重點。
+
+### 明確缺口
+
+- [src/file_manager/open.rs](/Users/otto/Documents/terminal-file-manager/src/file_manager/open.rs)
+  裡的 `$EDITOR` / `Vim` 目前仍寫死用 `/bin/sh` 啟動，Windows 一定不對。
+- `system_open_spec()` 目前只有 macOS 用 `open`，其他平台都走 `xdg-open`；
+  這代表 Windows 現在會錯用 `xdg-open`。
+- `Reveal` 在 Windows 也還沒做成 `explorer.exe /select,...` 這種比較合理的行為。
+- 雖然 SMB 已有 Windows UNC 路徑分支，但整體「連線成功後的外部整合」還沒有完成驗證。
+
+## 明天接手時的建議順序
+
+1. 先跑一次 `cargo test`，確認今天的基線還是乾淨的。
+2. 先處理 Windows 的外部開啟抽象層：
+   `Open`、`Reveal`、`$EDITOR`、`Vim`。
+3. 把 [src/file_manager/open.rs](/Users/otto/Documents/terminal-file-manager/src/file_manager/open.rs) 做成明確的平台分流，不要再用「非 mac 一律 xdg-open」。
+4. 補 Windows 專用測試：
+   至少要覆蓋 `system_open_spec`、`reveal_in_system_spec`、編輯器與 Vim 啟動命令。
+5. 如果還有時間，再檢查 SMB 在 Windows 實際使用時，是否需要把 UNC 路徑與 pane 導航再補一層保護。
+
 ## 已知待優化問題
 
 - global search 在超大目錄中的體感速度仍明顯落後 mature-reference。
@@ -88,5 +161,6 @@
 
 1. 先執行 `cargo test`，確認基線狀態正常。
 2. 打開這份筆記確認上次討論到哪裡。
-3. 下一步可以往 visual mode / trash / open-edit 這些高頻操作補強。
-4. global search 的更深層效能優化另外開一段來做，避免和一般功能開發混在一起。
+3. 下一步先優先處理 Windows 相容層，特別是 `open.rs`。
+4. Windows 相容補完後，再回頭做 global search 的深層效能優化。
+5. visual mode / trash / open-edit 這些高頻操作仍可持續補強，但目前優先度低於 Windows。

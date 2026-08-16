@@ -3,6 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// 描述拆解後的外部命令，供 `$EDITOR`、`vim` 這類需要在終端內阻塞執行的動作使用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandLineSpec {
+    program: String,
+    args: Vec<String>,
+}
+
 /// 描述目前要對選取項目執行的外部開啟動作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAction {
@@ -92,31 +99,19 @@ pub(crate) fn build_launch_spec(target: &OpenTarget, action: OpenAction) -> io::
         OpenAction::Editor => {
             if target.is_dir || !is_text_like_path(&target.path) {
                 system_open_spec(&target.path)
-            } else if preferred_editor().is_some() {
-                Ok(LaunchSpec {
-                    program: "/bin/sh".to_string(),
-                    args: vec![
-                        "-lc".to_string(),
-                        "exec \"$EDITOR\" \"$1\"".to_string(),
-                        "sh".to_string(),
-                        target.path.display().to_string(),
-                    ],
-                    mode: LaunchMode::TerminalBlocking,
-                })
+            } else if let Some(editor) = preferred_editor_command() {
+                Ok(blocking_command_spec(editor, &target.path))
             } else {
                 system_open_spec(&target.path)
             }
         }
-        OpenAction::Vim => Ok(LaunchSpec {
-            program: "/bin/sh".to_string(),
-            args: vec![
-                "-lc".to_string(),
-                "exec vim \"$1\"".to_string(),
-                "sh".to_string(),
-                target.path.display().to_string(),
-            ],
-            mode: LaunchMode::TerminalBlocking,
-        }),
+        OpenAction::Vim => Ok(blocking_command_spec(
+            CommandLineSpec {
+                program: default_vim_command().to_string(),
+                args: Vec::new(),
+            },
+            &target.path,
+        )),
         OpenAction::Open => system_open_spec(&target.path),
         OpenAction::Reveal => reveal_in_system_spec(&target.path),
     }
@@ -128,6 +123,28 @@ fn preferred_editor() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// 將 `$EDITOR` 的內容拆成實際命令與參數，避免再依賴 shell 包裝。
+fn preferred_editor_command() -> Option<CommandLineSpec> {
+    let editor = preferred_editor()?;
+    parse_command_line(&editor)
+}
+
+/// 根據拆解後的命令與目標路徑，建立阻塞式終端命令。
+fn blocking_command_spec(command: CommandLineSpec, path: &Path) -> LaunchSpec {
+    let mut args = command.args;
+    args.push(path.display().to_string());
+    LaunchSpec {
+        program: command.program,
+        args,
+        mode: LaunchMode::TerminalBlocking,
+    }
+}
+
+/// 回傳內建 `Vim` 動作預設要執行的命令名稱。
+fn default_vim_command() -> &'static str {
+    "vim"
 }
 
 /// 判斷某個路徑是否應該被視為文字類型檔案。
@@ -188,37 +205,58 @@ pub(crate) fn is_text_like_path(path: &Path) -> bool {
     )
 }
 
-#[cfg(target_os = "macos")]
 fn system_open_spec(path: &Path) -> io::Result<LaunchSpec> {
-    Ok(LaunchSpec {
-        program: "open".to_string(),
-        args: vec![path.display().to_string()],
-        mode: LaunchMode::Detached,
-    })
+    super::platform::system_open_spec_for_platform(path, super::platform::current_platform())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn system_open_spec(path: &Path) -> io::Result<LaunchSpec> {
-    Ok(LaunchSpec {
-        program: "xdg-open".to_string(),
-        args: vec![path.display().to_string()],
-        mode: LaunchMode::Detached,
-    })
-}
-
-#[cfg(target_os = "macos")]
+/// 依照目前平台建立「在系統檔案管理器中顯示目標」的命令。
 fn reveal_in_system_spec(path: &Path) -> io::Result<LaunchSpec> {
-    Ok(LaunchSpec {
-        program: "open".to_string(),
-        args: vec!["-R".to_string(), path.display().to_string()],
-        mode: LaunchMode::Detached,
-    })
+    super::platform::reveal_in_system_spec_for_platform(path, super::platform::current_platform())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn reveal_in_system_spec(path: &Path) -> io::Result<LaunchSpec> {
-    let parent = path.parent().unwrap_or(path);
-    system_open_spec(parent)
+/// 將像 `nvim -p` 或 `"C:\\Program Files\\Vim\\vim.exe" -u NONE` 這種字串拆成命令與參數。
+fn parse_command_line(input: &str) -> Option<CommandLineSpec> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = input.trim().chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            None if ch == '\\' => {
+                if let Some(next) = chars.peek().copied() {
+                    if next == '"' || next == '\'' || next.is_whitespace() || next == '\\' {
+                        current.push(next);
+                        chars.next();
+                    } else {
+                        current.push(ch);
+                    }
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    let mut parts = parts.into_iter();
+    let program = parts.next()?;
+    Some(CommandLineSpec {
+        program,
+        args: parts.collect(),
+    })
 }
 
 #[cfg(test)]
@@ -227,7 +265,7 @@ mod tests {
 
     use super::{
         LaunchMode, OpenAction, OpenTarget, build_launch_spec, is_text_like_path,
-        open_picker_options,
+        open_picker_options, parse_command_line,
     };
 
     #[test]
@@ -274,5 +312,14 @@ mod tests {
             LaunchMode::Detached
         };
         assert_eq!(spec.mode, expected);
+    }
+
+    #[test]
+    fn parse_command_line_supports_quoted_program_and_args() {
+        let command = parse_command_line("\"C:\\Program Files\\Neovim\\bin\\nvim.exe\" -u NONE")
+            .expect("command");
+
+        assert_eq!(command.program, "C:\\Program Files\\Neovim\\bin\\nvim.exe");
+        assert_eq!(command.args, vec!["-u", "NONE"]);
     }
 }

@@ -310,11 +310,7 @@ fn archive_output_base_name(file_name: &str, format: ArchiveFormat) -> String {
 }
 
 /// 用不分大小寫的方式移除檔名尾端副檔名。
-fn strip_suffix_case_insensitive(
-    original: &str,
-    lower: &str,
-    suffix: &str,
-) -> Option<String> {
+fn strip_suffix_case_insensitive(original: &str, lower: &str, suffix: &str) -> Option<String> {
     lower
         .strip_suffix(suffix)
         .map(|trimmed| original[..trimmed.len()].to_string())
@@ -405,7 +401,10 @@ mod tests {
             ArchiveFormat::Zip,
         );
 
-        assert_eq!(output.file_name().and_then(|name| name.to_str()), Some("alpha copy"));
+        assert_eq!(
+            output.file_name().and_then(|name| name.to_str()),
+            Some("alpha copy")
+        );
     }
 
     #[test]

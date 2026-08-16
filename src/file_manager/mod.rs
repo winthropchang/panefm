@@ -5,6 +5,7 @@ mod entry;
 mod layout;
 mod open;
 mod pane;
+mod platform;
 mod search;
 mod smb;
 mod trash;

@@ -777,10 +777,7 @@ pub(crate) fn render_command_palette(
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
     frame.render_widget(Paragraph::new(format!(":{}", buffer)), chunks[0]);
 

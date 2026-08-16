@@ -13,12 +13,12 @@ use std::{
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use regex::Regex;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+use regex::Regex;
 
 use crate::{
     config::{AppConfig, LoadedConfig, StartupSort},
@@ -27,7 +27,7 @@ use crate::{
 
 use super::{
     archive::{ExtractedArchive, compress_entries_to_zip, extract_entries},
-    bookmark::{BookmarkEntry, BookmarkStore, bookmark_file_path},
+    bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     layout::{LayoutNode, SplitDirection},
     open::{
         LaunchSpec, OpenAction, OpenTarget, build_launch_spec, default_open_action,
@@ -35,14 +35,16 @@ use super::{
     },
     pane::{PaneState, SortMode},
     search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
-    smb::{ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location, resolve_smb_location_with_mount_root},
+    smb::{
+        ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location,
+        resolve_smb_location_with_mount_root,
+    },
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
         InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TrashPanelLine,
-        render_bookmark_picker, render_command_palette, render_confirm_dialog,
-        render_filter_input, render_global_search_panel, render_pane,
-        render_preview_search_input, render_theme_picker,
+        render_bookmark_picker, render_command_palette, render_confirm_dialog, render_filter_input,
+        render_global_search_panel, render_pane, render_preview_search_input, render_theme_picker,
     },
 };
 
@@ -2203,7 +2205,10 @@ impl App {
             }
             KeyCode::Enter => {
                 let selected_suggestion = suggestions
-                    .get(self.command_suggestion_selected.min(suggestions.len().saturating_sub(1)))
+                    .get(
+                        self.command_suggestion_selected
+                            .min(suggestions.len().saturating_sub(1)),
+                    )
                     .map(|entry| entry.command.trim_start_matches(':').to_string());
                 let current = self.command_buffer.trim();
                 let has_arguments = current.contains(char::is_whitespace);
@@ -2311,9 +2316,7 @@ impl App {
             "preview-search" => self.open_preview_search_input(),
             "search" => self.open_global_search()?,
             "connect" => {
-                self.status = String::from(
-                    "SMB 連線需要完整位址：connect smb://host/share[/path]",
-                );
+                self.status = String::from("SMB 連線需要完整位址：connect smb://host/share[/path]");
             }
             "trash" => self.open_trash_panel()?,
             "help" => self.open_help_panel(),
@@ -2564,33 +2567,32 @@ impl App {
             self.status = String::from("pane no longer exists");
             return Ok(());
         };
-        self.bookmark_store
-            .set(key, pane.cwd.clone())
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        self.status = format!("bookmark [{key}] = {}", pane.cwd.display());
+        let target = pane.bookmark_target.clone();
+        match &target {
+            BookmarkTarget::LocalPath(path) => {
+                self.bookmark_store
+                    .set(key, path.clone())
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                self.status = format!("bookmark [{key}] = {}", path.display());
+            }
+            BookmarkTarget::SmbLocation(location) => {
+                self.bookmark_store
+                    .set_smb(key, location.clone())
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                self.status = format!("bookmark [{key}] = {location}");
+            }
+        }
         Ok(())
     }
 
     /// 跳到指定書籤對應的路徑。
     fn jump_to_bookmark(&mut self, key: char) -> io::Result<()> {
-        let Some(path) = self.bookmark_store.get(key).cloned() else {
+        let Some(target) = self.bookmark_store.get(key).cloned() else {
             self.status = format!("bookmark [{key}] not found");
             return Ok(());
         };
 
-        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
-            self.status = String::from("pane no longer exists");
-            return Ok(());
-        };
-
-        if !path.exists() {
-            self.status = format!("bookmark [{key}] missing: {}", path.display());
-            return Ok(());
-        }
-
-        pane.go_to_path(&path)?;
-        self.status = format!("jumped to bookmark [{key}]");
-        Ok(())
+        self.jump_to_bookmark_target(self.focused_pane, key, &target)
     }
 
     /// 讓 `:bookmark set <key>` 可以直接把目前目錄存成指定書籤。
@@ -2647,16 +2649,69 @@ impl App {
                     return Ok(());
                 };
                 pane.go_to_path(&path)?;
+                pane.set_bookmark_target(BookmarkTarget::SmbLocation(location.url.clone()));
                 self.status = format!("connected smb: {}", location.url);
             }
             ResolvedSmbLocation::NeedsMount { local_path } => {
                 self.pending_launch = Some(build_smb_mount_launch(&location));
                 self.status = format!(
                     "已請求系統掛載 SMB：{}；若系統連線失敗，請檢查主機、share 名稱、網路與權限，成功後再重試。預期掛載位置：{}",
-                    location.url, local_path.display()
+                    location.url,
+                    local_path.display()
                 );
             }
         }
+        Ok(())
+    }
+
+    /// 依書籤目標型別跳到本機目錄，或自動發起 SMB 連線流程。
+    fn jump_to_bookmark_target(
+        &mut self,
+        pane_id: usize,
+        key: char,
+        target: &BookmarkTarget,
+    ) -> io::Result<()> {
+        self.jump_to_bookmark_target_with_mount_root(
+            pane_id,
+            key,
+            target,
+            std::path::Path::new("/Volumes"),
+        )
+    }
+
+    /// 依書籤目標型別跳到本機目錄，或用指定掛載根目錄自動發起 SMB 連線流程。
+    fn jump_to_bookmark_target_with_mount_root(
+        &mut self,
+        pane_id: usize,
+        key: char,
+        target: &BookmarkTarget,
+        mount_root: &std::path::Path,
+    ) -> io::Result<()> {
+        self.focused_pane = pane_id;
+
+        match target {
+            BookmarkTarget::LocalPath(path) => {
+                let Some(pane) = self.panes.get_mut(&pane_id) else {
+                    self.status = String::from("pane no longer exists");
+                    return Ok(());
+                };
+                if !path.exists() {
+                    self.status = format!("bookmark [{key}] missing: {}", path.display());
+                    return Ok(());
+                }
+                pane.go_to_path(path)?;
+                self.status = format!("jumped to bookmark [{key}]");
+            }
+            BookmarkTarget::SmbLocation(location) => {
+                self.connect_smb_location_with_mount_root(location, mount_root)?;
+                if self.status.starts_with("connected smb:") {
+                    self.status = format!("jumped to bookmark [{key}]");
+                } else if self.status.starts_with("已請求系統掛載 SMB：") {
+                    self.status = format!("bookmark [{key}] 正在連線：{location}");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2671,22 +2726,11 @@ impl App {
             self.status = String::from("bookmark list: empty");
             return Ok(());
         };
-        let Some(path) = self.bookmark_store.get(entry.key).cloned() else {
+        let Some(target) = self.bookmark_store.get(entry.key).cloned() else {
             self.status = format!("bookmark [{}] not found", entry.key);
             return Ok(());
         };
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
-            return Ok(());
-        };
-        if !path.exists() {
-            self.status = format!("bookmark [{}] missing: {}", entry.key, path.display());
-            return Ok(());
-        }
-        pane.go_to_path(&path)?;
-        self.focused_pane = pane_id;
-        self.status = format!("jumped to bookmark [{}]", entry.key);
-        Ok(())
+        self.jump_to_bookmark_target(pane_id, entry.key, &target)
     }
 
     /// 取得目前選取項目的外部開啟目標資訊。
@@ -3059,7 +3103,9 @@ impl App {
             .iter()
             .filter(|preview| matches!(preview.outcome, RegexRenameOutcome::Ready))
         {
-            *target_counts.entry(preview.new_name.clone()).or_insert(0usize) += 1;
+            *target_counts
+                .entry(preview.new_name.clone())
+                .or_insert(0usize) += 1;
         }
 
         for preview in &mut previews {
@@ -3710,12 +3756,8 @@ impl App {
             .iter()
             .enumerate()
             .map(|(index, preview)| {
-                let temp_path = unique_regex_rename_temp_path(
-                    &cwd,
-                    &preview.original_name,
-                    index,
-                    &ready,
-                );
+                let temp_path =
+                    unique_regex_rename_temp_path(&cwd, &preview.original_name, index, &ready);
                 (
                     preview.source_path.clone(),
                     temp_path,
@@ -4487,15 +4529,14 @@ impl App {
         if self.command_mode
             && let Some(area) = pane_rects.get(&self.focused_pane)
         {
-            let command_cursor =
-                render_command_palette(
-                    frame,
-                    *area,
-                    self.theme,
-                    &self.command_buffer,
-                    &command_suggestions(&self.command_buffer),
-                    self.command_suggestion_selected,
-                );
+            let command_cursor = render_command_palette(
+                frame,
+                *area,
+                self.theme,
+                &self.command_buffer,
+                &command_suggestions(&self.command_buffer),
+                self.command_suggestion_selected,
+            );
             if cursor_position.is_none() {
                 cursor_position = Some(command_cursor);
             }
@@ -4692,7 +4733,7 @@ fn bookmark_panel_lines(entries: Vec<BookmarkEntry>) -> Vec<BookmarkPanelLine> {
         .into_iter()
         .map(|entry| BookmarkPanelLine {
             key: format!("[{}]", entry.key),
-            path: entry.path.display().to_string(),
+            path: entry.target.display_text(),
         })
         .collect()
 }
@@ -5620,6 +5661,7 @@ mod tests {
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
         file_manager::{
+            bookmark::BookmarkTarget,
             layout::{LayoutNode, SplitDirection},
             open::LaunchMode,
             pane::SortMode,
@@ -5684,7 +5726,10 @@ mod tests {
             'p'
         ));
         assert!(key_matches_ctrl_letter(
-            &KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            &KeyEvent::new(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
             'p'
         ));
         assert!(key_matches_letter_any_case(
@@ -5701,10 +5746,7 @@ mod tests {
     /// 驗證 command 補全的切換快捷鍵支援多種常見 terminal 回報格式。
     fn command_suggestion_navigation_accepts_terminal_variants() {
         assert_eq!(
-            command_suggestion_navigation(&KeyEvent::new(
-                KeyCode::Char('n'),
-                KeyModifiers::SHIFT
-            )),
+            command_suggestion_navigation(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT)),
             Some(super::SuggestionNavigation::Next)
         );
         assert_eq!(
@@ -5719,10 +5761,7 @@ mod tests {
             Some(super::SuggestionNavigation::Next)
         );
         assert_eq!(
-            command_suggestion_navigation(&KeyEvent::new(
-                KeyCode::Char('p'),
-                KeyModifiers::SHIFT
-            )),
+            command_suggestion_navigation(&KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT)),
             Some(super::SuggestionNavigation::Previous)
         );
         assert_eq!(
@@ -5762,7 +5801,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("next suggestion");
-        assert_eq!(app.command_suggestion_selected, 1.min(suggestions.len() - 1));
+        assert_eq!(
+            app.command_suggestion_selected,
+            1.min(suggestions.len() - 1)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
             .expect("previous suggestion");
@@ -5791,7 +5833,10 @@ mod tests {
         app.command_buffer = String::from("t");
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT))
             .expect("next suggestion with lowercase+shift");
-        assert_eq!(app.command_suggestion_selected, 1.min(suggestions.len() - 1));
+        assert_eq!(
+            app.command_suggestion_selected,
+            1.min(suggestions.len() - 1)
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::CONTROL))
             .expect("next suggestion with uppercase ctrl");
@@ -6335,6 +6380,46 @@ mod tests {
 
         assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
         assert_eq!(app.status, "jumped to bookmark [d]");
+    }
+
+    #[test]
+    /// 驗證 SMB 連線成功後存下書籤，會把 `smb://...` 寫進 `bookmark.toml`，而不是掛載後的本機路徑。
+    fn app_bookmark_set_persists_smb_location_after_connect() {
+        let dir = tempdir().expect("tempdir");
+        let mount_root = dir.path().join("mounts");
+        let share_docs = mount_root.join("shared").join("docs");
+        fs::create_dir_all(&share_docs).expect("share docs");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.connect_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+            .expect("connect smb");
+        app.set_bookmark('s').expect("set bookmark");
+
+        let bookmark_file =
+            fs::read_to_string(dir.path().join("bookmark.toml")).expect("bookmark file");
+        assert!(bookmark_file.contains("smb://192.0.2.10/shared/docs"));
+        assert_eq!(app.status, "bookmark [s] = smb://192.0.2.10/shared/docs");
+    }
+
+    #[test]
+    /// 驗證 SMB 書籤在跳轉時會自動走 SMB 連線流程，成功後直接切到目標目錄。
+    fn app_jump_to_smb_bookmark_connects_and_enters_target() {
+        let dir = tempdir().expect("tempdir");
+        let mount_root = dir.path().join("mounts");
+        let share_docs = mount_root.join("shared").join("docs");
+        fs::create_dir_all(&share_docs).expect("share docs");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.jump_to_bookmark_target_with_mount_root(
+            1,
+            's',
+            &BookmarkTarget::SmbLocation(String::from("smb://192.0.2.10/shared/docs")),
+            &mount_root,
+        )
+        .expect("jump smb bookmark");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, share_docs);
+        assert_eq!(app.status, "jumped to bookmark [s]");
     }
 
     #[test]

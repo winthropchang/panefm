@@ -7,18 +7,40 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+/// 描述書籤實際指向的目標類型，可能是本機路徑，也可能是遠端 SMB 位址。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BookmarkTarget {
+    LocalPath(PathBuf),
+    SmbLocation(String),
+}
+
+impl BookmarkTarget {
+    /// 回傳適合寫進 `bookmark.toml` 的原始字串。
+    pub(crate) fn as_storage_value(&self) -> String {
+        match self {
+            Self::LocalPath(path) => path.display().to_string(),
+            Self::SmbLocation(location) => location.clone(),
+        }
+    }
+
+    /// 回傳目前書籤要顯示在列表上的文字。
+    pub(crate) fn display_text(&self) -> String {
+        self.as_storage_value()
+    }
+}
+
 /// 表示單一書籤在列表中要顯示的內容。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BookmarkEntry {
     pub(crate) key: char,
-    pub(crate) path: PathBuf,
+    pub(crate) target: BookmarkTarget,
 }
 
 /// 負責管理 `bookmark.toml` 的讀取、寫入與記憶體同步。
 #[derive(Clone, Debug)]
 pub(crate) struct BookmarkStore {
     path: PathBuf,
-    entries: BTreeMap<char, PathBuf>,
+    entries: BTreeMap<char, BookmarkTarget>,
 }
 
 impl BookmarkStore {
@@ -39,15 +61,15 @@ impl BookmarkStore {
     pub(crate) fn list(&self) -> Vec<BookmarkEntry> {
         self.entries
             .iter()
-            .map(|(key, path)| BookmarkEntry {
+            .map(|(key, target)| BookmarkEntry {
                 key: *key,
-                path: path.clone(),
+                target: target.clone(),
             })
             .collect()
     }
 
     /// 取得指定書籤按鍵對應的路徑。
-    pub(crate) fn get(&self, key: char) -> Option<&PathBuf> {
+    pub(crate) fn get(&self, key: char) -> Option<&BookmarkTarget> {
         self.entries.get(&key)
     }
 
@@ -59,7 +81,20 @@ impl BookmarkStore {
     ///
     /// 回傳：`Result<()>`。
     pub(crate) fn set(&mut self, key: char, path: PathBuf) -> Result<()> {
-        self.entries.insert(key, path);
+        self.entries.insert(key, BookmarkTarget::LocalPath(path));
+        self.save()
+    }
+
+    /// 設定或覆蓋單一 SMB 書籤，並立即同步寫回 `bookmark.toml`。
+    ///
+    /// 參數：
+    /// - `key: char`，書籤按鍵。
+    /// - `location: String`，完整的 `smb://host/share[/path]` 目標。
+    ///
+    /// 回傳：`Result<()>`。
+    pub(crate) fn set_smb(&mut self, key: char, location: String) -> Result<()> {
+        self.entries
+            .insert(key, BookmarkTarget::SmbLocation(location));
         self.save()
     }
 
@@ -74,7 +109,7 @@ impl BookmarkStore {
         let raw = self
             .entries
             .iter()
-            .map(|(key, path)| (key.to_string(), path.display().to_string()))
+            .map(|(key, target)| (key.to_string(), target.as_storage_value()))
             .collect::<BTreeMap<_, _>>();
         let content = toml::to_string_pretty(&BookmarkFile(raw))
             .context("failed to serialize bookmark.toml")?;
@@ -103,7 +138,7 @@ pub(crate) fn bookmark_file_path(base_dir: &Path, config_source: Option<&Path>) 
 struct BookmarkFile(BTreeMap<String, String>);
 
 /// 從指定檔案讀取全部書籤；若檔案不存在則回傳空集合。
-fn load_entries(path: &Path) -> Result<BTreeMap<char, PathBuf>> {
+fn load_entries(path: &Path) -> Result<BTreeMap<char, BookmarkTarget>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -116,14 +151,25 @@ fn load_entries(path: &Path) -> Result<BTreeMap<char, PathBuf>> {
     let mut entries = BTreeMap::new();
     for (raw_key, raw_path) in raw {
         let key = parse_bookmark_key(&raw_key)?;
-        let trimmed = raw_path.trim();
-        if trimmed.is_empty() {
-            bail!("bookmark path cannot be empty");
-        }
-        entries.insert(key, PathBuf::from(trimmed));
+        let target = parse_bookmark_target(&raw_path)?;
+        entries.insert(key, target);
     }
 
     Ok(entries)
+}
+
+/// 將 `bookmark.toml` 中的字串解析成書籤目標。
+fn parse_bookmark_target(raw: &str) -> Result<BookmarkTarget> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("bookmark path cannot be empty");
+    }
+
+    if trimmed.starts_with("smb://") {
+        Ok(BookmarkTarget::SmbLocation(trimmed.to_string()))
+    } else {
+        Ok(BookmarkTarget::LocalPath(PathBuf::from(trimmed)))
+    }
 }
 
 /// 驗證單一書籤名稱，確保它符合單鍵操作的設計。
@@ -169,7 +215,35 @@ mod tests {
             .expect("save bookmark");
 
         let reloaded = BookmarkStore::load(file).expect("reload");
-        assert_eq!(reloaded.get('a'), Some(&PathBuf::from("/tmp/demo")));
+        assert_eq!(
+            reloaded.get('a'),
+            Some(&BookmarkTarget::LocalPath(PathBuf::from("/tmp/demo")))
+        );
+    }
+
+    #[test]
+    /// 驗證 SMB 書籤會以原始 `smb://...` 字串寫回檔案，重新載入後仍能辨識成 SMB 目標。
+    fn set_smb_bookmark_persists_to_file() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("bookmark.toml");
+
+        let mut store = BookmarkStore::load(file.clone()).expect("load");
+        store
+            .set_smb('s', String::from("smb://192.0.2.10/shared/docs"))
+            .expect("save smb bookmark");
+
+        let reloaded = BookmarkStore::load(file.clone()).expect("reload");
+        assert_eq!(
+            reloaded.get('s'),
+            Some(&BookmarkTarget::SmbLocation(String::from(
+                "smb://192.0.2.10/shared/docs"
+            )))
+        );
+        assert!(
+            fs::read_to_string(file)
+                .expect("bookmark file")
+                .contains("smb://192.0.2.10/shared/docs")
+        );
     }
 
     #[test]
