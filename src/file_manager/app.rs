@@ -34,8 +34,9 @@ use super::{
     },
     layout::{LayoutNode, SplitDirection},
     open::{
-        LaunchSpec, OpenAction, OpenTarget, build_launch_spec, default_open_action,
-        open_picker_options,
+        LaunchSpec, OpenAction, OpenPickerAction, OpenPickerOption, OpenTarget,
+        build_custom_launch_spec, build_launch_spec, custom_action_applies_to_target,
+        default_open_action, open_picker_options,
     },
     pane::{PaneState, SortMode},
     search::{
@@ -288,6 +289,7 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         target: OpenTarget,
         selected: usize,
+        options: Vec<OpenPickerOption>,
     },
     Rename {
         pane_id: usize,
@@ -2744,13 +2746,14 @@ impl App {
                 pane_id,
                 target,
                 mut selected,
+                options,
             } => {
-                let options = open_picker_options(&target);
                 if self.capture_pending_count_digit(&key) {
                     self.pending_action = Some(PendingAction::OpenPicker {
                         pane_id,
                         target: target.clone(),
                         selected,
+                        options: options.clone(),
                     });
                     self.status = format!("open with: {}", target.display_name);
                     return Ok(true);
@@ -2765,6 +2768,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2777,6 +2781,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2786,6 +2791,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2795,6 +2801,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2807,6 +2814,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2816,6 +2824,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2828,6 +2837,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -2837,13 +2847,14 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
                     KeyCode::Enter => {
                         self.clear_pending_count();
                         if let Some(option) = options.get(selected) {
-                            self.queue_open_action(target.clone(), option.action)?;
+                            self.queue_open_picker_action(target.clone(), option.action.clone())?;
                         } else {
                             self.status = String::from("open with: no option selected");
                         }
@@ -2851,7 +2862,7 @@ impl App {
                     _ if key_matches_plain_letter(&key, 'l') => {
                         self.clear_pending_count();
                         if let Some(option) = options.get(selected) {
-                            self.queue_open_action(target.clone(), option.action)?;
+                            self.queue_open_picker_action(target.clone(), option.action.clone())?;
                         } else {
                             self.status = String::from("open with: no option selected");
                         }
@@ -2872,6 +2883,7 @@ impl App {
                             pane_id,
                             target: target.clone(),
                             selected,
+                            options: options.clone(),
                         });
                         self.status = format!("open with: {}", target.display_name);
                     }
@@ -4116,11 +4128,13 @@ impl App {
             self.status = String::from("nothing selected to open");
             return Ok(());
         };
+        let options = self.open_picker_options_for_target(&target);
 
         self.pending_action = Some(PendingAction::OpenPicker {
             pane_id: self.focused_pane,
             target: target.clone(),
             selected: 0,
+            options: options.clone(),
         });
         self.status = format!("open with: {}", target.display_name);
         Ok(())
@@ -4174,6 +4188,44 @@ impl App {
             OpenAction::Reveal => format!("revealing {}", target.display_name),
         };
         Ok(())
+    }
+
+    /// 根據目前選取目標與設定檔，組出 Open with 面板應顯示的完整選項。
+    fn open_picker_options_for_target(&self, target: &OpenTarget) -> Vec<OpenPickerOption> {
+        let mut options = open_picker_options(target);
+        options.extend(
+            self.config
+                .actions
+                .open_with
+                .iter()
+                .filter(|action| custom_action_applies_to_target(action, target))
+                .cloned()
+                .map(|action| OpenPickerOption {
+                    label: action.name.clone(),
+                    action: OpenPickerAction::Custom(action),
+                }),
+        );
+        options
+    }
+
+    /// 依照 Open with 面板中的選項類型，排入內建或自訂的外部動作。
+    fn queue_open_picker_action(
+        &mut self,
+        target: OpenTarget,
+        action: OpenPickerAction,
+    ) -> io::Result<()> {
+        match action {
+            OpenPickerAction::Builtin(action) => self.queue_open_action(target, action),
+            OpenPickerAction::Custom(action) => {
+                let launch = build_custom_launch_spec(&target, &action)?;
+                let title = format!("run {} on {}", action.name, target.display_name);
+                let detail = format!("{} {}", launch.program, launch.args.join(" "));
+                let task_id = self.push_task(self.focused_pane, "open", title, detail);
+                self.pending_launch = Some(QueuedLaunch { task_id, launch });
+                self.status = format!("running {} on {}", action.name, target.display_name);
+                Ok(())
+            }
+        }
     }
 
     /// 取出目前排隊中的外部開啟請求，交給主事件迴圈處理。
@@ -6330,12 +6382,12 @@ impl App {
                     ),
                     Some(PendingAction::OpenPicker {
                         pane_id: open_pane_id,
-                        target,
+                        options,
                         ..
                     }) if *open_pane_id == pane_id => Some(
-                        open_picker_options(target)
-                            .into_iter()
-                            .map(|option| option.label.to_string())
+                        options
+                            .iter()
+                            .map(|option| option.label.clone())
                             .collect::<Vec<_>>(),
                     ),
                     _ => None,
@@ -7877,7 +7929,10 @@ mod tests {
         rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
-        config::{AppConfig, LoadedConfig, StartupSort},
+        config::{
+            ActionLaunchMode, ActionTargetScope, AppConfig, CustomOpenActionConfig, LoadedConfig,
+            StartupSort,
+        },
         file_manager::{
             bookmark::BookmarkTarget,
             layout::{LayoutNode, SplitDirection},
@@ -8644,6 +8699,47 @@ mod tests {
             app.pending_action,
             Some(PendingAction::OpenPicker { .. })
         ));
+    }
+
+    #[test]
+    /// 驗證自訂 open action 會出現在 Open with 面板中，並能排入外部啟動佇列。
+    fn app_open_picker_includes_custom_actions() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut loaded = default_loaded_config();
+        loaded.config.actions.open_with.push(CustomOpenActionConfig {
+            name: "Git log".to_string(),
+            scope: ActionTargetScope::Both,
+            mode: ActionLaunchMode::TerminalBlocking,
+            command: Some("git -C {parent} log --oneline".to_string()),
+            mac_command: None,
+            windows_command: Some("git -C {parent} log --oneline".to_string()),
+        });
+
+        let mut app = App::new(dir.path().to_path_buf(), loaded).expect("app");
+        app.open_selected_with_picker().expect("open picker");
+
+        match app.pending_action.as_mut() {
+            Some(PendingAction::OpenPicker {
+                options, selected, ..
+            }) => {
+                *selected = options
+                    .iter()
+                    .position(|option| option.label == "Git log")
+                    .expect("custom option");
+            }
+            other => panic!("unexpected pending action: {other:?}"),
+        }
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("queue custom action");
+
+        let launch = app.take_pending_launch().expect("launch");
+        assert_eq!(launch.launch.mode, LaunchMode::TerminalBlocking);
+        assert!(launch.launch.args.join(" ").contains("git -C"));
+        assert!(app.status.contains("running Git log on notes.txt"));
     }
 
     #[test]

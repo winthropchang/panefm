@@ -131,4 +131,27 @@ panel_page_step = 10
 
 [behavior]
 cancel_search_on_leave = true
+
+[actions]
+
+[[actions.open_with]]
+name = "Xcode"
+scope = "dir" # file / dir / both
+mode = "detached" # detached / terminal
+mac_command = "open -a Xcode {path}"
+
+[[actions.open_with]]
+name = "Git log"
+scope = "both"
+mode = "terminal"
+command = "git -C {parent} log --oneline"
+windows_command = "git -C {parent} log --oneline"
 ```
+
+`actions.open_with` 目前會直接出現在 `Open with` 面板。
+可用佔位字串：
+
+- `{path}`：目前選取項目的完整路徑
+- `{parent}`：目前選取項目的父目錄
+- `{name}`：目前顯示名稱
+- `{stem}`：去掉副檔名後的檔名

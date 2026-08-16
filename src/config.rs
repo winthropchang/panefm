@@ -74,6 +74,7 @@ pub struct AppConfig {
     pub search: SearchConfig,
     pub navigation: NavigationConfig,
     pub behavior: BehaviorConfig,
+    pub actions: ActionsConfig,
 }
 
 /// 表示 UI 相關的設定群組。
@@ -113,6 +114,38 @@ pub struct NavigationConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BehaviorConfig {
     pub cancel_search_on_leave: bool,
+}
+
+/// 表示使用者在設定檔中定義的外部動作集合。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionsConfig {
+    pub open_with: Vec<CustomOpenActionConfig>,
+}
+
+/// 表示單一自訂外部動作。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomOpenActionConfig {
+    pub name: String,
+    pub scope: ActionTargetScope,
+    pub mode: ActionLaunchMode,
+    pub command: Option<String>,
+    pub mac_command: Option<String>,
+    pub windows_command: Option<String>,
+}
+
+/// 描述自訂動作適用於檔案、資料夾或兩者。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionTargetScope {
+    File,
+    Directory,
+    Both,
+}
+
+/// 描述自訂動作要阻塞在終端中執行，還是背景分離執行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionLaunchMode {
+    TerminalBlocking,
+    Detached,
 }
 
 /// 表示 preview 區塊的高度設定。
@@ -179,6 +212,9 @@ impl Default for AppConfig {
             behavior: BehaviorConfig {
                 cancel_search_on_leave: true,
             },
+            actions: ActionsConfig {
+                open_with: Vec::new(),
+            },
         }
     }
 }
@@ -203,6 +239,7 @@ struct AppConfigFile {
     search: Option<SearchConfigFile>,
     navigation: Option<NavigationConfigFile>,
     behavior: Option<BehaviorConfigFile>,
+    actions: Option<ActionsConfigFile>,
 }
 
 /// 表示舊版平鋪設定檔格式。
@@ -257,6 +294,23 @@ struct NavigationConfigFile {
 #[derive(Debug, Default, Deserialize)]
 struct BehaviorConfigFile {
     cancel_search_on_leave: Option<bool>,
+}
+
+/// 表示 `actions` 區塊的原始設定格式。
+#[derive(Debug, Default, Deserialize)]
+struct ActionsConfigFile {
+    open_with: Option<Vec<CustomOpenActionFile>>,
+}
+
+/// 表示單一自訂動作在設定檔中的原始欄位。
+#[derive(Debug, Default, Deserialize)]
+struct CustomOpenActionFile {
+    name: Option<String>,
+    scope: Option<String>,
+    mode: Option<String>,
+    command: Option<String>,
+    mac_command: Option<String>,
+    windows_command: Option<String>,
 }
 
 /// 表示所有 dialog 群組的原始設定格式。
@@ -377,6 +431,9 @@ fn apply_new_file(config: &mut AppConfig, file: AppConfigFile) -> Result<()> {
     }
     if let Some(behavior) = file.behavior {
         apply_behavior_config(config, behavior);
+    }
+    if let Some(actions) = file.actions {
+        apply_actions_config(config, actions)?;
     }
     Ok(())
 }
@@ -501,6 +558,68 @@ fn apply_behavior_config(config: &mut AppConfig, behavior: BehaviorConfigFile) {
     if let Some(cancel_search_on_leave) = behavior.cancel_search_on_leave {
         config.behavior.cancel_search_on_leave = cancel_search_on_leave;
     }
+}
+
+/// 套用並驗證 `actions` 區塊設定。
+fn apply_actions_config(config: &mut AppConfig, actions: ActionsConfigFile) -> Result<()> {
+    let Some(raw_actions) = actions.open_with else {
+        return Ok(());
+    };
+
+    let mut parsed = Vec::with_capacity(raw_actions.len());
+    for (index, raw) in raw_actions.into_iter().enumerate() {
+        let name = raw
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .with_context(|| format!("actions.open_with[{index}].name is required"))?;
+
+        if raw.command.as_deref().is_none()
+            && raw.mac_command.as_deref().is_none()
+            && raw.windows_command.as_deref().is_none()
+        {
+            bail!(
+                "actions.open_with[{index}] must define at least one of command / mac_command / windows_command"
+            );
+        }
+
+        let scope = match raw.scope.as_deref().map(|value| value.trim().to_ascii_lowercase()) {
+            None => ActionTargetScope::Both,
+            Some(value) if value == "both" => ActionTargetScope::Both,
+            Some(value) if value == "file" => ActionTargetScope::File,
+            Some(value) if value == "dir" || value == "directory" => ActionTargetScope::Directory,
+            Some(value) => {
+                bail!(
+                    "unknown actions.open_with[{index}].scope: {value}. available: file, dir, both"
+                );
+            }
+        };
+
+        let mode = match raw.mode.as_deref().map(|value| value.trim().to_ascii_lowercase()) {
+            None => ActionLaunchMode::Detached,
+            Some(value) if value == "detached" => ActionLaunchMode::Detached,
+            Some(value) if value == "terminal" || value == "terminal_blocking" => {
+                ActionLaunchMode::TerminalBlocking
+            }
+            Some(value) => {
+                bail!(
+                    "unknown actions.open_with[{index}].mode: {value}. available: detached, terminal"
+                );
+            }
+        };
+
+        parsed.push(CustomOpenActionConfig {
+            name,
+            scope,
+            mode,
+            command: raw.command.map(|value| value.trim().to_string()),
+            mac_command: raw.mac_command.map(|value| value.trim().to_string()),
+            windows_command: raw.windows_command.map(|value| value.trim().to_string()),
+        });
+    }
+
+    config.actions.open_with = parsed;
+    Ok(())
 }
 
 /// 套用並驗證 `navigation` 區塊設定。
@@ -647,6 +766,7 @@ cancel_search_on_leave = false
         assert_eq!(loaded.config.navigation.fast_move_step, 7);
         assert_eq!(loaded.config.navigation.panel_page_step, 14);
         assert!(!loaded.config.behavior.cancel_search_on_leave);
+        assert!(loaded.config.actions.open_with.is_empty());
         assert_eq!(loaded.source, Some(dir.path().join("config.toml")));
     }
 
@@ -691,6 +811,44 @@ height = 9
         assert_eq!(loaded.config.ui.dialogs.confirm.height, 6);
         assert_eq!(loaded.config.ui.dialogs.theme_picker.width_percent, 44);
         assert_eq!(loaded.config.ui.dialogs.theme_picker.height, 9);
+        assert!(loaded.config.actions.open_with.is_empty());
+    }
+
+    #[test]
+    /// 驗證 `actions.open_with` 會正確載入自訂外部動作設定。
+    fn load_config_reads_custom_open_actions() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[actions]
+
+[[actions.open_with]]
+name = "Xcode"
+scope = "dir"
+mode = "detached"
+mac_command = "open -a Xcode {path}"
+
+[[actions.open_with]]
+name = "Git log"
+scope = "both"
+mode = "terminal"
+command = "git -C {parent} log --oneline"
+windows_command = "git -C {parent} log --oneline"
+"#,
+        )
+        .expect("config file");
+
+        let loaded = load_config(dir.path()).expect("config");
+
+        assert_eq!(loaded.config.actions.open_with.len(), 2);
+        assert_eq!(loaded.config.actions.open_with[0].name, "Xcode");
+        assert_eq!(loaded.config.actions.open_with[0].scope, ActionTargetScope::Directory);
+        assert_eq!(loaded.config.actions.open_with[1].mode, ActionLaunchMode::TerminalBlocking);
+        assert_eq!(
+            loaded.config.actions.open_with[1].command.as_deref(),
+            Some("git -C {parent} log --oneline")
+        );
     }
 
     #[test]
