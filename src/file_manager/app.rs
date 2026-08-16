@@ -8,7 +8,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -47,9 +47,10 @@ use super::{
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
-        InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TrashPanelLine,
-        render_bookmark_picker, render_command_palette, render_confirm_dialog, render_filter_input,
-        render_global_search_panel, render_pane, render_preview_search_input, render_theme_picker,
+        InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TaskPanelLine,
+        TrashPanelLine, render_bookmark_picker, render_command_palette, render_confirm_dialog,
+        render_filter_input, render_global_search_panel, render_pane,
+        render_preview_search_input, render_theme_picker,
     },
     debug_timing_log, debug_timing_message,
 };
@@ -123,6 +124,7 @@ pub(crate) struct FzfJumpRequest {
     pub(crate) root_dir: PathBuf,
     pub(crate) show_hidden: bool,
     pub(crate) follow_links: bool,
+    pub(crate) task_id: usize,
 }
 
 /// 記錄目前 global search 的目標 pane、查詢文字與搜尋結果狀態。
@@ -136,6 +138,36 @@ pub(crate) struct GlobalSearchState {
     pub(crate) searched: bool,
     pub(crate) selected: usize,
     pub(crate) results: Vec<GlobalSearchEntry>,
+    pub(crate) task_id: Option<usize>,
+}
+
+/// 描述目前 task manager 中單一任務的狀態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskState {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// 描述單一背景或外部任務在 task manager 中的紀錄。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskRecord {
+    pub(crate) id: usize,
+    pub(crate) pane_id: usize,
+    pub(crate) kind: &'static str,
+    pub(crate) title: String,
+    pub(crate) detail: String,
+    pub(crate) state: TaskState,
+    pub(crate) started_at_unix_ms: u64,
+    pub(crate) finished_at_unix_ms: Option<u64>,
+}
+
+/// 描述排隊中的外部命令與它對應的 task id。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueuedLaunch {
+    pub(crate) task_id: usize,
+    pub(crate) launch: LaunchSpec,
 }
 
 /// 記錄目前是否處於範圍標記模式，以及起點和目前游標位置。
@@ -207,6 +239,10 @@ pub(crate) enum PendingAction {
         selected: usize,
         search: PanelSearchState,
     },
+    TaskPanel {
+        pane_id: usize,
+        selected: usize,
+    },
     BookmarkList {
         pane_id: usize,
         selected: usize,
@@ -277,9 +313,11 @@ pub(crate) struct App {
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
-    pub(crate) pending_launch: Option<LaunchSpec>,
+    pub(crate) pending_launch: Option<QueuedLaunch>,
     pub(crate) pending_fzf_jump: Option<FzfJumpRequest>,
     pub(crate) preview_focus: Option<usize>,
+    pub(crate) task_log: Vec<TaskRecord>,
+    pub(crate) next_task_id: usize,
 }
 
 /// 記錄 F1 help 關閉後應回復到哪一種互動上下文。
@@ -354,6 +392,8 @@ impl App {
             pending_launch: None,
             pending_fzf_jump: None,
             preview_focus: None,
+            task_log: Vec::new(),
+            next_task_id: 1,
         })
     }
 
@@ -2112,6 +2152,136 @@ impl App {
                     self.status = status;
                 }
             }
+            PendingAction::TaskPanel {
+                pane_id,
+                mut selected,
+            } => {
+                let tasks = self.tasks_for_pane(pane_id);
+                let len = tasks.len();
+                if self.capture_pending_count_digit(&key) {
+                    self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
+                    return Ok(true);
+                }
+                if key_matches_shifted_letter(&key, 'G') {
+                    if let Some(count) = self.take_pending_count() {
+                        if len > 0 {
+                            selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                        }
+                    } else if len > 0 {
+                        selected = len - 1;
+                    }
+                    self.pending_g = false;
+                    self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
+                    self.status = task_panel_status(len, selected);
+                    return Ok(true);
+                }
+                match key.code {
+                    KeyCode::Down => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'j') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'k') => {
+                        selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'd') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'u') => {
+                        selected = selected.saturating_sub(self.take_panel_page_step());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_shifted_letter(&key, 'J') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_shifted_letter(&key, 'K') => {
+                        selected = selected.saturating_sub(self.take_large_move_step());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'g') => {
+                        if self.pending_g {
+                            if let Some(count) = self.take_pending_count() {
+                                selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                            } else {
+                                selected = 0;
+                            }
+                            self.pending_g = false;
+                        } else {
+                            self.pending_g = true;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Right => {
+                        if let Some(task) = tasks.get(selected) {
+                            self.status = format!(
+                                "task {} [{}] {}",
+                                task.id,
+                                task.kind,
+                                task.detail
+                            );
+                        } else {
+                            self.status = String::from("tasks: empty");
+                        }
+                    }
+                    _ if key_matches_plain_letter(&key, 'l') => {
+                        if let Some(task) = tasks.get(selected) {
+                            self.status = format!(
+                                "task {} [{}] {}",
+                                task.id,
+                                task.kind,
+                                task.detail
+                            );
+                        } else {
+                            self.status = String::from("tasks: empty");
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
+                    _ if key_matches_plain_letter(&key, 'q')
+                        || key_matches_plain_letter(&key, 'h') =>
+                    {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
+                    _ => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                    }
+                }
+                self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
+                if !matches!(key.code, KeyCode::Enter | KeyCode::Right)
+                    && !key_matches_plain_letter(&key, 'l')
+                {
+                    self.status = task_panel_status(len, selected);
+                }
+            }
             PendingAction::BookmarkList {
                 pane_id,
                 mut selected,
@@ -3300,6 +3470,7 @@ impl App {
                 self.status = String::from("SMB 連線需要完整位址：connect smb://host/share[/path]");
             }
             "trash" => self.open_trash_panel()?,
+            "tasks" => self.open_task_panel(),
             "help" => self.open_help_panel(),
             "bookmark list" => self.open_bookmark_list(),
             "restore" => self.restore_latest_from_trash()?,
@@ -3509,6 +3680,16 @@ impl App {
         self.status = help_panel_status("", help_entries("").len(), false);
     }
 
+    /// 打開 task 面板，查看目前 pane 最近執行過的任務與狀態。
+    pub(crate) fn open_task_panel(&mut self) {
+        let count = self.tasks_for_pane(self.focused_pane).len();
+        self.pending_action = Some(PendingAction::TaskPanel {
+            pane_id: self.focused_pane,
+            selected: 0,
+        });
+        self.status = task_panel_status(count, 0);
+    }
+
     /// 打開書籤列表彈窗，讓使用者可以用列表方式查看與跳轉書籤。
     pub(crate) fn open_bookmark_list(&mut self) {
         self.pending_action = Some(PendingAction::BookmarkList {
@@ -3636,7 +3817,14 @@ impl App {
                 self.status = format!("connected smb: {}", location.url);
             }
             ResolvedSmbLocation::NeedsMount { local_path } => {
-                self.pending_launch = Some(build_smb_mount_launch(&location));
+                let launch = build_smb_mount_launch(&location);
+                let task_id = self.push_task(
+                    self.focused_pane,
+                    "smb",
+                    format!("mount {}", location.url),
+                    format!("expected mount path: {}", local_path.display()),
+                );
+                self.pending_launch = Some(QueuedLaunch { task_id, launch });
                 self.status = format!(
                     "已請求系統掛載 SMB：{}；若系統連線失敗，請檢查主機、share 名稱、網路與權限，成功後再重試。預期掛載位置：{}",
                     location.url,
@@ -3784,7 +3972,15 @@ impl App {
     /// 將外部開啟動作排入待執行佇列。
     fn queue_open_action(&mut self, target: OpenTarget, action: OpenAction) -> io::Result<()> {
         let launch = build_launch_spec(&target, action)?;
-        self.pending_launch = Some(launch);
+        let title = match action {
+            OpenAction::Editor => format!("open {} with editor", target.display_name),
+            OpenAction::Vim => format!("open {} with vim", target.display_name),
+            OpenAction::Open => format!("open {}", target.display_name),
+            OpenAction::Reveal => format!("reveal {}", target.display_name),
+        };
+        let detail = format!("{} {}", launch.program, launch.args.join(" "));
+        let task_id = self.push_task(self.focused_pane, "open", title, detail);
+        self.pending_launch = Some(QueuedLaunch { task_id, launch });
         self.status = match action {
             OpenAction::Editor => format!("opening {} with editor", target.display_name),
             OpenAction::Vim => format!("opening {} with vim", target.display_name),
@@ -3795,8 +3991,20 @@ impl App {
     }
 
     /// 取出目前排隊中的外部開啟請求，交給主事件迴圈處理。
-    pub(crate) fn take_pending_launch(&mut self) -> Option<LaunchSpec> {
+    pub(crate) fn take_pending_launch(&mut self) -> Option<QueuedLaunch> {
         self.pending_launch.take()
+    }
+
+    /// 根據外部開啟結果，更新 task manager 中對應任務的最終狀態。
+    pub(crate) fn finish_launch_task(&mut self, task_id: usize, result: io::Result<()>) {
+        match result {
+            Ok(()) => self.finish_task(task_id, TaskState::Done, String::from("completed")),
+            Err(error) => {
+                let detail = error.to_string();
+                self.finish_task(task_id, TaskState::Failed, detail.clone());
+                self.status = format!("open failed: {detail}");
+            }
+        }
     }
 
     /// 取出目前排隊中的 `fzf` 跳轉請求，交給主事件迴圈處理。
@@ -3811,11 +4019,21 @@ impl App {
         selected_line: Option<&str>,
     ) {
         let Some(line) = selected_line.map(str::trim).filter(|line| !line.is_empty()) else {
+            self.finish_task(
+                request.task_id,
+                TaskState::Cancelled,
+                String::from("fzf cancelled"),
+            );
             self.status = String::from("jump cancelled");
             return;
         };
 
         let Some(pane) = self.panes.get_mut(&request.pane_id) else {
+            self.finish_task(
+                request.task_id,
+                TaskState::Failed,
+                String::from("pane no longer exists"),
+            );
             self.status = String::from("jump failed: pane no longer exists");
             return;
         };
@@ -3826,10 +4044,16 @@ impl App {
             Ok(()) => {
                 debug_timing_message(&format!("jump target path: {}", target_path.display()));
                 debug_timing_log("jump go_to_path", go_to_path_started_at);
+                self.finish_task(request.task_id, TaskState::Done, format!("opened {line}"));
                 self.status = format!("jumped: {line}");
             }
             Err(error) => {
                 debug_timing_log("jump go_to_path (failed)", go_to_path_started_at);
+                self.finish_task(
+                    request.task_id,
+                    TaskState::Failed,
+                    error.to_string(),
+                );
                 self.status = format!("jump failed for {line}: {error}");
             }
         }
@@ -3988,6 +4212,9 @@ impl App {
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::ThemePicker { selected } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
+            }
+            PendingAction::TaskPanel { pane_id, selected } => {
+                task_panel_status(self.tasks_for_pane(*pane_id).len(), *selected)
             }
             PendingAction::TrashPanel {
                 selected,
@@ -4227,6 +4454,7 @@ impl App {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            task_id: None,
         };
         self.status = String::from("global search (insert): type query and Enter");
         self.global_search = Some(search);
@@ -4278,11 +4506,19 @@ impl App {
             return;
         }
 
+        let root_dir = pane.cwd.clone();
+        let task_id = self.push_task(
+            self.focused_pane,
+            "jump",
+            format!("fzf jump in {}", root_dir.display()),
+            String::from("waiting for fzf"),
+        );
         self.pending_fzf_jump = Some(FzfJumpRequest {
             pane_id: self.focused_pane,
-            root_dir: pane.cwd.clone(),
+            root_dir,
             show_hidden: true,
             follow_links: self.config.search.fzf_follow_links,
+            task_id,
         });
         self.status = String::from("jump: fzf loading");
     }
@@ -4475,6 +4711,52 @@ impl App {
         } else {
             format!("cleared {cleared} marks")
         };
+    }
+
+    /// 建立新的 task 紀錄並加入 task log，回傳這筆任務的 id。
+    fn push_task(
+        &mut self,
+        pane_id: usize,
+        kind: &'static str,
+        title: String,
+        detail: String,
+    ) -> usize {
+        let id = self.next_task_id;
+        self.next_task_id += 1;
+        self.task_log.push(TaskRecord {
+            id,
+            pane_id,
+            kind,
+            title,
+            detail,
+            state: TaskState::Running,
+            started_at_unix_ms: unix_time_ms_now(),
+            finished_at_unix_ms: None,
+        });
+        if self.task_log.len() > 200 {
+            let overflow = self.task_log.len() - 200;
+            self.task_log.drain(0..overflow);
+        }
+        id
+    }
+
+    /// 更新指定 task 的最終狀態與說明文字。
+    fn finish_task(&mut self, task_id: usize, state: TaskState, detail: String) {
+        if let Some(task) = self.task_log.iter_mut().find(|task| task.id == task_id) {
+            task.state = state;
+            task.detail = detail;
+            task.finished_at_unix_ms = Some(unix_time_ms_now());
+        }
+    }
+
+    /// 取得目前 pane 對應的任務清單，最新的排在最上面。
+    fn tasks_for_pane(&self, pane_id: usize) -> Vec<TaskRecord> {
+        self.task_log
+            .iter()
+            .filter(|task| task.pane_id == pane_id)
+            .cloned()
+            .rev()
+            .collect()
     }
 
     /// 將目前選取或標記的項目壓成單一 zip 檔，並在完成後刷新所有 pane。
@@ -5028,6 +5310,9 @@ impl App {
 
     /// 啟動一個背景 global search 工作，避免在大型目錄中阻塞主介面。
     fn start_global_search(&mut self, search: &mut GlobalSearchState) -> io::Result<()> {
+        if let Some(task_id) = search.task_id.take() {
+            self.finish_task(task_id, TaskState::Cancelled, String::from("replaced by new query"));
+        }
         self.cancel_global_search_worker();
 
         let pane_id = search.pane_id;
@@ -5044,6 +5329,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let task_id = self.push_task(
+            pane_id,
+            "search",
+            format!("global search: {}", if query.is_empty() { "<all>" } else { &query }),
+            format!("root: {}", root_dir.display()),
+        );
         thread::spawn(move || {
             stream_search_entries(
                 pane_id,
@@ -5061,6 +5352,7 @@ impl App {
         search.searched = false;
         search.selected = 0;
         search.results.clear();
+        search.task_id = Some(task_id);
         self.global_search_rx = Some(rx);
         self.global_search_cancelled = Some(cancelled);
         Ok(())
@@ -5076,6 +5368,11 @@ impl App {
 
     /// 關閉 global search 畫面，並同步停止正在進行中的背景搜尋。
     fn cancel_global_search(&mut self) {
+        if let Some(search) = &mut self.global_search
+            && let Some(task_id) = search.task_id.take()
+        {
+            self.finish_task(task_id, TaskState::Cancelled, String::from("cancelled"));
+        }
         self.cancel_global_search_worker();
         self.global_search = None;
         self.status = String::from("normal mode");
@@ -5577,6 +5874,73 @@ impl App {
         self.layout.render_rects(outer[0], &mut pane_rects);
         let mut cursor_position = None;
         for (&pane_id, &rect) in &pane_rects {
+            let trash_lines = if let Some(PendingAction::TrashPanel {
+                pane_id: action_pane_id,
+                selected,
+                search,
+                marked_ids,
+                visual_anchor,
+                ..
+            }) = &self.pending_action
+            {
+                if *action_pane_id == pane_id {
+                    Some(
+                        trash_panel_lines(
+                            &self.trash_store,
+                            &search.buffer,
+                            marked_ids,
+                            visual_anchor.map(|anchor| (anchor, *selected)),
+                        )
+                        .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let task_records = if matches!(
+                &self.pending_action,
+                Some(PendingAction::TaskPanel {
+                    pane_id: action_pane_id,
+                    ..
+                }) if *action_pane_id == pane_id
+            ) {
+                Some(self.tasks_for_pane(pane_id))
+            } else {
+                None
+            };
+            let task_lines = task_records
+                .as_deref()
+                .map(task_panel_lines);
+            let help_lines = if let Some(PendingAction::HelpPanel {
+                pane_id: action_pane_id,
+                search,
+                ..
+            }) = &self.pending_action
+            {
+                if *action_pane_id == pane_id {
+                    Some(help_panel_lines(&search.buffer))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let regex_rename_lines = if let Some(PendingAction::RegexRename {
+                pane_id: action_pane_id,
+                previews,
+                ..
+            }) = &self.pending_action
+            {
+                if *action_pane_id == pane_id {
+                    Some(regex_rename_panel_lines(previews))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 let rename_buffer = match &self.pending_action {
                     Some(PendingAction::Rename {
@@ -5652,59 +6016,6 @@ impl App {
                     }
                     _ => None,
                 };
-                let trash_lines = if let Some(PendingAction::TrashPanel {
-                    pane_id: action_pane_id,
-                    selected,
-                    search,
-                    marked_ids,
-                    visual_anchor,
-                    ..
-                }) = &self.pending_action
-                {
-                    if *action_pane_id == pane_id {
-                        Some(
-                            trash_panel_lines(
-                                &self.trash_store,
-                                &search.buffer,
-                                marked_ids,
-                                visual_anchor.map(|anchor| (anchor, *selected)),
-                            )
-                            .unwrap_or_default(),
-                        )
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let help_lines = if let Some(PendingAction::HelpPanel {
-                    pane_id: action_pane_id,
-                    search,
-                    ..
-                }) = &self.pending_action
-                {
-                    if *action_pane_id == pane_id {
-                        Some(help_panel_lines(&search.buffer))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let regex_rename_lines = if let Some(PendingAction::RegexRename {
-                    pane_id: action_pane_id,
-                    previews,
-                    ..
-                }) = &self.pending_action
-                {
-                    if *action_pane_id == pane_id {
-                        Some(regex_rename_panel_lines(previews))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
                 let panel_state = if let Some(search) = self.global_search.as_ref() {
                     (search.pane_id == pane_id && (search.loading || search.searched)).then_some(
                         PaneListState::Search(SearchListState {
@@ -5726,6 +6037,19 @@ impl App {
                             selected: *selected,
                             search: &search.buffer,
                             editing: search.editing,
+                        })
+                    } else {
+                        None
+                    }
+                } else if let Some(PendingAction::TaskPanel {
+                    pane_id: action_pane_id,
+                    selected,
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(PaneListState::Tasks {
+                            lines: task_lines.as_deref().unwrap_or(&[]),
+                            selected: *selected,
                         })
                     } else {
                         None
@@ -5940,6 +6264,7 @@ impl App {
                 }
             }
             Some(PendingAction::TrashPanel { .. })
+            | Some(PendingAction::TaskPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
             | Some(PendingAction::CopyPicker { .. })
             | Some(PendingAction::OpenPicker { .. })
@@ -5985,6 +6310,7 @@ impl App {
         }
 
         let mut finished = false;
+        let mut completed_search_task = None;
         for message in messages {
             let Some(search) = &mut self.global_search else {
                 break;
@@ -6023,6 +6349,9 @@ impl App {
                     }
                     search.loading = false;
                     search.searched = true;
+                    if let Some(task_id) = search.task_id.take() {
+                        completed_search_task = Some((task_id, search.results.len()));
+                    }
                     self.status = global_search_status(
                         &search.buffer,
                         search.results.len(),
@@ -6033,6 +6362,14 @@ impl App {
                     finished = true;
                 }
             }
+        }
+
+        if let Some((task_id, result_count)) = completed_search_task {
+            self.finish_task(
+                task_id,
+                TaskState::Done,
+                format!("{result_count} results"),
+            );
         }
 
         if finished {
@@ -6604,6 +6941,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("trash"),
         ),
         help_entry(
+            ":tasks",
+            "",
+            "打開目前 pane 的任務面板，查看最近的 search / jump / open / smb 任務狀態",
+            HelpAction::Command("tasks"),
+        ),
+        help_entry(
             ":restore",
             "",
             "還原最近一次移到 trash 的項目",
@@ -6827,6 +7170,52 @@ fn help_panel_status(query: &str, count: usize, editing: bool) -> String {
     } else {
         format!("help: {} ({count})", query)
     }
+}
+
+/// 產生 task 面板底部狀態列訊息。
+fn task_panel_status(count: usize, selected: usize) -> String {
+    if count == 0 {
+        String::from("tasks: empty")
+    } else {
+        format!("tasks: {}/{} (j/k move, l detail, h close)", selected + 1, count)
+    }
+}
+
+/// 將目前 task log 轉成面板可直接渲染的資料列。
+fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
+    tasks.iter()
+        .map(|task| TaskPanelLine {
+            state: task_state_label(task.state).to_string(),
+            time: format_task_time(task.started_at_unix_ms),
+            title: task.title.clone(),
+            detail: task.detail.clone(),
+        })
+        .collect()
+}
+
+/// 將 task 狀態轉成簡短標籤。
+fn task_state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Running => "RUNNING",
+        TaskState::Done => "DONE",
+        TaskState::Failed => "FAILED",
+        TaskState::Cancelled => "CANCELLED",
+    }
+}
+
+/// 將 unix 毫秒時間轉成 task 面板使用的簡短時間。
+fn format_task_time(unix_ms: u64) -> String {
+    DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_millis(unix_ms))
+        .format("%H:%M")
+        .to_string()
+}
+
+/// 取得目前系統時間的 unix 毫秒。
+fn unix_time_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// 將 unix 毫秒時間轉成較容易閱讀的本地時間字串。
@@ -7109,11 +7498,11 @@ mod tests {
 
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, ListFindState, PendingAction,
-        RegexRenameOutcome, RenameMode, VisualSelectionState, command_suggestion_navigation,
-        command_suggestions, help_entries, key_matches_ctrl_letter,
-        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end, typed_char_from_key,
+        RegexRenameOutcome, RenameMode, TaskState, VisualSelectionState,
+        command_suggestion_navigation, command_suggestions, help_entries,
+        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
+        key_matches_plain_letter, key_matches_shifted_letter, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{AppConfig, LoadedConfig, StartupSort},
@@ -7777,6 +8166,72 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 `:tasks` 會打開目前 pane 的任務面板，且空清單時狀態訊息正確。
+    fn app_tasks_command_opens_task_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.execute_command("tasks").expect("open tasks");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TaskPanel {
+                pane_id: 1,
+                selected: 0
+            })
+        ));
+        assert_eq!(app.status, "tasks: empty");
+    }
+
+    #[test]
+    /// 驗證一般外部開啟會建立 task，並在主事件迴圈回報成功後標記完成。
+    fn app_open_task_is_created_and_can_finish() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("queue open");
+
+        assert_eq!(app.task_log.len(), 1);
+        let task = app.task_log.last().expect("task");
+        assert_eq!(task.kind, "open");
+        assert_eq!(task.state, TaskState::Running);
+
+        let queued = app.take_pending_launch().expect("queued launch");
+        let task_id = queued.task_id;
+        app.finish_launch_task(task_id, Ok(()));
+
+        let task = app.task_log.iter().find(|task| task.id == task_id).expect("task");
+        assert_eq!(task.state, TaskState::Done);
+        assert_eq!(task.detail, "completed");
+        assert!(task.finished_at_unix_ms.is_some());
+    }
+
+    #[test]
+    /// 驗證 `z` 打開 fzf jump 時會建立 task，取消後也會正確標成 cancelled。
+    fn app_fzf_jump_task_is_created_and_cancelled() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_fzf_jump();
+
+        assert_eq!(app.task_log.len(), 1);
+        let request = app.take_pending_fzf_jump().expect("fzf request");
+        let task_id = request.task_id;
+        let task = app.task_log.iter().find(|task| task.id == task_id).expect("task");
+        assert_eq!(task.kind, "jump");
+        assert_eq!(task.state, TaskState::Running);
+
+        app.apply_fzf_jump_selection(request, None);
+
+        let task = app.task_log.iter().find(|task| task.id == task_id).expect("task");
+        assert_eq!(task.state, TaskState::Cancelled);
+        assert_eq!(task.detail, "fzf cancelled");
+    }
+
+    #[test]
     /// 驗證在一般列表按下 Enter 會依預設外部開啟規則排入文字編輯器啟動。
     fn app_enter_queues_default_open_for_text_file() {
         let dir = tempdir().expect("tempdir");
@@ -7797,7 +8252,7 @@ mod tests {
         } else {
             LaunchMode::Detached
         };
-        assert_eq!(launch.mode, expected);
+        assert_eq!(launch.launch.mode, expected);
         assert_eq!(app.status, "opening notes.txt with editor");
     }
 
@@ -7843,7 +8298,7 @@ mod tests {
             .expect("open directory");
 
         let launch = app.take_pending_launch().expect("launch");
-        assert_eq!(launch.mode, LaunchMode::Detached);
+        assert_eq!(launch.launch.mode, LaunchMode::Detached);
     }
 
     #[test]

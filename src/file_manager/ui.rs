@@ -48,6 +48,10 @@ pub(crate) struct SearchListState<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum PaneListState<'a> {
     Search(SearchListState<'a>),
+    Tasks {
+        lines: &'a [TaskPanelLine],
+        selected: usize,
+    },
     Trash {
         lines: &'a [TrashPanelLine],
         selected: usize,
@@ -81,6 +85,15 @@ pub(crate) struct HelpPanelLine {
     pub(crate) command: String,
     pub(crate) shortcut: String,
     pub(crate) description: String,
+}
+
+/// 描述 task 面板中單一列要顯示的內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskPanelLine {
+    pub(crate) state: String,
+    pub(crate) time: String,
+    pub(crate) title: String,
+    pub(crate) detail: String,
 }
 
 /// 描述書籤列表彈窗中單一列要顯示的內容。
@@ -177,6 +190,7 @@ pub(crate) fn render_pane(
     };
     let panel_suffix = match panel_state {
         Some(PaneListState::Search(_)) => "  [search]",
+        Some(PaneListState::Tasks { .. }) => "  [tasks]",
         Some(PaneListState::Trash { .. }) => "  [trash]",
         Some(PaneListState::Help { .. }) => "  [help]",
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
@@ -211,6 +225,21 @@ pub(crate) fn render_pane(
                 .results
                 .iter()
                 .map(|entry| ListItem::new(Line::from(entry.relative_path.clone())))
+                .collect(),
+            PaneListState::Tasks { lines, .. } if lines.is_empty() => {
+                vec![ListItem::new(Line::from("No tasks yet"))]
+            }
+            PaneListState::Tasks { lines, .. } => lines
+                .iter()
+                .map(|line| {
+                    ListItem::new(Line::from(format!(
+                        "{:<10} {:<8} {:<24} {}",
+                        truncate_text(&line.state, 10),
+                        truncate_text(&line.time, 8),
+                        truncate_text(&line.title, 24),
+                        line.detail
+                    )))
+                })
                 .collect(),
             PaneListState::Trash { lines, .. } if lines.is_empty() => {
                 vec![ListItem::new(Line::from("Trash is empty"))]
@@ -309,6 +338,9 @@ pub(crate) fn render_pane(
             PaneListState::Trash {
                 lines, selected, ..
             } if !lines.is_empty() => {
+                list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+            }
+            PaneListState::Tasks { lines, selected } if !lines.is_empty() => {
                 list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
             }
             PaneListState::Help {

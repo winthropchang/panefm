@@ -114,8 +114,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             break;
         }
 
-        if let Some(launch) = app.take_pending_launch() {
-            run_launch_spec(terminal, launch)?;
+        if let Some(queued) = app.take_pending_launch() {
+            let result = run_launch_spec(terminal, queued.launch)
+                .map_err(|error| io::Error::other(error.to_string()));
+            app.finish_launch_task(queued.task_id, result);
             last_cursor_mode = None;
         }
 
