@@ -4898,7 +4898,21 @@ fn typed_char_from_key(key: &KeyEvent) -> Option<char> {
 /// 這類按鍵主要用在 normal mode、panel 導航或 Vim 風格命令，
 /// 目的是把「文字輸入」與「功能命令」分成兩條不同路徑處理。
 fn key_matches_plain_letter(key: &KeyEvent, lowercase: char) -> bool {
-    key.code == KeyCode::Char(lowercase) && key.modifiers.is_empty()
+    if key.code == KeyCode::Char(lowercase) && key.modifiers.is_empty() {
+        return true;
+    }
+
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+
+    matches!(
+        (lowercase, key.code),
+        ('h', KeyCode::Left)
+            | ('j', KeyCode::Down)
+            | ('k', KeyCode::Up)
+            | ('l', KeyCode::Right)
+    )
 }
 
 /// 判斷某些終端送出的 `Shift+字母` 是否應視為大寫命令。
@@ -5655,6 +5669,7 @@ mod tests {
         App, BookmarkPrompt, ClipboardOperation, FilterState, PendingAction, RegexRenameOutcome,
         RenameMode, VisualSelectionState, command_suggestion_navigation, command_suggestions,
         help_entries, key_matches_ctrl_letter, key_matches_letter_any_case,
+        key_matches_plain_letter,
         key_matches_shifted_letter, rename_basename_cursor, rename_next_word_start,
         rename_previous_word_start, rename_word_end, typed_char_from_key,
     };
@@ -5713,6 +5728,22 @@ mod tests {
     #[test]
     /// 驗證功能型按鍵 helper 會接受常見的 terminal 事件變體。
     fn key_normalization_helpers_accept_terminal_variants() {
+        assert!(key_matches_plain_letter(
+            &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            'h'
+        ));
+        assert!(key_matches_plain_letter(
+            &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            'j'
+        ));
+        assert!(key_matches_plain_letter(
+            &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            'k'
+        ));
+        assert!(key_matches_plain_letter(
+            &KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            'l'
+        ));
         assert!(key_matches_shifted_letter(
             &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT),
             'N'
@@ -5782,6 +5813,51 @@ mod tests {
             .expect("type caret");
 
         assert_eq!(app.command_buffer, "^");
+    }
+
+    #[test]
+    /// 驗證一般列表模式下，方向鍵會走和 `hjkl` 相同的移動與進出目錄邏輯。
+    fn app_normal_mode_arrow_keys_map_to_vim_movement() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let initial_cwd = app.panes.get(&1).expect("pane").cwd.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move down");
+        let selected_after_down = app
+            .panes
+            .get(&1)
+            .expect("pane")
+            .selected_entry()
+            .expect("selected")
+            .path
+            .clone();
+        assert_eq!(selected_after_down, beta);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("move up");
+        let selected_after_up = app
+            .panes
+            .get(&1)
+            .expect("pane")
+            .selected_entry()
+            .expect("selected")
+            .path
+            .clone();
+        assert_eq!(selected_after_up, alpha);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .expect("enter directory");
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, alpha);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .expect("go parent");
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, initial_cwd);
     }
 
     #[test]
