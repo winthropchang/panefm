@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+use std::path::Path;
 
 use crate::{
     config::AppConfig,
@@ -205,14 +206,13 @@ pub(crate) fn render_pane(
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
     };
-    let title = format!(
-        " pane {}  {}{}{}{}  [sort: {}]",
+    let title = format_pane_title(
         pane_id,
-        pane.cwd.display(),
+        pane.cwd.as_path(),
         filter_suffix,
-        mark_suffix,
+        &mark_suffix,
         panel_suffix,
-        pane.sort_mode.label()
+        pane.sort_mode.label(),
     );
     let block = Block::default()
         .title(title)
@@ -466,6 +466,24 @@ pub(crate) fn render_pane(
     frame.render_widget(preview, chunks[1]);
 
     editor_cursor.or(panel_cursor)
+}
+
+/// 組合 pane 標題列文字，讓 pane 編號固定顯示在最前面，方便搭配數字切換。
+fn format_pane_title(
+    pane_id: usize,
+    cwd: &Path,
+    filter_suffix: &str,
+    mark_suffix: &str,
+    panel_suffix: &str,
+    sort_label: &str,
+) -> String {
+    format!(
+        " pane #{pane_id}  {}{}{}{}  [sort: {sort_label}]",
+        cwd.display(),
+        filter_suffix,
+        mark_suffix,
+        panel_suffix,
+    )
 }
 
 /// 將 preview 行內容依照可見寬度補齊，讓目前命中列的背景可以延伸到整行右側。
@@ -1178,7 +1196,8 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_size_short;
+    use super::{format_pane_title, format_size_short};
+    use std::path::Path;
 
     #[test]
     /// 驗證大小格式會轉成人類較容易閱讀的單位顯示。
@@ -1187,6 +1206,24 @@ mod tests {
         assert_eq!(format_size_short(2_048), "2kb");
         assert_eq!(format_size_short(1_572_864), "1.5mb");
         assert_eq!(format_size_short(3_221_225_472), "3G");
+    }
+
+    #[test]
+    /// 驗證 pane 標題會把固定 pane 編號顯示在最前面，方便對照快捷鍵切換。
+    fn format_pane_title_keeps_stable_pane_id_prefix() {
+        let title = format_pane_title(
+            3,
+            Path::new("/tmp/demo"),
+            "  [filter]",
+            "  [mark: 2]",
+            "  [help]",
+            "natural",
+        );
+
+        assert_eq!(
+            title,
+            " pane #3  /tmp/demo  [filter]  [mark: 2]  [help]  [sort: natural]"
+        );
     }
 }
 

@@ -509,6 +509,18 @@ impl App {
         self.pending_y = false;
     }
 
+    /// 打開 command UI，並可選擇先填入一段命令前綴，方便使用者直接補參數。
+    fn open_prefilled_command(&mut self, prefill: impl Into<String>) {
+        self.command_mode = true;
+        self.command_buffer = prefill.into();
+        self.command_suggestion_selected = 0;
+        self.command_completion_cycle = None;
+        self.status = String::from("command mode");
+        self.pending_g = false;
+        self.pending_y = false;
+        self.pending_bookmark = None;
+    }
+
     /// 處理一般輸入事件的總入口。
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.code == KeyCode::F(1) {
@@ -551,6 +563,13 @@ impl App {
         }
         if self.pending_bookmark.is_some() {
             return self.handle_bookmark_key(key);
+        }
+        if let Some(target_pane_id) = ctrl_digit_target_pane_id(&key) {
+            self.clear_pending_count();
+            self.pending_g = false;
+            self.pending_y = false;
+            self.focus_pane_by_id(target_pane_id);
+            return Ok(true);
         }
         if self.preview_focus == Some(self.focused_pane) {
             return self.handle_preview_key(key);
@@ -604,25 +623,15 @@ impl App {
             KeyCode::Char(':')
                 if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                self.command_mode = true;
-                self.command_buffer.clear();
-                self.command_suggestion_selected = 0;
-                self.command_completion_cycle = None;
-                self.status = String::from("command mode");
-                self.pending_g = false;
-                self.pending_y = false;
-                self.pending_bookmark = None;
+                self.open_prefilled_command("");
                 true
             }
             KeyCode::Char(';') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.command_mode = true;
-                self.command_buffer.clear();
-                self.command_suggestion_selected = 0;
-                self.command_completion_cycle = None;
-                self.status = String::from("command mode");
-                self.pending_g = false;
-                self.pending_y = false;
-                self.pending_bookmark = None;
+                self.open_prefilled_command("");
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'p') => {
+                self.open_prefilled_command("pane ");
                 true
             }
             _ if key_matches_plain_letter(&key, 'j') => {
@@ -3941,6 +3950,9 @@ impl App {
             "theme next" => self.cycle_theme(),
             "split" => self.split_current(SplitDirection::Horizontal)?,
             "vsplit" => self.split_current(SplitDirection::Vertical)?,
+            "pane" => {
+                self.status = format!("usage: pane <pane-id>. available: {}", self.available_pane_ids_label());
+            }
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
             "rename-regex" => {
@@ -3958,6 +3970,8 @@ impl App {
                     self.start_regex_rename_from_command(args)?;
                 } else if let Some(args) = other.strip_prefix("move-panel ") {
                     self.move_selected_to_pane_id(args.trim())?;
+                } else if let Some(args) = other.strip_prefix("pane ") {
+                    self.focus_pane_by_id_argument(args.trim());
                 } else if let Some(path) = other.strip_prefix("move ") {
                     self.move_selected_to_path(path.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark set ") {
@@ -4034,6 +4048,31 @@ impl App {
             self.focused_pane = ids[(index + ids.len() - 1) % ids.len()];
             self.status = format!("focused pane {}", self.focused_pane);
         }
+    }
+
+    /// 將焦點直接切到指定 pane 編號。
+    pub(crate) fn focus_pane_by_id(&mut self, target_pane_id: usize) {
+        if self.panes.contains_key(&target_pane_id) {
+            self.focused_pane = target_pane_id;
+            self.status = format!("focused pane {target_pane_id}");
+        } else {
+            self.status = format!(
+                "unknown pane {target_pane_id}. available: {}",
+                self.available_pane_ids_label()
+            );
+        }
+    }
+
+    /// 從 `:pane <id>` 的參數解析目標 pane 編號並切換焦點。
+    fn focus_pane_by_id_argument(&mut self, target: &str) {
+        let Some(target_pane_id) = parse_pane_id_argument(target) else {
+            self.status = format!(
+                "usage: pane <pane-id>. available: {}",
+                self.available_pane_ids_label()
+            );
+            return;
+        };
+        self.focus_pane_by_id(target_pane_id);
     }
 
     /// 關閉目前有焦點的 pane。
@@ -4705,9 +4744,7 @@ impl App {
                 self.status = self.visual_status_label();
             }
             HelpReturnState::CommandMode(buffer) => {
-                self.command_mode = true;
-                self.command_buffer = buffer;
-                self.status = String::from("command mode");
+                self.open_prefilled_command(buffer);
             }
             HelpReturnState::AwaitingCtrlW => {
                 self.awaiting_ctrl_w = true;
@@ -5742,10 +5779,17 @@ impl App {
         };
 
         self.pending_action = None;
+        let mut should_restore_help_return = true;
         match entry.action {
-            HelpAction::Command(command) => self
-                .execute_command(command)
-                .map_err(|error| io::Error::other(error.to_string()))?,
+            HelpAction::Command(command) => {
+                if command.ends_with(' ') {
+                    self.open_prefilled_command(command);
+                    should_restore_help_return = false;
+                } else {
+                    self.execute_command(command)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
+            }
             HelpAction::Delete => self.start_delete_confirmation(false),
             HelpAction::Filter => self.open_filter_input(),
             HelpAction::Sort => self.open_sort_picker(),
@@ -5760,7 +5804,7 @@ impl App {
             }
         }
 
-        if self.pending_action.is_none() && self.help_return.is_some() {
+        if should_restore_help_return && self.pending_action.is_none() && self.help_return.is_some() {
             self.restore_help_return_state(true)?;
         }
         Ok(())
@@ -7475,6 +7519,31 @@ fn key_matches_ctrl_shift_letter(key: &KeyEvent, letter: char) -> bool {
         && matches!(key.code, KeyCode::Char(c) if c == lower || c == upper)
 }
 
+/// 把 `Ctrl+數字` 轉成目標 pane 編號。
+///
+/// 目前規則：
+/// - `Ctrl+1` 到 `Ctrl+9` 對應 pane 1..9
+/// - `Ctrl+0` 對應 pane 10
+fn ctrl_digit_target_pane_id(key: &KeyEvent) -> Option<usize> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('1') => Some(1),
+        KeyCode::Char('2') => Some(2),
+        KeyCode::Char('3') => Some(3),
+        KeyCode::Char('4') => Some(4),
+        KeyCode::Char('5') => Some(5),
+        KeyCode::Char('6') => Some(6),
+        KeyCode::Char('7') => Some(7),
+        KeyCode::Char('8') => Some(8),
+        KeyCode::Char('9') => Some(9),
+        KeyCode::Char('0') => Some(10),
+        _ => None,
+    }
+}
+
 /// 描述 command mode 補全候選目前要往前還是往後切換。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuggestionNavigation {
@@ -7717,6 +7786,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "",
             "把目前選取或標記的項目移動到指定 pane 編號目前所在的目錄",
             HelpAction::Command("move-panel "),
+        ),
+        help_entry(
+            ":pane <id>",
+            "Ctrl-p",
+            "打開 pane 切換命令，輸入 pane 編號後可直接把焦點跳到指定 pane",
+            HelpAction::Command("pane "),
         ),
         help_entry(
             ":paste",
@@ -8545,7 +8620,7 @@ mod tests {
         App, BookmarkPrompt, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
         PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
         command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
-        help_entries, is_windows_drive_path, key_matches_ctrl_letter,
+        ctrl_digit_target_pane_id, help_entries, is_windows_drive_path, key_matches_ctrl_letter,
         key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
         key_matches_shifted_letter, looks_like_navigation_path, rename_basename_cursor,
         rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
@@ -8662,6 +8737,27 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 `Ctrl+數字` 會正確轉成 pane 編號，供 pane 快速切換功能共用。
+    fn ctrl_digit_target_pane_id_maps_to_expected_panes() {
+        assert_eq!(
+            ctrl_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL)),
+            Some(1)
+        );
+        assert_eq!(
+            ctrl_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('9'), KeyModifiers::CONTROL)),
+            Some(9)
+        );
+        assert_eq!(
+            ctrl_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('0'), KeyModifiers::CONTROL)),
+            Some(10)
+        );
+        assert_eq!(
+            ctrl_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
     /// 驗證 command 補全的切換快捷鍵支援多種常見 terminal 回報格式。
     fn command_suggestion_navigation_accepts_terminal_variants() {
         assert_eq!(
@@ -8701,6 +8797,20 @@ mod tests {
             .expect("type caret");
 
         assert_eq!(app.command_buffer, "^");
+    }
+
+    #[test]
+    /// 驗證 `Ctrl+p` 會打開 command UI，並預先填入 `pane ` 方便直接輸入目標編號。
+    fn app_ctrl_p_opens_prefilled_pane_command() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .expect("open prefilled pane command");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "pane ");
+        assert_eq!(app.status, "command mode");
     }
 
     #[test]
@@ -9846,6 +9956,88 @@ mod tests {
 
         assert!(app.command_mode);
         assert_eq!(app.command_buffer, "");
+        assert_eq!(app.status, "command mode");
+    }
+
+    #[test]
+    /// 驗證 `:pane <id>` 會把焦點直接切到指定 pane。
+    fn app_pane_command_focuses_target_pane() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+        app.focus_previous_pane();
+        assert_eq!(app.focused_pane, 1);
+
+        app.execute_command("pane 2").expect("focus pane 2");
+
+        assert_eq!(app.focused_pane, 2);
+        assert_eq!(app.status, "focused pane 2");
+    }
+
+    #[test]
+    /// 驗證 `Ctrl+數字` 可直接切換焦點 pane，避免多 pane 時只能依賴 `Ctrl-w hjkl`。
+    fn app_ctrl_digit_focuses_target_pane() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+        app.focus_previous_pane();
+        assert_eq!(app.focused_pane, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL))
+            .expect("focus pane 2");
+
+        assert_eq!(app.focused_pane, 2);
+        assert_eq!(app.status, "focused pane 2");
+    }
+
+    #[test]
+    /// 驗證 `Ctrl+0` 會對應到 pane 10，讓雙位數前的最後一個快捷鍵也可直接使用。
+    fn app_ctrl_zero_focuses_tenth_pane() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        for _ in 0..9 {
+            app.split_current(SplitDirection::Vertical).expect("split");
+        }
+        assert_eq!(app.focused_pane, 10);
+        app.focus_pane_by_id(1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::CONTROL))
+            .expect("focus pane 10");
+
+        assert_eq!(app.focused_pane, 10);
+        assert_eq!(app.status, "focused pane 10");
+    }
+
+    #[test]
+    /// 驗證 help 面板中需要參數的命令，按 Enter 後會打開預填命令，而不是直接執行空參數。
+    fn app_help_panel_argument_command_opens_prefilled_command_mode() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_help_panel();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start help search");
+        for ch in ['C', 't', 'r', 'l', '-', 'p'] {
+            let modifiers = if ch.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), modifiers))
+                .expect("type help query");
+        }
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock help search");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open pane command");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "pane ");
         assert_eq!(app.status, "command mode");
     }
 
