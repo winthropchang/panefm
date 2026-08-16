@@ -38,7 +38,9 @@ use super::{
         open_picker_options,
     },
     pane::{PaneState, SortMode},
-    search::{GlobalSearchEntry, GlobalSearchEvent, stream_search_entries},
+    search::{
+        GlobalSearchEntry, GlobalSearchEvent, stream_content_search_entries, stream_search_entries,
+    },
     smb::{
         ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location,
         resolve_smb_location_with_mount_root,
@@ -132,6 +134,7 @@ pub(crate) struct FzfJumpRequest {
 pub(crate) struct GlobalSearchState {
     pub(crate) pane_id: usize,
     pub(crate) root_dir: PathBuf,
+    pub(crate) mode: SearchMode,
     pub(crate) buffer: String,
     pub(crate) editing: bool,
     pub(crate) loading: bool,
@@ -139,6 +142,33 @@ pub(crate) struct GlobalSearchState {
     pub(crate) selected: usize,
     pub(crate) results: Vec<GlobalSearchEntry>,
     pub(crate) task_id: Option<usize>,
+}
+
+/// 表示目前搜尋面板是在找路徑，還是在找檔案內容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchMode {
+    Path,
+    Content,
+}
+
+impl SearchMode {
+    /// 回傳狀態列與說明文字使用的搜尋模式標籤。
+    fn status_label(self) -> &'static str {
+        match self {
+            SearchMode::Path => "global search",
+            SearchMode::Content => "content search",
+        }
+    }
+
+    /// 回傳搜尋輸入框標題。
+    fn panel_title(self, editing: bool) -> &'static str {
+        match (self, editing) {
+            (SearchMode::Path, true) => " Global Search (insert) ",
+            (SearchMode::Path, false) => " Global Search (normal) ",
+            (SearchMode::Content, true) => " Content Search (insert) ",
+            (SearchMode::Content, false) => " Content Search (normal) ",
+        }
+    }
 }
 
 /// 描述目前 task manager 中單一任務的狀態。
@@ -760,6 +790,13 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            _ if key_matches_shifted_letter(&key, 'S') => {
+                self.clear_pending_count();
+                self.open_content_search()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
             KeyCode::Char('.') => {
                 self.clear_pending_count();
                 self.toggle_hidden_files()?;
@@ -1212,6 +1249,19 @@ impl App {
                     search.results.clear();
                 }
                 KeyCode::Enter => {
+                    if matches!(search.mode, SearchMode::Content) && search.buffer.trim().is_empty()
+                    {
+                        self.status = global_search_status(
+                            search.mode,
+                            &search.buffer,
+                            search.results.len(),
+                            search.editing,
+                            search.searched,
+                            search.loading,
+                        );
+                        self.global_search = Some(search);
+                        return Ok(true);
+                    }
                     self.start_global_search(&mut search)?;
                     search.editing = false;
                 }
@@ -1223,6 +1273,7 @@ impl App {
 
             if !matches!(key.code, KeyCode::Esc) {
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     search.editing,
@@ -1245,6 +1296,7 @@ impl App {
                 search.selected =
                     (search.selected + count).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1258,6 +1310,7 @@ impl App {
                 search.selected =
                     (search.selected + count).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1271,6 +1324,7 @@ impl App {
                 search.selected =
                     (search.selected + step).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1283,6 +1337,7 @@ impl App {
                 let count = self.take_count_or_one();
                 search.selected = search.selected.saturating_sub(count);
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1295,6 +1350,7 @@ impl App {
                 let step = self.take_large_move_step();
                 search.selected = search.selected.saturating_sub(step);
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1308,6 +1364,7 @@ impl App {
                 search.selected =
                     (search.selected + step).min(search.results.len().saturating_sub(1));
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1320,6 +1377,7 @@ impl App {
                 let step = self.take_panel_page_step();
                 search.selected = search.selected.saturating_sub(step);
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1332,6 +1390,7 @@ impl App {
                 let count = self.take_count_or_one();
                 search.selected = search.selected.saturating_sub(count);
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1355,6 +1414,7 @@ impl App {
                     self.pending_g = true;
                 }
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1363,9 +1423,9 @@ impl App {
                 );
                 if self.pending_g {
                     self.status = if let Some(count) = pending_line {
-                        format!("global search (normal): pending {count}g")
+                        format!("{} (normal): pending {count}g", search.mode.status_label())
                     } else {
-                        String::from("global search (normal): pending g")
+                        format!("{} (normal): pending g", search.mode.status_label())
                     };
                 }
                 self.global_search = Some(search);
@@ -1382,6 +1442,7 @@ impl App {
                 }
                 self.pending_g = false;
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -1395,6 +1456,7 @@ impl App {
                 search.editing = true;
                 self.pending_g = false;
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     true,
@@ -1427,6 +1489,7 @@ impl App {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     false,
@@ -3466,6 +3529,7 @@ impl App {
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
             "search" => self.open_global_search()?,
+            "search-content" | "grep" => self.open_content_search()?,
             "connect" => {
                 self.status = String::from("SMB 連線需要完整位址：connect smb://host/share[/path]");
             }
@@ -4152,6 +4216,7 @@ impl App {
             }
             HelpReturnState::GlobalSearch(search) => {
                 self.status = global_search_status(
+                    search.mode,
                     &search.buffer,
                     search.results.len(),
                     search.editing,
@@ -4448,6 +4513,7 @@ impl App {
         let search = GlobalSearchState {
             pane_id: self.focused_pane,
             root_dir: pane.cwd.clone(),
+            mode: SearchMode::Path,
             buffer: String::new(),
             editing: true,
             loading: false,
@@ -4456,7 +4522,32 @@ impl App {
             results: Vec::new(),
             task_id: None,
         };
-        self.status = String::from("global search (insert): type query and Enter");
+        self.status = global_search_status(search.mode, "", 0, true, false, false);
+        self.global_search = Some(search);
+        self.cancel_global_search_worker();
+        Ok(())
+    }
+
+    /// 打開內容搜尋面板，遞迴搜尋目前目錄下所有檔案內容。
+    pub(crate) fn open_content_search(&mut self) -> io::Result<()> {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+
+        let search = GlobalSearchState {
+            pane_id: self.focused_pane,
+            root_dir: pane.cwd.clone(),
+            mode: SearchMode::Content,
+            buffer: String::new(),
+            editing: true,
+            loading: false,
+            searched: false,
+            selected: 0,
+            results: Vec::new(),
+            task_id: None,
+        };
+        self.status = global_search_status(search.mode, "", 0, true, false, false);
         self.global_search = Some(search);
         self.cancel_global_search_worker();
         Ok(())
@@ -5317,6 +5408,7 @@ impl App {
 
         let pane_id = search.pane_id;
         let root_dir = search.root_dir.clone();
+        let mode = search.mode;
         let query = search.buffer.clone();
         let show_hidden = self
             .panes
@@ -5332,20 +5424,36 @@ impl App {
         let task_id = self.push_task(
             pane_id,
             "search",
-            format!("global search: {}", if query.is_empty() { "<all>" } else { &query }),
+            format!(
+                "{}: {}",
+                mode.status_label(),
+                if query.is_empty() { "<all>" } else { &query }
+            ),
             format!("root: {}", root_dir.display()),
         );
         thread::spawn(move || {
-            stream_search_entries(
-                pane_id,
-                &root_dir,
-                show_hidden,
-                &query,
-                limit,
-                chunk_size,
-                worker_cancelled,
-                tx,
-            );
+            match mode {
+                SearchMode::Path => stream_search_entries(
+                    pane_id,
+                    &root_dir,
+                    show_hidden,
+                    &query,
+                    limit,
+                    chunk_size,
+                    worker_cancelled,
+                    tx,
+                ),
+                SearchMode::Content => stream_content_search_entries(
+                    pane_id,
+                    &root_dir,
+                    show_hidden,
+                    &query,
+                    limit,
+                    chunk_size,
+                    worker_cancelled,
+                    tx,
+                ),
+            };
         });
 
         search.loading = true;
@@ -6156,6 +6264,8 @@ impl App {
             Span::raw(" create  "),
             Span::styled("s", self.theme.accent_style()),
             Span::raw(" global search  "),
+            Span::styled("S", self.theme.accent_style()),
+            Span::raw(" content search  "),
             Span::styled("f", self.theme.accent_style()),
             Span::raw(" filter  "),
             Span::styled(".", self.theme.accent_style()),
@@ -6228,6 +6338,7 @@ impl App {
                 frame,
                 *area,
                 self.theme,
+                search.mode.panel_title(search.editing),
                 &search.buffer,
                 search.editing,
             );
@@ -6336,6 +6447,7 @@ impl App {
                     search.selected = search.selected.min(search.results.len().saturating_sub(1));
                     search.searched = true;
                     self.status = global_search_status(
+                        search.mode,
                         &search.buffer,
                         search.results.len(),
                         search.editing,
@@ -6353,6 +6465,7 @@ impl App {
                         completed_search_task = Some((task_id, search.results.len()));
                     }
                     self.status = global_search_status(
+                        search.mode,
                         &search.buffer,
                         search.results.len(),
                         search.editing,
@@ -6973,8 +7086,14 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":search",
             "s",
-            "打開全域搜尋輸入框",
+            "遞迴搜尋目前目錄下的檔名與路徑",
             HelpAction::Command("search"),
+        ),
+        help_entry(
+            ":search-content",
+            "S",
+            "遞迴搜尋目前目錄下檔案內容",
+            HelpAction::Command("search-content"),
         ),
         help_entry(
             ":preview-search",
@@ -7259,25 +7378,27 @@ fn list_find_locked_status(buffer: &str, matches: usize) -> String {
 
 /// 依照目前 global search 文字、結果數與模式，產生狀態列訊息。
 fn global_search_status(
+    mode: SearchMode,
     buffer: &str,
     matches: usize,
     editing: bool,
     searched: bool,
     loading: bool,
 ) -> String {
-    let mode = if editing { "insert" } else { "normal" };
+    let interaction_mode = if editing { "insert" } else { "normal" };
+    let label = mode.status_label();
     if loading {
-        format!("global search ({mode}): loading...")
+        format!("{label} ({interaction_mode}): loading...")
     } else if !searched {
         if buffer.is_empty() {
-            format!("global search ({mode}): type query and Enter")
+            format!("{label} ({interaction_mode}): type query and Enter")
         } else {
-            format!("global search ({mode}): {buffer} (press Enter to search)")
+            format!("{label} ({interaction_mode}): {buffer} (press Enter to search)")
         }
     } else if buffer.is_empty() {
-        format!("global search ({mode}): all ({matches})")
+        format!("{label} ({interaction_mode}): all ({matches})")
     } else {
-        format!("global search ({mode}): {buffer} ({matches})")
+        format!("{label} ({interaction_mode}): {buffer} ({matches})")
     }
 }
 
@@ -7498,7 +7619,7 @@ mod tests {
 
     use super::{
         App, BookmarkPrompt, ClipboardOperation, FilterState, ListFindState, PendingAction,
-        RegexRenameOutcome, RenameMode, TaskState, VisualSelectionState,
+        RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
         command_suggestion_navigation, command_suggestions, help_entries,
         key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
         key_matches_plain_letter, key_matches_shifted_letter, rename_basename_cursor,
@@ -10124,6 +10245,50 @@ mod tests {
         assert!(app.global_search.is_none());
         assert!(app.global_search_rx.is_none());
         assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 `Shift+S` 會打開內容搜尋面板，而不是一般路徑搜尋。
+    fn app_shift_s_opens_content_search() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE))
+            .expect("open content search");
+
+        let search = app.global_search.as_ref().expect("search");
+        assert_eq!(search.mode, SearchMode::Content);
+        assert!(search.editing);
+        assert_eq!(app.status, "content search (insert): type query and Enter");
+    }
+
+    #[test]
+    /// 驗證內容搜尋會依照檔案內容比對結果，並只回傳真正命中的檔案。
+    fn app_content_search_matches_file_contents() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("docs")).expect("docs");
+        fs::write(dir.path().join("docs").join("guide.md"), "release note").expect("guide");
+        fs::write(dir.path().join("todo.txt"), "buy milk").expect("todo");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE))
+            .expect("open content search");
+        for ch in ['r', 'e', 'l', 'e', 'a', 's', 'e'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type query");
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run content search");
+        wait_for_global_search(&mut app);
+
+        let search = app.global_search.as_ref().expect("search");
+        assert_eq!(search.mode, SearchMode::Content);
+        assert!(!search.editing);
+        assert!(search.searched);
+        assert_eq!(search.results.len(), 1);
+        assert_eq!(search.results[0].relative_path, "docs/guide.md");
+        assert_eq!(app.status, "content search (normal): release (1)");
     }
 
     #[test]

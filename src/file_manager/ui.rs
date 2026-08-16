@@ -651,8 +651,9 @@ pub(crate) fn render_global_search_panel(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     theme: Theme,
+    title: &str,
     buffer: &str,
-    editing: bool,
+    _editing: bool,
 ) -> (u16, u16) {
     let width = area.width.min(40).max(24);
     let panel_area = Rect {
@@ -665,11 +666,7 @@ pub(crate) fn render_global_search_panel(
     frame.render_widget(Clear, panel_area);
     let block = Block::default()
         .title(Line::from(Span::styled(
-            if editing {
-                " Global Search (insert) "
-            } else {
-                " Global Search (normal) "
-            },
+            title,
             theme.accent_style().add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)

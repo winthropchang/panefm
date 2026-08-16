@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -251,13 +253,176 @@ pub(crate) fn stream_search_entries(
     });
 }
 
+/// 以分批方式掃描檔案內容，找到至少一個文字命中的檔案就立即回傳。
+///
+/// 規則：
+/// - 只搜尋檔案，不回傳資料夾。
+/// - 以不分大小寫方式比對內容。
+/// - 若檔案含有 NUL byte，視為 binary 檔並略過，避免把大量二進位資料灌進搜尋。
+pub(crate) fn stream_content_search_entries(
+    pane_id: usize,
+    root: &Path,
+    show_hidden: bool,
+    query: &str,
+    limit: usize,
+    chunk_size: usize,
+    cancelled: Arc<AtomicBool>,
+    sender: Sender<GlobalSearchEvent>,
+) {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        let _ = sender.send(GlobalSearchEvent::Done {
+            pane_id,
+            query: query.to_string(),
+        });
+        return;
+    }
+
+    let walker = WalkBuilder::new(root).hidden(!show_hidden).build();
+    let query_lower = trimmed.to_lowercase();
+    let mut batch = Vec::new();
+    let mut matched = 0usize;
+
+    for entry in walker {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            continue;
+        }
+
+        if !file_contains_query(path, &query_lower, &cancelled) {
+            continue;
+        }
+
+        let relative_path = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        batch.push(GlobalSearchEntry {
+            path: path.to_path_buf(),
+            relative_path,
+            is_dir: false,
+        });
+        matched += 1;
+
+        if batch.len() >= chunk_size.max(1) {
+            batch.sort_by(|left, right| {
+                left.relative_path
+                    .to_lowercase()
+                    .cmp(&right.relative_path.to_lowercase())
+                    .then_with(|| left.relative_path.cmp(&right.relative_path))
+            });
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if sender
+                .send(GlobalSearchEvent::Chunk {
+                    pane_id,
+                    query: query.to_string(),
+                    entries: std::mem::take(&mut batch),
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        if matched >= limit.max(1) {
+            break;
+        }
+    }
+
+    if !batch.is_empty() {
+        batch.sort_by(|left, right| {
+            left.relative_path
+                .to_lowercase()
+                .cmp(&right.relative_path.to_lowercase())
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        if sender
+            .send(GlobalSearchEvent::Chunk {
+                pane_id,
+                query: query.to_string(),
+                entries: batch,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = sender.send(GlobalSearchEvent::Done {
+        pane_id,
+        query: query.to_string(),
+    });
+}
+
+/// 檢查單一檔案內容是否包含指定查詢字串。
+fn file_contains_query(path: &Path, query_lower: &str, cancelled: &AtomicBool) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        buffer.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut buffer) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        if buffer.contains(&0) {
+            return false;
+        }
+        let line = String::from_utf8_lossy(&buffer);
+        if line.to_lowercase().contains(query_lower) {
+            return true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{
+        Arc,
+        atomic::AtomicBool,
+        mpsc,
+    };
 
     use tempfile::tempdir;
 
-    use super::{collect_search_entries, filter_search_entries};
+    use super::{
+        GlobalSearchEvent, collect_search_entries, filter_search_entries,
+        stream_content_search_entries,
+    };
 
     #[test]
     /// 驗證 global search 會遞迴收集巢狀目錄中的檔案與資料夾。
@@ -287,5 +452,36 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].relative_path, "Readme.md");
+    }
+
+    #[test]
+    /// 驗證內容搜尋只會回傳真正命中文字內容的檔案，且會略過 binary 檔。
+    fn stream_content_search_entries_matches_file_contents() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "hello rust world\n").expect("notes");
+        fs::write(dir.path().join("other.txt"), "python only\n").expect("other");
+        fs::write(dir.path().join("image.bin"), [0, 159, 146, 150]).expect("binary");
+
+        let (tx, rx) = mpsc::channel();
+        stream_content_search_entries(
+            1,
+            dir.path(),
+            false,
+            "rust",
+            20,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let mut results = Vec::new();
+        for event in rx.try_iter() {
+            if let GlobalSearchEvent::Chunk { entries, .. } = event {
+                results.extend(entries);
+            }
+        }
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].relative_path, "notes.txt");
     }
 }
