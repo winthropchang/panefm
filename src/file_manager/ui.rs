@@ -197,6 +197,8 @@ pub(crate) fn render_pane(
         .border_style(border_style);
 
     let content_width = chunks[0].width.saturating_sub(4) as usize;
+    let list_viewport_height = chunks[0].height.saturating_sub(2).max(1) as usize;
+    pane.set_list_viewport_height(list_viewport_height);
     let items: Vec<ListItem<'static>> = if let Some(panel_state) = panel_state {
         match panel_state {
             PaneListState::Search(search_state) if search_state.loading => {

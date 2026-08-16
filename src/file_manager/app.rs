@@ -376,6 +376,16 @@ impl App {
         self.take_pending_count().unwrap_or(1).max(1)
     }
 
+    /// 取出目前 count，並轉成固定大步長移動的實際步數。
+    fn take_large_move_step(&mut self) -> usize {
+        self.take_count_or_one().saturating_mul(5)
+    }
+
+    /// 取出目前 count，並轉成一般彈窗列表使用的 page 步長。
+    fn take_panel_page_step(&mut self) -> usize {
+        self.take_count_or_one().saturating_mul(10)
+    }
+
     /// 清除目前暫存的 count prefix。
     fn clear_pending_count(&mut self) {
         self.pending_count = None;
@@ -494,11 +504,43 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            _ if key_matches_shifted_letter(&key, 'J') => {
+                let step = self.take_large_move_step();
+                self.current_pane_mut()?.move_down_by(step);
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = format!("fast down: {step}");
+                true
+            }
             _ if key_matches_plain_letter(&key, 'k') => {
                 let count = self.take_count_or_one();
                 self.current_pane_mut()?.move_up_by(count);
                 self.pending_g = false;
                 self.pending_y = false;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'K') => {
+                let step = self.take_large_move_step();
+                self.current_pane_mut()?.move_up_by(step);
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = format!("fast up: {step}");
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'd') => {
+                self.clear_pending_count();
+                let step = self.current_pane_mut()?.page_down();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = format!("page down: {step}");
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'u') => {
+                self.clear_pending_count();
+                let step = self.current_pane_mut()?.page_up();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = format!("page up: {step}");
                 true
             }
             _ if key_matches_plain_letter(&key, 'h') => {
@@ -724,6 +766,20 @@ impl App {
             self.status = self.jump_preview_match(false, count)?;
             return Ok(true);
         }
+        if key_matches_shifted_letter(&key, 'J') {
+            let step = self.take_large_move_step();
+            self.current_pane_mut()?.scroll_preview_down(step);
+            self.pending_g = false;
+            self.status = format!("preview: fast down {step}");
+            return Ok(true);
+        }
+        if key_matches_shifted_letter(&key, 'K') {
+            let step = self.take_large_move_step();
+            self.current_pane_mut()?.scroll_preview_up(step);
+            self.pending_g = false;
+            self.status = format!("preview: fast up {step}");
+            return Ok(true);
+        }
         if key_matches_shifted_letter(&key, 'G') {
             if let Some(count) = self.take_pending_count() {
                 self.current_pane_mut()?
@@ -884,6 +940,34 @@ impl App {
                 self.sync_visual_selection_cursor();
                 self.status = self.visual_status_label();
             }
+            _ if key_matches_shifted_letter(&key, 'J') => {
+                let step = self.take_large_move_step();
+                self.current_pane_mut()?.move_down_by(step);
+                self.sync_visual_selection_cursor();
+                self.pending_g = false;
+                self.status = self.visual_status_label();
+            }
+            _ if key_matches_shifted_letter(&key, 'K') => {
+                let step = self.take_large_move_step();
+                self.current_pane_mut()?.move_up_by(step);
+                self.sync_visual_selection_cursor();
+                self.pending_g = false;
+                self.status = self.visual_status_label();
+            }
+            _ if key_matches_ctrl_letter(&key, 'd') => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.page_down();
+                self.sync_visual_selection_cursor();
+                self.pending_g = false;
+                self.status = self.visual_status_label();
+            }
+            _ if key_matches_ctrl_letter(&key, 'u') => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.page_up();
+                self.sync_visual_selection_cursor();
+                self.pending_g = false;
+                self.status = self.visual_status_label();
+            }
             _ if key_matches_plain_letter(&key, 'g') => {
                 let pending_line = self.pending_count;
                 if self.pending_g {
@@ -1038,9 +1122,59 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
+            _ if key_matches_shifted_letter(&key, 'J') => {
+                let step = self.take_large_move_step();
+                search.selected =
+                    (search.selected + step).min(search.results.len().saturating_sub(1));
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
             KeyCode::Up => {
                 let count = self.take_count_or_one();
                 search.selected = search.selected.saturating_sub(count);
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            _ if key_matches_shifted_letter(&key, 'K') => {
+                let step = self.take_large_move_step();
+                search.selected = search.selected.saturating_sub(step);
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            _ if key_matches_ctrl_letter(&key, 'd') => {
+                let step = self.take_panel_page_step();
+                search.selected =
+                    (search.selected + step).min(search.results.len().saturating_sub(1));
+                self.status = global_search_status(
+                    &search.buffer,
+                    search.results.len(),
+                    false,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+            }
+            _ if key_matches_ctrl_letter(&key, 'u') => {
+                let step = self.take_panel_page_step();
+                search.selected = search.selected.saturating_sub(step);
                 self.status = global_search_status(
                     &search.buffer,
                     search.results.len(),
@@ -1352,6 +1486,28 @@ impl App {
                     self.pending_action = Some(PendingAction::ThemePicker { selected });
                     self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
                 }
+                _ if key_matches_shifted_letter(&key, 'J') => {
+                    selected = (selected + self.take_large_move_step())
+                        .min(ThemePreset::ALL.len().saturating_sub(1));
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                _ if key_matches_shifted_letter(&key, 'K') => {
+                    selected = selected.saturating_sub(self.take_large_move_step());
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                _ if key_matches_ctrl_letter(&key, 'd') => {
+                    selected = (selected + self.take_panel_page_step())
+                        .min(ThemePreset::ALL.len().saturating_sub(1));
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
+                _ if key_matches_ctrl_letter(&key, 'u') => {
+                    selected = selected.saturating_sub(self.take_panel_page_step());
+                    self.pending_action = Some(PendingAction::ThemePicker { selected });
+                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                }
                 KeyCode::Enter => self.apply_theme(ThemePreset::ALL[selected]),
                 _ if key_matches_plain_letter(&key, 'l') => {
                     self.apply_theme(ThemePreset::ALL[selected])
@@ -1566,12 +1722,24 @@ impl App {
                         }
                         _ if key_matches_ctrl_letter(&key, 'd') => {
                             if len > 0 {
-                                selected = (selected + 10).min(len.saturating_sub(1));
+                                selected = (selected + self.take_panel_page_step())
+                                    .min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
                         _ if key_matches_ctrl_letter(&key, 'u') => {
-                            selected = selected.saturating_sub(10);
+                            selected = selected.saturating_sub(self.take_panel_page_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'J') => {
+                            if len > 0 {
+                                selected = (selected + self.take_large_move_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'K') => {
+                            selected = selected.saturating_sub(self.take_large_move_step());
                             self.pending_g = false;
                         }
                         KeyCode::Enter => {
@@ -1765,12 +1933,24 @@ impl App {
                         }
                         _ if key_matches_ctrl_letter(&key, 'd') => {
                             if filtered_len > 0 {
-                                selected = (selected + 10).min(filtered_len.saturating_sub(1));
+                                selected = (selected + self.take_panel_page_step())
+                                    .min(filtered_len.saturating_sub(1));
                             }
                             self.pending_g = false;
                         }
                         _ if key_matches_ctrl_letter(&key, 'u') => {
-                            selected = selected.saturating_sub(10);
+                            selected = selected.saturating_sub(self.take_panel_page_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'J') => {
+                            if filtered_len > 0 {
+                                selected = (selected + self.take_large_move_step())
+                                    .min(filtered_len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'K') => {
+                            selected = selected.saturating_sub(self.take_large_move_step());
                             self.pending_g = false;
                         }
                         KeyCode::Enter => {
@@ -1858,6 +2038,28 @@ impl App {
                     }
                     _ if key_matches_plain_letter(&key, 'k') => {
                         selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'd') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'u') => {
+                        selected = selected.saturating_sub(self.take_panel_page_step());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_shifted_letter(&key, 'J') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_shifted_letter(&key, 'K') => {
+                        selected = selected.saturating_sub(self.take_large_move_step());
                         self.pending_g = false;
                     }
                     _ if key_matches_plain_letter(&key, 'g') => {
@@ -1957,6 +2159,48 @@ impl App {
                     }
                     _ if key_matches_plain_letter(&key, 'k') => {
                         selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'd') => {
+                        if !options.is_empty() {
+                            selected = (selected + self.take_panel_page_step())
+                                .min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'u') => {
+                        selected = selected.saturating_sub(self.take_panel_page_step());
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    _ if key_matches_shifted_letter(&key, 'J') => {
+                        if !options.is_empty() {
+                            selected = (selected + self.take_large_move_step())
+                                .min(options.len().saturating_sub(1));
+                        }
+                        self.pending_action = Some(PendingAction::OpenPicker {
+                            pane_id,
+                            target: target.clone(),
+                            selected,
+                        });
+                        self.status = format!("open with: {}", target.display_name);
+                    }
+                    _ if key_matches_shifted_letter(&key, 'K') => {
+                        selected = selected.saturating_sub(self.take_large_move_step());
                         self.pending_action = Some(PendingAction::OpenPicker {
                             pane_id,
                             target: target.clone(),
@@ -2482,6 +2726,56 @@ impl App {
                     }
                     _ if key_matches_plain_letter(&key, 'k') => {
                         selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'd') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'u') => {
+                        selected = selected.saturating_sub(self.take_panel_page_step());
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    _ if key_matches_shifted_letter(&key, 'J') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                        self.pending_action = Some(PendingAction::RegexRename {
+                            pane_id,
+                            pattern,
+                            replacement,
+                            selected,
+                            previews,
+                        });
+                    }
+                    _ if key_matches_shifted_letter(&key, 'K') => {
+                        selected = selected.saturating_sub(self.take_large_move_step());
                         self.pending_g = false;
                         self.pending_action = Some(PendingAction::RegexRename {
                             pane_id,
@@ -4972,6 +5266,10 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled("hjkl", self.theme.accent_style()),
             Span::raw(" move  "),
+            Span::styled("J/K", self.theme.accent_style()),
+            Span::raw(" fast  "),
+            Span::styled("Ctrl-d/u", self.theme.accent_style()),
+            Span::raw(" page  "),
             Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
             Span::styled("m / '", self.theme.accent_style()),
@@ -7234,6 +7532,88 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 normal mode 的 `J / K` 會用固定大步長快速移動列表游標。
+    fn app_shift_j_and_k_move_by_large_step() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..12 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").expect("file");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE))
+            .expect("fast down");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 5);
+        assert_eq!(app.status, "fast down: 5");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE))
+            .expect("fast up");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 0);
+        assert_eq!(app.status, "fast up: 5");
+    }
+
+    #[test]
+    /// 驗證 preview mode 的 `J / K` 會用固定大步長快速捲動內容。
+    fn app_preview_shift_j_and_k_scroll_by_large_step() {
+        let dir = tempdir().expect("tempdir");
+        let content = (0..20)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(dir.path().join("notes.txt"), content).expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_preview_viewport_height(4);
+        app.open_preview_focus();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE))
+            .expect("preview fast down");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 5);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE))
+            .expect("preview fast up");
+        assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+    }
+
+    #[test]
+    /// 驗證 help 面板支援 `J / K` 與 `Ctrl-d / Ctrl-u`，讓大步長與分頁移動可在暫時列表中共用。
+    fn app_help_panel_supports_fast_and_page_navigation() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_help_panel();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE))
+            .expect("help fast down");
+        match app.pending_action {
+            Some(PendingAction::HelpPanel { selected, .. }) => assert_eq!(selected, 5),
+            ref other => panic!("unexpected pending action: {other:?}"),
+        }
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("help page down");
+        match app.pending_action {
+            Some(PendingAction::HelpPanel { selected, .. }) => assert_eq!(selected, 15),
+            ref other => panic!("unexpected pending action: {other:?}"),
+        }
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("help page up");
+        match app.pending_action {
+            Some(PendingAction::HelpPanel { selected, .. }) => assert_eq!(selected, 5),
+            ref other => panic!("unexpected pending action: {other:?}"),
+        }
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE))
+            .expect("help fast up");
+        match app.pending_action {
+            Some(PendingAction::HelpPanel { selected, .. }) => assert_eq!(selected, 0),
+            ref other => panic!("unexpected pending action: {other:?}"),
+        }
+    }
+
+    #[test]
     /// 驗證 help 面板中的 `:delete` 會保留 `d` 快捷鍵，並透過 Enter 進入刪除確認。
     fn app_help_panel_delete_entry_matches_delete_behavior() {
         let dir = tempdir().expect("tempdir");
@@ -8840,5 +9220,71 @@ mod tests {
             "alps.txt"
         );
         assert!(app.pending_count.is_none());
+    }
+
+    #[test]
+    /// 驗證 normal mode 的 `Ctrl-d / Ctrl-u` 會依照目前列表 viewport 高度做半頁移動。
+    fn app_ctrl_d_and_ctrl_u_move_by_half_page() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..10 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").expect("file");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_list_viewport_height(6);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("page down");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 3);
+        assert_eq!(app.status, "page down: 3");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("page up");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 0);
+        assert_eq!(app.status, "page up: 3");
+    }
+
+    #[test]
+    /// 驗證 visual selection 中的 `Ctrl-d / Ctrl-u` 也會用半頁步長移動，並同步更新範圍。
+    fn app_visual_selection_ctrl_d_and_ctrl_u_follow_half_page() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..10 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").expect("file");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_list_viewport_height(6);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
+            .expect("visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("visual page down");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 3);
+        assert_eq!(
+            app.visual_selection,
+            Some(VisualSelectionState {
+                pane_id: 1,
+                anchor: 0,
+                current: 3,
+            })
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("visual page up");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 0);
+        assert_eq!(
+            app.visual_selection,
+            Some(VisualSelectionState {
+                pane_id: 1,
+                anchor: 0,
+                current: 0,
+            })
+        );
     }
 }

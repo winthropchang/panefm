@@ -33,6 +33,8 @@ pub(crate) struct PaneState {
     pub(crate) selected: usize,
     /// `ratatui` 的列表狀態，供畫面渲染使用。
     pub(crate) list_state: ListState,
+    /// 目前列表區實際可顯示的列數，供半頁移動等行為計算步長。
+    pub(crate) list_viewport_height: usize,
     /// 目前啟用中的過濾字串，`None` 代表沒有啟用 filter。
     pub(crate) filter_query: Option<String>,
     /// 目前實際顯示在列表中的項目索引。
@@ -126,6 +128,7 @@ impl PaneState {
             entries: Vec::new(),
             selected: 0,
             list_state: ListState::default(),
+            list_viewport_height: 1,
             filter_query: None,
             visible_indices: Vec::new(),
             show_hidden: false,
@@ -219,6 +222,34 @@ impl PaneState {
         self.selected = self.visible_indices.len() - 1;
         self.list_state.select(Some(self.selected));
         self.preview_scroll = 0;
+    }
+
+    /// 更新列表區目前實際可顯示的列數，供半頁移動等行為使用。
+    ///
+    /// 參數：
+    /// - `height: usize`，扣掉邊框後目前列表區可視的列數。
+    ///
+    /// 回傳：`()`
+    pub(crate) fn set_list_viewport_height(&mut self, height: usize) {
+        self.list_viewport_height = height.max(1);
+    }
+
+    /// 依照目前列表 viewport 高度向下移動半頁。
+    ///
+    /// 回傳：實際採用的步長。
+    pub(crate) fn page_down(&mut self) -> usize {
+        let step = (self.list_viewport_height / 2).max(1);
+        self.move_down_by(step);
+        step
+    }
+
+    /// 依照目前列表 viewport 高度向上移動半頁。
+    ///
+    /// 回傳：實際採用的步長。
+    pub(crate) fn page_up(&mut self) -> usize {
+        let step = (self.list_viewport_height / 2).max(1);
+        self.move_up_by(step);
+        step
     }
 
     /// 將列表選取游標跳到指定的可見索引位置。
