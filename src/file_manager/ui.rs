@@ -106,6 +106,12 @@ pub(crate) struct BookmarkPanelLine {
     pub(crate) path: String,
 }
 
+/// 描述 recent 目錄列表彈窗中單一列要顯示的內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecentPanelLine {
+    pub(crate) path: String,
+}
+
 /// 描述 regex 批次改名預覽面板中單一列要顯示的內容。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegexRenamePanelLine {
@@ -837,6 +843,53 @@ pub(crate) fn render_bookmark_picker(
                     line.path
                 )))
             })
+            .collect::<Vec<_>>()
+    };
+
+    let mut list_state = ListState::default();
+    if !lines.is_empty() {
+        list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+    }
+
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(theme.selected_item_style())
+            .highlight_symbol("▶ "),
+        inner,
+        &mut list_state,
+    );
+}
+
+/// 在畫面中央繪製 recent 目錄列表彈窗，供 `:recent` 使用。
+pub(crate) fn render_recent_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    lines: &[RecentPanelLine],
+    selected: usize,
+) {
+    let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
+    let popup_area = centered_rect(area, 68, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Recent ",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let items = if lines.is_empty() {
+        vec![ListItem::new(Line::from(
+            "沒有 recent 目錄，先切換幾次目錄再回來",
+        ))]
+    } else {
+        lines
+            .iter()
+            .map(|line| ListItem::new(Line::from(line.path.clone())))
             .collect::<Vec<_>>()
     };
 

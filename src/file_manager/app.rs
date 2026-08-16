@@ -49,10 +49,10 @@ use super::{
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
-        InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TaskPanelLine,
-        TrashPanelLine, render_bookmark_picker, render_command_palette, render_confirm_dialog,
-        render_filter_input, render_global_search_panel, render_pane, render_preview_search_input,
-        render_theme_picker,
+        InlinePickerState, PaneListState, RecentPanelLine, RegexRenamePanelLine, SearchListState,
+        TaskPanelLine, TrashPanelLine, render_bookmark_picker, render_command_palette,
+        render_confirm_dialog, render_filter_input, render_global_search_panel, render_pane,
+        render_preview_search_input, render_recent_picker, render_theme_picker,
     },
 };
 
@@ -275,6 +275,10 @@ pub(crate) enum PendingAction {
         selected: usize,
     },
     BookmarkList {
+        pane_id: usize,
+        selected: usize,
+    },
+    RecentList {
         pane_id: usize,
         selected: usize,
     },
@@ -2599,6 +2603,123 @@ impl App {
                 self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
                 self.status = bookmark_list_status(len, selected);
             }
+            PendingAction::RecentList {
+                pane_id,
+                mut selected,
+            } => {
+                let len = self
+                    .panes
+                    .get(&pane_id)
+                    .map(|pane| pane.recent_dirs().len())
+                    .unwrap_or(0);
+                if self.capture_pending_count_digit(&key) {
+                    self.pending_action = Some(PendingAction::RecentList { pane_id, selected });
+                    return Ok(true);
+                }
+                if key_matches_shifted_letter(&key, 'G') {
+                    if let Some(count) = self.take_pending_count() {
+                        if len > 0 {
+                            selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                        }
+                    } else if len > 0 {
+                        selected = len - 1;
+                    }
+                    self.pending_g = false;
+                    self.pending_action = Some(PendingAction::RecentList { pane_id, selected });
+                    self.status = recent_list_status(len, selected);
+                    return Ok(true);
+                }
+                match key.code {
+                    KeyCode::Down => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'j') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'k') => {
+                        selected = selected.saturating_sub(self.take_count_or_one());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'd') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_ctrl_letter(&key, 'u') => {
+                        selected = selected.saturating_sub(self.take_panel_page_step());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_shifted_letter(&key, 'J') => {
+                        if len > 0 {
+                            selected =
+                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
+                        }
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_shifted_letter(&key, 'K') => {
+                        selected = selected.saturating_sub(self.take_large_move_step());
+                        self.pending_g = false;
+                    }
+                    _ if key_matches_plain_letter(&key, 'g') => {
+                        if self.pending_g {
+                            if let Some(count) = self.take_pending_count() {
+                                selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                            } else {
+                                selected = 0;
+                            }
+                            self.pending_g = false;
+                        } else {
+                            self.pending_g = true;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.open_recent_from_list(pane_id, selected)?;
+                        return Ok(true);
+                    }
+                    _ if key_matches_plain_letter(&key, 'l') => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.open_recent_from_list(pane_id, selected)?;
+                        return Ok(true);
+                    }
+                    KeyCode::Esc => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
+                    _ if key_matches_plain_letter(&key, 'q')
+                        || key_matches_plain_letter(&key, 'h') =>
+                    {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
+                    _ => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                    }
+                }
+                self.pending_action = Some(PendingAction::RecentList { pane_id, selected });
+                self.status = recent_list_status(len, selected);
+            }
             PendingAction::CopyPicker {
                 pane_id,
                 target,
@@ -3537,6 +3658,13 @@ impl App {
             self.apply_path_completion_tab_cycle(key.code == KeyCode::BackTab, &suggestions);
             return Ok(true);
         }
+        if !path_completion_active
+            && (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
+            && !suggestions.is_empty()
+        {
+            self.apply_command_completion_tab(key.code == KeyCode::BackTab, &suggestions);
+            return Ok(true);
+        }
         if let Some(direction) = command_suggestion_navigation(&key) {
             if !suggestions.is_empty() {
                 match direction {
@@ -3675,6 +3803,34 @@ impl App {
         });
     }
 
+    /// 在一般 command 提示模式下處理 `Tab` / `Shift+Tab`，直接採用最接近的候選。
+    ///
+    /// `Tab` 會使用目前選取的提示；若使用者尚未手動切換，預設採用排序後的第一筆。
+    /// `Shift+Tab` 則會先往上一筆，再套用該提示，方便快速反向挑選。
+    fn apply_command_completion_tab(
+        &mut self,
+        reverse: bool,
+        suggestions: &[CommandSuggestionLine],
+    ) {
+        if suggestions.is_empty() {
+            return;
+        }
+
+        let len = suggestions.len();
+        let selected = if reverse {
+            (self.command_suggestion_selected + len - 1) % len
+        } else {
+            self.command_suggestion_selected.min(len - 1)
+        };
+
+        self.command_suggestion_selected = selected;
+        self.command_buffer = suggestions[selected]
+            .command
+            .trim_start_matches(':')
+            .to_string();
+        self.command_completion_cycle = None;
+    }
+
     /// 在一般模式按下 `Esc` 時，優先處理 filter 的兩段式離開流程。
     fn handle_escape_in_normal_mode(&mut self) {
         if let Some(filter) = self.filter.take() {
@@ -3775,6 +3931,7 @@ impl App {
             "tasks" => self.open_task_panel(),
             "help" => self.open_help_panel(),
             "bookmark list" => self.open_bookmark_list(),
+            "recent" => self.open_recent_list(),
             "restore" => self.restore_latest_from_trash()?,
             "trash clear" => self.clear_trash()?,
             "trash restore-all" => self.restore_all_from_trash()?,
@@ -4005,6 +4162,20 @@ impl App {
         self.status = bookmark_list_status(self.bookmark_store.list().len(), 0);
     }
 
+    /// 打開目前 pane 的 recent 目錄列表，方便快速跳回先前去過的位置。
+    pub(crate) fn open_recent_list(&mut self) {
+        let count = self
+            .panes
+            .get(&self.focused_pane)
+            .map(|pane| pane.recent_dirs().len())
+            .unwrap_or(0);
+        self.pending_action = Some(PendingAction::RecentList {
+            pane_id: self.focused_pane,
+            selected: 0,
+        });
+        self.status = recent_list_status(count, 0);
+    }
+
     /// 處理等待書籤按鍵時的輸入。
     pub(crate) fn handle_bookmark_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(prompt) = self.pending_bookmark.take() else {
@@ -4208,6 +4379,27 @@ impl App {
             return Ok(());
         };
         self.jump_to_bookmark_target(pane_id, entry.key, &target)
+    }
+
+    /// 從 recent 列表中打開目前選取的目錄。
+    fn open_recent_from_list(&mut self, pane_id: usize, selected: usize) -> io::Result<()> {
+        let Some(target_path) = self
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.recent_dirs().get(selected).cloned())
+        else {
+            self.status = String::from("recent: empty");
+            return Ok(());
+        };
+
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        pane.go_to_path(&target_path)?;
+        self.focused_pane = pane_id;
+        self.status = format!("jumped to recent: {}", target_path.display());
+        Ok(())
     }
 
     /// 取得目前選取項目的外部開啟目標資訊。
@@ -4586,6 +4778,14 @@ impl App {
             ),
             PendingAction::BookmarkList { selected, .. } => {
                 bookmark_list_status(self.bookmark_store.list().len(), *selected)
+            }
+            PendingAction::RecentList { pane_id, selected } => {
+                let count = self
+                    .panes
+                    .get(pane_id)
+                    .map(|pane| pane.recent_dirs().len())
+                    .unwrap_or(0);
+                recent_list_status(count, *selected)
             }
             PendingAction::CopyPicker { target, .. } => {
                 format!("copy to clipboard: {}", target.display_name)
@@ -6821,6 +7021,17 @@ impl App {
                     render_bookmark_picker(frame, *area, self.theme, &lines, *selected);
                 }
             }
+            Some(PendingAction::RecentList { pane_id, selected }) => {
+                let lines = recent_panel_lines(
+                    self.panes
+                        .get(pane_id)
+                        .map(|pane| pane.recent_dirs().to_vec())
+                        .unwrap_or_default(),
+                );
+                if let Some(area) = pane_rects.get(pane_id) {
+                    render_recent_picker(frame, *area, self.theme, &lines, *selected);
+                }
+            }
             Some(PendingAction::TrashPanel { .. })
             | Some(PendingAction::TaskPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
@@ -6979,6 +7190,16 @@ fn bookmark_panel_lines(entries: Vec<BookmarkEntry>) -> Vec<BookmarkPanelLine> {
         .map(|entry| BookmarkPanelLine {
             key: format!("[{}]", entry.key),
             path: entry.target.display_text(),
+        })
+        .collect()
+}
+
+/// 將 recent 目錄清單轉成彈窗可直接顯示的列內容。
+fn recent_panel_lines(entries: Vec<PathBuf>) -> Vec<RecentPanelLine> {
+    entries
+        .into_iter()
+        .map(|path| RecentPanelLine {
+            path: path.display().to_string(),
         })
         .collect()
 }
@@ -7304,6 +7525,19 @@ fn bookmark_list_status(count: usize, selected: usize) -> String {
     }
 }
 
+/// 根據目前 recent 面板內容，產生適合顯示在狀態列的提示文字。
+fn recent_list_status(count: usize, selected: usize) -> String {
+    if count == 0 {
+        String::from("recent: empty")
+    } else {
+        format!(
+            "recent: {}/{} (j/k move, Enter open, Esc close)",
+            selected.saturating_add(1).min(count),
+            count
+        )
+    }
+}
+
 /// 描述 help 面板中某一列按下 Enter 後要執行的行為。
 #[derive(Clone, Copy)]
 enum HelpAction {
@@ -7423,6 +7657,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "",
             "列出目前可用的書籤按鍵與對應路徑",
             HelpAction::Command("bookmark list"),
+        ),
+        help_entry(
+            ":recent",
+            "",
+            "打開目前 pane 最近去過的目錄列表，方便快速跳回上一些工作位置",
+            HelpAction::Command("recent"),
         ),
         help_entry(
             ":copy",
@@ -7751,12 +7991,29 @@ fn command_suggestions(query: &str) -> Vec<CommandSuggestionLine> {
             display_command: entry.line.command,
             description: entry.line.description,
         });
-        if suggestions.len() >= 8 {
-            break;
-        }
     }
 
+    if trimmed.chars().count() > 1 {
+        suggestions.sort_by(|left, right| {
+            command_suggestion_sort_key(trimmed, &left.command)
+                .cmp(&command_suggestion_sort_key(trimmed, &right.command))
+        });
+    }
+    suggestions.truncate(8);
+
     suggestions
+}
+
+/// 計算 command 補全候選的排序鍵，讓較接近使用者輸入的指令排在前面。
+///
+/// 目前會優先比較：
+/// 1. 指令第一段名稱和查詢字串的長度差距
+/// 2. 指令第一段名稱的字母順序
+/// 3. 完整命令模板，作為最後的穩定排序條件
+fn command_suggestion_sort_key(query: &str, command: &str) -> (usize, String, String) {
+    let head = command.split_whitespace().next().unwrap_or(command);
+    let remainder = head.chars().count().saturating_sub(query.chars().count());
+    (remainder, head.to_string(), command.to_string())
 }
 
 /// 找出多個候選字串的最長共同前綴，供路徑補全先延伸到共享部分。
@@ -8629,29 +8886,27 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 command mode 的補全候選會隨輸入過濾，並可用候選切換快捷鍵往返移動。
-    fn app_command_mode_cycles_autocomplete_suggestions() {
+    /// 驗證 command mode 按下 Tab 時，會直接採用目前最接近的命令提示。
+    fn app_command_mode_tab_autocompletes_closest_command_suggestion() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
-            .expect("type t");
+        for ch in "re".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type re");
+        }
 
         let suggestions = command_suggestions(&app.command_buffer);
         assert!(!suggestions.is_empty());
+        assert_eq!(suggestions[0].command, "recent");
         assert_eq!(app.command_suggestion_selected, 0);
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .expect("next suggestion");
-        assert_eq!(
-            app.command_suggestion_selected,
-            1.min(suggestions.len() - 1)
-        );
+            .expect("autocomplete closest suggestion");
 
-        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
-            .expect("previous suggestion");
+        assert_eq!(app.command_buffer, "recent");
         assert_eq!(app.command_suggestion_selected, 0);
     }
 
@@ -8709,10 +8964,31 @@ mod tests {
             app.command_suggestion_selected,
             (1).min(suggestions.len().saturating_sub(1))
         );
+    }
 
-        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
-            .expect("previous suggestion with backtab");
-        assert_eq!(app.command_suggestion_selected, 0);
+    #[test]
+    /// 驗證 command mode 可先用提示切換快捷鍵選中候選，再按 Tab 套用該提示。
+    fn app_command_mode_tab_uses_currently_selected_suggestion() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
+            .expect("open command mode");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("type r");
+
+        let suggestions = command_suggestions(&app.command_buffer);
+        assert!(suggestions.len() >= 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT))
+            .expect("move to next suggestion");
+        let selected = app.command_suggestion_selected;
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("apply selected suggestion");
+
+        assert_eq!(app.command_buffer, suggestions[selected].command);
+        assert_eq!(app.command_suggestion_selected, selected);
     }
 
     #[test]
@@ -9496,6 +9772,70 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 pane 在切換目錄後，會把先前位置記進 recent 清單。
+    fn pane_directory_changes_are_recorded_in_recent_history() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        let src = dir.path().join("src");
+        fs::create_dir(&docs).expect("docs");
+        fs::create_dir(&src).expect("src");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .go_to_path(&docs)
+            .expect("go docs");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .go_to_path(&src)
+            .expect("go src");
+
+        let recent = app.panes.get(&1).expect("pane").recent_dirs();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0], docs);
+        assert_eq!(recent[1], dir.path());
+    }
+
+    #[test]
+    /// 驗證 `:recent` 會打開目前 pane 的 recent 列表，並可用 Enter 跳回選中的目錄。
+    fn app_recent_command_opens_and_jumps_to_selected_directory() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        let src = dir.path().join("src");
+        fs::create_dir(&docs).expect("docs");
+        fs::create_dir(&src).expect("src");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .go_to_path(&docs)
+            .expect("go docs");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .go_to_path(&src)
+            .expect("go src");
+
+        app.execute_command("recent").expect("open recent");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::RecentList {
+                pane_id: 1,
+                selected: 0
+            })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open recent entry");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
+        assert_eq!(app.status, format!("jumped to recent: {}", docs.display()));
+    }
+
+    #[test]
     /// 驗證 `Shift+;` 也能正確打開命令模式，避免不同終端的事件格式造成 `:` 失效。
     fn app_shift_semicolon_opens_command_mode() {
         let dir = tempdir().expect("tempdir");
@@ -9602,6 +9942,34 @@ mod tests {
             other => panic!("unexpected pending action: {other:?}"),
         }
         assert_eq!(app.status, "help: res (3)");
+    }
+
+    #[test]
+    /// 驗證 help 面板搜尋輸入中的 `Tab` 不會誤套用 command hint。
+    fn app_help_panel_search_tab_does_not_apply_command_autocomplete() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start help search");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("tab in help search");
+
+        match app.pending_action.as_ref() {
+            Some(PendingAction::HelpPanel { search, selected, .. }) => {
+                assert_eq!(search.buffer, "re");
+                assert!(search.editing);
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("unexpected pending action: {other:?}"),
+        }
+        assert_eq!(app.status, "help search: re (12)");
     }
 
     #[test]
@@ -10662,6 +11030,34 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 filter 輸入框中的 `Tab` 不會被當成 command 補齊，避免誤改目前查詢字串。
+    fn app_filter_input_tab_does_not_apply_command_autocomplete() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("recent.txt"), "a").expect("recent");
+        fs::write(dir.path().join("rename.txt"), "b").expect("rename");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open filter");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("tab in filter");
+
+        assert_eq!(
+            app.filter,
+            Some(FilterState {
+                pane_id: 1,
+                buffer: String::from("re"),
+                editing: true,
+            })
+        );
+        assert_eq!(app.status, "filter: re");
+    }
+
+    #[test]
     /// 驗證按下 `.` 後會顯示隱藏檔，並可與 filter 一起使用。
     fn app_toggle_hidden_reveals_hidden_entries_and_works_with_filter() {
         let dir = tempdir().expect("tempdir");
@@ -11021,6 +11417,31 @@ mod tests {
             None
         );
         assert_eq!(app.status, "preview search: all");
+    }
+
+    #[test]
+    /// 驗證 preview search 輸入框中的 `Tab` 不會誤套用 command 補齊。
+    fn app_preview_search_tab_does_not_apply_command_autocomplete() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "recent\nrename\n").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_preview_focus();
+        app.open_preview_search_input();
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("type query");
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("tab in preview search");
+
+        assert!(
+            app.preview_search
+                .as_ref()
+                .is_some_and(|search| search.buffer == "re" && search.editing)
+        );
+        assert_eq!(app.panes.get(&1).expect("pane").preview_search_query(), Some("re"));
+        assert_eq!(app.status, "preview search: re (2)");
     }
 
     #[test]
