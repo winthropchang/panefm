@@ -2,6 +2,7 @@ mod app;
 mod archive;
 mod bookmark;
 mod entry;
+mod fzf;
 mod layout;
 mod open;
 mod pane;
@@ -35,6 +36,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::config::load_config;
 
 use self::app::{App, FzfJumpRequest, RenameMode};
+use self::fzf::bundled_fzf_command;
 use self::open::{LaunchMode, LaunchSpec};
 
 /// 啟動檔案管理器模組的完整執行流程。
@@ -136,7 +138,7 @@ fn run_fzf_jump(
     request: &FzfJumpRequest,
 ) -> Result<Option<String>> {
     let jump_started_at = Instant::now();
-    ensure_fzf_available()?;
+    let fzf_command = bundled_fzf_command()?;
 
     disable_raw_mode()?;
     leave_tui_mode(terminal.backend_mut())?;
@@ -147,7 +149,7 @@ fn run_fzf_jump(
     let follow_links = request.follow_links;
     let helper_command =
         build_fzf_helper_command(&root_dir, show_hidden, follow_links).context("build jump helper command")?;
-    let child = spawn_fzf_process(&helper_command).context("spawn fzf")?;
+    let child = spawn_fzf_process(&fzf_command, &helper_command).context("spawn fzf")?;
     let fzf_wait_started_at = Instant::now();
     let output_result = child.wait_with_output().context("wait for fzf");
     debug_timing_log("fzf wait", fzf_wait_started_at);
@@ -223,8 +225,11 @@ where
 ///
 /// 這裡不依賴使用者自己的 `FZF_DEFAULT_OPTS` 去決定核心行為，
 /// 避免不同 terminal / shell 環境導致 `Esc` 無法穩定返回 TUI。
-fn spawn_fzf_process(helper_command: &str) -> io::Result<std::process::Child> {
-    Command::new("fzf")
+fn spawn_fzf_process(
+    fzf_command: &std::ffi::OsString,
+    helper_command: &str,
+) -> io::Result<std::process::Child> {
+    Command::new(fzf_command)
         .arg("--bind")
         .arg(fzf_bindings())
         .env("FZF_DEFAULT_COMMAND", helper_command)
@@ -358,22 +363,6 @@ fn quote_windows_cmd_arg(arg: &std::ffi::OsString) -> String {
     }
     quoted.push('"');
     quoted
-}
-
-/// 檢查目前環境是否可執行 `fzf`，避免使用者按下 `z` 後只看到不明失敗。
-fn ensure_fzf_available() -> Result<()> {
-    let status = Command::new("fzf")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("fzf is not installed or not in PATH")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("fzf is not available"))
-    }
 }
 
 /// 回傳目前 TUI 真正需要的 keyboard enhancement flag。
