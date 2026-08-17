@@ -153,7 +153,7 @@ pub(crate) fn render_pane(
     visual_range: Option<(usize, usize)>,
     panel_state: Option<PaneListState<'_>>,
     theme: Theme,
-    config: &AppConfig,
+    _config: &AppConfig,
     editor_state: Option<InlineEditorState<'_>>,
     picker_state: Option<InlinePickerState<'_>>,
     list_find_buffer: Option<&str>,
@@ -161,27 +161,6 @@ pub(crate) fn render_pane(
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
-    let preview_height = config
-        .ui
-        .preview
-        .height
-        .min(area.height.saturating_sub(4))
-        .max(4);
-    let list_height = config
-        .ui
-        .preview
-        .focus_list_height
-        .min(area.height.saturating_sub(4))
-        .max(3);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if preview_focused {
-            [Constraint::Length(list_height), Constraint::Min(6)]
-        } else {
-            [Constraint::Min(3), Constraint::Length(preview_height)]
-        })
-        .split(area);
-
     let border_style = if focused {
         theme.focused_border_style()
     } else {
@@ -220,8 +199,69 @@ pub(crate) fn render_pane(
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let content_width = chunks[0].width.saturating_sub(4) as usize;
-    let list_viewport_height = chunks[0].height.saturating_sub(2).max(1) as usize;
+    if preview_focused {
+        let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
+        let (preview_title, preview_lines) = match panel_state {
+            Some(PaneListState::Search(search_state))
+                if !search_state.loading
+                    && !search_state.results.is_empty()
+                    && search_state.preview_query.is_some() =>
+            {
+                let selected = search_state
+                    .selected
+                    .min(search_state.results.len().saturating_sub(1));
+                let entry = &search_state.results[selected];
+                let preview = PaneState::search_preview_for_entry(
+                    entry,
+                    preview_viewport_height,
+                    search_state.preview_query.unwrap_or_default(),
+                    search_state.preview_scroll,
+                    search_state.preview_current_match,
+                    true,
+                    theme,
+                );
+                (preview.title, preview.lines)
+            }
+            _ => {
+                let default_preview_title = pane
+                    .selected_entry()
+                    .map(|entry| {
+                        let mut title = format!("Preview: {}", entry.name);
+                        title.push_str("  [preview]");
+                        if let Some(query) = pane.preview_search_query() {
+                            title.push_str(&format!("  [/{}]", query));
+                        }
+                        if pane.has_preview_scroll() {
+                            title.push_str("  ^");
+                        }
+                        if pane.preview_has_more_below() {
+                            title.push_str("  v");
+                        }
+                        title
+                    })
+                    .unwrap_or_else(|| "Preview".to_string());
+                pane.set_preview_viewport_height(preview_viewport_height);
+                (
+                    default_preview_title,
+                    pane.preview_lines(preview_viewport_height, theme),
+                )
+            }
+        };
+        let preview_content_width = area.width.saturating_sub(2) as usize;
+        let preview_lines =
+            pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
+        let preview = Paragraph::new(preview_lines).block(
+            Block::default()
+                .title(preview_title)
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        );
+        frame.render_widget(preview, area);
+        return None;
+    }
+
+    let content_width = area.width.saturating_sub(4) as usize;
+    let list_viewport_height = area.height.saturating_sub(2).max(1) as usize;
     pane.set_list_viewport_height(list_viewport_height);
     let items: Vec<ListItem<'static>> = if let Some(panel_state) = panel_state {
         match panel_state {
@@ -363,17 +403,17 @@ pub(crate) fn render_pane(
             }
             _ => {}
         }
-        frame.render_stateful_widget(list, chunks[0], &mut list_state);
+        frame.render_stateful_widget(list, area, &mut list_state);
     } else {
-        frame.render_stateful_widget(list, chunks[0], &mut pane.list_state);
+        frame.render_stateful_widget(list, area, &mut pane.list_state);
     }
 
     let mut editor_cursor = None;
     if let Some(state) = editor_state {
-        editor_cursor = render_inline_editor(frame, chunks[0], pane, theme, state);
+        editor_cursor = render_inline_editor(frame, area, pane, theme, state);
     }
     if let Some(state) = picker_state {
-        render_inline_picker(frame, chunks[0], pane, theme, state);
+        render_inline_picker(frame, area, pane, theme, state);
     }
 
     let panel_cursor = match panel_state {
@@ -383,7 +423,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            chunks[0],
+            area,
             theme,
             "Trash Search",
             search,
@@ -394,77 +434,20 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            chunks[0],
+            area,
             theme,
             "Help Search",
             search,
         )),
         _ if list_find_editing => Some(render_top_right_input(
             frame,
-            chunks[0],
+            area,
             theme,
             "Find next",
             list_find_buffer.unwrap_or_default(),
         )),
         _ => None,
     };
-
-    let default_preview_title = pane
-        .selected_entry()
-        .map(|entry| {
-            let mut title = format!("Preview: {}", entry.name);
-            if preview_focused {
-                title.push_str("  [preview]");
-            }
-            if let Some(query) = pane.preview_search_query() {
-                title.push_str(&format!("  [/{}]", query));
-            }
-            if pane.has_preview_scroll() {
-                title.push_str("  ^");
-            }
-            if pane.preview_has_more_below() {
-                title.push_str("  v");
-            }
-            title
-        })
-        .unwrap_or_else(|| "Preview".to_string());
-    let preview_viewport_height = chunks[1].height.saturating_sub(2).max(1) as usize;
-    pane.set_preview_viewport_height(preview_viewport_height);
-    let (preview_title, preview_lines) = match panel_state {
-        Some(PaneListState::Search(search_state))
-            if !search_state.loading
-                && !search_state.results.is_empty()
-                && search_state.preview_query.is_some() =>
-        {
-            let selected = search_state
-                .selected
-                .min(search_state.results.len().saturating_sub(1));
-            let entry = &search_state.results[selected];
-            let preview = PaneState::search_preview_for_entry(
-                entry,
-                preview_viewport_height,
-                search_state.preview_query.unwrap_or_default(),
-                search_state.preview_scroll,
-                search_state.preview_current_match,
-                preview_focused,
-                theme,
-            );
-            (preview.title, preview.lines)
-        }
-        _ => (
-            default_preview_title,
-            pane.preview_lines(preview_viewport_height, theme),
-        ),
-    };
-    let preview_content_width = chunks[1].width.saturating_sub(2) as usize;
-    let preview_lines = pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
-    let preview = Paragraph::new(preview_lines).block(
-        Block::default()
-            .title(preview_title)
-            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-            .border_style(border_style),
-    );
-    frame.render_widget(preview, chunks[1]);
 
     editor_cursor.or(panel_cursor)
 }
@@ -1494,6 +1477,53 @@ pub(crate) fn render_confirm_dialog(
         .block(
             Block::default()
                 .title(Line::from(Span::styled(title, theme.danger_title_style())))
+                .borders(Borders::ALL),
+        ),
+        dialog_area,
+    );
+}
+
+/// 繪製貼上覆蓋確認視窗。
+///
+/// 參數：
+/// - `frame: &mut ratatui::Frame<'_>`，目前的畫面物件。
+/// - `area: Rect`，整體可用畫面範圍。
+/// - `target_name: &str`，這次會被覆蓋的目標名稱摘要。
+/// - `entry_count: usize`，這次整批貼上的項目數量。
+/// - `theme: Theme`，目前使用中的主題色盤。
+/// - `config: &AppConfig`，控制 popup 尺寸的應用程式設定。
+///
+/// 回傳：`()`
+pub(crate) fn render_paste_overwrite_dialog(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    target_name: &str,
+    entry_count: usize,
+    theme: Theme,
+    config: &AppConfig,
+) {
+    let dialog_area = centered_rect(
+        area,
+        config.ui.dialogs.confirm.width_percent,
+        config.ui.dialogs.confirm.height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let question = if entry_count <= 1 {
+        format!("Overwrite existing item {target_name}?")
+    } else {
+        format!("Overwrite existing items {target_name}?")
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(question),
+            Line::from("Press y or Enter to overwrite, n or Esc to cancel."),
+        ])
+        .block(
+            Block::default()
+                .title(Line::from(Span::styled(
+                    " Confirm Paste Overwrite ",
+                    theme.danger_title_style(),
+                )))
                 .borders(Borders::ALL),
         ),
         dialog_area,

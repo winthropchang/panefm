@@ -52,7 +52,8 @@ use super::{
         InlinePickerState, PaneListState, RecentPanelLine, RegexRenamePanelLine, SearchListState,
         TaskPanelLine, TrashPanelLine, render_bookmark_picker, render_command_palette,
         render_confirm_dialog, render_filter_input, render_global_search_panel, render_pane,
-        render_preview_search_input, render_recent_picker, render_theme_picker,
+        render_paste_overwrite_dialog, render_preview_search_input, render_recent_picker,
+        render_theme_picker,
     },
 };
 
@@ -251,6 +252,12 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         target_name: String,
         permanent: bool,
+    },
+    ConfirmPasteOverwrite {
+        pane_id: usize,
+        target_name: String,
+        entry_count: usize,
+        operation: ClipboardOperation,
     },
     SortPicker {
         pane_id: usize,
@@ -597,6 +604,13 @@ impl App {
         if self.capture_pending_count_digit(&key) {
             return Ok(true);
         }
+        if key.code == KeyCode::Tab {
+            self.clear_pending_count();
+            self.open_preview_focus();
+            self.pending_g = false;
+            self.pending_y = false;
+            return Ok(true);
+        }
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.open_selected_with_picker()?;
             self.reset_pending_motion_state();
@@ -622,12 +636,6 @@ impl App {
         }
         if key_matches_shifted_letter(&key, 'V') {
             self.open_visual_selection()?;
-            self.pending_g = false;
-            self.pending_y = false;
-            return Ok(true);
-        }
-        if key_matches_shifted_letter(&key, 'P') && self.clipboard.is_none() {
-            self.open_preview_focus();
             self.pending_g = false;
             self.pending_y = false;
             return Ok(true);
@@ -878,17 +886,8 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'p') => {
-                if self
-                    .panes
-                    .get(&self.focused_pane)
-                    .is_some_and(|pane| pane.has_list_find())
-                {
-                    let count = self.take_count_or_one();
-                    self.status = self.jump_list_find_match(false, count)?;
-                } else {
-                    self.clear_pending_count();
-                    self.paste_into_focused_pane()?;
-                }
+                self.clear_pending_count();
+                self.paste_into_focused_pane()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -908,6 +907,21 @@ impl App {
                 {
                     let count = self.take_count_or_one();
                     self.status = self.jump_list_find_match(true, count)?;
+                } else {
+                    self.clear_pending_count();
+                }
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'N') => {
+                if self
+                    .panes
+                    .get(&self.focused_pane)
+                    .is_some_and(|pane| pane.has_list_find())
+                {
+                    let count = self.take_count_or_one();
+                    self.status = self.jump_list_find_match(false, count)?;
                 } else {
                     self.clear_pending_count();
                 }
@@ -982,7 +996,7 @@ impl App {
         if self.capture_pending_count_digit(&key) {
             return Ok(true);
         }
-        if key_matches_shifted_letter(&key, 'P') {
+        if key.code == KeyCode::Tab {
             if self.clear_preview_search_if_active() {
                 self.clear_pending_count();
                 self.pending_g = false;
@@ -1345,6 +1359,21 @@ impl App {
         if self.preview_focus == Some(search.pane_id) && matches!(search.mode, SearchMode::Content)
         {
             match key.code {
+                KeyCode::Tab => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.preview_focus = None;
+                    self.status = global_search_status(
+                        search.mode,
+                        &search.buffer,
+                        search.results.len(),
+                        false,
+                        search.searched,
+                        search.loading,
+                    );
+                    self.global_search = Some(search);
+                    return Ok(true);
+                }
                 KeyCode::Esc => {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -1362,8 +1391,7 @@ impl App {
                     self.global_search = Some(search);
                     return Ok(true);
                 }
-                _ if key_matches_shifted_letter(&key, 'P')
-                    || key_matches_plain_letter(&key, 'h') =>
+                _ if key_matches_plain_letter(&key, 'h') =>
                 {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -1631,8 +1659,7 @@ impl App {
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
-            _ if key_matches_shifted_letter(&key, 'P')
-                && matches!(search.mode, SearchMode::Content) =>
+            KeyCode::Tab if matches!(search.mode, SearchMode::Content) =>
             {
                 self.clear_pending_count();
                 self.pending_g = false;
@@ -1803,6 +1830,31 @@ impl App {
                     } else {
                         format!("confirm trash {target_name}: y/n")
                     };
+                }
+            },
+            PendingAction::ConfirmPasteOverwrite {
+                pane_id,
+                target_name,
+                entry_count,
+                operation,
+            } => match key.code {
+                _ if key_matches_letter_any_case(&key, 'y') || key.code == KeyCode::Enter => {
+                    self.confirm_paste_overwrite(pane_id, target_name, entry_count, operation)?;
+                }
+                KeyCode::Esc => {
+                    self.status = paste_overwrite_cancelled_status(&target_name, entry_count);
+                }
+                _ if key_matches_letter_any_case(&key, 'n') => {
+                    self.status = paste_overwrite_cancelled_status(&target_name, entry_count);
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::ConfirmPasteOverwrite {
+                        pane_id,
+                        target_name: target_name.clone(),
+                        entry_count,
+                        operation,
+                    });
+                    self.status = paste_overwrite_confirm_status(&target_name, entry_count);
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
@@ -4861,6 +4913,11 @@ impl App {
                     format!("confirm trash {target_name}: y/n")
                 }
             }
+            PendingAction::ConfirmPasteOverwrite {
+                target_name,
+                entry_count,
+                ..
+            } => paste_overwrite_confirm_status(target_name, *entry_count),
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::ThemePicker { selected } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
@@ -5154,6 +5211,13 @@ impl App {
 
     /// 進入 preview mode，讓目前焦點 pane 的預覽區放大並接手捲動按鍵。
     pub(crate) fn open_preview_focus(&mut self) {
+        if self.preview_focus == Some(self.focused_pane) {
+            self.preview_focus = None;
+            self.pending_g = false;
+            self.pending_y = false;
+            self.status = String::from("normal mode");
+            return;
+        }
         self.preview_focus = Some(self.focused_pane);
         self.pending_g = false;
         self.pending_y = false;
@@ -6475,7 +6539,7 @@ impl App {
     /// - 成功時代表貼上流程已完成，並同步更新所有 pane。
     /// - 失敗時代表目標目錄或檔案系統操作失敗。
     pub(crate) fn paste_into_focused_pane(&mut self) -> io::Result<()> {
-        self.paste_into_focused_pane_impl(false)
+        self.paste_into_focused_pane_with_confirmation()
     }
 
     /// 將內部剪貼簿中的項目以覆蓋模式貼到目前有焦點的 pane 目錄。
@@ -6485,6 +6549,44 @@ impl App {
     /// - 若來源與目標本來就在同一路徑，會退回一般不覆蓋的行為避免覆寫自己。
     pub(crate) fn paste_into_focused_pane_with_overwrite(&mut self) -> io::Result<()> {
         self.paste_into_focused_pane_impl(true)
+    }
+
+    /// 先檢查目前貼上目標是否會和既有項目同名，必要時再打開覆蓋確認視窗。
+    ///
+    /// 規則：
+    /// - 若沒有任何同名衝突，直接沿用一般貼上流程。
+    /// - 若有同名衝突，先詢問是否要整批覆蓋。
+    /// - 若來源與目標本來就是同一路徑，仍維持原本的 duplicate 命名策略，不視為衝突。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前應用程式狀態。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表已直接貼上，或已打開確認視窗等待使用者決定。
+    /// - 失敗時代表在檢查目標目錄是否衝突時發生 I/O 錯誤。
+    fn paste_into_focused_pane_with_confirmation(&mut self) -> io::Result<()> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            self.status = String::from("clipboard is empty");
+            return Ok(());
+        };
+        let conflicts = self.paste_conflict_names()?;
+        if conflicts.is_empty() {
+            return self.paste_into_focused_pane_impl(false);
+        }
+
+        let target_name = if conflicts.len() == 1 {
+            conflicts[0].clone()
+        } else {
+            format!("{} items", conflicts.len())
+        };
+        self.pending_action = Some(PendingAction::ConfirmPasteOverwrite {
+            pane_id: self.focused_pane,
+            target_name: target_name.clone(),
+            entry_count: clipboard.entries.len(),
+            operation: clipboard.operation,
+        });
+        self.status = paste_overwrite_confirm_status(&target_name, clipboard.entries.len());
+        Ok(())
     }
 
     /// 負責實作一般貼上與覆蓋貼上的共用流程。
@@ -6567,6 +6669,74 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// 掃描這次貼上是否會和目前目標目錄中的既有項目同名。
+    ///
+    /// 規則：
+    /// - 只有「直接同名」的目標才算衝突。
+    /// - 若來源本身就位於同一個目錄，視為 duplicate copy / move 情境，不算衝突。
+    ///
+    /// 參數：
+    /// - `self: &App`，目前應用程式狀態。
+    ///
+    /// 回傳：`io::Result<Vec<String>>`。
+    /// - 成功時回傳所有會衝突的名稱清單。
+    /// - 失敗時回傳取得目標 pane 或檢查檔案資訊時的錯誤。
+    fn paste_conflict_names(&self) -> io::Result<Vec<String>> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let target_dir = self
+            .panes
+            .get(&self.focused_pane)
+            .map(|pane| pane.cwd.clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pane no longer exists"))?;
+
+        let mut conflicts = Vec::new();
+        for entry in &clipboard.entries {
+            let Some(file_name) = entry.source_path.file_name() else {
+                continue;
+            };
+            let direct_target = target_dir.join(file_name);
+            let same_location =
+                entry.source_path.parent() == Some(target_dir.as_path()) && direct_target == entry.source_path;
+            if !same_location && direct_target.exists() {
+                conflicts.push(entry.display_name.clone());
+            }
+        }
+
+        Ok(conflicts)
+    }
+
+    /// 在使用者確認後，以覆蓋模式完成這次貼上。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，目前應用程式狀態。
+    /// - `pane_id: usize`，當初打開確認視窗時的目標 pane。
+    /// - `target_name: String`，顯示在確認視窗中的名稱摘要。
+    /// - `entry_count: usize`，這次整批貼上的項目數。
+    /// - `operation: ClipboardOperation`，這批項目原本是 copy 還是 cut。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表覆蓋貼上已完成。
+    /// - 失敗時代表貼上過程發生 I/O 錯誤。
+    fn confirm_paste_overwrite(
+        &mut self,
+        pane_id: usize,
+        target_name: String,
+        entry_count: usize,
+        operation: ClipboardOperation,
+    ) -> io::Result<()> {
+        if self.focused_pane != pane_id {
+            self.focused_pane = pane_id;
+        }
+        if self.clipboard.as_ref().is_none_or(|clipboard| clipboard.operation != operation) {
+            self.status = format!("paste changed before overwrite: {target_name}");
+            return Ok(());
+        }
+        let _ = entry_count;
+        self.paste_into_focused_pane_impl(true)
     }
 
     /// 將目前選取或已標記的項目直接移動到指定路徑。
@@ -7124,6 +7294,20 @@ impl App {
                     frame.area(),
                     target_name,
                     *permanent,
+                    self.theme,
+                    &self.config,
+                );
+            }
+            Some(PendingAction::ConfirmPasteOverwrite {
+                target_name,
+                entry_count,
+                ..
+            }) => {
+                render_paste_overwrite_dialog(
+                    frame,
+                    frame.area(),
+                    target_name,
+                    *entry_count,
                     self.theme,
                     &self.config,
                 );
@@ -7871,13 +8055,13 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":paste",
             "p",
-            "貼上剪貼簿項目到目前目錄",
+            "貼上剪貼簿項目到目前目錄；若遇到同名項目，會先詢問是否整批覆蓋",
             HelpAction::Command("paste"),
         ),
         help_entry(
             ":paste!",
             "P",
-            "貼上剪貼簿項目到目前目錄；若同名已存在就直接覆蓋",
+            "貼上剪貼簿項目到目前目錄；若同名已存在就直接覆蓋，不會再詢問",
             HelpAction::Command("paste!"),
         ),
         help_entry(
@@ -8002,8 +8186,8 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":preview",
-            "P",
-            "切換到 preview focus 模式",
+            "Tab",
+            "切換 preview mode；平常隱藏 preview，開啟後用整個 pane 顯示內容",
             HelpAction::Command("preview"),
         ),
         help_entry(
@@ -8380,6 +8564,24 @@ fn task_panel_status(count: usize, selected: usize) -> String {
             selected + 1,
             count
         )
+    }
+}
+
+/// 依照本次貼上衝突的名稱與數量，產生覆蓋確認視窗的狀態列文字。
+fn paste_overwrite_confirm_status(target_name: &str, entry_count: usize) -> String {
+    if entry_count <= 1 {
+        format!("confirm overwrite {target_name}: y/n")
+    } else {
+        format!("confirm overwrite {target_name} ({entry_count} items): y/n")
+    }
+}
+
+/// 當使用者取消這次覆蓋貼上時，回傳狀態列要顯示的訊息。
+fn paste_overwrite_cancelled_status(target_name: &str, entry_count: usize) -> String {
+    if entry_count <= 1 {
+        format!("paste cancelled: {target_name}")
+    } else {
+        format!("paste cancelled: {target_name} ({entry_count} items)")
     }
 }
 
@@ -9751,14 +9953,14 @@ mod tests {
     }
 
     #[test]
-    /// 驗證某些終端把 `Shift+p` 回報成 `p + Shift` 時，也能正確進入 preview mode。
-    fn app_shift_p_opens_preview_mode() {
+    /// 驗證按下 `Tab` 會直接進入 preview mode。
+    fn app_tab_opens_preview_mode() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT))
-            .expect("open preview with shifted p");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("open preview with tab");
 
         assert_eq!(app.preview_focus, Some(1));
         assert_eq!(app.status, "preview mode");
@@ -11487,7 +11689,7 @@ mod tests {
             .expect("pane")
             .set_preview_viewport_height(4);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("open preview");
         assert_eq!(app.preview_focus, Some(1));
         assert_eq!(app.status, "preview mode");
@@ -11502,6 +11704,25 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("leave preview");
+        assert_eq!(app.preview_focus, None);
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證按下 `Tab` 會切換 preview mode，再按一次同樣的鍵會回到一般列表。
+    fn app_preview_mode_toggles_with_tab() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "preview").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("open preview");
+        assert_eq!(app.preview_focus, Some(1));
+        assert_eq!(app.status, "preview mode");
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("toggle preview off");
         assert_eq!(app.preview_focus, None);
         assert_eq!(app.status, "normal mode");
     }
@@ -12363,7 +12584,7 @@ mod tests {
     }
 
     #[test]
-    /// 驗證列表模式按下 `/` 後會即時套用 find-next，並可在 Enter 後用 `n/p` 跳轉命中項目。
+    /// 驗證列表模式按下 `/` 後會即時套用 find-next，並可在 Enter 後用 `n/N` 跳轉命中項目。
     fn app_list_find_supports_lock_and_navigation() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -12401,7 +12622,7 @@ mod tests {
             "alps.txt"
         );
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT))
             .expect("previous match");
         assert_eq!(
             app.panes
@@ -12409,9 +12630,95 @@ mod tests {
                 .expect("pane")
                 .selected_entry()
                 .expect("selected")
-                .name,
+            .name,
             "alpha.txt"
         );
+    }
+
+    #[test]
+    /// 驗證一般貼上遇到同名檔案時，會先開啟覆蓋確認視窗，使用者確認後才覆蓋。
+    fn app_paste_with_conflict_requires_confirmation_before_overwrite() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source");
+        fs::create_dir(&target_dir).expect("target");
+        let source_file = source_dir.join("alpha.txt");
+        let target_file = target_dir.join("alpha.txt");
+        fs::write(&source_file, "from source").expect("source file");
+        fs::write(&target_file, "from target").expect("target file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("pending copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy");
+
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload target");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("open overwrite confirm");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmPasteOverwrite { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(&target_file).expect("target content before confirm"),
+            "from target"
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm overwrite");
+
+        assert_eq!(
+            fs::read_to_string(&target_file).expect("target content after confirm"),
+            "from source"
+        );
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "pasted copy with overwrite: 1 item");
+    }
+
+    #[test]
+    /// 驗證一般貼上遇到同名檔案時，若使用者取消，會保留原檔案且不執行貼上。
+    fn app_paste_with_conflict_can_be_cancelled() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source");
+        fs::create_dir(&target_dir).expect("target");
+        let source_file = source_dir.join("alpha.txt");
+        let target_file = target_dir.join("alpha.txt");
+        fs::write(&source_file, "from source").expect("source file");
+        fs::write(&target_file, "from target").expect("target file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("pending copy");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy");
+
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload target");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("open overwrite confirm");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel overwrite");
+
+        assert_eq!(
+            fs::read_to_string(&target_file).expect("target content after cancel"),
+            "from target"
+        );
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "paste cancelled: alpha.txt");
     }
 
     #[test]
