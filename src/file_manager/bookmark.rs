@@ -73,6 +73,22 @@ impl BookmarkStore {
         self.entries.get(&key)
     }
 
+    /// 回傳目前可用的下一個自動書籤按鍵。
+    ///
+    /// 目前順序會優先使用：
+    /// - `a..z`
+    /// - `A..Z`
+    /// - `0..9`
+    ///
+    /// 回傳：`Option<char>`。
+    /// - `Some(char)` 代表找到尚未使用的書籤代號。
+    /// - `None` 代表這批預設代號都已經被用完。
+    pub(crate) fn next_available_key(&self) -> Option<char> {
+        preferred_bookmark_keys()
+            .into_iter()
+            .find(|key| !self.entries.contains_key(key))
+    }
+
     /// 設定或覆蓋單一書籤，並立即同步寫回 `bookmark.toml`。
     ///
     /// 參數：
@@ -95,6 +111,28 @@ impl BookmarkStore {
     pub(crate) fn set_smb(&mut self, key: char, location: String) -> Result<()> {
         self.entries
             .insert(key, BookmarkTarget::SmbLocation(location));
+        self.save()
+    }
+
+    /// 刪除單一書籤，並立即同步寫回 `bookmark.toml`。
+    ///
+    /// 參數：
+    /// - `key: char`，要刪除的書籤代號。
+    ///
+    /// 回傳：`Result<bool>`。
+    /// - `Ok(true)` 代表確實刪除了既有書籤。
+    /// - `Ok(false)` 代表該代號原本不存在。
+    pub(crate) fn remove(&mut self, key: char) -> Result<bool> {
+        let removed = self.entries.remove(&key).is_some();
+        self.save()?;
+        Ok(removed)
+    }
+
+    /// 清空全部書籤，並立即同步寫回 `bookmark.toml`。
+    ///
+    /// 回傳：`Result<()>`。
+    pub(crate) fn clear(&mut self) -> Result<()> {
+        self.entries.clear();
         self.save()
     }
 
@@ -136,6 +174,14 @@ pub(crate) fn bookmark_file_path(base_dir: &Path, config_source: Option<&Path>) 
 #[derive(Serialize)]
 #[serde(transparent)]
 struct BookmarkFile(BTreeMap<String, String>);
+
+/// 回傳自動分配書籤時使用的預設代號順序。
+fn preferred_bookmark_keys() -> Vec<char> {
+    let mut keys = ('a'..='z').collect::<Vec<_>>();
+    keys.extend('A'..='Z');
+    keys.extend('0'..='9');
+    keys
+}
 
 /// 從指定檔案讀取全部書籤；若檔案不存在則回傳空集合。
 fn load_entries(path: &Path) -> Result<BTreeMap<char, BookmarkTarget>> {
@@ -260,5 +306,54 @@ mod tests {
             bookmark_file_path(base, None),
             PathBuf::from("/workspace/project/bookmark.toml")
         );
+    }
+
+    #[test]
+    /// 驗證自動分配書籤代號時，會挑出目前尚未使用的第一個預設按鍵。
+    fn next_available_key_uses_first_free_preferred_key() {
+        let dir = tempdir().expect("tempdir");
+        let mut store = BookmarkStore::load(dir.path().join("bookmark.toml")).expect("load");
+        store
+            .set('a', PathBuf::from("/tmp/a"))
+            .expect("save a bookmark");
+        store
+            .set('b', PathBuf::from("/tmp/b"))
+            .expect("save b bookmark");
+
+        assert_eq!(store.next_available_key(), Some('c'));
+    }
+
+    #[test]
+    /// 驗證刪除單一書籤後，記憶體與檔案都會同步更新。
+    fn remove_bookmark_persists_to_file() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("bookmark.toml");
+
+        let mut store = BookmarkStore::load(file.clone()).expect("load");
+        store
+            .set('a', PathBuf::from("/tmp/demo"))
+            .expect("save bookmark");
+
+        assert!(store.remove('a').expect("remove bookmark"));
+        assert_eq!(store.get('a'), None);
+        assert!(!fs::read_to_string(file).expect("bookmark file").contains("/tmp/demo"));
+    }
+
+    #[test]
+    /// 驗證清空全部書籤後，列表會變成空集合。
+    fn clear_bookmarks_removes_all_entries() {
+        let dir = tempdir().expect("tempdir");
+        let mut store = BookmarkStore::load(dir.path().join("bookmark.toml")).expect("load");
+        store
+            .set('a', PathBuf::from("/tmp/demo"))
+            .expect("save bookmark");
+        store
+            .set('b', PathBuf::from("/tmp/demo2"))
+            .expect("save bookmark");
+
+        store.clear().expect("clear bookmarks");
+
+        assert!(store.list().is_empty());
+        assert_eq!(store.next_available_key(), Some('a'));
     }
 }

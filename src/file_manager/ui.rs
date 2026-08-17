@@ -1023,12 +1023,61 @@ pub(crate) fn render_linemode_picker(frame: &mut ratatui::Frame<'_>, area: Rect,
 }
 
 /// 在畫面中央繪製書籤列表彈窗，供 `:bookmark list` 使用。
+pub(crate) fn render_bookmark_action_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+) {
+    let panel_height = 6;
+    let panel_area = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(panel_height),
+        width: area.width,
+        height: panel_height,
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("s", theme.accent_style()),
+            Span::raw(" -> save bookmark (auto key)  "),
+            Span::styled("g", theme.accent_style()),
+            Span::raw(" -> jump from list"),
+        ]),
+        Line::from(vec![
+            Span::styled("d", theme.accent_style()),
+            Span::raw(" -> delete one bookmark  "),
+            Span::styled("D", theme.accent_style()),
+            Span::raw(" -> delete all bookmarks"),
+        ]),
+        Line::from(vec![
+            Span::styled("Esc", theme.accent_style()),
+            Span::raw(" -> cancel"),
+        ]),
+    ];
+
+    frame.render_widget(Clear, panel_area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Line::from(Span::styled(
+                    " Bookmark ",
+                    theme.accent_style().add_modifier(Modifier::BOLD),
+                )))
+                .borders(Borders::TOP),
+        ),
+        panel_area,
+    );
+}
+
+/// 在畫面中央繪製書籤列表彈窗，供 `:bookmark list` 使用。
 pub(crate) fn render_bookmark_picker(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     theme: Theme,
     lines: &[BookmarkPanelLine],
     selected: usize,
+    title: &str,
+    empty_message: &str,
 ) {
     let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
     let popup_area = centered_rect(area, 68, popup_height);
@@ -1036,7 +1085,7 @@ pub(crate) fn render_bookmark_picker(
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .title(Line::from(Span::styled(
-            " Bookmarks ",
+            title,
             theme.accent_style().add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)
@@ -1045,7 +1094,7 @@ pub(crate) fn render_bookmark_picker(
     frame.render_widget(block, popup_area);
 
     let items = if lines.is_empty() {
-        vec![ListItem::new(Line::from("沒有書籤，按 b{key} 新增"))]
+        vec![ListItem::new(Line::from(empty_message))]
     } else {
         lines
             .iter()

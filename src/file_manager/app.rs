@@ -50,10 +50,11 @@ use super::{
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
         InlinePickerState, PaneListState, RecentPanelLine, RegexRenamePanelLine, SearchListState,
-        TaskPanelLine, TrashPanelLine, render_bookmark_picker, render_command_palette,
-        render_confirm_dialog, render_filter_input, render_global_search_panel, render_pane,
-        render_linemode_picker, render_paste_overwrite_dialog, render_preview_search_input,
-        render_recent_picker, render_theme_picker,
+        TaskPanelLine, TrashPanelLine, render_bookmark_action_picker, render_bookmark_picker,
+        render_command_palette, render_confirm_dialog, render_filter_input,
+        render_global_search_panel, render_pane, render_linemode_picker,
+        render_paste_overwrite_dialog, render_preview_search_input, render_recent_picker,
+        render_theme_picker,
     },
 };
 
@@ -213,8 +214,14 @@ pub(crate) struct VisualSelectionState {
 /// 表示目前是否正在等待使用者補上書籤按鍵。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BookmarkPrompt {
-    Set,
     Jump,
+}
+
+/// 描述目前書籤列表面板是用來跳轉，還是用來刪除書籤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BookmarkListMode {
+    Jump,
+    Delete,
 }
 
 /// 描述暫時面板中的搜尋輸入狀態。
@@ -284,9 +291,13 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         selected: usize,
     },
+    BookmarkPicker {
+        pane_id: usize,
+    },
     BookmarkList {
         pane_id: usize,
         selected: usize,
+        mode: BookmarkListMode,
     },
     RecentList {
         pane_id: usize,
@@ -982,7 +993,7 @@ impl App {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_y = false;
-                self.set_bookmark_pending();
+                self.open_bookmark_picker();
                 true
             }
             _ if key_matches_plain_letter(&key, 'm') => {
@@ -2648,14 +2659,64 @@ impl App {
                     self.status = task_panel_status(len, selected);
                 }
             }
+            PendingAction::BookmarkPicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 's') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.save_bookmark_with_auto_key(pane_id)?;
+                    return Ok(true);
+                }
+                _ if key_matches_plain_letter(&key, 'g') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.open_bookmark_list_with_mode(pane_id, BookmarkListMode::Jump);
+                    return Ok(true);
+                }
+                _ if key_matches_plain_letter(&key, 'd') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.open_bookmark_list_with_mode(pane_id, BookmarkListMode::Delete);
+                    return Ok(true);
+                }
+                _ if key_matches_shifted_letter(&key, 'D') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.delete_all_bookmarks()?;
+                    return Ok(true);
+                }
+                KeyCode::Esc => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.status = String::from("normal mode");
+                    return Ok(true);
+                }
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.status = String::from("normal mode");
+                    return Ok(true);
+                }
+                _ => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_action = Some(PendingAction::BookmarkPicker { pane_id });
+                    self.status = String::from("bookmark: choose s/g/d/D from the panel");
+                    return Ok(true);
+                }
+            },
             PendingAction::BookmarkList {
                 pane_id,
                 mut selected,
+                mode,
             } => {
                 let entries = self.bookmark_store.list();
                 let len = entries.len();
                 if self.capture_pending_count_digit(&key) {
-                    self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
+                    self.pending_action = Some(PendingAction::BookmarkList {
+                        pane_id,
+                        selected,
+                        mode,
+                    });
                     return Ok(true);
                 }
                 if key_matches_shifted_letter(&key, 'G') {
@@ -2667,11 +2728,24 @@ impl App {
                         selected = len - 1;
                     }
                     self.pending_g = false;
-                    self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
-                    self.status = bookmark_list_status(len, selected);
+                    self.pending_action = Some(PendingAction::BookmarkList {
+                        pane_id,
+                        selected,
+                        mode,
+                    });
+                    self.status = bookmark_list_status(len, selected, mode);
                     return Ok(true);
                 }
                 match key.code {
+                    KeyCode::Char(bookmark_key)
+                        if matches!(mode, BookmarkListMode::Delete)
+                            && entries.iter().any(|entry| entry.key == bookmark_key) =>
+                    {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.delete_bookmark(bookmark_key)?;
+                        return Ok(true);
+                    }
                     KeyCode::Down => {
                         if len > 0 {
                             selected =
@@ -2731,13 +2805,29 @@ impl App {
                     KeyCode::Enter => {
                         self.clear_pending_count();
                         self.pending_g = false;
-                        self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                        match mode {
+                            BookmarkListMode::Jump => {
+                                self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                            }
+                            BookmarkListMode::Delete => {
+                                self.delete_bookmark_from_list(&entries, selected)?;
+                            }
+                        }
                         return Ok(true);
                     }
                     _ if key_matches_plain_letter(&key, 'l') => {
                         self.clear_pending_count();
                         self.pending_g = false;
-                        self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                        if matches!(mode, BookmarkListMode::Jump) {
+                            self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                        } else {
+                            self.pending_action = Some(PendingAction::BookmarkList {
+                                pane_id,
+                                selected,
+                                mode,
+                            });
+                            self.status = bookmark_list_status(len, selected, mode);
+                        }
                         return Ok(true);
                     }
                     KeyCode::Esc => {
@@ -2759,8 +2849,12 @@ impl App {
                         self.pending_g = false;
                     }
                 }
-                self.pending_action = Some(PendingAction::BookmarkList { pane_id, selected });
-                self.status = bookmark_list_status(len, selected);
+                self.pending_action = Some(PendingAction::BookmarkList {
+                    pane_id,
+                    selected,
+                    mode,
+                });
+                self.status = bookmark_list_status(len, selected, mode);
             }
             PendingAction::RecentList {
                 pane_id,
@@ -4125,6 +4219,13 @@ impl App {
             "search" => self.open_global_search()?,
             "search-content" | "grep" => self.open_content_search()?,
             "linemode" => self.open_linemode_picker(),
+            "bookmark" => self.open_bookmark_picker(),
+            "bookmark save" => self.save_bookmark_with_auto_key(self.focused_pane)?,
+            "bookmark jump" => self.open_bookmark_list(),
+            "bookmark delete" => {
+                self.open_bookmark_list_with_mode(self.focused_pane, BookmarkListMode::Delete);
+            }
+            "bookmark clear" => self.delete_all_bookmarks()?,
             "connect" => {
                 self.status = String::from("SMB 連線需要完整位址：connect smb://host/share[/path]");
             }
@@ -4170,6 +4271,12 @@ impl App {
                     self.set_bookmark_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark jump ") {
                     self.jump_to_bookmark_from_command(args.trim())?;
+                } else if let Some(args) = other.strip_prefix("bookmark delete ") {
+                    let Some(key) = parse_bookmark_argument(args) else {
+                        self.status = String::from("usage: bookmark delete <key>");
+                        return Ok(());
+                    };
+                    self.delete_bookmark(key)?;
                 } else if let Some(target) = other.strip_prefix("connect ") {
                     self.connect_smb_location(target.trim())?;
                 } else if looks_like_navigation_path(other) {
@@ -4362,10 +4469,12 @@ impl App {
         self.status = String::from("linemode: choose a key from the panel");
     }
 
-    /// 進入等待書籤按鍵的狀態，讓使用者用單一字元儲存目前目錄。
-    pub(crate) fn set_bookmark_pending(&mut self) {
-        self.pending_bookmark = Some(BookmarkPrompt::Set);
-        self.status = String::from("bookmark: press a key to save current directory");
+    /// 打開書籤功能面板，列出目前可用的書籤操作。
+    pub(crate) fn open_bookmark_picker(&mut self) {
+        self.pending_action = Some(PendingAction::BookmarkPicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from("bookmark: choose s/g/d/D from the panel");
     }
 
     /// 打開 trash 面板，列出目前可還原的項目。
@@ -4409,13 +4518,23 @@ impl App {
         self.status = task_panel_status(count, 0);
     }
 
-    /// 打開書籤列表彈窗，讓使用者可以用列表方式查看與跳轉書籤。
+    /// 打開書籤列表彈窗，讓使用者可以用列表方式跳轉既有書籤。
     pub(crate) fn open_bookmark_list(&mut self) {
+        self.open_bookmark_list_with_mode(self.focused_pane, BookmarkListMode::Jump);
+    }
+
+    /// 以指定模式打開書籤列表彈窗，供跳轉或刪除流程共用。
+    pub(crate) fn open_bookmark_list_with_mode(
+        &mut self,
+        pane_id: usize,
+        mode: BookmarkListMode,
+    ) {
         self.pending_action = Some(PendingAction::BookmarkList {
-            pane_id: self.focused_pane,
+            pane_id,
             selected: 0,
+            mode,
         });
-        self.status = bookmark_list_status(self.bookmark_store.list().len(), 0);
+        self.status = bookmark_list_status(self.bookmark_store.list().len(), 0, mode);
     }
 
     /// 打開目前 pane 的 recent 目錄列表，方便快速跳回先前去過的位置。
@@ -4443,13 +4562,11 @@ impl App {
                 self.status = String::from("normal mode");
             }
             KeyCode::Char(bookmark) => match prompt {
-                BookmarkPrompt::Set => self.set_bookmark(bookmark)?,
                 BookmarkPrompt::Jump => self.jump_to_bookmark(bookmark)?,
             },
             _ => {
                 self.pending_bookmark = Some(prompt);
                 self.status = match prompt {
-                    BookmarkPrompt::Set => String::from("bookmark: use a single character key"),
                     BookmarkPrompt::Jump => String::from("bookmark: choose an existing key"),
                 };
             }
@@ -4482,6 +4599,22 @@ impl App {
         Ok(())
     }
 
+    /// 自動挑選下一個可用書籤代號，並把指定 pane 目前位置存成書籤。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，要儲存位置的 pane 編號。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn save_bookmark_with_auto_key(&mut self, pane_id: usize) -> io::Result<()> {
+        let Some(key) = self.bookmark_store.next_available_key() else {
+            self.status = String::from("bookmark: no available auto key");
+            return Ok(());
+        };
+
+        self.focused_pane = pane_id;
+        self.set_bookmark(key)
+    }
+
     /// 跳到指定書籤對應的路徑。
     fn jump_to_bookmark(&mut self, key: char) -> io::Result<()> {
         let Some(target) = self.bookmark_store.get(key).cloned() else {
@@ -4508,6 +4641,57 @@ impl App {
             return Ok(());
         };
         self.jump_to_bookmark(key)
+    }
+
+    /// 刪除指定代號的單一書籤，並同步更新狀態列。
+    ///
+    /// 參數：
+    /// - `key: char`，要刪除的書籤代號。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn delete_bookmark(&mut self, key: char) -> io::Result<()> {
+        let removed = self
+            .bookmark_store
+            .remove(key)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        if removed {
+            self.status = format!("bookmark [{key}] deleted");
+        } else {
+            self.status = format!("bookmark [{key}] not found");
+        }
+        Ok(())
+    }
+
+    /// 根據目前書籤列表選取位置刪除單一書籤。
+    ///
+    /// 參數：
+    /// - `entries: &[BookmarkEntry]`，目前列表中可見的書籤資料。
+    /// - `selected: usize`，目前游標指到的列索引。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn delete_bookmark_from_list(
+        &mut self,
+        entries: &[BookmarkEntry],
+        selected: usize,
+    ) -> io::Result<()> {
+        let Some(entry) = entries.get(selected) else {
+            self.status = String::from("bookmark delete: empty");
+            return Ok(());
+        };
+
+        self.delete_bookmark(entry.key)
+    }
+
+    /// 清空全部書籤，並同步寫回 `bookmark.toml`。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn delete_all_bookmarks(&mut self) -> io::Result<()> {
+        self.bookmark_store
+            .clear()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.status = String::from("all bookmarks deleted");
+        Ok(())
     }
 
     /// 讓 `:linemode <mode>` 可以直接切換目前 pane 的右側欄位顯示模式。
@@ -4652,7 +4836,7 @@ impl App {
         selected: usize,
     ) -> io::Result<()> {
         let Some(entry) = entries.get(selected) else {
-            self.status = String::from("bookmark list: empty");
+            self.status = String::from("bookmark jump: empty");
             return Ok(());
         };
         let Some(target) = self.bookmark_store.get(entry.key).cloned() else {
@@ -4995,9 +5179,6 @@ impl App {
             HelpReturnState::PendingBookmark(prompt) => {
                 self.pending_bookmark = Some(prompt);
                 self.status = match prompt {
-                    BookmarkPrompt::Set => {
-                        String::from("bookmark: press a key to save current directory")
-                    }
                     BookmarkPrompt::Jump => String::from("bookmark: press a key to jump"),
                 };
             }
@@ -5043,6 +5224,9 @@ impl App {
             PendingAction::TaskPanel { pane_id, selected } => {
                 task_panel_status(self.tasks_for_pane(*pane_id).len(), *selected)
             }
+            PendingAction::BookmarkPicker { .. } => {
+                String::from("bookmark: choose s/g/d/D from the panel")
+            }
             PendingAction::TrashPanel {
                 selected,
                 search,
@@ -5063,8 +5247,8 @@ impl App {
                 help_entries(&search.buffer).len(),
                 search.editing,
             ),
-            PendingAction::BookmarkList { selected, .. } => {
-                bookmark_list_status(self.bookmark_store.list().len(), *selected)
+            PendingAction::BookmarkList { selected, mode, .. } => {
+                bookmark_list_status(self.bookmark_store.list().len(), *selected, *mode)
             }
             PendingAction::RecentList { pane_id, selected } => {
                 let count = self
@@ -7312,8 +7496,10 @@ impl App {
             Span::raw(" pane  "),
             Span::styled("m", self.theme.accent_style()),
             Span::raw(" linemode  "),
-            Span::styled("b / '", self.theme.accent_style()),
+            Span::styled("b", self.theme.accent_style()),
             Span::raw(" bookmark  "),
+            Span::styled("'", self.theme.accent_style()),
+            Span::raw(" jump  "),
             Span::styled("V", self.theme.accent_style()),
             Span::raw(" visual mark  "),
             Span::styled("yy", self.theme.accent_style()),
@@ -7461,13 +7647,31 @@ impl App {
             Some(PendingAction::LineModePicker { .. }) => {
                 render_linemode_picker(frame, frame.area(), self.theme);
             }
+            Some(PendingAction::BookmarkPicker { pane_id }) => {
+                if let Some(area) = pane_rects.get(pane_id) {
+                    render_bookmark_action_picker(frame, *area, self.theme);
+                }
+            }
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
-            Some(PendingAction::BookmarkList { pane_id, selected }) => {
+            Some(PendingAction::BookmarkList {
+                pane_id,
+                selected,
+                mode,
+            }) => {
                 let lines = bookmark_panel_lines(self.bookmark_store.list());
                 if let Some(area) = pane_rects.get(pane_id) {
-                    render_bookmark_picker(frame, *area, self.theme, &lines, *selected);
+                    let (title, empty_message) = bookmark_picker_copy(*mode);
+                    render_bookmark_picker(
+                        frame,
+                        *area,
+                        self.theme,
+                        &lines,
+                        *selected,
+                        title,
+                        empty_message,
+                    );
                 }
             }
             Some(PendingAction::RecentList { pane_id, selected }) => {
@@ -7641,6 +7845,14 @@ fn bookmark_panel_lines(entries: Vec<BookmarkEntry>) -> Vec<BookmarkPanelLine> {
             path: entry.target.display_text(),
         })
         .collect()
+}
+
+/// 依書籤列表模式回傳彈窗標題與空狀態訊息。
+fn bookmark_picker_copy(mode: BookmarkListMode) -> (&'static str, &'static str) {
+    match mode {
+        BookmarkListMode::Jump => (" Bookmarks ", "沒有書籤，按 b 再按 s 新增"),
+        BookmarkListMode::Delete => (" Delete Bookmark ", "沒有可刪除的書籤"),
+    }
 }
 
 /// 將 recent 目錄清單轉成彈窗可直接顯示的列內容。
@@ -8012,15 +8224,25 @@ fn command_suggestion_navigation(key: &KeyEvent) -> Option<SuggestionNavigation>
 }
 
 /// 根據目前書籤彈窗的內容，產生適合顯示在狀態列的提示文字。
-fn bookmark_list_status(count: usize, selected: usize) -> String {
+fn bookmark_list_status(count: usize, selected: usize, mode: BookmarkListMode) -> String {
     if count == 0 {
-        String::from("bookmark list: empty")
+        match mode {
+            BookmarkListMode::Jump => String::from("bookmark jump: empty"),
+            BookmarkListMode::Delete => String::from("bookmark delete: empty"),
+        }
     } else {
-        format!(
-            "bookmarks: {}/{} (j/k move, Enter open, Esc close)",
-            selected.saturating_add(1).min(count),
-            count
-        )
+        match mode {
+            BookmarkListMode::Jump => format!(
+                "bookmarks jump: {}/{} (j/k move, Enter open, Esc close)",
+                selected.saturating_add(1).min(count),
+                count
+            ),
+            BookmarkListMode::Delete => format!(
+                "bookmarks delete: {}/{} (press key or Enter delete, Esc close)",
+                selected.saturating_add(1).min(count),
+                count
+            ),
+        }
     }
 }
 
@@ -8140,22 +8362,46 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("cd "),
         ),
         help_entry(
-            ":bookmark set",
-            "b{key}",
-            "把目前 pane 的目錄記成書籤，之後可快速跳回來",
-            HelpAction::Command("bookmark set "),
+            ":bookmark",
+            "b",
+            "打開書籤功能面板，可選擇自動儲存、列表跳轉、刪除單筆或清空全部書籤",
+            HelpAction::Command("bookmark"),
+        ),
+        help_entry(
+            ":bookmark save",
+            "b s",
+            "自動挑選下一個可用代號，把目前 pane 的位置存成書籤",
+            HelpAction::Command("bookmark save"),
         ),
         help_entry(
             ":bookmark jump",
-            "'{key}",
-            "跳到已記錄的書籤目錄；設定檔中的固定書籤也能直接使用",
-            HelpAction::Command("bookmark jump "),
+            "b g / '{key}",
+            "用列表挑選要跳去的書籤，或直接用單鍵快速跳轉",
+            HelpAction::Command("bookmark jump"),
         ),
         help_entry(
             ":bookmark list",
-            "",
-            "列出目前可用的書籤按鍵與對應路徑",
+            "b g",
+            "列出目前可用的書籤清單，Enter 或 l 直接跳過去",
             HelpAction::Command("bookmark list"),
+        ),
+        help_entry(
+            ":bookmark delete",
+            "b d",
+            "打開書籤刪除列表，可按對應按鍵或 Enter 刪除單筆書籤",
+            HelpAction::Command("bookmark delete"),
+        ),
+        help_entry(
+            ":bookmark clear",
+            "b D",
+            "直接刪除全部書籤",
+            HelpAction::Command("bookmark clear"),
+        ),
+        help_entry(
+            ":bookmark set",
+            "",
+            "手動指定代號儲存書籤，適合想自行固定快捷鍵時使用",
+            HelpAction::Command("bookmark set "),
         ),
         help_entry(
             ":recent",
@@ -9083,8 +9329,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, ClipboardOperation, FilterState, GlobalSearchState, ListFindState, PendingAction,
-        RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
+        App, BookmarkListMode, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
+        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState,
+        VisualSelectionState,
         command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
         ctrl_digit_target_pane_id, help_entries, is_windows_drive_path, key_matches_ctrl_letter,
         key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
@@ -9936,6 +10183,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("clear-via-help.txt");
         fs::write(&file_path, "hello").expect("file");
+        let clear_index = help_entries("")
+            .iter()
+            .position(|entry| entry.line.command == ":trash clear")
+            .expect("trash clear help entry");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.start_delete_confirmation(false);
@@ -9945,14 +10196,10 @@ mod tests {
         app.open_trash_panel().expect("open trash");
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
             .expect("open help from trash");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
-            .expect("start help search");
-        for ch in ['c', 'l', 'e', 'a', 'r'] {
-            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .expect("type help query");
+        for _ in 0..clear_index {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .expect("move to trash clear help entry");
         }
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("lock help search");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("execute trash clear from help");
 
@@ -10180,13 +10427,11 @@ mod tests {
     }
 
     #[test]
-    /// 驗證可以用 `b{key}` 記錄目前目錄，再用 `'{key}` 跳回該書籤。
-    fn app_bookmark_set_and_jump_with_keys() {
+    /// 驗證按下 `b` 會先打開書籤功能面板，再用 `s` 自動分配代號存書籤。
+    fn app_bookmark_picker_saves_with_auto_key() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
-        let src = dir.path().join("src");
         fs::create_dir(&docs).expect("docs");
-        fs::create_dir(&src).expect("src");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.panes
@@ -10196,10 +10441,38 @@ mod tests {
             .expect("go docs");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
-            .expect("start bookmark set");
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("open bookmark picker");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::BookmarkPicker { pane_id: 1 })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
             .expect("save bookmark");
 
+        assert_eq!(app.status, format!("bookmark [a] = {}", docs.display()));
+        assert!(
+            fs::read_to_string(dir.path().join("bookmark.toml"))
+                .expect("bookmark file")
+                .contains("a =")
+        );
+    }
+
+    #[test]
+    /// 驗證仍可用 `'{key}` 直接跳回既有書籤，保留快速單鍵 workflow。
+    fn app_bookmark_direct_jump_still_works() {
+        let dir = tempdir().expect("tempdir");
+        let docs = dir.path().join("docs");
+        let src = dir.path().join("src");
+        fs::create_dir(&docs).expect("docs");
+        fs::create_dir(&src).expect("src");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\n", docs.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.panes
             .get_mut(&1)
             .expect("pane")
@@ -10213,11 +10486,6 @@ mod tests {
 
         assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
         assert_eq!(app.status, "jumped to bookmark [a]");
-        assert!(
-            fs::read_to_string(dir.path().join("bookmark.toml"))
-                .expect("bookmark file")
-                .contains("a =")
-        );
     }
 
     #[test]
@@ -10366,7 +10634,8 @@ mod tests {
             app.pending_action,
             Some(PendingAction::BookmarkList {
                 pane_id: 1,
-                selected: 0
+                selected: 0,
+                mode: BookmarkListMode::Jump
             })
         ));
 
@@ -10402,7 +10671,8 @@ mod tests {
             app.pending_action,
             Some(PendingAction::BookmarkList {
                 pane_id: 2,
-                selected: 0
+                selected: 0,
+                mode: BookmarkListMode::Jump
             })
         ));
 
@@ -10413,6 +10683,96 @@ mod tests {
 
         assert_eq!(app.panes.get(&2).expect("pane").cwd, beta);
         assert_ne!(app.panes.get(&1).expect("pane").cwd, beta);
+    }
+
+    #[test]
+    /// 驗證按下 `b` 再按 `d` 會進入刪除列表，並可按對應書籤鍵直接刪除。
+    fn app_bookmark_delete_mode_removes_entry_by_matching_key() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("open bookmark picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("open delete list");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::BookmarkList {
+                pane_id: 1,
+                selected: 0,
+                mode: BookmarkListMode::Delete
+            })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("delete bookmark by key");
+
+        assert_eq!(app.status, "bookmark [b] deleted");
+        let content = fs::read_to_string(dir.path().join("bookmark.toml")).expect("bookmark file");
+        assert!(content.contains("a = "));
+        assert!(!content.contains("b = "));
+    }
+
+    #[test]
+    /// 驗證書籤刪除列表可用游標移動後按 Enter 刪除選中的書籤。
+    fn app_bookmark_delete_mode_removes_selected_entry_with_enter() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.execute_command("bookmark delete")
+            .expect("open delete list");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("delete selected bookmark");
+
+        assert_eq!(app.status, "bookmark [b] deleted");
+        let content = fs::read_to_string(dir.path().join("bookmark.toml")).expect("bookmark file");
+        assert!(content.contains("a = "));
+        assert!(!content.contains("b = "));
+    }
+
+    #[test]
+    /// 驗證按下 `b` 再按 `D` 會直接清空全部書籤。
+    fn app_bookmark_picker_can_delete_all_bookmarks() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\n", alpha.display()),
+        )
+        .expect("bookmark file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("open bookmark picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+            .expect("delete all bookmarks");
+
+        assert_eq!(app.status, "all bookmarks deleted");
+        assert!(
+            app.bookmark_store.list().is_empty(),
+            "bookmark store should be empty after clear"
+        );
     }
 
     #[test]
@@ -10847,20 +11207,20 @@ mod tests {
             .iter()
             .find(|entry| entry.line.command == ":trash")
             .expect("trash help entry");
+        let delete_index = entries
+            .iter()
+            .position(|entry| entry.line.command == ":delete")
+            .expect("delete help index");
         assert_eq!(delete_entry.line.shortcut, "d");
         assert!(trash_entry.line.shortcut.is_empty());
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.open_help_panel();
 
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
-            .expect("start help search");
-        for ch in ['d', 'e', 'l'] {
-            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .expect("type help query");
+        for _ in 0..delete_index {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .expect("move to delete help entry");
         }
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("lock help search");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("execute delete from help");
 
