@@ -546,7 +546,7 @@ impl App {
 
     /// 處理一般輸入事件的總入口。
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if key.code == KeyCode::F(1) {
+        if key.code == KeyCode::F(1) || key_matches_tilde(&key) {
             if matches!(self.pending_action, Some(PendingAction::HelpPanel { .. })) {
                 return self.handle_pending_action_key(key);
             }
@@ -1001,6 +1001,13 @@ impl App {
                 self.pending_g = false;
                 self.pending_y = false;
                 self.open_linemode_picker();
+                true
+            }
+            _ if key_matches_plain_letter(&key, 't') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_task_panel();
                 true
             }
             KeyCode::Char('\'') => {
@@ -7498,6 +7505,10 @@ impl App {
             Span::raw(" linemode  "),
             Span::styled("b", self.theme.accent_style()),
             Span::raw(" bookmark  "),
+            Span::styled("t", self.theme.accent_style()),
+            Span::raw(" tasks  "),
+            Span::styled("~ / F1", self.theme.accent_style()),
+            Span::raw(" help  "),
             Span::styled("'", self.theme.accent_style()),
             Span::raw(" jump  "),
             Span::styled("V", self.theme.accent_style()),
@@ -8110,6 +8121,16 @@ fn key_matches_shifted_letter(key: &KeyEvent, uppercase: char) -> bool {
         || (key.code == KeyCode::Char(lower) && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// 判斷目前按鍵是否應視為 `~`，支援不同終端可能回報的格式差異。
+///
+/// 常見情況：
+/// - 直接回報 `Char('~')`
+/// - 回報 `Char('`') + Shift`
+fn key_matches_tilde(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('~')
+        || (key.code == KeyCode::Char('`') && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 /// 判斷某個英文字母命令是否要接受大小寫等價輸入。
 ///
 /// 這主要用在 `y/n` 這種確認提示，或某些不區分大小寫的互動按鍵。
@@ -8561,7 +8582,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":tasks",
-            "",
+            "t",
             "打開目前 pane 的任務面板，查看最近的 search / jump / open / smb 任務狀態",
             HelpAction::Command("tasks"),
         ),
@@ -8663,7 +8684,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":help",
-            "F1",
+            "~ / F1",
             "打開這個功能說明面板",
             HelpAction::Command("help"),
         ),
@@ -11074,6 +11095,55 @@ mod tests {
             other => panic!("unexpected pending action: {other:?}"),
         }
         assert_eq!(app.status, "help search: re (12)");
+    }
+
+    #[test]
+    /// 驗證按下 `~` 時，也會像 F1 一樣打開 help 面板。
+    fn app_tilde_opens_help_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE))
+            .expect("open help with tilde");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel { .. })
+        ));
+    }
+
+    #[test]
+    /// 驗證某些終端把 `~` 回報成 `Shift+\`` 時，也能正確打開 help 面板。
+    fn app_shift_backtick_opens_help_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::SHIFT))
+            .expect("open help with shift backtick");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel { .. })
+        ));
+    }
+
+    #[test]
+    /// 驗證按下 `t` 會直接打開目前 pane 的 task 面板。
+    fn app_t_opens_task_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open tasks with t");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TaskPanel {
+                pane_id: 1,
+                selected: 0
+            })
+        ));
+        assert_eq!(app.status, "tasks: empty");
     }
 
     #[test]
