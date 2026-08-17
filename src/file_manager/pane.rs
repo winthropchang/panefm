@@ -269,6 +269,24 @@ impl PaneState {
         step
     }
 
+    /// 依照目前列表 viewport 高度向下移動一整頁。
+    ///
+    /// 回傳：實際採用的步長。
+    pub(crate) fn full_page_down(&mut self) -> usize {
+        let step = self.list_viewport_height.max(1);
+        self.move_down_by(step);
+        step
+    }
+
+    /// 依照目前列表 viewport 高度向上移動一整頁。
+    ///
+    /// 回傳：實際採用的步長。
+    pub(crate) fn full_page_up(&mut self) -> usize {
+        let step = self.list_viewport_height.max(1);
+        self.move_up_by(step);
+        step
+    }
+
     /// 將列表選取游標跳到指定的可見索引位置。
     ///
     /// 參數：
@@ -555,6 +573,18 @@ impl PaneState {
     /// 依照目前 viewport 高度向上翻半頁。
     pub(crate) fn page_preview_up(&mut self) {
         let step = (self.preview_viewport_height / 2).max(1);
+        self.scroll_preview_up(step);
+    }
+
+    /// 依照目前 preview viewport 高度向下翻一整頁。
+    pub(crate) fn full_page_preview_down(&mut self) {
+        let step = self.preview_viewport_height.max(1);
+        self.scroll_preview_down(step);
+    }
+
+    /// 依照目前 preview viewport 高度向上翻一整頁。
+    pub(crate) fn full_page_preview_up(&mut self) {
+        let step = self.preview_viewport_height.max(1);
         self.scroll_preview_up(step);
     }
 

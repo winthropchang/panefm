@@ -577,6 +577,15 @@ impl App {
         if self.pending_bookmark.is_some() {
             return self.handle_bookmark_key(key);
         }
+        if self.panes.len() > 1
+            && let Some(target_pane_id) = plain_digit_target_pane_id(&key)
+        {
+            self.clear_pending_count();
+            self.pending_g = false;
+            self.pending_y = false;
+            self.focus_pane_by_id(target_pane_id);
+            return Ok(true);
+        }
         if let Some(target_pane_id) = ctrl_digit_target_pane_id(&key) {
             self.clear_pending_count();
             self.pending_g = false;
@@ -697,12 +706,28 @@ impl App {
                 let step = self.current_pane_mut()?.page_down();
                 self.pending_g = false;
                 self.pending_y = false;
-                self.status = format!("page down: {step}");
+                self.status = format!("half page down: {step}");
                 true
             }
             _ if key_matches_ctrl_letter(&key, 'u') => {
                 self.clear_pending_count();
                 let step = self.current_pane_mut()?.page_up();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = format!("half page up: {step}");
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'f') => {
+                self.clear_pending_count();
+                let step = self.current_pane_mut()?.full_page_down();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.status = format!("page down: {step}");
+                true
+            }
+            _ if key_matches_ctrl_letter(&key, 'b') => {
+                self.clear_pending_count();
+                let step = self.current_pane_mut()?.full_page_up();
                 self.pending_g = false;
                 self.pending_y = false;
                 self.status = format!("page up: {step}");
@@ -1115,11 +1140,23 @@ impl App {
                 self.clear_pending_count();
                 self.current_pane_mut()?.page_preview_down();
                 self.pending_g = false;
-                self.status = String::from("preview: page down");
+                self.status = String::from("preview: half page down");
             }
             _ if key_matches_ctrl_letter(&key, 'u') => {
                 self.clear_pending_count();
                 self.current_pane_mut()?.page_preview_up();
+                self.pending_g = false;
+                self.status = String::from("preview: half page up");
+            }
+            _ if key_matches_ctrl_letter(&key, 'f') => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.full_page_preview_down();
+                self.pending_g = false;
+                self.status = String::from("preview: page down");
+            }
+            _ if key_matches_ctrl_letter(&key, 'b') => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.full_page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
             }
@@ -7166,9 +7203,13 @@ impl App {
             Span::styled("J/K", self.theme.accent_style()),
             Span::raw(" fast  "),
             Span::styled("Ctrl-d/u", self.theme.accent_style()),
+            Span::raw(" half  "),
+            Span::styled("Ctrl-b/f", self.theme.accent_style()),
             Span::raw(" page  "),
             Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
+            Span::styled("1..9/0", self.theme.accent_style()),
+            Span::raw(" pane  "),
             Span::styled("m / '", self.theme.accent_style()),
             Span::raw(" bookmark  "),
             Span::styled("V", self.theme.accent_style()),
@@ -7803,6 +7844,31 @@ fn ctrl_digit_target_pane_id(key: &KeyEvent) -> Option<usize> {
     }
 }
 
+/// 把不帶修飾鍵的數字轉成目標 pane 編號，供多 pane 模式直接切換焦點。
+///
+/// 目前規則：
+/// - `1` 到 `9` 對應 pane 1..9
+/// - `0` 對應 pane 10
+fn plain_digit_target_pane_id(key: &KeyEvent) -> Option<usize> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('1') => Some(1),
+        KeyCode::Char('2') => Some(2),
+        KeyCode::Char('3') => Some(3),
+        KeyCode::Char('4') => Some(4),
+        KeyCode::Char('5') => Some(5),
+        KeyCode::Char('6') => Some(6),
+        KeyCode::Char('7') => Some(7),
+        KeyCode::Char('8') => Some(8),
+        KeyCode::Char('9') => Some(9),
+        KeyCode::Char('0') => Some(10),
+        _ => None,
+    }
+}
+
 /// 描述 command mode 補全候選目前要往前還是往後切換。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuggestionNavigation {
@@ -8048,8 +8114,8 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":pane <id>",
-            "Ctrl-p",
-            "打開 pane 切換命令，輸入 pane 編號後可直接把焦點跳到指定 pane",
+            "1..9 / 0, Ctrl-p",
+            "多 pane 時可直接按數字切換焦點；也可打開 pane 切換命令輸入指定編號",
             HelpAction::Command("pane "),
         ),
         help_entry(
@@ -8911,8 +8977,9 @@ mod tests {
         command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
         ctrl_digit_target_pane_id, help_entries, is_windows_drive_path, key_matches_ctrl_letter,
         key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, looks_like_navigation_path, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end, typed_char_from_key,
+        key_matches_shifted_letter, looks_like_navigation_path, plain_digit_target_pane_id,
+        rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
+        rename_word_end, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -9042,6 +9109,27 @@ mod tests {
         );
         assert_eq!(
             ctrl_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    /// 驗證不帶修飾鍵的數字會正確轉成 pane 編號，供多 pane 直接切換焦點使用。
+    fn plain_digit_target_pane_id_maps_to_expected_panes() {
+        assert_eq!(
+            plain_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Some(1)
+        );
+        assert_eq!(
+            plain_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE)),
+            Some(9)
+        );
+        assert_eq!(
+            plain_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE)),
+            Some(10)
+        );
+        assert_eq!(
+            plain_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL)),
             None
         );
     }
@@ -10277,6 +10365,24 @@ mod tests {
         assert_eq!(app.focused_pane, 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL))
+            .expect("focus pane 2");
+
+        assert_eq!(app.focused_pane, 2);
+        assert_eq!(app.status, "focused pane 2");
+    }
+
+    #[test]
+    /// 驗證多 pane 時直接按數字鍵，也能快速把焦點切到指定 pane。
+    fn app_plain_digit_focuses_target_pane_when_multiple_panes_exist() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+        app.focus_previous_pane();
+        assert_eq!(app.focused_pane, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
             .expect("focus pane 2");
 
         assert_eq!(app.focused_pane, 2);
@@ -13104,12 +13210,37 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
             .expect("page down");
         assert_eq!(app.panes.get(&1).expect("pane").selected, 3);
-        assert_eq!(app.status, "page down: 3");
+        assert_eq!(app.status, "half page down: 3");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
             .expect("page up");
         assert_eq!(app.panes.get(&1).expect("pane").selected, 0);
-        assert_eq!(app.status, "page up: 3");
+        assert_eq!(app.status, "half page up: 3");
+    }
+
+    #[test]
+    /// 驗證 normal mode 的 `Ctrl-f / Ctrl-b` 會依照目前列表 viewport 高度做整頁移動。
+    fn app_ctrl_f_and_ctrl_b_move_by_full_page() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..12 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").expect("file");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_list_viewport_height(5);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .expect("full page down");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 5);
+        assert_eq!(app.status, "page down: 5");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .expect("full page up");
+        assert_eq!(app.panes.get(&1).expect("pane").selected, 0);
+        assert_eq!(app.status, "page up: 5");
     }
 
     #[test]
