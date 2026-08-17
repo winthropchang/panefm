@@ -47,6 +47,8 @@ pub(crate) struct PaneState {
     pub(crate) show_hidden: bool,
     /// 目前使用中的排序模式。
     pub(crate) sort_mode: SortMode,
+    /// 目前是否用 linemode 覆蓋右側欄位顯示內容。
+    pub(crate) line_mode: Option<LineMode>,
     /// 隨機排序時使用的種子，讓每次重新套用時都能洗牌。
     pub(crate) random_seed: u64,
     /// 目前 preview 在內容中的捲動偏移量。
@@ -75,6 +77,16 @@ pub(crate) enum SortMode {
     Created { reverse: bool },
     Extension { reverse: bool },
     Random,
+}
+
+/// 描述列表右側附加欄位目前採用的 linemode。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineMode {
+    Size,
+    Permissions,
+    Btime,
+    Mtime,
+    None,
 }
 
 impl SortMode {
@@ -109,6 +121,30 @@ impl SortMode {
     }
 }
 
+impl LineMode {
+    /// 回傳適合顯示在狀態列與 pane 標題上的 linemode 名稱。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Permissions => "permissions",
+            Self::Btime => "btime",
+            Self::Mtime => "mtime",
+            Self::None => "none",
+        }
+    }
+
+    /// 將 linemode 轉成右側欄位實際應顯示的資料種類。
+    pub(crate) fn detail_kind(self) -> SortDetailKind {
+        match self {
+            Self::Size => SortDetailKind::Size,
+            Self::Permissions => SortDetailKind::Permissions,
+            Self::Btime => SortDetailKind::Created,
+            Self::Mtime => SortDetailKind::Modified,
+            Self::None => SortDetailKind::None,
+        }
+    }
+}
+
 /// 描述列表右側欄位目前應該顯示哪一種排序依據。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SortDetailKind {
@@ -117,6 +153,7 @@ pub(crate) enum SortDetailKind {
     Modified,
     Created,
     Extension,
+    Permissions,
 }
 
 /// 描述搜尋列表下方 preview 區塊需要繪製的內容與捲動資訊。
@@ -148,6 +185,7 @@ impl PaneState {
             visible_indices: Vec::new(),
             show_hidden: false,
             sort_mode: SortMode::Natural { reverse: false },
+            line_mode: None,
             random_seed,
             preview_scroll: 0,
             preview_viewport_height: 4,
@@ -1375,11 +1413,45 @@ impl PaneState {
     /// 切換到下一個排序模式，並立即重排目前列表。
     pub(crate) fn set_sort_mode(&mut self, sort_mode: SortMode) {
         self.sort_mode = sort_mode;
+        self.line_mode = None;
         if matches!(sort_mode, SortMode::Random) {
             self.random_seed = self.random_seed.wrapping_add(1);
         }
         self.sort_entries();
         self.refresh_visible_entries();
+    }
+
+    /// 設定目前 pane 的 linemode，只改變右側欄位顯示，不改變排序順序。
+    ///
+    /// 參數：
+    /// - `line_mode: LineMode`，要套用的 linemode。
+    ///
+    /// 回傳：`()`
+    pub(crate) fn set_line_mode(&mut self, line_mode: LineMode) {
+        self.line_mode = Some(line_mode);
+    }
+
+    /// 回傳右側欄位目前實際應顯示的資料種類。
+    ///
+    /// 回傳：
+    /// - 若目前已有 linemode，就優先使用 linemode。
+    /// - 否則退回排序模式預設的右側欄位。
+    pub(crate) fn active_detail_kind(&self) -> SortDetailKind {
+        self.line_mode
+            .map(LineMode::detail_kind)
+            .unwrap_or_else(|| self.sort_mode.detail_kind())
+    }
+
+    /// 回傳 pane 標題尾端目前應顯示的模式文字。
+    ///
+    /// 回傳：
+    /// - 若目前有 linemode，格式為 `linemode: ...`。
+    /// - 否則顯示 `sort: ...`。
+    pub(crate) fn title_mode_label(&self) -> String {
+        match self.line_mode {
+            Some(line_mode) => format!("linemode: {}", line_mode.label()),
+            None => format!("sort: {}", self.sort_mode.label()),
+        }
     }
 
     /// 重新計算目前實際應該顯示的項目與選取位置。
@@ -2399,17 +2471,57 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
         let item = item?;
         let file_type = item.file_type()?;
         let metadata = item.metadata()?;
+        let entry_path = item.path();
         entries.push(FileEntry {
             name: item.file_name().to_string_lossy().into_owned(),
-            path: item.path(),
+            path: entry_path.clone(),
             is_dir: file_type.is_dir(),
             size: metadata.len(),
+            child_count: file_type
+                .is_dir()
+                .then(|| count_directory_children(&entry_path).ok())
+                .flatten(),
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             created: metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
+            readonly: metadata.permissions().readonly(),
+            unix_mode: read_unix_mode(&metadata),
         });
     }
 
     Ok(entries)
+}
+
+/// 讀取單一目錄的直接子項目數量，供 linemode size 在資料夾時顯示。
+///
+/// 參數：
+/// - `path: &Path`，要統計的目錄路徑。
+///
+/// 回傳：`io::Result<usize>`。
+/// - 成功時回傳目前目錄直接包含的子項目數量。
+/// - 失敗時回傳讀取子目錄時發生的 I/O 錯誤。
+fn count_directory_children(path: &Path) -> io::Result<usize> {
+    Ok(fs::read_dir(path)?.filter_map(Result::ok).count())
+}
+
+/// 讀取目前平台可提供的 Unix 權限位元，供 linemode permissions 顯示。
+///
+/// 參數：
+/// - `metadata: &fs::Metadata`，目前項目的 metadata。
+///
+/// 回傳：`Option<u32>`。
+/// - 在 Unix 平台回傳完整 mode bit。
+/// - 在其他平台回傳 `None`，讓 UI 採用跨平台 fallback 顯示。
+#[cfg(unix)]
+fn read_unix_mode(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.mode())
+}
+
+/// 在非 Unix 平台上，目前沒有標準庫可直接讀完整 rwx 權限，因此回傳 `None`。
+#[cfg(not(unix))]
+fn read_unix_mode(_: &fs::Metadata) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]

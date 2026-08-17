@@ -37,7 +37,7 @@ use super::{
         build_custom_launch_spec, build_launch_spec, custom_action_applies_to_target,
         default_open_action, open_picker_options,
     },
-    pane::{PaneState, SortMode},
+    pane::{LineMode, PaneState, SortMode},
     platform::write_text_to_system_clipboard,
     search::{
         GlobalSearchEntry, GlobalSearchEvent, stream_content_search_entries, stream_search_entries,
@@ -52,8 +52,8 @@ use super::{
         InlinePickerState, PaneListState, RecentPanelLine, RegexRenamePanelLine, SearchListState,
         TaskPanelLine, TrashPanelLine, render_bookmark_picker, render_command_palette,
         render_confirm_dialog, render_filter_input, render_global_search_panel, render_pane,
-        render_paste_overwrite_dialog, render_preview_search_input, render_recent_picker,
-        render_theme_picker,
+        render_linemode_picker, render_paste_overwrite_dialog, render_preview_search_input,
+        render_recent_picker, render_theme_picker,
     },
 };
 
@@ -260,6 +260,9 @@ pub(crate) enum PendingAction {
         operation: ClipboardOperation,
     },
     SortPicker {
+        pane_id: usize,
+    },
+    LineModePicker {
         pane_id: usize,
     },
     ThemePicker {
@@ -975,12 +978,18 @@ impl App {
                 self.clear_clipboard(ClipboardOperation::Copy);
                 true
             }
+            _ if key_matches_plain_letter(&key, 'b') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.set_bookmark_pending();
+                true
+            }
             _ if key_matches_plain_letter(&key, 'm') => {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_y = false;
-                self.pending_bookmark = Some(BookmarkPrompt::Set);
-                self.status = String::from("bookmark: press a key to save current directory");
+                self.open_linemode_picker();
                 true
             }
             KeyCode::Char('\'') => {
@@ -1943,6 +1952,33 @@ impl App {
                 _ => {
                     self.pending_action = Some(PendingAction::SortPicker { pane_id });
                     self.status = String::from("sort: choose a key from the panel");
+                }
+            },
+            PendingAction::LineModePicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 's') => {
+                    self.apply_line_mode(pane_id, LineMode::Size)?;
+                }
+                _ if key_matches_plain_letter(&key, 'p') => {
+                    self.apply_line_mode(pane_id, LineMode::Permissions)?;
+                }
+                _ if key_matches_plain_letter(&key, 'b') => {
+                    self.apply_line_mode(pane_id, LineMode::Btime)?;
+                }
+                _ if key_matches_plain_letter(&key, 'm') => {
+                    self.apply_line_mode(pane_id, LineMode::Mtime)?;
+                }
+                _ if key_matches_plain_letter(&key, 'n') => {
+                    self.apply_line_mode(pane_id, LineMode::None)?;
+                }
+                KeyCode::Esc => {
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                    self.status = String::from("normal mode");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::LineModePicker { pane_id });
+                    self.status = String::from("linemode: choose a key from the panel");
                 }
             },
             PendingAction::ThemePicker { mut selected } => match key.code {
@@ -4088,6 +4124,7 @@ impl App {
             "preview-search" => self.open_preview_search_input(),
             "search" => self.open_global_search()?,
             "search-content" | "grep" => self.open_content_search()?,
+            "linemode" => self.open_linemode_picker(),
             "connect" => {
                 self.status = String::from("SMB 連線需要完整位址：connect smb://host/share[/path]");
             }
@@ -4127,6 +4164,8 @@ impl App {
                     self.focus_pane_by_id_argument(args.trim());
                 } else if let Some(path) = other.strip_prefix("move ") {
                     self.move_selected_to_path(path.trim())?;
+                } else if let Some(args) = other.strip_prefix("linemode ") {
+                    self.apply_line_mode_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark set ") {
                     self.set_bookmark_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark jump ") {
@@ -4315,6 +4354,20 @@ impl App {
         self.status = String::from("sort: choose a key from the panel");
     }
 
+    /// 打開底部 linemode 面板，等待使用者輸入右側欄位顯示模式。
+    pub(crate) fn open_linemode_picker(&mut self) {
+        self.pending_action = Some(PendingAction::LineModePicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from("linemode: choose a key from the panel");
+    }
+
+    /// 進入等待書籤按鍵的狀態，讓使用者用單一字元儲存目前目錄。
+    pub(crate) fn set_bookmark_pending(&mut self) {
+        self.pending_bookmark = Some(BookmarkPrompt::Set);
+        self.status = String::from("bookmark: press a key to save current directory");
+    }
+
     /// 打開 trash 面板，列出目前可還原的項目。
     pub(crate) fn open_trash_panel(&mut self) -> io::Result<()> {
         self.pending_action = Some(PendingAction::TrashPanel {
@@ -4455,6 +4508,31 @@ impl App {
             return Ok(());
         };
         self.jump_to_bookmark(key)
+    }
+
+    /// 讓 `:linemode <mode>` 可以直接切換目前 pane 的右側欄位顯示模式。
+    ///
+    /// 支援：
+    /// - `size`
+    /// - `permissions`
+    /// - `btime`
+    /// - `mtime`
+    /// - `none`
+    fn apply_line_mode_from_command(&mut self, args: &str) -> io::Result<()> {
+        let line_mode = match args {
+            "size" => LineMode::Size,
+            "permissions" => LineMode::Permissions,
+            "btime" => LineMode::Btime,
+            "mtime" => LineMode::Mtime,
+            "none" => LineMode::None,
+            _ => {
+                self.status =
+                    String::from("usage: linemode <size|permissions|btime|mtime|none>");
+                return Ok(());
+            }
+        };
+
+        self.apply_line_mode(self.focused_pane, line_mode)
     }
 
     /// 讓目前焦點 pane 連到指定的 SMB share；若尚未掛載則先請求系統掛載。
@@ -4956,6 +5034,9 @@ impl App {
                 ..
             } => paste_overwrite_confirm_status(target_name, *entry_count),
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
+            PendingAction::LineModePicker { .. } => {
+                String::from("linemode: choose a key from the panel")
+            }
             PendingAction::ThemePicker { selected } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
             }
@@ -6483,6 +6564,25 @@ impl App {
         Ok(())
     }
 
+    /// 套用指定 pane 的 linemode，只更新右側欄位顯示方式，不改動原本排序順序。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，要被套用 linemode 的 pane 編號。
+    /// - `line_mode: LineMode`，要切換成的右側欄位模式。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表 linemode 已套用完成。
+    /// - 若目標 pane 已不存在，會改寫狀態列並直接結束。
+    fn apply_line_mode(&mut self, pane_id: usize, line_mode: LineMode) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("pane no longer exists");
+            return Ok(());
+        };
+        pane.set_line_mode(line_mode);
+        self.status = format!("linemode: {}", line_mode.label());
+        Ok(())
+    }
+
     /// 將目前選取項目放進內部剪貼簿，模式為複製。
     ///
     /// 參數：無。
@@ -7210,7 +7310,9 @@ impl App {
             Span::raw(" jump  "),
             Span::styled("1..9/0", self.theme.accent_style()),
             Span::raw(" pane  "),
-            Span::styled("m / '", self.theme.accent_style()),
+            Span::styled("m", self.theme.accent_style()),
+            Span::raw(" linemode  "),
+            Span::styled("b / '", self.theme.accent_style()),
             Span::raw(" bookmark  "),
             Span::styled("V", self.theme.accent_style()),
             Span::raw(" visual mark  "),
@@ -7355,6 +7457,9 @@ impl App {
             }
             Some(PendingAction::SortPicker { .. }) => {
                 super::ui::render_sort_picker(frame, frame.area(), self.theme);
+            }
+            Some(PendingAction::LineModePicker { .. }) => {
+                render_linemode_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
@@ -8036,7 +8141,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":bookmark set",
-            "m{key}",
+            "b{key}",
             "把目前 pane 的目錄記成書籤，之後可快速跳回來",
             HelpAction::Command("bookmark set "),
         ),
@@ -8057,6 +8162,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "",
             "打開目前 pane 最近去過的目錄列表，方便快速跳回上一些工作位置",
             HelpAction::Command("recent"),
+        ),
+        help_entry(
+            ":linemode",
+            "m",
+            "打開 linemode 面板，改變列表右側欄位顯示；目前支援 size、permissions、btime、mtime、none",
+            HelpAction::Command("linemode "),
         ),
         help_entry(
             ":copy",
@@ -8972,8 +9083,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, BookmarkPrompt, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
-        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
+        App, ClipboardOperation, FilterState, GlobalSearchState, ListFindState, PendingAction,
+        RegexRenameOutcome, RenameMode, SearchMode, TaskState, VisualSelectionState,
         command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
         ctrl_digit_target_pane_id, help_entries, is_windows_drive_path, key_matches_ctrl_letter,
         key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
@@ -8990,7 +9101,7 @@ mod tests {
             bookmark::BookmarkTarget,
             layout::{LayoutNode, SplitDirection},
             open::LaunchMode,
-            pane::SortMode,
+            pane::{LineMode, SortMode},
             search::GlobalSearchEntry,
         },
         theme::ThemePreset,
@@ -10069,7 +10180,7 @@ mod tests {
     }
 
     #[test]
-    /// 驗證可以用 `m{key}` 記錄目前目錄，再用 `'{key}` 跳回該書籤。
+    /// 驗證可以用 `b{key}` 記錄目前目錄，再用 `'{key}` 跳回該書籤。
     fn app_bookmark_set_and_jump_with_keys() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -10084,7 +10195,7 @@ mod tests {
             .go_to_path(&docs)
             .expect("go docs");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
             .expect("start bookmark set");
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .expect("save bookmark");
@@ -10107,6 +10218,52 @@ mod tests {
                 .expect("bookmark file")
                 .contains("a =")
         );
+    }
+
+    #[test]
+    /// 驗證按下 `m` 後再按 `s`，會套用 linemode size，而不改變目前排序方式。
+    fn app_linemode_picker_applies_size_without_changing_sort_order() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "1234").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .get_mut(&1)
+            .expect("pane")
+            .set_sort_mode(SortMode::Modified { reverse: true });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("open linemode");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::LineModePicker { pane_id: 1 })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("apply line mode size");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.line_mode, Some(LineMode::Size));
+        assert_eq!(pane.sort_mode, SortMode::Modified { reverse: true });
+        assert_eq!(app.status, "linemode: size");
+    }
+
+    #[test]
+    /// 驗證 linemode 面板收到非保留鍵時，不會誤存書籤，而是維持原本面板等待合法指令。
+    fn app_linemode_picker_ignores_unknown_keys() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("open linemode");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("ignore unknown key");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::LineModePicker { pane_id: 1 })
+        );
+        assert_eq!(app.status, "linemode: choose a key from the panel");
     }
 
     #[test]
@@ -10170,23 +10327,23 @@ mod tests {
     }
 
     #[test]
-    /// 驗證等待書籤按鍵時打開 F1，離開 help 後仍能回到原本的書籤等待狀態。
-    fn app_help_panel_restores_pending_bookmark_prompt() {
+    /// 驗證等待 linemode 按鍵時打開 F1，離開 help 後仍能回到原本的 linemode 面板。
+    fn app_help_panel_restores_pending_linemode_picker() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
-            .expect("start bookmark set");
+            .expect("open linemode");
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
             .expect("open help");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("close help");
 
-        assert_eq!(app.pending_bookmark, Some(BookmarkPrompt::Set));
         assert_eq!(
-            app.status,
-            "bookmark: press a key to save current directory"
+            app.pending_action,
+            Some(PendingAction::LineModePicker { pane_id: 1 })
         );
+        assert_eq!(app.status, "linemode: choose a key from the panel");
     }
 
     #[test]

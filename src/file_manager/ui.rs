@@ -191,7 +191,7 @@ pub(crate) fn render_pane(
         filter_suffix,
         &mark_suffix,
         panel_suffix,
-        pane.sort_mode.label(),
+        &pane.title_mode_label(),
         area.width.saturating_sub(3) as usize,
     );
     let block = Block::default()
@@ -337,7 +337,7 @@ pub(crate) fn render_pane(
         }
     } else {
         let visible_entries = pane.visible_entries();
-        let detail_kind = pane.sort_mode.detail_kind();
+        let detail_kind = pane.active_detail_kind();
         let find_match_position = pane.list_find_match_position();
         if visible_entries.is_empty() {
             vec![ListItem::new(Line::from("empty directory"))]
@@ -459,7 +459,7 @@ fn format_pane_title(
     filter_suffix: &str,
     mark_suffix: &str,
     panel_suffix: &str,
-    sort_label: &str,
+    mode_label: &str,
     max_width: usize,
 ) -> String {
     let prefix = format!("pane #{pane_id}");
@@ -467,14 +467,14 @@ fn format_pane_title(
     let status_suffix = normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
     let suffix_candidates = [
         if status_suffix.is_empty() {
-            format!("[sort: {sort_label}]")
+            format!("[{mode_label}]")
         } else {
-            format!("{status_suffix} [sort: {sort_label}]")
+            format!("{status_suffix} [{mode_label}]")
         },
         if status_suffix.is_empty() {
-            format!("[{sort_label}]")
+            format!("[{mode_label}]")
         } else {
-            format!("{status_suffix} [{sort_label}]")
+            format!("{status_suffix} [{mode_label}]")
         },
         status_suffix.clone(),
         String::new(),
@@ -977,6 +977,51 @@ pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, the
     );
 }
 
+/// 在畫面底部繪製 linemode 快捷鍵面板，供 `m` 使用。
+pub(crate) fn render_linemode_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
+    let panel_height = 6;
+    let panel_area = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(panel_height),
+        width: area.width,
+        height: panel_height,
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("s", theme.accent_style()),
+            Span::raw(" -> linemode size  "),
+            Span::styled("p", theme.accent_style()),
+            Span::raw(" -> linemode permissions  "),
+            Span::styled("b", theme.accent_style()),
+            Span::raw(" -> linemode btime"),
+        ]),
+        Line::from(vec![
+            Span::styled("m", theme.accent_style()),
+            Span::raw(" -> linemode mtime  "),
+            Span::styled("n", theme.accent_style()),
+            Span::raw(" -> linemode none"),
+        ]),
+        Line::from(vec![
+            Span::styled("Esc", theme.accent_style()),
+            Span::raw(" -> cancel"),
+        ]),
+    ];
+
+    frame.render_widget(Clear, panel_area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Line::from(Span::styled(
+                    " LineMode ",
+                    theme.accent_style().add_modifier(Modifier::BOLD),
+                )))
+                .borders(Borders::TOP),
+        ),
+        panel_area,
+    );
+}
+
 /// 在畫面中央繪製書籤列表彈窗，供 `:bookmark list` 使用。
 pub(crate) fn render_bookmark_picker(
     frame: &mut ratatui::Frame<'_>,
@@ -1000,7 +1045,7 @@ pub(crate) fn render_bookmark_picker(
     frame.render_widget(block, popup_area);
 
     let items = if lines.is_empty() {
-        vec![ListItem::new(Line::from("沒有書籤，按 m{key} 新增"))]
+        vec![ListItem::new(Line::from("沒有書籤，按 b{key} 新增"))]
     } else {
         lines
             .iter()
@@ -1290,7 +1335,10 @@ fn format_sort_detail(entry: &super::entry::FileEntry, detail_kind: SortDetailKi
         SortDetailKind::None => String::new(),
         SortDetailKind::Size => {
             if entry.is_dir {
-                String::from("dir")
+                entry
+                    .child_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| String::from("?"))
             } else {
                 format_size_short(entry.size)
             }
@@ -1308,7 +1356,33 @@ fn format_sort_detail(entry: &super::entry::FileEntry, detail_kind: SortDetailKi
                     .unwrap_or_default()
             }
         }
+        SortDetailKind::Permissions => format_permissions_detail(entry),
     }
+}
+
+/// 依照目前平台與快取 metadata，產生適合列表右側顯示的權限字串。
+fn format_permissions_detail(entry: &super::entry::FileEntry) -> String {
+    if let Some(mode) = entry.unix_mode {
+        return format_unix_permissions(entry.is_dir, mode);
+    }
+
+    let kind = if entry.is_dir { "dir" } else { "file" };
+    let access = if entry.readonly { "readonly" } else { "writable" };
+    format!("{kind} {access}")
+}
+
+/// 把 Unix 權限位元轉成類似 `drwxr-xr-x` 的緊湊字串。
+fn format_unix_permissions(is_dir: bool, mode: u32) -> String {
+    let mut result = String::with_capacity(10);
+    result.push(if is_dir { 'd' } else { '-' });
+
+    for shift in [6_u32, 3_u32, 0_u32] {
+        result.push(if mode & (0o4 << shift) != 0 { 'r' } else { '-' });
+        result.push(if mode & (0o2 << shift) != 0 { 'w' } else { '-' });
+        result.push(if mode & (0o1 << shift) != 0 { 'x' } else { '-' });
+    }
+
+    result
 }
 
 /// 把 `SystemTime` 轉成比較容易閱讀的本地時間字串。
@@ -1346,8 +1420,11 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_pane_title, format_size_short};
+    use super::{format_pane_title, format_permissions_detail, format_size_short};
     use std::path::Path;
+    use std::time::SystemTime;
+
+    use crate::file_manager::entry::FileEntry;
 
     #[test]
     /// 驗證大小格式會轉成人類較容易閱讀的單位顯示。
@@ -1367,7 +1444,7 @@ mod tests {
             "  [filter]",
             "  [mark: 2]",
             "  [help]",
-            "natural",
+            "sort: natural",
             80,
         );
 
@@ -1386,7 +1463,7 @@ mod tests {
             "",
             "",
             "",
-            "natural",
+            "sort: natural",
             120,
         );
 
@@ -1405,7 +1482,7 @@ mod tests {
             "",
             "",
             "",
-            "natural",
+            "sort: natural",
             32,
         );
 
@@ -1426,7 +1503,7 @@ mod tests {
             "",
             "",
             "",
-            "natural",
+            "sort: natural",
             40,
         );
 
@@ -1434,6 +1511,32 @@ mod tests {
         assert!(title.contains("file-manager"));
         assert!(title.contains("[sort: natural]"));
         assert!(!title.contains("/…/…"));
+    }
+
+    #[test]
+    /// 驗證 linemode 開啟後，pane 標題尾端會顯示目前啟用的 linemode。
+    fn format_pane_title_supports_linemode_status() {
+        let title = format_pane_title(5, Path::new("/tmp/demo"), "", "", "", "linemode: size", 80);
+
+        assert_eq!(title, "pane #5 /tmp/demo [linemode: size]");
+    }
+
+    #[test]
+    /// 驗證非 Unix 平台或缺少 mode bits 時，permissions 仍有可讀的 fallback 顯示。
+    fn format_permissions_detail_falls_back_to_cross_platform_text() {
+        let entry = FileEntry {
+            name: String::from("notes.txt"),
+            path: Path::new("/tmp/notes.txt").to_path_buf(),
+            is_dir: false,
+            size: 12,
+            child_count: None,
+            modified: SystemTime::UNIX_EPOCH,
+            created: SystemTime::UNIX_EPOCH,
+            readonly: true,
+            unix_mode: None,
+        };
+
+        assert_eq!(format_permissions_detail(&entry), "file readonly");
     }
 }
 

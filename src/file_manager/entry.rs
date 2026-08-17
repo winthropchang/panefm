@@ -9,8 +9,11 @@ pub(crate) struct FileEntry {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
     pub(crate) size: u64,
+    pub(crate) child_count: Option<usize>,
     pub(crate) modified: SystemTime,
     pub(crate) created: SystemTime,
+    pub(crate) readonly: bool,
+    pub(crate) unix_mode: Option<u32>,
 }
 
 impl FileEntry {

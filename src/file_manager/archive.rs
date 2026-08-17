@@ -418,8 +418,11 @@ mod tests {
             path: source,
             is_dir: false,
             size: 13,
+            child_count: None,
             modified: std::time::SystemTime::now(),
             created: std::time::SystemTime::now(),
+            readonly: false,
+            unix_mode: None,
         };
 
         let archive = compress_entries_to_zip(dir.path(), &[entry]).expect("compress");
