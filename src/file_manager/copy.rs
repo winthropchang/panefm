@@ -25,7 +25,7 @@ pub(crate) struct CopyPickerOption {
 pub(crate) fn copy_picker_options() -> Vec<CopyPickerOption> {
     vec![
         CopyPickerOption {
-            shortcut: 'c',
+            shortcut: 'u',
             label: "Copy file path",
             action: CopyAction::FileUrl,
         },

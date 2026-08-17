@@ -1922,6 +1922,9 @@ impl App {
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
+                KeyCode::Char(',') => {
+                    self.status = String::from("sort cancelled");
+                }
                 _ if key_matches_shifted_letter(&key, 'M') => {
                     self.apply_sort_mode(pane_id, SortMode::Modified { reverse: true })?
                 }
@@ -1973,6 +1976,9 @@ impl App {
                 }
             },
             PendingAction::LineModePicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 'm') => {
+                    self.status = String::from("normal mode");
+                }
                 _ if key_matches_plain_letter(&key, 's') => {
                     self.apply_line_mode(pane_id, LineMode::Size)?;
                 }
@@ -1982,7 +1988,7 @@ impl App {
                 _ if key_matches_plain_letter(&key, 'b') => {
                     self.apply_line_mode(pane_id, LineMode::Btime)?;
                 }
-                _ if key_matches_plain_letter(&key, 'm') => {
+                _ if key_matches_plain_letter(&key, 't') => {
                     self.apply_line_mode(pane_id, LineMode::Mtime)?;
                 }
                 _ if key_matches_plain_letter(&key, 'n') => {
@@ -2505,6 +2511,12 @@ impl App {
                             self.restore_help_return_state(false)?;
                             return Ok(true);
                         }
+                        _ if key_matches_tilde(&key) => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.restore_help_return_state(false)?;
+                            return Ok(true);
+                        }
                         _ if key_matches_plain_letter(&key, 'q')
                             || key_matches_plain_letter(&key, 'h') =>
                         {
@@ -2646,6 +2658,12 @@ impl App {
                         self.status = String::from("normal mode");
                         return Ok(true);
                     }
+                    _ if key_matches_plain_letter(&key, 't') => {
+                        self.clear_pending_count();
+                        self.pending_g = false;
+                        self.status = String::from("normal mode");
+                        return Ok(true);
+                    }
                     _ if key_matches_plain_letter(&key, 'q')
                         || key_matches_plain_letter(&key, 'h') =>
                     {
@@ -2667,6 +2685,12 @@ impl App {
                 }
             }
             PendingAction::BookmarkPicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 'b') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.status = String::from("normal mode");
+                    return Ok(true);
+                }
                 _ if key_matches_plain_letter(&key, 's') => {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -2998,6 +3022,10 @@ impl App {
                 match key.code {
                     _ if key_matches_plain_letter(&key, 'c') => {
                         self.clear_pending_count();
+                        self.status = String::from("normal mode");
+                    }
+                    _ if key_matches_plain_letter(&key, 'u') => {
+                        self.clear_pending_count();
                         self.copy_target_to_system_clipboard(target.clone(), CopyAction::FileUrl)?;
                     }
                     _ if key_matches_plain_letter(&key, 'd') => {
@@ -3156,6 +3184,14 @@ impl App {
                     return Ok(true);
                 }
                 match key.code {
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.clear_pending_count();
+                        self.status = String::from("normal mode");
+                    }
+                    _ if key_matches_shifted_letter(&key, 'O') => {
+                        self.clear_pending_count();
+                        self.status = String::from("normal mode");
+                    }
                     KeyCode::Down => {
                         if !options.is_empty() {
                             selected = (selected + self.take_count_or_one())
@@ -7658,10 +7694,8 @@ impl App {
             Some(PendingAction::LineModePicker { .. }) => {
                 render_linemode_picker(frame, frame.area(), self.theme);
             }
-            Some(PendingAction::BookmarkPicker { pane_id }) => {
-                if let Some(area) = pane_rects.get(pane_id) {
-                    render_bookmark_action_picker(frame, *area, self.theme);
-                }
+            Some(PendingAction::BookmarkPicker { .. }) => {
+                render_bookmark_action_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::ThemePicker { selected }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
@@ -10375,6 +10409,40 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 open picker 打開後，再按一次 `O` 會直接關閉。
+    fn app_shift_o_toggles_open_picker_closed() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT))
+            .expect("open picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT))
+            .expect("toggle close open picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 open picker 打開後，再按一次 `Shift+Enter` 也會直接關閉。
+    fn app_shift_enter_toggles_open_picker_closed() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .expect("open picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .expect("toggle close open picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
     /// 驗證自訂 open action 會出現在 Open with 面板中，並能排入外部啟動佇列。
     fn app_open_picker_includes_custom_actions() {
         let dir = tempdir().expect("tempdir");
@@ -10553,6 +10621,37 @@ mod tests {
             Some(PendingAction::LineModePicker { pane_id: 1 })
         );
         assert_eq!(app.status, "linemode: choose a key from the panel");
+    }
+
+    #[test]
+    /// 驗證 linemode 面板打開後，再按一次 `m` 會直接關閉。
+    fn app_linemode_picker_m_toggles_closed() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("open linemode");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("toggle close linemode");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證 linemode 面板的 mtime 已改成 `t`，避免和 opener `m` 衝突。
+    fn app_linemode_picker_t_applies_mtime() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("open linemode");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("apply mtime linemode");
+
+        let pane = app.panes.get(&1).expect("pane");
+        assert_eq!(pane.line_mode, Some(LineMode::Mtime));
+        assert_eq!(app.status, "linemode: mtime");
     }
 
     #[test]
@@ -10794,6 +10893,21 @@ mod tests {
             app.bookmark_store.list().is_empty(),
             "bookmark store should be empty after clear"
         );
+    }
+
+    #[test]
+    /// 驗證書籤功能面板打開後，再按一次 `b` 會直接關閉。
+    fn app_bookmark_picker_b_toggles_closed() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("open bookmark picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("toggle close bookmark picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
     }
 
     #[test]
@@ -11113,6 +11227,21 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 help 面板已開啟時，再按一次 `~` 會直接關閉回 normal mode。
+    fn app_tilde_toggles_help_panel_closed() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE))
+            .expect("open help with tilde");
+        app.handle_key(KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE))
+            .expect("close help with tilde");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
     /// 驗證某些終端把 `~` 回報成 `Shift+\`` 時，也能正確打開 help 面板。
     fn app_shift_backtick_opens_help_panel() {
         let dir = tempdir().expect("tempdir");
@@ -11144,6 +11273,21 @@ mod tests {
             })
         ));
         assert_eq!(app.status, "tasks: empty");
+    }
+
+    #[test]
+    /// 驗證 task 面板已開啟時，再按一次 `t` 會直接關閉回 normal mode。
+    fn app_t_toggles_task_panel_closed() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open tasks with t");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("close tasks with t");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
     }
 
     #[test]
@@ -11383,6 +11527,20 @@ mod tests {
         app.open_sort_picker();
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
             .expect("close sort picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "sort cancelled");
+    }
+
+    #[test]
+    /// 驗證排序面板打開後，再按一次 `,` 會直接關閉。
+    fn app_sort_picker_comma_toggles_closed() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_sort_picker();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
+            .expect("toggle close sort picker");
 
         assert!(app.pending_action.is_none());
         assert_eq!(app.status, "sort cancelled");
@@ -13758,6 +13916,36 @@ mod tests {
 
         assert!(app.pending_action.is_none());
         assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證文字複製小視窗打開後，再按一次 `c` 會直接關閉。
+    fn app_copy_picker_c_toggles_closed() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_copy_picker().expect("open copy picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .expect("toggle close copy picker");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證文字複製小視窗中，原本的檔案路徑複製已改成 `u`，避免和 opener `c` 衝突。
+    fn app_copy_picker_u_copies_file_path() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "a").expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.open_copy_picker().expect("open copy picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .expect("copy file path");
+
+        assert_eq!(app.status, "copied file path: alpha.txt");
     }
 
     #[test]

@@ -17,6 +17,13 @@ use super::{
     search::GlobalSearchEntry,
 };
 
+/// 描述底部快捷鍵面板中的單一項目。
+#[derive(Clone, Copy)]
+struct ShortcutPanelItem<'a> {
+    shortcut: &'a str,
+    label: &'a str,
+}
+
 /// 描述 inline 編輯器目前需要顯示的內容、標題與游標位置。
 ///
 /// 這個結構只負責把 `App` 的輸入狀態轉交給 UI，
@@ -916,109 +923,105 @@ pub(crate) fn render_global_search_panel(
 
 /// 在畫面底部繪製排序選單，模仿 mature-reference 的快捷鍵提示面板。
 pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
-    let panel_height = 7;
-    let panel_area = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(panel_height),
-        width: area.width,
-        height: panel_height,
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(",m", theme.accent_style()),
-            Span::raw(" -> modified  "),
-            Span::styled(",M", theme.accent_style()),
-            Span::raw(" -> modified (reverse)  "),
-            Span::styled(",b", theme.accent_style()),
-            Span::raw(" -> birth  "),
-            Span::styled(",B", theme.accent_style()),
-            Span::raw(" -> birth (reverse)"),
-        ]),
-        Line::from(vec![
-            Span::styled(",a", theme.accent_style()),
-            Span::raw(" -> alphabetical  "),
-            Span::styled(",A", theme.accent_style()),
-            Span::raw(" -> alphabetical (reverse)  "),
-            Span::styled(",n", theme.accent_style()),
-            Span::raw(" -> natural  "),
-            Span::styled(",N", theme.accent_style()),
-            Span::raw(" -> natural (reverse)"),
-        ]),
-        Line::from(vec![
-            Span::styled(",e", theme.accent_style()),
-            Span::raw(" -> extension  "),
-            Span::styled(",E", theme.accent_style()),
-            Span::raw(" -> extension (reverse)  "),
-            Span::styled(",s", theme.accent_style()),
-            Span::raw(" -> size  "),
-            Span::styled(",S", theme.accent_style()),
-            Span::raw(" -> size (reverse)"),
-        ]),
-        Line::from(vec![
-            Span::styled(",r", theme.accent_style()),
-            Span::raw(" -> random  "),
-            Span::styled("Esc", theme.accent_style()),
-            Span::raw(" -> cancel"),
-        ]),
-    ];
-
-    frame.render_widget(Clear, panel_area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(Span::styled(
-                    " Sort ",
-                    theme.accent_style().add_modifier(Modifier::BOLD),
-                )))
-                .borders(Borders::TOP),
-        ),
-        panel_area,
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Sort ",
+        &[
+            ShortcutPanelItem {
+                shortcut: ",m",
+                label: "modified",
+            },
+            ShortcutPanelItem {
+                shortcut: ",M",
+                label: "modified (reverse)",
+            },
+            ShortcutPanelItem {
+                shortcut: ",b",
+                label: "birth",
+            },
+            ShortcutPanelItem {
+                shortcut: ",B",
+                label: "birth (reverse)",
+            },
+            ShortcutPanelItem {
+                shortcut: ",a",
+                label: "alphabetical",
+            },
+            ShortcutPanelItem {
+                shortcut: ",A",
+                label: "alphabetical (reverse)",
+            },
+            ShortcutPanelItem {
+                shortcut: ",n",
+                label: "natural",
+            },
+            ShortcutPanelItem {
+                shortcut: ",N",
+                label: "natural (reverse)",
+            },
+            ShortcutPanelItem {
+                shortcut: ",e",
+                label: "extension",
+            },
+            ShortcutPanelItem {
+                shortcut: ",E",
+                label: "extension (reverse)",
+            },
+            ShortcutPanelItem {
+                shortcut: ",s",
+                label: "size",
+            },
+            ShortcutPanelItem {
+                shortcut: ",S",
+                label: "size (reverse)",
+            },
+            ShortcutPanelItem {
+                shortcut: ",r",
+                label: "random",
+            },
+            ShortcutPanelItem {
+                shortcut: ", / Esc",
+                label: "cancel",
+            },
+        ],
     );
 }
 
 /// 在畫面底部繪製 linemode 快捷鍵面板，供 `m` 使用。
 pub(crate) fn render_linemode_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
-    let panel_height = 6;
-    let panel_area = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(panel_height),
-        width: area.width,
-        height: panel_height,
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("s", theme.accent_style()),
-            Span::raw(" -> linemode size  "),
-            Span::styled("p", theme.accent_style()),
-            Span::raw(" -> linemode permissions  "),
-            Span::styled("b", theme.accent_style()),
-            Span::raw(" -> linemode btime"),
-        ]),
-        Line::from(vec![
-            Span::styled("m", theme.accent_style()),
-            Span::raw(" -> linemode mtime  "),
-            Span::styled("n", theme.accent_style()),
-            Span::raw(" -> linemode none"),
-        ]),
-        Line::from(vec![
-            Span::styled("Esc", theme.accent_style()),
-            Span::raw(" -> cancel"),
-        ]),
-    ];
-
-    frame.render_widget(Clear, panel_area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(Span::styled(
-                    " LineMode ",
-                    theme.accent_style().add_modifier(Modifier::BOLD),
-                )))
-                .borders(Borders::TOP),
-        ),
-        panel_area,
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " LineMode ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "s",
+                label: "linemode size",
+            },
+            ShortcutPanelItem {
+                shortcut: "p",
+                label: "linemode permissions",
+            },
+            ShortcutPanelItem {
+                shortcut: "b",
+                label: "linemode btime",
+            },
+            ShortcutPanelItem {
+                shortcut: "t",
+                label: "linemode mtime",
+            },
+            ShortcutPanelItem {
+                shortcut: "n",
+                label: "linemode none",
+            },
+            ShortcutPanelItem {
+                shortcut: "m / Esc",
+                label: "cancel",
+            },
+        ],
     );
 }
 
@@ -1028,7 +1031,47 @@ pub(crate) fn render_bookmark_action_picker(
     area: Rect,
     theme: Theme,
 ) {
-    let panel_height = 6;
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Bookmark ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "s",
+                label: "save bookmark (auto key)",
+            },
+            ShortcutPanelItem {
+                shortcut: "g",
+                label: "jump from list",
+            },
+            ShortcutPanelItem {
+                shortcut: "d",
+                label: "delete one bookmark",
+            },
+            ShortcutPanelItem {
+                shortcut: "D",
+                label: "delete all bookmarks",
+            },
+            ShortcutPanelItem {
+                shortcut: "b / Esc",
+                label: "cancel",
+            },
+        ],
+    );
+}
+
+/// 將底部快捷鍵面板項目依目前寬度自動分欄，避免小 pane 時擠成難讀的一長行。
+fn render_shortcut_grid_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    title: &str,
+    items: &[ShortcutPanelItem<'_>],
+) {
+    let lines = shortcut_panel_lines(items, area.width.saturating_sub(2) as usize, theme);
+    let desired_height = (lines.len() as u16).saturating_add(2).max(4);
+    let panel_height = desired_height.min(area.height.max(1));
     let panel_area = Rect {
         x: area.x,
         y: area.y + area.height.saturating_sub(panel_height),
@@ -1036,37 +1079,61 @@ pub(crate) fn render_bookmark_action_picker(
         height: panel_height,
     };
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("s", theme.accent_style()),
-            Span::raw(" -> save bookmark (auto key)  "),
-            Span::styled("g", theme.accent_style()),
-            Span::raw(" -> jump from list"),
-        ]),
-        Line::from(vec![
-            Span::styled("d", theme.accent_style()),
-            Span::raw(" -> delete one bookmark  "),
-            Span::styled("D", theme.accent_style()),
-            Span::raw(" -> delete all bookmarks"),
-        ]),
-        Line::from(vec![
-            Span::styled("Esc", theme.accent_style()),
-            Span::raw(" -> cancel"),
-        ]),
-    ];
-
     frame.render_widget(Clear, panel_area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .title(Line::from(Span::styled(
-                    " Bookmark ",
+                    title,
                     theme.accent_style().add_modifier(Modifier::BOLD),
                 )))
                 .borders(Borders::TOP),
         ),
         panel_area,
     );
+}
+
+/// 依目前可用寬度，把快捷鍵項目排成多欄對齊的行。
+fn shortcut_panel_lines(
+    items: &[ShortcutPanelItem<'_>],
+    available_width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    if items.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let cell_width = items
+        .iter()
+        .map(shortcut_panel_item_width)
+        .max()
+        .unwrap_or(1)
+        .saturating_add(2);
+    let columns = available_width.max(1) / cell_width.max(1);
+    let columns = columns.max(1);
+
+    items.chunks(columns)
+        .map(|row| {
+            let mut spans = Vec::new();
+            for (index, item) in row.iter().enumerate() {
+                spans.push(Span::styled(item.shortcut.to_string(), theme.accent_style()));
+                spans.push(Span::raw(" -> "));
+                spans.push(Span::raw(item.label.to_string()));
+
+                if index + 1 < row.len() {
+                    let used_width = shortcut_panel_item_width(item);
+                    let padding = cell_width.saturating_sub(used_width).max(2);
+                    spans.push(Span::raw(" ".repeat(padding)));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// 計算單一快捷鍵項目在面板中實際會佔用的字元寬度。
+fn shortcut_panel_item_width(item: &ShortcutPanelItem<'_>) -> usize {
+    item.shortcut.chars().count() + 4 + item.label.chars().count()
 }
 
 /// 在畫面中央繪製書籤列表彈窗，供 `:bookmark list` 使用。
