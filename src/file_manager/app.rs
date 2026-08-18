@@ -52,7 +52,7 @@ use super::{
         InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TaskPanelLine,
         TrashPanelLine, ZoxidePanelLine, render_bookmark_action_picker, render_bookmark_picker,
         render_command_palette, render_confirm_dialog, render_filter_input,
-        render_global_search_panel, render_linemode_picker, render_pane,
+        render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_picker,
         render_window_picker, render_zoxide_picker,
     },
@@ -268,6 +268,9 @@ pub(crate) enum PendingAction {
         operation: ClipboardOperation,
     },
     SortPicker {
+        pane_id: usize,
+    },
+    GoPicker {
         pane_id: usize,
     },
     WindowPicker {
@@ -667,13 +670,6 @@ impl App {
 
         let should_continue = match key.code {
             _ if key_matches_plain_letter(&key, 'q') => false,
-            _ if self.pending_g && key_matches_plain_letter(&key, 't') => {
-                self.clear_pending_count();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.open_prefilled_command("goto ");
-                true
-            }
             KeyCode::Char(':')
                 if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
@@ -783,26 +779,8 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'g') => {
-                let pending_line = self.pending_count;
                 self.pending_y = false;
-                if self.pending_g {
-                    if let Some(count) = self.take_pending_count() {
-                        self.current_pane_mut()?
-                            .move_to_visible_index(count.saturating_sub(1));
-                        self.status = format!("jumped to item {count}");
-                    } else {
-                        self.current_pane_mut()?.move_top();
-                        self.status = String::from("jumped to top");
-                    }
-                    self.pending_g = false;
-                } else {
-                    self.pending_g = true;
-                    self.status = if let Some(count) = pending_line {
-                        format!("pending: {count}g")
-                    } else {
-                        String::from("pending: g")
-                    };
-                }
+                self.open_go_picker();
                 true
             }
             _ if key_matches_plain_letter(&key, 'd') => {
@@ -1917,6 +1895,42 @@ impl App {
                         operation,
                     });
                     self.status = paste_overwrite_confirm_status(&target_name, entry_count);
+                }
+            },
+            PendingAction::GoPicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 'g') => {
+                    if let Some(count) = self.take_pending_count() {
+                        self.current_pane_mut()?
+                            .move_to_visible_index(count.saturating_sub(1));
+                        self.status = format!("jumped to item {count}");
+                    } else {
+                        self.current_pane_mut()?.move_top();
+                        self.status = String::from("jumped to top");
+                    }
+                    self.pending_g = false;
+                    self.pending_y = false;
+                }
+                _ if key_matches_plain_letter(&key, 't') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.open_prefilled_command("goto ");
+                }
+                KeyCode::Esc => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.status = String::from("normal mode");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::GoPicker { pane_id });
+                    self.status = String::from("go: choose g/t from the panel");
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
@@ -4706,6 +4720,14 @@ impl App {
         self.status = String::from("sort: choose a key from the panel");
     }
 
+    /// 打開底部 `g` 系列命令面板，供 `gg`、`gt` 等 leader 指令共用。
+    pub(crate) fn open_go_picker(&mut self) {
+        self.pending_action = Some(PendingAction::GoPicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from("go: choose g/t from the panel");
+    }
+
     /// 打開底部 panel 操作面板，讓使用者可視化選擇 `w` 的第二個按鍵。
     pub(crate) fn open_window_picker(&mut self) {
         self.pending_action = Some(PendingAction::WindowPicker {
@@ -5473,6 +5495,7 @@ impl App {
                 entry_count,
                 ..
             } => paste_overwrite_confirm_status(target_name, *entry_count),
+            PendingAction::GoPicker { .. } => String::from("go: choose g/t from the panel"),
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::WindowPicker { .. } => {
                 String::from("panel: choose h/j/k/l/c/o from the panel")
@@ -7986,6 +8009,9 @@ impl App {
                     &self.config,
                 );
             }
+            Some(PendingAction::GoPicker { .. }) => {
+                render_go_picker(frame, frame.area(), self.theme);
+            }
             Some(PendingAction::SortPicker { .. }) => {
                 super::ui::render_sort_picker(frame, frame.area(), self.theme);
             }
@@ -10160,7 +10186,23 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 normal mode 按下 `gt` 會打開預填好的 `goto ` 命令輸入框。
+    /// 驗證 normal mode 按下第一個 `g` 會先打開 `g` 系列命令面板。
+    fn app_g_opens_go_picker() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("open go picker");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::GoPicker { pane_id: 1 })
+        ));
+        assert_eq!(app.status, "go: choose g/t from the panel");
+    }
+
+    #[test]
+    /// 驗證 normal mode 按下 `gt` 會先經過 `g` 面板，再打開預填好的 `goto ` 命令輸入框。
     fn app_gt_opens_prefilled_goto_command() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");

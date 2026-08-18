@@ -948,59 +948,59 @@ pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, the
         " Sort ",
         &[
             ShortcutPanelItem {
-                shortcut: ",m",
+                shortcut: "m",
                 label: "modified",
             },
             ShortcutPanelItem {
-                shortcut: ",M",
+                shortcut: "M",
                 label: "modified (reverse)",
             },
             ShortcutPanelItem {
-                shortcut: ",b",
+                shortcut: "b",
                 label: "birth",
             },
             ShortcutPanelItem {
-                shortcut: ",B",
+                shortcut: "B",
                 label: "birth (reverse)",
             },
             ShortcutPanelItem {
-                shortcut: ",a",
+                shortcut: "a",
                 label: "alphabetical",
             },
             ShortcutPanelItem {
-                shortcut: ",A",
+                shortcut: "A",
                 label: "alphabetical (reverse)",
             },
             ShortcutPanelItem {
-                shortcut: ",n",
+                shortcut: "n",
                 label: "natural",
             },
             ShortcutPanelItem {
-                shortcut: ",N",
+                shortcut: "N",
                 label: "natural (reverse)",
             },
             ShortcutPanelItem {
-                shortcut: ",e",
+                shortcut: "e",
                 label: "extension",
             },
             ShortcutPanelItem {
-                shortcut: ",E",
+                shortcut: "E",
                 label: "extension (reverse)",
             },
             ShortcutPanelItem {
-                shortcut: ",s",
+                shortcut: "s",
                 label: "size",
             },
             ShortcutPanelItem {
-                shortcut: ",S",
+                shortcut: "S",
                 label: "size (reverse)",
             },
             ShortcutPanelItem {
-                shortcut: ",r",
+                shortcut: "r",
                 label: "random",
             },
             ShortcutPanelItem {
-                shortcut: ", / Esc",
+                shortcut: "Esc",
                 label: "cancel",
             },
         ],
@@ -1036,7 +1036,7 @@ pub(crate) fn render_linemode_picker(frame: &mut ratatui::Frame<'_>, area: Rect,
                 label: "linemode none",
             },
             ShortcutPanelItem {
-                shortcut: "m / Esc",
+                shortcut: "Esc",
                 label: "cancel",
             },
         ],
@@ -1072,7 +1072,31 @@ pub(crate) fn render_bookmark_action_picker(
                 label: "delete all bookmarks",
             },
             ShortcutPanelItem {
-                shortcut: "b / Esc",
+                shortcut: "Esc",
+                label: "cancel",
+            },
+        ],
+    );
+}
+
+/// 在畫面底部繪製 `g` 系列命令面板，供 `gg` 與 `gt` 這類兩段式操作共用。
+pub(crate) fn render_go_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Go ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "g",
+                label: "jump top",
+            },
+            ShortcutPanelItem {
+                shortcut: "t",
+                label: "goto path",
+            },
+            ShortcutPanelItem {
+                shortcut: "Esc",
                 label: "cancel",
             },
         ],
@@ -1088,31 +1112,31 @@ pub(crate) fn render_window_picker(frame: &mut ratatui::Frame<'_>, area: Rect, t
         " Panel ",
         &[
             ShortcutPanelItem {
-                shortcut: "wh",
+                shortcut: "h",
                 label: "split left",
             },
             ShortcutPanelItem {
-                shortcut: "wj",
+                shortcut: "j",
                 label: "split down",
             },
             ShortcutPanelItem {
-                shortcut: "wk",
+                shortcut: "k",
                 label: "split up",
             },
             ShortcutPanelItem {
-                shortcut: "wl",
+                shortcut: "l",
                 label: "split right",
             },
             ShortcutPanelItem {
-                shortcut: "wc",
+                shortcut: "c",
                 label: "close panel",
             },
             ShortcutPanelItem {
-                shortcut: "wo",
+                shortcut: "o",
                 label: "keep only current panel",
             },
             ShortcutPanelItem {
-                shortcut: "w / Esc",
+                shortcut: "Esc",
                 label: "cancel",
             },
         ],
