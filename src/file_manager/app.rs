@@ -49,13 +49,14 @@ use super::{
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
-        InlinePickerState, PaneListState, RecentPanelLine, RegexRenamePanelLine, SearchListState,
-        TaskPanelLine, TrashPanelLine, render_bookmark_action_picker, render_bookmark_picker,
+        InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TaskPanelLine,
+        TrashPanelLine, ZoxidePanelLine, render_bookmark_action_picker, render_bookmark_picker,
         render_command_palette, render_confirm_dialog, render_filter_input,
-        render_global_search_panel, render_pane, render_linemode_picker,
-        render_paste_overwrite_dialog, render_preview_search_input, render_recent_picker,
-        render_theme_picker,
+        render_global_search_panel, render_linemode_picker, render_pane,
+        render_paste_overwrite_dialog, render_preview_search_input, render_theme_picker,
+        render_window_picker, render_zoxide_picker,
     },
+    zoxide::{add_directory_to_zoxide, query_zoxide_directories},
 };
 
 #[cfg(target_os = "windows")]
@@ -269,6 +270,9 @@ pub(crate) enum PendingAction {
     SortPicker {
         pane_id: usize,
     },
+    WindowPicker {
+        pane_id: usize,
+    },
     LineModePicker {
         pane_id: usize,
     },
@@ -290,6 +294,7 @@ pub(crate) enum PendingAction {
     TaskPanel {
         pane_id: usize,
         selected: usize,
+        search: PanelSearchState,
     },
     BookmarkPicker {
         pane_id: usize,
@@ -298,10 +303,13 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         selected: usize,
         mode: BookmarkListMode,
+        search: PanelSearchState,
     },
-    RecentList {
+    ZoxideList {
         pane_id: usize,
         selected: usize,
+        entries: Vec<PathBuf>,
+        search: PanelSearchState,
     },
     CopyPicker {
         pane_id: usize,
@@ -356,8 +364,6 @@ pub(crate) struct App {
     pub(crate) command_buffer: String,
     pub(crate) command_suggestion_selected: usize,
     pub(crate) command_completion_cycle: Option<CommandCompletionCycle>,
-    pub(crate) awaiting_ctrl_w: bool,
-    pub(crate) awaiting_w_leader: bool,
     pub(crate) pending_count: Option<usize>,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
@@ -390,7 +396,6 @@ pub(crate) enum HelpReturnState {
     GlobalSearch(GlobalSearchState),
     VisualSelection(VisualSelectionState),
     CommandMode(String),
-    AwaitingCtrlW,
     PendingBookmark(BookmarkPrompt),
     PreviewFocus(usize),
 }
@@ -416,6 +421,7 @@ impl App {
         let LoadedConfig { config, source } = loaded_config;
         let bookmark_store = BookmarkStore::load(bookmark_file_path(&cwd, source.as_deref()))
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let _ = add_directory_to_zoxide(&cwd);
         let mut pane = PaneState::new(cwd)?;
         apply_config_to_pane(&config, &mut pane);
         let mut panes = BTreeMap::new();
@@ -441,8 +447,6 @@ impl App {
             command_buffer: String::new(),
             command_suggestion_selected: 0,
             command_completion_cycle: None,
-            awaiting_ctrl_w: false,
-            awaiting_w_leader: false,
             pending_count: None,
             pending_g: false,
             pending_y: false,
@@ -580,14 +584,6 @@ impl App {
         if self.command_mode {
             return self.handle_command_key(key);
         }
-        if self.awaiting_w_leader {
-            self.awaiting_w_leader = false;
-            return self.handle_w_leader(key);
-        }
-        if self.awaiting_ctrl_w {
-            self.awaiting_ctrl_w = false;
-            return self.handle_ctrl_w(key);
-        }
         if self.pending_bookmark.is_some() {
             return self.handle_bookmark_key(key);
         }
@@ -671,6 +667,13 @@ impl App {
 
         let should_continue = match key.code {
             _ if key_matches_plain_letter(&key, 'q') => false,
+            _ if self.pending_g && key_matches_plain_letter(&key, 't') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_prefilled_command("goto ");
+                true
+            }
             KeyCode::Char(':')
                 if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
@@ -682,7 +685,7 @@ impl App {
                 true
             }
             _ if key_matches_ctrl_letter(&key, 'p') => {
-                self.open_prefilled_command("pane ");
+                self.open_prefilled_command("panel ");
                 true
             }
             _ if key_matches_plain_letter(&key, 'j') => {
@@ -750,6 +753,7 @@ impl App {
             _ if key_matches_plain_letter(&key, 'h') => {
                 self.clear_pending_count();
                 self.current_pane_mut()?.go_parent()?;
+                self.track_focused_pane_cwd_in_zoxide();
                 self.status = String::from("moved to parent directory");
                 self.pending_g = false;
                 self.pending_y = false;
@@ -758,6 +762,7 @@ impl App {
             _ if key_matches_plain_letter(&key, 'l') => {
                 self.clear_pending_count();
                 self.current_pane_mut()?.enter_selected()?;
+                self.track_focused_pane_cwd_in_zoxide();
                 self.status = String::from("opened directory");
                 self.pending_g = false;
                 self.pending_y = false;
@@ -821,9 +826,23 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            _ if key_matches_shifted_letter(&key, 'R') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_prefilled_command("rename-regex ");
+                true
+            }
             _ if key_matches_plain_letter(&key, 'z') => {
                 self.clear_pending_count();
                 self.open_fzf_jump();
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'Z') => {
+                self.clear_pending_count();
+                self.open_zoxide_list();
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -871,8 +890,10 @@ impl App {
                 true
             }
             _ if key_matches_plain_letter(&key, 'w') => {
-                self.awaiting_w_leader = true;
-                self.status = String::from("w");
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_window_picker();
                 true
             }
             _ if key_matches_plain_letter(&key, 'f') => {
@@ -972,13 +993,8 @@ impl App {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_bookmark = None;
-                if self.pending_y {
-                    self.copy_selected();
-                    self.pending_y = false;
-                } else {
-                    self.pending_y = true;
-                    self.status = String::from("pending: y");
-                }
+                self.pending_y = false;
+                self.copy_selected();
                 true
             }
             _ if key_matches_shifted_letter(&key, 'Y') => {
@@ -1016,15 +1032,6 @@ impl App {
                 self.pending_y = false;
                 self.pending_bookmark = Some(BookmarkPrompt::Jump);
                 self.status = String::from("bookmark: press a key to jump");
-                true
-            }
-            _ if key_matches_ctrl_letter(&key, 'w') => {
-                self.clear_pending_count();
-                self.awaiting_ctrl_w = true;
-                self.pending_g = false;
-                self.pending_y = false;
-                self.pending_bookmark = None;
-                self.status = String::from("Ctrl-w");
                 true
             }
             KeyCode::Esc => {
@@ -1186,13 +1193,6 @@ impl App {
                 self.current_pane_mut()?.full_page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
-            }
-            _ if key_matches_ctrl_letter(&key, 'w') => {
-                self.clear_pending_count();
-                self.awaiting_ctrl_w = true;
-                self.pending_g = false;
-                self.pending_y = false;
-                self.status = String::from("Ctrl-w");
             }
             _ => {
                 self.clear_pending_count();
@@ -1455,8 +1455,7 @@ impl App {
                     self.global_search = Some(search);
                     return Ok(true);
                 }
-                _ if key_matches_plain_letter(&key, 'h') =>
-                {
+                _ if key_matches_plain_letter(&key, 'h') => {
                     self.clear_pending_count();
                     self.pending_g = false;
                     self.preview_focus = None;
@@ -1723,8 +1722,7 @@ impl App {
                 self.pending_g = false;
                 self.open_global_search_result(search)?;
             }
-            KeyCode::Tab if matches!(search.mode, SearchMode::Content) =>
-            {
+            KeyCode::Tab if matches!(search.mode, SearchMode::Content) => {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.preview_focus = Some(search.pane_id);
@@ -1973,6 +1971,65 @@ impl App {
                 _ => {
                     self.pending_action = Some(PendingAction::SortPicker { pane_id });
                     self.status = String::from("sort: choose a key from the panel");
+                }
+            },
+            PendingAction::WindowPicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 'w') => {
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'h') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.split_current_at(SplitDirection::Vertical, SplitPlacement::Before)?;
+                }
+                _ if key_matches_plain_letter(&key, 'j') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.split_current_at(SplitDirection::Horizontal, SplitPlacement::After)?;
+                }
+                _ if key_matches_plain_letter(&key, 'k') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.split_current_at(SplitDirection::Horizontal, SplitPlacement::Before)?;
+                }
+                _ if key_matches_plain_letter(&key, 'l') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.split_current_at(SplitDirection::Vertical, SplitPlacement::After)?;
+                }
+                _ if key_matches_plain_letter(&key, 'c') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    if self.focused_pane == pane_id {
+                        self.close_current_pane();
+                    } else {
+                        self.status = String::from("panel focus changed");
+                    }
+                }
+                _ if key_matches_plain_letter(&key, 'o') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    if self.focused_pane == pane_id {
+                        self.only_current_pane();
+                    } else {
+                        self.status = String::from("panel focus changed");
+                    }
+                }
+                KeyCode::Esc => {
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'q') => {
+                    self.status = String::from("normal mode");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::WindowPicker { pane_id });
+                    self.status = String::from("panel: choose h/j/k/l/c/o from the panel");
                 }
             },
             PendingAction::LineModePicker { pane_id } => match key.code {
@@ -2543,145 +2600,202 @@ impl App {
             PendingAction::TaskPanel {
                 pane_id,
                 mut selected,
+                mut search,
             } => {
                 let tasks = self.tasks_for_pane(pane_id);
-                let len = tasks.len();
-                if self.capture_pending_count_digit(&key) {
-                    self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
-                    return Ok(true);
-                }
-                if key_matches_shifted_letter(&key, 'G') {
-                    if let Some(count) = self.take_pending_count() {
-                        if len > 0 {
-                            selected = count.saturating_sub(1).min(len.saturating_sub(1));
-                        }
-                    } else if len > 0 {
-                        selected = len - 1;
-                    }
-                    self.pending_g = false;
-                    self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
-                    self.status = task_panel_status(len, selected);
-                    return Ok(true);
-                }
-                match key.code {
-                    KeyCode::Down => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'j') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(self.take_count_or_one());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'k') => {
-                        selected = selected.saturating_sub(self.take_count_or_one());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_ctrl_letter(&key, 'd') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_ctrl_letter(&key, 'u') => {
-                        selected = selected.saturating_sub(self.take_panel_page_step());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_shifted_letter(&key, 'J') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_shifted_letter(&key, 'K') => {
-                        selected = selected.saturating_sub(self.take_large_move_step());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'x')
-                        || key_matches_plain_letter(&key, 'c') =>
-                    {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        if let Some(task) = tasks.get(selected) {
-                            self.cancel_task_by_id(task.id);
-                            let len = self.tasks_for_pane(pane_id).len();
-                            self.pending_action =
-                                Some(PendingAction::TaskPanel { pane_id, selected });
-                            if self.status.is_empty() {
-                                self.status = task_panel_status(len, selected);
+                let filtered_tasks = filtered_task_entries(&tasks, &search.buffer);
+                let len = filtered_tasks.len();
+                if search.editing {
+                    match key.code {
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                search.buffer.push(c);
                             }
-                            return Ok(true);
+                            selected = 0;
                         }
+                        KeyCode::Backspace => {
+                            search.buffer.pop();
+                            selected = 0;
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
+                        }
+                        _ => {}
                     }
-                    _ if key_matches_plain_letter(&key, 'g') => {
-                        if self.pending_g {
-                            if let Some(count) = self.take_pending_count() {
+                    let next_len = filtered_task_entries(&tasks, &search.buffer).len();
+                    let status =
+                        task_panel_status(&search.buffer, next_len, selected, search.editing);
+                    self.pending_action = Some(PendingAction::TaskPanel {
+                        pane_id,
+                        selected,
+                        search,
+                    });
+                    self.status = status;
+                } else {
+                    if self.capture_pending_count_digit(&key) {
+                        self.pending_action = Some(PendingAction::TaskPanel {
+                            pane_id,
+                            selected,
+                            search,
+                        });
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'G') {
+                        if let Some(count) = self.take_pending_count() {
+                            if len > 0 {
                                 selected = count.saturating_sub(1).min(len.saturating_sub(1));
-                            } else {
-                                selected = 0;
+                            }
+                        } else if len > 0 {
+                            selected = len - 1;
+                        }
+                        self.pending_g = false;
+                        let status = task_panel_status(&search.buffer, len, selected, false);
+                        self.pending_action = Some(PendingAction::TaskPanel {
+                            pane_id,
+                            selected,
+                            search,
+                        });
+                        self.status = status;
+                        return Ok(true);
+                    }
+                    match key.code {
+                        KeyCode::Down => {
+                            if len > 0 {
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
-                        } else {
-                            self.pending_g = true;
+                        }
+                        _ if key_matches_plain_letter(&key, 'j') => {
+                            if len > 0 {
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Up => {
+                            selected = selected.saturating_sub(self.take_count_or_one());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'k') => {
+                            selected = selected.saturating_sub(self.take_count_or_one());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_ctrl_letter(&key, 'd') => {
+                            if len > 0 {
+                                selected = (selected + self.take_panel_page_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_ctrl_letter(&key, 'u') => {
+                            selected = selected.saturating_sub(self.take_panel_page_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'J') => {
+                            if len > 0 {
+                                selected = (selected + self.take_large_move_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'K') => {
+                            selected = selected.saturating_sub(self.take_large_move_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'f') => {
+                            self.clear_pending_count();
+                            search.editing = true;
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'x')
+                            || key_matches_plain_letter(&key, 'c') =>
+                        {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            if let Some(task) = filtered_tasks.get(selected) {
+                                self.cancel_task_by_id(task.id);
+                                let next_tasks = self.tasks_for_pane(pane_id);
+                                let next_len =
+                                    filtered_task_entries(&next_tasks, &search.buffer).len();
+                                selected = selected.min(next_len.saturating_sub(1));
+                                let status =
+                                    task_panel_status(&search.buffer, next_len, selected, false);
+                                self.pending_action = Some(PendingAction::TaskPanel {
+                                    pane_id,
+                                    selected,
+                                    search,
+                                });
+                                if self.status.is_empty() {
+                                    self.status = status;
+                                }
+                                return Ok(true);
+                            }
+                        }
+                        _ if key_matches_plain_letter(&key, 'g') => {
+                            if self.pending_g {
+                                if let Some(count) = self.take_pending_count() {
+                                    selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                                } else {
+                                    selected = 0;
+                                }
+                                self.pending_g = false;
+                            } else {
+                                self.pending_g = true;
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Right => {
+                            if let Some(task) = filtered_tasks.get(selected) {
+                                self.status =
+                                    format!("task {} [{}] {}", task.id, task.kind, task.detail);
+                            } else {
+                                self.status = String::from("tasks: empty");
+                            }
+                        }
+                        _ if key_matches_plain_letter(&key, 'l') => {
+                            if let Some(task) = filtered_tasks.get(selected) {
+                                self.status =
+                                    format!("task {} [{}] {}", task.id, task.kind, task.detail);
+                            } else {
+                                self.status = String::from("tasks: empty");
+                            }
+                        }
+                        KeyCode::Esc => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 't') => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 'q')
+                            || key_matches_plain_letter(&key, 'h') =>
+                        {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
                         }
                     }
-                    KeyCode::Enter | KeyCode::Right => {
-                        if let Some(task) = tasks.get(selected) {
-                            self.status =
-                                format!("task {} [{}] {}", task.id, task.kind, task.detail);
-                        } else {
-                            self.status = String::from("tasks: empty");
-                        }
-                    }
-                    _ if key_matches_plain_letter(&key, 'l') => {
-                        if let Some(task) = tasks.get(selected) {
-                            self.status =
-                                format!("task {} [{}] {}", task.id, task.kind, task.detail);
-                        } else {
-                            self.status = String::from("tasks: empty");
-                        }
-                    }
-                    KeyCode::Esc => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
-                    }
-                    _ if key_matches_plain_letter(&key, 't') => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
-                    }
-                    _ if key_matches_plain_letter(&key, 'q')
-                        || key_matches_plain_letter(&key, 'h') =>
+                    let status = task_panel_status(&search.buffer, len, selected, false);
+                    self.pending_action = Some(PendingAction::TaskPanel {
+                        pane_id,
+                        selected,
+                        search,
+                    });
+                    if !matches!(key.code, KeyCode::Enter | KeyCode::Right)
+                        && !key_matches_plain_letter(&key, 'l')
                     {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
+                        self.status = status;
                     }
-                    _ => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                    }
-                }
-                self.pending_action = Some(PendingAction::TaskPanel { pane_id, selected });
-                if !matches!(key.code, KeyCode::Enter | KeyCode::Right)
-                    && !key_matches_plain_letter(&key, 'l')
-                {
-                    self.status = task_panel_status(len, selected);
                 }
             }
             PendingAction::BookmarkPicker { pane_id } => match key.code {
@@ -2739,270 +2853,382 @@ impl App {
                 pane_id,
                 mut selected,
                 mode,
+                mut search,
             } => {
                 let entries = self.bookmark_store.list();
-                let len = entries.len();
-                if self.capture_pending_count_digit(&key) {
-                    self.pending_action = Some(PendingAction::BookmarkList {
-                        pane_id,
-                        selected,
-                        mode,
-                    });
-                    return Ok(true);
-                }
-                if key_matches_shifted_letter(&key, 'G') {
-                    if let Some(count) = self.take_pending_count() {
-                        if len > 0 {
-                            selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                let filtered_entries = filtered_bookmark_entries(entries.clone(), &search.buffer);
+                let len = filtered_entries.len();
+                if search.editing {
+                    match key.code {
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                search.buffer.push(c);
+                            }
+                            selected = 0;
                         }
-                    } else if len > 0 {
-                        selected = len - 1;
+                        KeyCode::Backspace => {
+                            search.buffer.pop();
+                            selected = 0;
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
+                        }
+                        _ => {}
                     }
-                    self.pending_g = false;
+                    let next_len =
+                        filtered_bookmark_entries(self.bookmark_store.list(), &search.buffer).len();
+                    let status = bookmark_list_status(
+                        &search.buffer,
+                        next_len,
+                        selected,
+                        mode,
+                        search.editing,
+                    );
                     self.pending_action = Some(PendingAction::BookmarkList {
                         pane_id,
                         selected,
                         mode,
+                        search,
                     });
-                    self.status = bookmark_list_status(len, selected, mode);
-                    return Ok(true);
-                }
-                match key.code {
-                    KeyCode::Char(bookmark_key)
-                        if matches!(mode, BookmarkListMode::Delete)
-                            && entries.iter().any(|entry| entry.key == bookmark_key) =>
-                    {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.delete_bookmark(bookmark_key)?;
+                    self.status = status;
+                } else {
+                    if self.capture_pending_count_digit(&key) {
+                        self.pending_action = Some(PendingAction::BookmarkList {
+                            pane_id,
+                            selected,
+                            mode,
+                            search,
+                        });
                         return Ok(true);
                     }
-                    KeyCode::Down => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'j') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(self.take_count_or_one());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'k') => {
-                        selected = selected.saturating_sub(self.take_count_or_one());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_ctrl_letter(&key, 'd') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_ctrl_letter(&key, 'u') => {
-                        selected = selected.saturating_sub(self.take_panel_page_step());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_shifted_letter(&key, 'J') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_shifted_letter(&key, 'K') => {
-                        selected = selected.saturating_sub(self.take_large_move_step());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'g') => {
-                        if self.pending_g {
-                            if let Some(count) = self.take_pending_count() {
+                    if key_matches_shifted_letter(&key, 'G') {
+                        if let Some(count) = self.take_pending_count() {
+                            if len > 0 {
                                 selected = count.saturating_sub(1).min(len.saturating_sub(1));
-                            } else {
-                                selected = 0;
+                            }
+                        } else if len > 0 {
+                            selected = len - 1;
+                        }
+                        self.pending_g = false;
+                        let status =
+                            bookmark_list_status(&search.buffer, len, selected, mode, false);
+                        self.pending_action = Some(PendingAction::BookmarkList {
+                            pane_id,
+                            selected,
+                            mode,
+                            search,
+                        });
+                        self.status = status;
+                        return Ok(true);
+                    }
+                    match key.code {
+                        KeyCode::Char(bookmark_key)
+                            if matches!(mode, BookmarkListMode::Delete)
+                                && filtered_entries
+                                    .iter()
+                                    .any(|entry| entry.key == bookmark_key) =>
+                        {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.delete_bookmark(bookmark_key)?;
+                            return Ok(true);
+                        }
+                        KeyCode::Down => {
+                            if len > 0 {
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
-                        } else {
-                            self.pending_g = true;
                         }
-                    }
-                    KeyCode::Enter => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        match mode {
-                            BookmarkListMode::Jump => {
-                                self.open_bookmark_from_list(pane_id, &entries, selected)?;
+                        _ if key_matches_plain_letter(&key, 'j') => {
+                            if len > 0 {
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
                             }
-                            BookmarkListMode::Delete => {
-                                self.delete_bookmark_from_list(&entries, selected)?;
+                            self.pending_g = false;
+                        }
+                        KeyCode::Up => {
+                            selected = selected.saturating_sub(self.take_count_or_one());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'k') => {
+                            selected = selected.saturating_sub(self.take_count_or_one());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_ctrl_letter(&key, 'd') => {
+                            if len > 0 {
+                                selected = (selected + self.take_panel_page_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_ctrl_letter(&key, 'u') => {
+                            selected = selected.saturating_sub(self.take_panel_page_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'J') => {
+                            if len > 0 {
+                                selected = (selected + self.take_large_move_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'K') => {
+                            selected = selected.saturating_sub(self.take_large_move_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'f') => {
+                            self.clear_pending_count();
+                            search.editing = true;
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'g') => {
+                            if self.pending_g {
+                                if let Some(count) = self.take_pending_count() {
+                                    selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                                } else {
+                                    selected = 0;
+                                }
+                                self.pending_g = false;
+                            } else {
+                                self.pending_g = true;
                             }
                         }
-                        return Ok(true);
-                    }
-                    _ if key_matches_plain_letter(&key, 'l') => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        if matches!(mode, BookmarkListMode::Jump) {
-                            self.open_bookmark_from_list(pane_id, &entries, selected)?;
-                        } else {
-                            self.pending_action = Some(PendingAction::BookmarkList {
-                                pane_id,
-                                selected,
-                                mode,
-                            });
-                            self.status = bookmark_list_status(len, selected, mode);
+                        KeyCode::Enter => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            match mode {
+                                BookmarkListMode::Jump => {
+                                    self.open_bookmark_from_list(
+                                        pane_id,
+                                        &filtered_entries,
+                                        selected,
+                                    )?;
+                                }
+                                BookmarkListMode::Delete => {
+                                    self.delete_bookmark_from_list(&filtered_entries, selected)?;
+                                }
+                            }
+                            return Ok(true);
                         }
-                        return Ok(true);
+                        _ if key_matches_plain_letter(&key, 'l') => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            if matches!(mode, BookmarkListMode::Jump) {
+                                self.open_bookmark_from_list(pane_id, &filtered_entries, selected)?;
+                            } else {
+                                let status = bookmark_list_status(
+                                    &search.buffer,
+                                    len,
+                                    selected,
+                                    mode,
+                                    false,
+                                );
+                                self.pending_action = Some(PendingAction::BookmarkList {
+                                    pane_id,
+                                    selected,
+                                    mode,
+                                    search,
+                                });
+                                self.status = status;
+                            }
+                            return Ok(true);
+                        }
+                        KeyCode::Esc => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 'q')
+                            || key_matches_plain_letter(&key, 'h') =>
+                        {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                        }
                     }
-                    KeyCode::Esc => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
-                    }
-                    _ if key_matches_plain_letter(&key, 'q')
-                        || key_matches_plain_letter(&key, 'h') =>
-                    {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
-                    }
-                    _ => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                    }
+                    let status = bookmark_list_status(&search.buffer, len, selected, mode, false);
+                    self.pending_action = Some(PendingAction::BookmarkList {
+                        pane_id,
+                        selected,
+                        mode,
+                        search,
+                    });
+                    self.status = status;
                 }
-                self.pending_action = Some(PendingAction::BookmarkList {
-                    pane_id,
-                    selected,
-                    mode,
-                });
-                self.status = bookmark_list_status(len, selected, mode);
             }
-            PendingAction::RecentList {
+            PendingAction::ZoxideList {
                 pane_id,
                 mut selected,
+                entries,
+                mut search,
             } => {
-                let len = self
-                    .panes
-                    .get(&pane_id)
-                    .map(|pane| pane.recent_dirs().len())
-                    .unwrap_or(0);
-                if self.capture_pending_count_digit(&key) {
-                    self.pending_action = Some(PendingAction::RecentList { pane_id, selected });
-                    return Ok(true);
-                }
-                if key_matches_shifted_letter(&key, 'G') {
-                    if let Some(count) = self.take_pending_count() {
-                        if len > 0 {
-                            selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                let filtered_entries = filtered_zoxide_entries(&entries, &search.buffer);
+                let len = filtered_entries.len();
+                if search.editing {
+                    match key.code {
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                search.buffer.push(c);
+                            }
+                            selected = 0;
                         }
-                    } else if len > 0 {
-                        selected = len - 1;
-                    }
-                    self.pending_g = false;
-                    self.pending_action = Some(PendingAction::RecentList { pane_id, selected });
-                    self.status = recent_list_status(len, selected);
-                    return Ok(true);
-                }
-                match key.code {
-                    KeyCode::Down => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
+                        KeyCode::Backspace => {
+                            search.buffer.pop();
+                            selected = 0;
                         }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'j') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_count_or_one()).min(len.saturating_sub(1));
+                        KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
                         }
-                        self.pending_g = false;
+                        _ => {}
                     }
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(self.take_count_or_one());
-                        self.pending_g = false;
+                    let next_len = filtered_zoxide_entries(&entries, &search.buffer).len();
+                    let status =
+                        zoxide_list_status(&search.buffer, next_len, selected, search.editing);
+                    self.pending_action = Some(PendingAction::ZoxideList {
+                        pane_id,
+                        selected,
+                        entries,
+                        search,
+                    });
+                    self.status = status;
+                } else {
+                    if self.capture_pending_count_digit(&key) {
+                        self.pending_action = Some(PendingAction::ZoxideList {
+                            pane_id,
+                            selected,
+                            entries,
+                            search,
+                        });
+                        return Ok(true);
                     }
-                    _ if key_matches_plain_letter(&key, 'k') => {
-                        selected = selected.saturating_sub(self.take_count_or_one());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_ctrl_letter(&key, 'd') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_panel_page_step()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_ctrl_letter(&key, 'u') => {
-                        selected = selected.saturating_sub(self.take_panel_page_step());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_shifted_letter(&key, 'J') => {
-                        if len > 0 {
-                            selected =
-                                (selected + self.take_large_move_step()).min(len.saturating_sub(1));
-                        }
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_shifted_letter(&key, 'K') => {
-                        selected = selected.saturating_sub(self.take_large_move_step());
-                        self.pending_g = false;
-                    }
-                    _ if key_matches_plain_letter(&key, 'g') => {
-                        if self.pending_g {
-                            if let Some(count) = self.take_pending_count() {
+                    if key_matches_shifted_letter(&key, 'G') {
+                        if let Some(count) = self.take_pending_count() {
+                            if len > 0 {
                                 selected = count.saturating_sub(1).min(len.saturating_sub(1));
-                            } else {
-                                selected = 0;
+                            }
+                        } else if len > 0 {
+                            selected = len - 1;
+                        }
+                        self.pending_g = false;
+                        let status = zoxide_list_status(&search.buffer, len, selected, false);
+                        self.pending_action = Some(PendingAction::ZoxideList {
+                            pane_id,
+                            selected,
+                            entries,
+                            search,
+                        });
+                        self.status = status;
+                        return Ok(true);
+                    }
+                    match key.code {
+                        KeyCode::Down => {
+                            if len > 0 {
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
                             }
                             self.pending_g = false;
-                        } else {
-                            self.pending_g = true;
+                        }
+                        _ if key_matches_plain_letter(&key, 'j') => {
+                            if len > 0 {
+                                selected = (selected + self.take_count_or_one())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        KeyCode::Up => {
+                            selected = selected.saturating_sub(self.take_count_or_one());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'k') => {
+                            selected = selected.saturating_sub(self.take_count_or_one());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_ctrl_letter(&key, 'd') => {
+                            if len > 0 {
+                                selected = (selected + self.take_panel_page_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_ctrl_letter(&key, 'u') => {
+                            selected = selected.saturating_sub(self.take_panel_page_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'J') => {
+                            if len > 0 {
+                                selected = (selected + self.take_large_move_step())
+                                    .min(len.saturating_sub(1));
+                            }
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_shifted_letter(&key, 'K') => {
+                            selected = selected.saturating_sub(self.take_large_move_step());
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'f') => {
+                            self.clear_pending_count();
+                            search.editing = true;
+                            self.pending_g = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'g') => {
+                            if self.pending_g {
+                                if let Some(count) = self.take_pending_count() {
+                                    selected = count.saturating_sub(1).min(len.saturating_sub(1));
+                                } else {
+                                    selected = 0;
+                                }
+                                self.pending_g = false;
+                            } else {
+                                self.pending_g = true;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.open_zoxide_from_list(pane_id, &filtered_entries, selected)?;
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 'l') => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.open_zoxide_from_list(pane_id, &filtered_entries, selected)?;
+                            return Ok(true);
+                        }
+                        KeyCode::Esc => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ if key_matches_plain_letter(&key, 'q')
+                            || key_matches_plain_letter(&key, 'h') =>
+                        {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            self.status = String::from("normal mode");
+                            return Ok(true);
+                        }
+                        _ => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
                         }
                     }
-                    KeyCode::Enter => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.open_recent_from_list(pane_id, selected)?;
-                        return Ok(true);
-                    }
-                    _ if key_matches_plain_letter(&key, 'l') => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.open_recent_from_list(pane_id, selected)?;
-                        return Ok(true);
-                    }
-                    KeyCode::Esc => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
-                    }
-                    _ if key_matches_plain_letter(&key, 'q')
-                        || key_matches_plain_letter(&key, 'h') =>
-                    {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                        self.status = String::from("normal mode");
-                        return Ok(true);
-                    }
-                    _ => {
-                        self.clear_pending_count();
-                        self.pending_g = false;
-                    }
+                    let status = zoxide_list_status(&search.buffer, len, selected, false);
+                    self.pending_action = Some(PendingAction::ZoxideList {
+                        pane_id,
+                        selected,
+                        entries,
+                        search,
+                    });
+                    self.status = status;
                 }
-                self.pending_action = Some(PendingAction::RecentList { pane_id, selected });
-                self.status = recent_list_status(len, selected);
             }
             PendingAction::CopyPicker {
                 pane_id,
@@ -4157,68 +4383,11 @@ impl App {
         self.status = String::from("normal mode");
     }
 
-    /// 處理 `Ctrl-w` 前綴後的 pane 操作命令。
-    pub(crate) fn handle_ctrl_w(&mut self, key: KeyEvent) -> Result<bool> {
-        match key.code {
-            _ if key_matches_plain_letter(&key, 'h') || key_matches_plain_letter(&key, 'k') => {
-                self.focus_previous_pane()
-            }
-            _ if key_matches_plain_letter(&key, 'l') || key_matches_plain_letter(&key, 'j') => {
-                self.focus_next_pane()
-            }
-            _ if key_matches_plain_letter(&key, 'v') => {
-                self.split_current(SplitDirection::Vertical)?
-            }
-            _ if key_matches_plain_letter(&key, 's') => {
-                self.split_current(SplitDirection::Horizontal)?
-            }
-            _ if key_matches_plain_letter(&key, 'c') => self.close_current_pane(),
-            _ if key_matches_plain_letter(&key, 'o') => self.only_current_pane(),
-            _ => self.status = String::from("unknown Ctrl-w command"),
-        }
-        Ok(true)
-    }
-
-    /// 處理 `w` 前綴後的 pane split 操作命令。
-    pub(crate) fn handle_w_leader(&mut self, key: KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => {
-                self.status = String::from("normal mode");
-            }
-            _ if key_matches_plain_letter(&key, 'h') => {
-                self.clear_pending_count();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.split_current_at(SplitDirection::Vertical, SplitPlacement::Before)?;
-            }
-            _ if key_matches_plain_letter(&key, 'j') => {
-                self.clear_pending_count();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.split_current_at(SplitDirection::Horizontal, SplitPlacement::After)?;
-            }
-            _ if key_matches_plain_letter(&key, 'k') => {
-                self.clear_pending_count();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.split_current_at(SplitDirection::Horizontal, SplitPlacement::Before)?;
-            }
-            _ if key_matches_plain_letter(&key, 'l') => {
-                self.clear_pending_count();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.split_current_at(SplitDirection::Vertical, SplitPlacement::After)?;
-            }
-            _ => self.status = String::from("unknown w command"),
-        }
-        Ok(true)
-    }
-
     /// 執行 command mode 送出的命令字串。
     pub(crate) fn execute_command(&mut self, command: &str) -> Result<()> {
         match command {
             "q" => self.status = String::from("use q in normal mode to quit"),
-            "cd" => self.status = String::from("usage: cd <path>"),
+            "goto" => self.status = String::from("usage: goto <path>"),
             "rename" => self.start_rename(),
             "create" => self.start_create_entry(),
             "copy" => self.copy_selected(),
@@ -4241,7 +4410,9 @@ impl App {
             "split-up" => {
                 self.split_current_at(SplitDirection::Horizontal, SplitPlacement::Before)?
             }
-            "split-left" => self.split_current_at(SplitDirection::Vertical, SplitPlacement::Before)?,
+            "split-left" => {
+                self.split_current_at(SplitDirection::Vertical, SplitPlacement::Before)?
+            }
             "vim" => {
                 let Some(target) = self.selected_open_target() else {
                     self.status = String::from("nothing selected to open");
@@ -4276,7 +4447,7 @@ impl App {
             "tasks" => self.open_task_panel(),
             "help" => self.open_help_panel(),
             "bookmark list" => self.open_bookmark_list(),
-            "recent" => self.open_recent_list(),
+            "zoxide" => self.open_zoxide_list(),
             "restore" => self.restore_latest_from_trash()?,
             "trash clear" => self.clear_trash()?,
             "trash restore-all" => self.restore_all_from_trash()?,
@@ -4284,8 +4455,11 @@ impl App {
             "delete!" | "delete-permanently" => self.start_delete_confirmation(true),
             "theme" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
-            "pane" => {
-                self.status = format!("usage: pane <pane-id>. available: {}", self.available_pane_ids_label());
+            "panel" | "pane" => {
+                self.status = format!(
+                    "usage: panel <panel-id>. available: {}",
+                    self.available_pane_ids_label()
+                );
             }
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
@@ -4296,7 +4470,7 @@ impl App {
             other => {
                 if let Some(name) = other.strip_prefix("theme ") {
                     self.set_theme_by_name(name.trim());
-                } else if let Some(path) = other.strip_prefix("cd ") {
+                } else if let Some(path) = other.strip_prefix("goto ") {
                     self.change_directory_from_command(path.trim())?;
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;
@@ -4304,6 +4478,8 @@ impl App {
                     self.start_regex_rename_from_command(args)?;
                 } else if let Some(args) = other.strip_prefix("move-panel ") {
                     self.move_selected_to_pane_id(args.trim())?;
+                } else if let Some(args) = other.strip_prefix("panel ") {
+                    self.focus_pane_by_id_argument(args.trim());
                 } else if let Some(args) = other.strip_prefix("pane ") {
                     self.focus_pane_by_id_argument(args.trim());
                 } else if let Some(path) = other.strip_prefix("move ") {
@@ -4336,7 +4512,7 @@ impl App {
     pub(crate) fn current_pane_mut(&mut self) -> io::Result<&mut PaneState> {
         self.panes
             .get_mut(&self.focused_pane)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused pane"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused panel"))
     }
 
     /// 將目前焦點 pane 依指定方向分割成兩個 pane。
@@ -4353,7 +4529,7 @@ impl App {
         let source_pane = self
             .panes
             .get(&self.focused_pane)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused pane"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing focused panel"))?;
         let cwd = source_pane.cwd.clone();
         let show_hidden = source_pane.show_hidden;
         let sort_mode = source_pane.sort_mode;
@@ -4364,10 +4540,10 @@ impl App {
         pane.set_show_hidden(show_hidden);
         pane.set_sort_mode(sort_mode);
         self.panes.insert(new_id, pane);
-        self.layout = self
-            .layout
-            .clone()
-            .split_leaf(self.focused_pane, direction, placement, new_id);
+        self.layout =
+            self.layout
+                .clone()
+                .split_leaf(self.focused_pane, direction, placement, new_id);
         self.focused_pane = new_id;
         self.status = match (direction, placement) {
             (SplitDirection::Horizontal, SplitPlacement::Before) => String::from("split up"),
@@ -4385,42 +4561,68 @@ impl App {
         ids
     }
 
-    /// 將焦點切換到下一個 pane。
-    pub(crate) fn focus_next_pane(&mut self) {
-        let ids = self.ordered_pane_ids();
-        if let Some(index) = ids.iter().position(|id| *id == self.focused_pane) {
-            self.focused_pane = ids[(index + 1) % ids.len()];
-            self.status = format!("focused pane {}", self.focused_pane);
-        }
-    }
-
-    /// 將焦點切換到上一個 pane。
-    pub(crate) fn focus_previous_pane(&mut self) {
-        let ids = self.ordered_pane_ids();
-        if let Some(index) = ids.iter().position(|id| *id == self.focused_pane) {
-            self.focused_pane = ids[(index + ids.len() - 1) % ids.len()];
-            self.status = format!("focused pane {}", self.focused_pane);
-        }
-    }
-
     /// 將焦點直接切到指定 pane 編號。
     pub(crate) fn focus_pane_by_id(&mut self, target_pane_id: usize) {
         if self.panes.contains_key(&target_pane_id) {
             self.focused_pane = target_pane_id;
-            self.status = format!("focused pane {target_pane_id}");
+            self.status = format!("focused panel {target_pane_id}");
         } else {
             self.status = format!(
-                "unknown pane {target_pane_id}. available: {}",
+                "unknown panel {target_pane_id}. available: {}",
                 self.available_pane_ids_label()
             );
         }
     }
 
-    /// 從 `:pane <id>` 的參數解析目標 pane 編號並切換焦點。
+    /// 讓指定 panel 切換到目標路徑，並在成功後同步把最新目錄寫進 zoxide。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，要操作的 panel 編號。
+    /// - `target_path: &Path`，要切換或定位到的目標路徑。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn go_to_path_and_track(&mut self, pane_id: usize, target_path: &Path) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("panel no longer exists");
+            return Ok(());
+        };
+        pane.go_to_path(target_path)?;
+        let _ = add_directory_to_zoxide(&pane.cwd);
+        Ok(())
+    }
+
+    /// 讓指定 panel 定位到某個檔案或目錄，並在成功後同步把結果目錄寫進 zoxide。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，要操作的 panel 編號。
+    /// - `target_path: &Path`，要被 reveal 的目標。
+    ///
+    /// 回傳：`io::Result<()>`。
+    fn reveal_path_and_track(&mut self, pane_id: usize, target_path: &Path) -> io::Result<()> {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            self.status = String::from("panel no longer exists");
+            return Ok(());
+        };
+        pane.reveal_path(target_path)?;
+        let _ = add_directory_to_zoxide(&pane.cwd);
+        Ok(())
+    }
+
+    /// 把目前 focus 的 panel 工作目錄寫進 zoxide，供一般瀏覽操作完成後同步學習。
+    ///
+    /// 這個 helper 專門給 `h/l` 與方向鍵這類直接操作 pane 的流程使用，
+    /// 因為它們不會經過 `go_to_path_and_track()` 這類包裝函式。
+    fn track_focused_pane_cwd_in_zoxide(&self) {
+        if let Some(pane) = self.panes.get(&self.focused_pane) {
+            let _ = add_directory_to_zoxide(&pane.cwd);
+        }
+    }
+
+    /// 從 `:panel <id>` 的參數解析目標 panel 編號並切換焦點。
     fn focus_pane_by_id_argument(&mut self, target: &str) {
         let Some(target_pane_id) = parse_pane_id_argument(target) else {
             self.status = format!(
-                "usage: pane <pane-id>. available: {}",
+                "usage: panel <panel-id>. available: {}",
                 self.available_pane_ids_label()
             );
             return;
@@ -4432,7 +4634,7 @@ impl App {
     pub(crate) fn close_current_pane(&mut self) {
         let ids = self.ordered_pane_ids();
         if ids.len() <= 1 {
-            self.status = String::from("cannot close the last pane");
+            self.status = String::from("cannot close the last panel");
             return;
         }
 
@@ -4457,7 +4659,7 @@ impl App {
                     self.global_search = None;
                 }
                 self.focused_pane = fallback;
-                self.status = format!("closed pane {old_focus}");
+                self.status = format!("closed panel {old_focus}");
             }
         }
     }
@@ -4477,7 +4679,7 @@ impl App {
         {
             self.global_search = None;
         }
-        self.status = String::from("kept only focused pane");
+        self.status = String::from("kept only focused panel");
     }
 
     /// 將主題切換到下一個內建預設值。
@@ -4502,6 +4704,14 @@ impl App {
             pane_id: self.focused_pane,
         });
         self.status = String::from("sort: choose a key from the panel");
+    }
+
+    /// 打開底部 panel 操作面板，讓使用者可視化選擇 `w` 的第二個按鍵。
+    pub(crate) fn open_window_picker(&mut self) {
+        self.pending_action = Some(PendingAction::WindowPicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from("panel: choose h/j/k/l/c/o from the panel");
     }
 
     /// 打開底部 linemode 面板，等待使用者輸入右側欄位顯示模式。
@@ -4557,8 +4767,12 @@ impl App {
         self.pending_action = Some(PendingAction::TaskPanel {
             pane_id: self.focused_pane,
             selected: 0,
+            search: PanelSearchState {
+                buffer: String::new(),
+                editing: false,
+            },
         });
-        self.status = task_panel_status(count, 0);
+        self.status = task_panel_status("", count, 0, false);
     }
 
     /// 打開書籤列表彈窗，讓使用者可以用列表方式跳轉既有書籤。
@@ -4567,31 +4781,41 @@ impl App {
     }
 
     /// 以指定模式打開書籤列表彈窗，供跳轉或刪除流程共用。
-    pub(crate) fn open_bookmark_list_with_mode(
-        &mut self,
-        pane_id: usize,
-        mode: BookmarkListMode,
-    ) {
+    pub(crate) fn open_bookmark_list_with_mode(&mut self, pane_id: usize, mode: BookmarkListMode) {
         self.pending_action = Some(PendingAction::BookmarkList {
             pane_id,
             selected: 0,
             mode,
+            search: PanelSearchState {
+                buffer: String::new(),
+                editing: false,
+            },
         });
-        self.status = bookmark_list_status(self.bookmark_store.list().len(), 0, mode);
+        self.status = bookmark_list_status("", self.bookmark_store.list().len(), 0, mode, false);
     }
 
-    /// 打開目前 pane 的 recent 目錄列表，方便快速跳回先前去過的位置。
-    pub(crate) fn open_recent_list(&mut self) {
-        let count = self
-            .panes
-            .get(&self.focused_pane)
-            .map(|pane| pane.recent_dirs().len())
-            .unwrap_or(0);
-        self.pending_action = Some(PendingAction::RecentList {
-            pane_id: self.focused_pane,
-            selected: 0,
-        });
-        self.status = recent_list_status(count, 0);
+    /// 打開 zoxide 目錄列表，讓目前 panel 可依 frecency 快速跳到常用目錄。
+    ///
+    /// 這個面板是 `:zoxide` 的正式入口，`Z` 也會走這裡。
+    pub(crate) fn open_zoxide_list(&mut self) {
+        match query_zoxide_directories() {
+            Ok(entries) => {
+                let count = entries.len();
+                self.pending_action = Some(PendingAction::ZoxideList {
+                    pane_id: self.focused_pane,
+                    selected: 0,
+                    entries,
+                    search: PanelSearchState {
+                        buffer: String::new(),
+                        editing: false,
+                    },
+                });
+                self.status = zoxide_list_status("", count, 0, false);
+            }
+            Err(error) => {
+                self.status = format!("zoxide failed: {error}");
+            }
+        }
     }
 
     /// 處理等待書籤按鍵時的輸入。
@@ -4621,7 +4845,7 @@ impl App {
     /// 將目前焦點 pane 的目錄存成書籤。
     fn set_bookmark(&mut self, key: char) -> io::Result<()> {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
         let target = pane.bookmark_target.clone();
@@ -4753,8 +4977,7 @@ impl App {
             "mtime" => LineMode::Mtime,
             "none" => LineMode::None,
             _ => {
-                self.status =
-                    String::from("usage: linemode <size|permissions|btime|mtime|none>");
+                self.status = String::from("usage: linemode <size|permissions|btime|mtime|none>");
                 return Ok(());
             }
         };
@@ -4793,11 +5016,15 @@ impl App {
                     self.status = format!("smb path missing: {}", path.display());
                     return Ok(());
                 }
+                if !self.panes.contains_key(&self.focused_pane) {
+                    self.status = String::from("panel no longer exists");
+                    return Ok(());
+                }
+                self.go_to_path_and_track(self.focused_pane, &path)?;
                 let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
-                    self.status = String::from("pane no longer exists");
+                    self.status = String::from("panel no longer exists");
                     return Ok(());
                 };
-                pane.go_to_path(&path)?;
                 pane.set_bookmark_target(BookmarkTarget::SmbLocation(location.url.clone()));
                 self.status = format!("connected smb: {}", location.url);
             }
@@ -4847,15 +5074,15 @@ impl App {
 
         match target {
             BookmarkTarget::LocalPath(path) => {
-                let Some(pane) = self.panes.get_mut(&pane_id) else {
-                    self.status = String::from("pane no longer exists");
+                if !self.panes.contains_key(&pane_id) {
+                    self.status = String::from("panel no longer exists");
                     return Ok(());
-                };
+                }
                 if !path.exists() {
                     self.status = format!("bookmark [{key}] missing: {}", path.display());
                     return Ok(());
                 }
-                pane.go_to_path(path)?;
+                self.go_to_path_and_track(pane_id, path)?;
                 self.status = format!("jumped to bookmark [{key}]");
             }
             BookmarkTarget::SmbLocation(location) => {
@@ -4889,24 +5116,21 @@ impl App {
         self.jump_to_bookmark_target(pane_id, entry.key, &target)
     }
 
-    /// 從 recent 列表中打開目前選取的目錄。
-    fn open_recent_from_list(&mut self, pane_id: usize, selected: usize) -> io::Result<()> {
-        let Some(target_path) = self
-            .panes
-            .get(&pane_id)
-            .and_then(|pane| pane.recent_dirs().get(selected).cloned())
-        else {
-            self.status = String::from("recent: empty");
+    /// 從 zoxide 列表中打開目前選取的目錄。
+    fn open_zoxide_from_list(
+        &mut self,
+        pane_id: usize,
+        entries: &[PathBuf],
+        selected: usize,
+    ) -> io::Result<()> {
+        let Some(target_path) = entries.get(selected).cloned() else {
+            self.status = String::from("zoxide: empty");
             return Ok(());
         };
 
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
-            return Ok(());
-        };
-        pane.go_to_path(&target_path)?;
+        self.go_to_path_and_track(pane_id, &target_path)?;
         self.focused_pane = pane_id;
-        self.status = format!("jumped to recent: {}", target_path.display());
+        self.status = format!("jumped via zoxide: {}", target_path.display());
         Ok(())
     }
 
@@ -5078,19 +5302,19 @@ impl App {
             return;
         };
 
-        let Some(pane) = self.panes.get_mut(&request.pane_id) else {
+        if !self.panes.contains_key(&request.pane_id) {
             self.finish_task(
                 request.task_id,
                 TaskState::Failed,
-                String::from("pane no longer exists"),
+                String::from("panel no longer exists"),
             );
-            self.status = String::from("jump failed: pane no longer exists");
+            self.status = String::from("jump failed: panel no longer exists");
             return;
-        };
+        }
 
         let target_path = jump_selection_to_path(&request.root_dir, line);
         let go_to_path_started_at = Instant::now();
-        match pane.go_to_path(&target_path) {
+        match self.go_to_path_and_track(request.pane_id, &target_path) {
             Ok(()) => {
                 debug_timing_message(&format!("jump target path: {}", target_path.display()));
                 debug_timing_log("jump go_to_path", go_to_path_started_at);
@@ -5146,10 +5370,6 @@ impl App {
             return Some(HelpReturnState::CommandMode(std::mem::take(
                 &mut self.command_buffer,
             )));
-        }
-        if self.awaiting_ctrl_w {
-            self.awaiting_ctrl_w = false;
-            return Some(HelpReturnState::AwaitingCtrlW);
         }
         if let Some(prompt) = self.pending_bookmark.take() {
             return Some(HelpReturnState::PendingBookmark(prompt));
@@ -5215,10 +5435,6 @@ impl App {
             HelpReturnState::CommandMode(buffer) => {
                 self.open_prefilled_command(buffer);
             }
-            HelpReturnState::AwaitingCtrlW => {
-                self.awaiting_ctrl_w = true;
-                self.status = String::from("Ctrl-w");
-            }
             HelpReturnState::PendingBookmark(prompt) => {
                 self.pending_bookmark = Some(prompt);
                 self.status = match prompt {
@@ -5258,14 +5474,23 @@ impl App {
                 ..
             } => paste_overwrite_confirm_status(target_name, *entry_count),
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
+            PendingAction::WindowPicker { .. } => {
+                String::from("panel: choose h/j/k/l/c/o from the panel")
+            }
             PendingAction::LineModePicker { .. } => {
                 String::from("linemode: choose a key from the panel")
             }
             PendingAction::ThemePicker { selected } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
             }
-            PendingAction::TaskPanel { pane_id, selected } => {
-                task_panel_status(self.tasks_for_pane(*pane_id).len(), *selected)
+            PendingAction::TaskPanel {
+                pane_id,
+                selected,
+                search,
+            } => {
+                let filtered =
+                    filtered_task_entries(&self.tasks_for_pane(*pane_id), &search.buffer);
+                task_panel_status(&search.buffer, filtered.len(), *selected, search.editing)
             }
             PendingAction::BookmarkPicker { .. } => {
                 String::from("bookmark: choose s/g/d/D from the panel")
@@ -5290,16 +5515,30 @@ impl App {
                 help_entries(&search.buffer).len(),
                 search.editing,
             ),
-            PendingAction::BookmarkList { selected, mode, .. } => {
-                bookmark_list_status(self.bookmark_store.list().len(), *selected, *mode)
+            PendingAction::BookmarkList {
+                selected,
+                mode,
+                search,
+                ..
+            } => {
+                let filtered =
+                    filtered_bookmark_entries(self.bookmark_store.list(), &search.buffer);
+                bookmark_list_status(
+                    &search.buffer,
+                    filtered.len(),
+                    *selected,
+                    *mode,
+                    search.editing,
+                )
             }
-            PendingAction::RecentList { pane_id, selected } => {
-                let count = self
-                    .panes
-                    .get(pane_id)
-                    .map(|pane| pane.recent_dirs().len())
-                    .unwrap_or(0);
-                recent_list_status(count, *selected)
+            PendingAction::ZoxideList {
+                entries,
+                selected,
+                search,
+                ..
+            } => {
+                let filtered = filtered_zoxide_entries(entries, &search.buffer);
+                zoxide_list_status(&search.buffer, filtered.len(), *selected, search.editing)
             }
             PendingAction::CopyPicker { target, .. } => {
                 format!("copy to clipboard: {}", target.display_name)
@@ -5420,7 +5659,7 @@ impl App {
             }
         };
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
         let entries = pane.selected_or_marked_entries();
@@ -5503,7 +5742,7 @@ impl App {
     /// 打開 global search 面板，遞迴建立目前目錄下的搜尋候選資料集。
     pub(crate) fn open_global_search(&mut self) -> io::Result<()> {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
 
@@ -5530,7 +5769,7 @@ impl App {
     /// 打開內容搜尋面板，遞迴搜尋目前目錄下所有檔案內容。
     pub(crate) fn open_content_search(&mut self) -> io::Result<()> {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
 
@@ -5596,7 +5835,7 @@ impl App {
     /// 使用 `fzf` 遞迴掃描目前 pane 的目錄樹，快速挑選任意深度的目標。
     pub(crate) fn open_fzf_jump(&mut self) {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("jump failed: pane not found");
+            self.status = String::from("jump failed: panel not found");
             return;
         };
 
@@ -5643,7 +5882,7 @@ impl App {
             return Ok(());
         };
         let Some(pane) = self.panes.get_mut(&selection.pane_id) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
 
@@ -5920,9 +6159,7 @@ impl App {
         let target_dir = pane.cwd.clone();
         let archive_path = compress_entries_to_zip(&target_dir, &entries)?;
         self.reload_all_panes()?;
-        if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
-            let _ = pane.reveal_path(&archive_path);
-        }
+        let _ = self.reveal_path_and_track(self.focused_pane, &archive_path);
 
         self.status = if entries.len() == 1 {
             format!(
@@ -6023,38 +6260,61 @@ impl App {
         target_name: &str,
         permanent: bool,
     ) -> io::Result<()> {
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
+        let Some(_) = self.panes.get(&pane_id) else {
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
 
+        let mut should_reload_panels = false;
         if permanent {
-            match pane.delete_selected_or_marked() {
+            let delete_result = {
+                let pane = self
+                    .panes
+                    .get_mut(&pane_id)
+                    .expect("checked pane existence before delete");
+                pane.delete_selected_or_marked()
+            };
+            match delete_result {
                 Ok(deleted_names) if deleted_names.is_empty() => {
                     self.status = String::from("nothing selected to delete");
                 }
                 Ok(deleted_names) if deleted_names.len() == 1 => {
+                    should_reload_panels = true;
                     self.status = format!("deleted permanently {}", deleted_names[0]);
                 }
                 Ok(deleted_names) => {
+                    should_reload_panels = true;
                     self.status = format!("deleted permanently {} items", deleted_names.len());
                 }
                 Err(error) => self.status = format!("failed to delete {target_name}: {error}"),
             }
         } else {
             let trash_store = self.trash_store.clone();
-            match pane.trash_selected_or_marked(&trash_store) {
+            let trash_result = {
+                let pane = self
+                    .panes
+                    .get_mut(&pane_id)
+                    .expect("checked pane existence before trash");
+                pane.trash_selected_or_marked(&trash_store)
+            };
+            match trash_result {
                 Ok(trashed_names) if trashed_names.is_empty() => {
                     self.status = String::from("nothing selected to trash");
                 }
                 Ok(trashed_names) if trashed_names.len() == 1 => {
+                    should_reload_panels = true;
                     self.status = format!("trashed {}", trashed_names[0]);
                 }
                 Ok(trashed_names) => {
+                    should_reload_panels = true;
                     self.status = format!("trashed {} items", trashed_names.len());
                 }
                 Err(error) => self.status = format!("failed to trash {target_name}: {error}"),
             }
+        }
+
+        if should_reload_panels {
+            self.reload_all_panes()?;
         }
 
         Ok(())
@@ -6065,9 +6325,7 @@ impl App {
         match self.trash_store.restore_latest()? {
             Some(result) => {
                 self.reload_all_panes()?;
-                if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
-                    let _ = pane.reveal_path(&result.restored_path);
-                }
+                let _ = self.reveal_path_and_track(self.focused_pane, &result.restored_path);
                 self.status = format!("restored {}", result.display_name);
             }
             None => {
@@ -6093,9 +6351,7 @@ impl App {
 
         self.reload_all_panes()?;
         if let Some(first) = results.first() {
-            if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
-                let _ = pane.reveal_path(&first.restored_path);
-            }
+            let _ = self.reveal_path_and_track(self.focused_pane, &first.restored_path);
         }
         if results.len() == 1 {
             self.status = format!("restored {}", results[0].display_name);
@@ -6130,9 +6386,7 @@ impl App {
         match self.trash_store.restore_by_id(&entry.id)? {
             Some(result) => {
                 self.reload_all_panes()?;
-                if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
-                    let _ = pane.reveal_path(&result.restored_path);
-                }
+                let _ = self.reveal_path_and_track(self.focused_pane, &result.restored_path);
                 self.pending_action = None;
                 self.status = format!("restored {}", result.display_name);
             }
@@ -6288,7 +6542,8 @@ impl App {
             }
         }
 
-        if should_restore_help_return && self.pending_action.is_none() && self.help_return.is_some() {
+        if should_restore_help_return && self.pending_action.is_none() && self.help_return.is_some()
+        {
             self.restore_help_return_state(true)?;
         }
         Ok(())
@@ -6301,13 +6556,22 @@ impl App {
         original_name: &str,
         new_name: &str,
     ) -> io::Result<()> {
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
+        let Some(_) = self.panes.get(&pane_id) else {
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
 
-        match pane.rename_selected(new_name) {
+        let rename_result = {
+            let pane = self
+                .panes
+                .get_mut(&pane_id)
+                .expect("checked pane existence before rename");
+            pane.rename_selected(new_name)
+        };
+
+        match rename_result {
             Ok(Some(renamed_name)) => {
+                self.reload_all_panes()?;
                 self.status = format!("renamed {original_name} -> {renamed_name}");
             }
             Ok(None) => {
@@ -6334,7 +6598,7 @@ impl App {
         previews: &[RegexRenamePreview],
     ) -> io::Result<()> {
         let Some(pane) = self.panes.get(&pane_id) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
         let cwd = pane.cwd.clone();
@@ -6400,13 +6664,22 @@ impl App {
     ///
     /// 回傳：`io::Result<()>`。
     pub(crate) fn confirm_create_entry(&mut self, pane_id: usize, path: &str) -> io::Result<()> {
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
+        let Some(_) = self.panes.get(&pane_id) else {
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
 
-        match pane.create_entry(path) {
+        let create_result = {
+            let pane = self
+                .panes
+                .get_mut(&pane_id)
+                .expect("checked pane existence before create");
+            pane.create_entry(path)
+        };
+
+        match create_result {
             Ok(created_name) => {
+                self.reload_all_panes()?;
                 let item_type = if created_name.ends_with('/') {
                     "directory"
                 } else {
@@ -6652,7 +6925,7 @@ impl App {
             .preview_focus
             .and_then(|pane_id| self.panes.get_mut(&pane_id))
         else {
-            return Ok(String::from("pane no longer exists"));
+            return Ok(String::from("panel no longer exists"));
         };
 
         let Some(query) = pane.preview_search_query().map(str::to_string) else {
@@ -6687,12 +6960,12 @@ impl App {
             return Ok(());
         };
 
-        let Some(pane) = self.panes.get_mut(&search.pane_id) else {
-            self.status = String::from("pane no longer exists");
+        if !self.panes.contains_key(&search.pane_id) {
+            self.status = String::from("panel no longer exists");
             return Ok(());
-        };
+        }
 
-        pane.reveal_path(&entry.path)?;
+        self.reveal_path_and_track(search.pane_id, &entry.path)?;
         if let Some(task_id) = search.task_id.or(self.active_global_search_task_id.take()) {
             self.finish_task(
                 task_id,
@@ -6783,7 +7056,7 @@ impl App {
     /// 將指定 pane 套用某一種排序模式。
     fn apply_sort_mode(&mut self, pane_id: usize, sort_mode: SortMode) -> io::Result<()> {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
         pane.set_sort_mode(sort_mode);
@@ -6802,7 +7075,7 @@ impl App {
     /// - 若目標 pane 已不存在，會改寫狀態列並直接結束。
     fn apply_line_mode(&mut self, pane_id: usize, line_mode: LineMode) -> io::Result<()> {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
         pane.set_line_mode(line_mode);
@@ -6963,7 +7236,7 @@ impl App {
         let target_dir = match self.panes.get(&self.focused_pane) {
             Some(pane) => pane.cwd.clone(),
             None => {
-                self.status = String::from("pane no longer exists");
+                self.status = String::from("panel no longer exists");
                 return Ok(());
             }
         };
@@ -6990,7 +7263,7 @@ impl App {
                     ClipboardOperation::Cut => pane.move_entry_into_current_dir(&entry.source_path),
                 },
                 None => {
-                    self.status = String::from("pane no longer exists");
+                    self.status = String::from("panel no longer exists");
                     return Ok(());
                 }
             };
@@ -7055,7 +7328,7 @@ impl App {
             .panes
             .get(&self.focused_pane)
             .map(|pane| pane.cwd.clone())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pane no longer exists"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "panel no longer exists"))?;
 
         let mut conflicts = Vec::new();
         for entry in &clipboard.entries {
@@ -7063,8 +7336,8 @@ impl App {
                 continue;
             };
             let direct_target = target_dir.join(file_name);
-            let same_location =
-                entry.source_path.parent() == Some(target_dir.as_path()) && direct_target == entry.source_path;
+            let same_location = entry.source_path.parent() == Some(target_dir.as_path())
+                && direct_target == entry.source_path;
             if !same_location && direct_target.exists() {
                 conflicts.push(entry.display_name.clone());
             }
@@ -7095,7 +7368,11 @@ impl App {
         if self.focused_pane != pane_id {
             self.focused_pane = pane_id;
         }
-        if self.clipboard.as_ref().is_none_or(|clipboard| clipboard.operation != operation) {
+        if self
+            .clipboard
+            .as_ref()
+            .is_none_or(|clipboard| clipboard.operation != operation)
+        {
             self.status = format!("paste changed before overwrite: {target_name}");
             return Ok(());
         }
@@ -7126,12 +7403,11 @@ impl App {
     /// - 成功時代表目前 pane 已切到指定目錄，或定位到指定檔案。
     pub(crate) fn change_directory_from_command(&mut self, target: &str) -> io::Result<()> {
         let Some(target_path) = self.resolve_path_argument(target) else {
-            self.status = String::from("usage: cd <path>");
+            self.status = String::from("usage: goto <path>");
             return Ok(());
         };
 
-        let pane = self.current_pane_mut()?;
-        match pane.go_to_path(&target_path) {
+        match self.go_to_path_and_track(self.focused_pane, &target_path) {
             Ok(()) => {
                 self.status = format!("jumped to path: {}", target_path.display());
             }
@@ -7151,14 +7427,14 @@ impl App {
     pub(crate) fn move_selected_to_pane_id(&mut self, target: &str) -> io::Result<()> {
         let Some(target_pane_id) = parse_pane_id_argument(target) else {
             self.status = format!(
-                "usage: move-panel <pane-id>. available: {}",
+                "usage: move-panel <panel-id>. available: {}",
                 self.available_pane_ids_label()
             );
             return Ok(());
         };
         let Some(target_dir) = self.panes.get(&target_pane_id).map(|pane| pane.cwd.clone()) else {
             self.status = format!(
-                "unknown pane {target_pane_id}. available: {}",
+                "unknown panel {target_pane_id}. available: {}",
                 self.available_pane_ids_label()
             );
             return Ok(());
@@ -7169,7 +7445,7 @@ impl App {
     /// 將目前焦點 pane 的選取項目批次移動到目標目錄。
     fn move_selected_entries_into_dir(&mut self, target_dir: &std::path::Path) -> io::Result<()> {
         let Some(source_pane) = self.panes.get(&self.focused_pane) else {
-            self.status = String::from("pane no longer exists");
+            self.status = String::from("panel no longer exists");
             return Ok(());
         };
         let source_dir = source_pane.cwd.clone();
@@ -7258,9 +7534,7 @@ impl App {
         let Some(first) = extracted.first() else {
             return Ok(());
         };
-        if let Some(pane) = self.panes.get_mut(&self.focused_pane) {
-            let _ = pane.reveal_path(&first.output_path);
-        }
+        let _ = self.reveal_path_and_track(self.focused_pane, &first.output_path);
         Ok(())
     }
 
@@ -7315,7 +7589,26 @@ impl App {
             } else {
                 None
             };
-            let task_lines = task_records.as_deref().map(task_panel_lines);
+            let task_lines = if let (
+                Some(records),
+                Some(PendingAction::TaskPanel {
+                    pane_id: action_pane_id,
+                    search,
+                    ..
+                }),
+            ) = (task_records.as_ref(), self.pending_action.as_ref())
+            {
+                if *action_pane_id == pane_id {
+                    Some(task_panel_lines(&filtered_task_entries(
+                        records,
+                        &search.buffer,
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let help_lines = if let Some(PendingAction::HelpPanel {
                 pane_id: action_pane_id,
                 search,
@@ -7451,12 +7744,15 @@ impl App {
                 } else if let Some(PendingAction::TaskPanel {
                     pane_id: action_pane_id,
                     selected,
+                    search,
                 }) = &self.pending_action
                 {
                     if *action_pane_id == pane_id {
                         Some(PaneListState::Tasks {
                             lines: task_lines.as_deref().unwrap_or(&[]),
                             selected: *selected,
+                            search: &search.buffer,
+                            editing: search.editing,
                         })
                     } else {
                         None
@@ -7536,7 +7832,7 @@ impl App {
             Span::styled("gg/G", self.theme.accent_style()),
             Span::raw(" jump  "),
             Span::styled("1..9/0", self.theme.accent_style()),
-            Span::raw(" pane  "),
+            Span::raw(" panel  "),
             Span::styled("m", self.theme.accent_style()),
             Span::raw(" linemode  "),
             Span::styled("b", self.theme.accent_style()),
@@ -7549,7 +7845,7 @@ impl App {
             Span::raw(" jump  "),
             Span::styled("V", self.theme.accent_style()),
             Span::raw(" visual mark  "),
-            Span::styled("yy", self.theme.accent_style()),
+            Span::styled("y", self.theme.accent_style()),
             Span::raw(" file copy  "),
             Span::styled("c", self.theme.accent_style()),
             Span::raw(" text copy  "),
@@ -7557,12 +7853,14 @@ impl App {
             Span::raw(" cut  "),
             Span::styled("z", self.theme.accent_style()),
             Span::raw(" jump  "),
+            Span::styled("Z", self.theme.accent_style()),
+            Span::raw(" zoxide  "),
             Span::styled("p", self.theme.accent_style()),
             Span::raw(" paste  "),
-            Span::styled("Ctrl-w s/v", self.theme.accent_style()),
-            Span::raw(" split  "),
-            Span::styled("Ctrl-w h/j/k/l", self.theme.accent_style()),
-            Span::raw(" focus  "),
+            Span::styled("w", self.theme.accent_style()),
+            Span::raw(" panel  "),
+            Span::styled("Ctrl-p", self.theme.accent_style()),
+            Span::raw(" panel cmd  "),
             Span::styled("d", self.theme.accent_style()),
             Span::raw(" trash  "),
             Span::styled("r", self.theme.accent_style()),
@@ -7691,6 +7989,9 @@ impl App {
             Some(PendingAction::SortPicker { .. }) => {
                 super::ui::render_sort_picker(frame, frame.area(), self.theme);
             }
+            Some(PendingAction::WindowPicker { .. }) => {
+                render_window_picker(frame, frame.area(), self.theme);
+            }
             Some(PendingAction::LineModePicker { .. }) => {
                 render_linemode_picker(frame, frame.area(), self.theme);
             }
@@ -7704,11 +8005,14 @@ impl App {
                 pane_id,
                 selected,
                 mode,
+                search,
             }) => {
-                let lines = bookmark_panel_lines(self.bookmark_store.list());
+                let filtered =
+                    filtered_bookmark_entries(self.bookmark_store.list(), &search.buffer);
+                let lines = bookmark_panel_lines(filtered);
                 if let Some(area) = pane_rects.get(pane_id) {
                     let (title, empty_message) = bookmark_picker_copy(*mode);
-                    render_bookmark_picker(
+                    let bookmark_cursor = render_bookmark_picker(
                         frame,
                         *area,
                         self.theme,
@@ -7716,18 +8020,35 @@ impl App {
                         *selected,
                         title,
                         empty_message,
+                        &search.buffer,
+                        search.editing,
                     );
+                    if search.editing && cursor_position.is_none() {
+                        cursor_position = bookmark_cursor;
+                    }
                 }
             }
-            Some(PendingAction::RecentList { pane_id, selected }) => {
-                let lines = recent_panel_lines(
-                    self.panes
-                        .get(pane_id)
-                        .map(|pane| pane.recent_dirs().to_vec())
-                        .unwrap_or_default(),
-                );
+            Some(PendingAction::ZoxideList {
+                pane_id,
+                selected,
+                entries,
+                search,
+            }) => {
+                let filtered = filtered_zoxide_entries(entries, &search.buffer);
+                let lines = zoxide_panel_lines(filtered);
                 if let Some(area) = pane_rects.get(pane_id) {
-                    render_recent_picker(frame, *area, self.theme, &lines, *selected);
+                    let zoxide_cursor = render_zoxide_picker(
+                        frame,
+                        *area,
+                        self.theme,
+                        &lines,
+                        *selected,
+                        &search.buffer,
+                        search.editing,
+                    );
+                    if search.editing && cursor_position.is_none() {
+                        cursor_position = zoxide_cursor;
+                    }
                 }
             }
             Some(PendingAction::TrashPanel { .. })
@@ -7892,6 +8213,26 @@ fn bookmark_panel_lines(entries: Vec<BookmarkEntry>) -> Vec<BookmarkPanelLine> {
         .collect()
 }
 
+/// 依照搜尋字串過濾書籤清單，讓書籤列表也能使用 `f` 做即時篩選。
+fn filtered_bookmark_entries(entries: Vec<BookmarkEntry>, query: &str) -> Vec<BookmarkEntry> {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return entries;
+    }
+
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry.key.to_string().to_lowercase().contains(&trimmed)
+                || entry
+                    .target
+                    .display_text()
+                    .to_lowercase()
+                    .contains(&trimmed)
+        })
+        .collect()
+}
+
 /// 依書籤列表模式回傳彈窗標題與空狀態訊息。
 fn bookmark_picker_copy(mode: BookmarkListMode) -> (&'static str, &'static str) {
     match mode {
@@ -7900,13 +8241,48 @@ fn bookmark_picker_copy(mode: BookmarkListMode) -> (&'static str, &'static str) 
     }
 }
 
-/// 將 recent 目錄清單轉成彈窗可直接顯示的列內容。
-fn recent_panel_lines(entries: Vec<PathBuf>) -> Vec<RecentPanelLine> {
+/// 將 zoxide 目錄清單轉成彈窗可直接顯示的列內容。
+fn zoxide_panel_lines(entries: Vec<PathBuf>) -> Vec<ZoxidePanelLine> {
     entries
         .into_iter()
-        .map(|path| RecentPanelLine {
+        .map(|path| ZoxidePanelLine {
             path: path.display().to_string(),
         })
+        .collect()
+}
+
+/// 依照搜尋字串過濾 zoxide 回傳的目錄列表，保留路徑中包含關鍵字的項目。
+fn filtered_zoxide_entries(entries: &[PathBuf], query: &str) -> Vec<PathBuf> {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return entries.to_vec();
+    }
+
+    entries
+        .iter()
+        .filter(|path| path.display().to_string().to_lowercase().contains(&trimmed))
+        .cloned()
+        .collect()
+}
+
+/// 依照搜尋字串過濾 task 清單，方便在任務很多時快速縮小範圍。
+fn filtered_task_entries(tasks: &[TaskRecord], query: &str) -> Vec<TaskRecord> {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return tasks.to_vec();
+    }
+
+    tasks
+        .iter()
+        .filter(|task| {
+            task_state_label(task.state)
+                .to_lowercase()
+                .contains(&trimmed)
+                || task.title.to_lowercase().contains(&trimmed)
+                || task.detail.to_lowercase().contains(&trimmed)
+                || task.kind.to_lowercase().contains(&trimmed)
+        })
+        .cloned()
         .collect()
 }
 
@@ -8279,21 +8655,52 @@ fn command_suggestion_navigation(key: &KeyEvent) -> Option<SuggestionNavigation>
 }
 
 /// 根據目前書籤彈窗的內容，產生適合顯示在狀態列的提示文字。
-fn bookmark_list_status(count: usize, selected: usize, mode: BookmarkListMode) -> String {
+fn bookmark_list_status(
+    query: &str,
+    count: usize,
+    selected: usize,
+    mode: BookmarkListMode,
+    editing: bool,
+) -> String {
+    if editing {
+        return match mode {
+            BookmarkListMode::Jump => format!(
+                "bookmark search: {} ({count})",
+                if query.is_empty() { "all" } else { query }
+            ),
+            BookmarkListMode::Delete => format!(
+                "bookmark delete search: {} ({count})",
+                if query.is_empty() { "all" } else { query }
+            ),
+        };
+    }
+
     if count == 0 {
         match mode {
-            BookmarkListMode::Jump => String::from("bookmark jump: empty"),
-            BookmarkListMode::Delete => String::from("bookmark delete: empty"),
+            BookmarkListMode::Jump => {
+                if query.is_empty() {
+                    String::from("bookmark jump: empty")
+                } else {
+                    format!("bookmark jump: {} (0)", query)
+                }
+            }
+            BookmarkListMode::Delete => {
+                if query.is_empty() {
+                    String::from("bookmark delete: empty")
+                } else {
+                    format!("bookmark delete: {} (0)", query)
+                }
+            }
         }
     } else {
         match mode {
             BookmarkListMode::Jump => format!(
-                "bookmarks jump: {}/{} (j/k move, Enter open, Esc close)",
+                "bookmarks jump: {}/{} (j/k move, Enter open, f search, Esc close)",
                 selected.saturating_add(1).min(count),
                 count
             ),
             BookmarkListMode::Delete => format!(
-                "bookmarks delete: {}/{} (press key or Enter delete, Esc close)",
+                "bookmarks delete: {}/{} (press key or Enter delete, f search, Esc close)",
                 selected.saturating_add(1).min(count),
                 count
             ),
@@ -8301,13 +8708,22 @@ fn bookmark_list_status(count: usize, selected: usize, mode: BookmarkListMode) -
     }
 }
 
-/// 根據目前 recent 面板內容，產生適合顯示在狀態列的提示文字。
-fn recent_list_status(count: usize, selected: usize) -> String {
-    if count == 0 {
-        String::from("recent: empty")
+/// 根據目前 zoxide 面板內容，產生適合顯示在狀態列的提示文字。
+fn zoxide_list_status(query: &str, count: usize, selected: usize, editing: bool) -> String {
+    if editing {
+        format!(
+            "zoxide search: {} ({count})",
+            if query.is_empty() { "all" } else { query }
+        )
+    } else if count == 0 {
+        if query.is_empty() {
+            String::from("zoxide: empty")
+        } else {
+            format!("zoxide: {} (0)", query)
+        }
     } else {
         format!(
-            "recent: {}/{} (j/k move, Enter open, Esc close)",
+            "zoxide: {}/{} (j/k move, Enter open, f search, Esc close)",
             selected.saturating_add(1).min(count),
             count
         )
@@ -8394,7 +8810,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":rename-regex",
-            "",
+            "R",
             "對目前選取或標記項目建立 regex 批次改名預覽，Enter 套用、Esc 取消",
             HelpAction::Command("rename-regex"),
         ),
@@ -8407,14 +8823,20 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":jump",
             "z",
-            "用 fzf 遞迴掃描目前 pane 的目錄樹，快速挑選檔案或資料夾後直接跳過去",
+            "用 fzf 遞迴掃描目前 panel 的目錄樹，快速挑選檔案或資料夾後直接跳過去",
             HelpAction::Command("jump"),
         ),
         help_entry(
-            ":cd <path>",
-            "",
-            "讓目前 pane 直接跳到指定路徑，支援相對路徑、絕對路徑與 Windows 磁碟機路徑",
-            HelpAction::Command("cd "),
+            ":zoxide",
+            "Z",
+            "打開 zoxide 目錄列表，依照常用頻率快速跳到歷史工作目錄",
+            HelpAction::Command("zoxide"),
+        ),
+        help_entry(
+            ":goto <path>",
+            "gt",
+            "讓目前 panel 直接跳到指定路徑，支援相對路徑、絕對路徑與 Windows 磁碟機路徑",
+            HelpAction::Command("goto "),
         ),
         help_entry(
             ":bookmark",
@@ -8424,31 +8846,31 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":bookmark save",
-            "b s",
-            "自動挑選下一個可用代號，把目前 pane 的位置存成書籤",
+            "bs",
+            "自動挑選下一個可用代號，把目前 panel 的位置存成書籤",
             HelpAction::Command("bookmark save"),
         ),
         help_entry(
             ":bookmark jump",
-            "b g / '{key}",
+            "bg/'{key}",
             "用列表挑選要跳去的書籤，或直接用單鍵快速跳轉",
             HelpAction::Command("bookmark jump"),
         ),
         help_entry(
             ":bookmark list",
-            "b g",
+            "bg",
             "列出目前可用的書籤清單，Enter 或 l 直接跳過去",
             HelpAction::Command("bookmark list"),
         ),
         help_entry(
             ":bookmark delete",
-            "b d",
+            "bd",
             "打開書籤刪除列表，可按對應按鍵或 Enter 刪除單筆書籤",
             HelpAction::Command("bookmark delete"),
         ),
         help_entry(
             ":bookmark clear",
-            "b D",
+            "bD",
             "直接刪除全部書籤",
             HelpAction::Command("bookmark clear"),
         ),
@@ -8459,20 +8881,44 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("bookmark set "),
         ),
         help_entry(
-            ":recent",
-            "",
-            "打開目前 pane 最近去過的目錄列表，方便快速跳回上一些工作位置",
-            HelpAction::Command("recent"),
-        ),
-        help_entry(
             ":linemode",
             "m",
             "打開 linemode 面板，改變列表右側欄位顯示；目前支援 size、permissions、btime、mtime、none",
             HelpAction::Command("linemode "),
         ),
         help_entry(
+            ":linemode size",
+            "ms",
+            "將列表右側欄位切成 size 顯示；資料夾顯示子項目數量，檔案顯示大小",
+            HelpAction::Command("linemode size"),
+        ),
+        help_entry(
+            ":linemode permissions",
+            "mp",
+            "將列表右側欄位切成 permissions 顯示",
+            HelpAction::Command("linemode permissions"),
+        ),
+        help_entry(
+            ":linemode btime",
+            "mb",
+            "將列表右側欄位切成 btime 顯示",
+            HelpAction::Command("linemode btime"),
+        ),
+        help_entry(
+            ":linemode mtime",
+            "mt",
+            "將列表右側欄位切成 mtime 顯示",
+            HelpAction::Command("linemode mtime"),
+        ),
+        help_entry(
+            ":linemode none",
+            "mn",
+            "關閉 linemode，回到由排序方式決定的右側欄位顯示",
+            HelpAction::Command("linemode none"),
+        ),
+        help_entry(
             ":copy",
-            "yy",
+            "y",
             "複製目前選取項目到內部剪貼簿",
             HelpAction::Command("copy"),
         ),
@@ -8480,6 +8926,30 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             ":copy-picker",
             "c",
             "打開文字複製小視窗，可快速複製檔案路徑、目錄路徑、檔名或無副檔名檔名",
+            HelpAction::Command("copy-picker"),
+        ),
+        help_entry(
+            ":copy file-path",
+            "cu",
+            "打開 Copy 面板後複製目前項目的完整檔案路徑",
+            HelpAction::Command("copy-picker"),
+        ),
+        help_entry(
+            ":copy directory-path",
+            "cd",
+            "打開 Copy 面板後複製目前項目的所在目錄路徑；若本身是資料夾就複製該資料夾路徑",
+            HelpAction::Command("copy-picker"),
+        ),
+        help_entry(
+            ":copy filename",
+            "cf",
+            "打開 Copy 面板後只複製目前項目的檔名",
+            HelpAction::Command("copy-picker"),
+        ),
+        help_entry(
+            ":copy filename-without-extension",
+            "cn",
+            "打開 Copy 面板後複製去掉副檔名的檔名",
             HelpAction::Command("copy-picker"),
         ),
         help_entry(
@@ -8491,19 +8961,19 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":mark-all",
             "Ctrl-a",
-            "把目前 pane 中所有可見的檔案與資料夾全部標記起來，方便批次操作",
+            "把目前 panel 中所有可見的檔案與資料夾全部標記起來，方便批次操作",
             HelpAction::Command("mark-all"),
         ),
         help_entry(
             ":mark-invert",
             "Ctrl-r",
-            "反轉目前 pane 所有可見項目的標記狀態",
+            "反轉目前 panel 所有可見項目的標記狀態",
             HelpAction::Command("mark-invert"),
         ),
         help_entry(
             ":unmark-all",
             "Ctrl-Shift-a",
-            "清掉目前 pane 內所有已標記項目",
+            "清掉目前 panel 內所有已標記項目",
             HelpAction::Command("unmark-all"),
         ),
         help_entry(
@@ -8521,14 +8991,14 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":move-panel",
             "",
-            "把目前選取或標記的項目移動到指定 pane 編號目前所在的目錄",
+            "把目前選取或標記的項目移動到指定 panel 編號目前所在的目錄",
             HelpAction::Command("move-panel "),
         ),
         help_entry(
-            ":pane <id>",
+            ":panel <id>",
             "1..9 / 0, Ctrl-p",
-            "多 pane 時可直接按數字切換焦點；也可打開 pane 切換命令輸入指定編號",
-            HelpAction::Command("pane "),
+            "多 panel 時可直接按數字切換焦點；也可打開 panel 切換命令輸入指定編號",
+            HelpAction::Command("panel "),
         ),
         help_entry(
             ":paste",
@@ -8557,7 +9027,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":connect smb://host/share",
             "",
-            "讓目前 pane 連到 SMB share；mac 若尚未掛載會先請求系統掛載",
+            "讓目前 panel 連到 SMB share；mac 若尚未掛載會先請求系統掛載",
             HelpAction::Command("connect "),
         ),
         help_entry(
@@ -8574,13 +9044,13 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":open",
-            "o / Enter",
+            "o/Enter",
             "用預設外部方式打開目前選取項目；文字檔走 $EDITOR，其他交給系統",
             HelpAction::Command("open"),
         ),
         help_entry(
             ":open-picker",
-            "O / Shift-Enter",
+            "O/Shift-Enter",
             "打開 Open with 小視窗，手動選擇 Editor、Vim、Open 或 Reveal",
             HelpAction::Command("open-picker"),
         ),
@@ -8617,7 +9087,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":tasks",
             "t",
-            "打開目前 pane 的任務面板，查看最近的 search / jump / open / smb 任務狀態",
+            "打開目前 panel 的任務面板，查看最近的 search / jump / open / smb 任務狀態",
             HelpAction::Command("tasks"),
         ),
         help_entry(
@@ -8628,19 +9098,19 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":trash restore-all",
-            "R in trash",
+            "trash:R",
             "在 trash 面板中還原目前篩選結果的全部項目",
             HelpAction::Command("trash restore-all"),
         ),
         help_entry(
             ":trash clear",
-            "C in trash",
+            "trash:C",
             "永久刪除 trash 內目前篩選結果的全部項目",
             HelpAction::Command("trash clear"),
         ),
         help_entry(
             ":trash mark",
-            "V in trash",
+            "trash:V",
             "在 trash 面板中用 Vim 風格選取多個項目後一起還原或刪除",
             HelpAction::Command("trash"),
         ),
@@ -8665,43 +9135,43 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":preview",
             "Tab",
-            "切換 preview mode；平常隱藏 preview，開啟後用整個 pane 顯示內容",
+            "切換 preview mode；平常隱藏 preview，開啟後用整個 panel 顯示內容",
             HelpAction::Command("preview"),
         ),
         help_entry(
             ":split",
-            "w j / Ctrl-w s",
-            "在目前 pane 下方建立新的 pane",
+            "wj",
+            "在目前 panel 下方建立新的 panel",
             HelpAction::Command("split"),
         ),
         help_entry(
             ":vsplit",
-            "w l / Ctrl-w v",
-            "在目前 pane 右側建立新的 pane",
+            "wl",
+            "在目前 panel 右側建立新的 panel",
             HelpAction::Command("vsplit"),
         ),
         help_entry(
             ":split-up",
-            "w k",
-            "在目前 pane 上方建立新的 pane",
+            "wk",
+            "在目前 panel 上方建立新的 panel",
             HelpAction::Command("split-up"),
         ),
         help_entry(
             ":split-left",
-            "w h",
-            "在目前 pane 左側建立新的 pane",
+            "wh",
+            "在目前 panel 左側建立新的 panel",
             HelpAction::Command("split-left"),
         ),
         help_entry(
             ":close",
-            "Ctrl-w c",
-            "關閉目前 pane",
+            "wc",
+            "關閉目前 panel",
             HelpAction::Command("close"),
         ),
         help_entry(
             ":only",
-            "Ctrl-w o",
-            "只保留目前 pane",
+            "wo",
+            "只保留目前 panel",
             HelpAction::Command("only"),
         ),
         help_entry(
@@ -8718,12 +9188,75 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":help",
-            "~ / F1",
+            "~/F1",
             "打開這個功能說明面板",
             HelpAction::Command("help"),
         ),
         help_entry(":filter", "f", "即時過濾目前列表內容", HelpAction::Filter),
         help_entry(":sort", ",", "打開排序方式快捷鍵面板", HelpAction::Sort),
+        help_entry(
+            ":sort modified",
+            ",m",
+            "依修改時間正序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort modified reverse",
+            ",M",
+            "依修改時間倒序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(":sort birth", ",b", "依建立時間正序排序", HelpAction::Sort),
+        help_entry(
+            ":sort birth reverse",
+            ",B",
+            "依建立時間倒序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort alphabetical",
+            ",a",
+            "依字母順序正序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort alphabetical reverse",
+            ",A",
+            "依字母順序倒序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort natural",
+            ",n",
+            "依自然順序正序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort natural reverse",
+            ",N",
+            "依自然順序倒序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort extension",
+            ",e",
+            "依副檔名正序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(
+            ":sort extension reverse",
+            ",E",
+            "依副檔名倒序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(":sort size", ",s", "依檔案大小正序排序", HelpAction::Sort),
+        help_entry(
+            ":sort size reverse",
+            ",S",
+            "依檔案大小倒序排序",
+            HelpAction::Sort,
+        ),
+        help_entry(":sort random", ",r", "隨機排序目前列表", HelpAction::Sort),
         help_entry(":hidden", ".", "切換是否顯示隱藏檔", HelpAction::Hidden),
         help_entry(":visual", "V", "進入視覺範圍標記模式", HelpAction::Visual),
         help_entry(
@@ -8878,8 +9411,8 @@ fn command_path_completion_context(
     query: &str,
 ) -> Option<CommandPathCompletionContext> {
     let base_dir = base_dir?;
-    let (replacement_prefix, raw_path) = if let Some(path) = query.strip_prefix("cd ") {
-        (String::from("cd "), path)
+    let (replacement_prefix, raw_path) = if let Some(path) = query.strip_prefix("goto ") {
+        (String::from("goto "), path)
     } else if looks_like_navigation_path(query) {
         (String::new(), query.trim())
     } else {
@@ -9033,12 +9566,21 @@ fn help_panel_status(query: &str, count: usize, editing: bool) -> String {
 }
 
 /// 產生 task 面板底部狀態列訊息。
-fn task_panel_status(count: usize, selected: usize) -> String {
-    if count == 0 {
-        String::from("tasks: empty")
+fn task_panel_status(query: &str, count: usize, selected: usize, editing: bool) -> String {
+    if editing {
+        format!(
+            "task search: {} ({count})",
+            if query.is_empty() { "all" } else { query }
+        )
+    } else if count == 0 {
+        if query.is_empty() {
+            String::from("tasks: empty")
+        } else {
+            format!("tasks: {} (0)", query)
+        }
     } else {
         format!(
-            "tasks: {}/{} (j/k move, l detail, x cancel, h close)",
+            "tasks: {}/{} (j/k move, l detail, x cancel, f search, h close)",
             selected + 1,
             count
         )
@@ -9385,12 +9927,12 @@ mod tests {
 
     use super::{
         App, BookmarkListMode, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
-        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskState,
-        VisualSelectionState,
-        command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
-        ctrl_digit_target_pane_id, help_entries, is_windows_drive_path, key_matches_ctrl_letter,
-        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, looks_like_navigation_path, plain_digit_target_pane_id,
+        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord, TaskState,
+        VisualSelectionState, command_suggestion_navigation, command_suggestions,
+        command_suggestions_for_buffer, ctrl_digit_target_pane_id, help_entries,
+        is_windows_drive_path, key_matches_ctrl_letter, key_matches_ctrl_shift_letter,
+        key_matches_letter_any_case, key_matches_plain_letter, key_matches_shifted_letter,
+        looks_like_navigation_path, plain_digit_target_pane_id, query_zoxide_directories,
         rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
         rename_word_end, typed_char_from_key,
     };
@@ -9590,16 +10132,46 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 `Ctrl+p` 會打開 command UI，並預先填入 `pane ` 方便直接輸入目標編號。
-    fn app_ctrl_p_opens_prefilled_pane_command() {
+    /// 驗證 `Ctrl+p` 會打開 command UI，並預先填入 `panel ` 方便直接輸入目標編號。
+    fn app_ctrl_p_opens_prefilled_panel_command() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
-            .expect("open prefilled pane command");
+            .expect("open prefilled panel command");
 
         assert!(app.command_mode);
-        assert_eq!(app.command_buffer, "pane ");
+        assert_eq!(app.command_buffer, "panel ");
+        assert_eq!(app.status, "command mode");
+    }
+
+    #[test]
+    /// 驗證 normal mode 按下 `R` 會打開預填好的 `rename-regex ` 命令輸入框。
+    fn app_shift_r_opens_prefilled_rename_regex_command() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT))
+            .expect("open prefilled rename-regex command");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "rename-regex ");
+        assert_eq!(app.status, "command mode");
+    }
+
+    #[test]
+    /// 驗證 normal mode 按下 `gt` 會打開預填好的 `goto ` 命令輸入框。
+    fn app_gt_opens_prefilled_goto_command() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("pending g");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open prefilled goto command");
+
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "goto ");
         assert_eq!(app.status, "command mode");
     }
 
@@ -9621,21 +10193,21 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 `:cd <path>` 會讓目前 pane 跳到指定子目錄。
-    fn app_cd_command_changes_to_target_directory() {
+    /// 驗證 `:goto <path>` 會讓目前 pane 跳到指定子目錄。
+    fn app_goto_command_changes_to_target_directory() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
         fs::create_dir(&docs).expect("docs");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.execute_command("cd docs").expect("cd command");
+        app.execute_command("goto docs").expect("goto command");
 
         assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
         assert_eq!(app.status, format!("jumped to path: {}", docs.display()));
     }
 
     #[test]
-    /// 驗證直接輸入絕對路徑也能跳到目標目錄，不必一定寫 `:cd`。
+    /// 驗證直接輸入絕對路徑也能跳到目標目錄，不必一定寫 `:goto`。
     fn app_bare_path_command_changes_directory() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -9664,10 +10236,10 @@ mod tests {
         fs::create_dir(dir.path().join("docs")).expect("docs");
         fs::write(dir.path().join("draft.md"), "draft").expect("draft");
 
-        let suggestions = command_suggestions_for_buffer(Some(dir.path()), "cd d");
+        let suggestions = command_suggestions_for_buffer(Some(dir.path()), "goto d");
 
         assert!(!suggestions.is_empty());
-        assert_eq!(suggestions[0].command, "cd docs/");
+        assert_eq!(suggestions[0].command, "goto docs/");
         assert_eq!(suggestions[0].display_command, "docs/");
         assert!(suggestions[0].description.is_empty());
     }
@@ -9681,7 +10253,7 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        for ch in "cd d".chars() {
+        for ch in "goto d".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .expect("type path command");
         }
@@ -9689,7 +10261,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("autocomplete path");
 
-        assert_eq!(app.command_buffer, "cd docs/");
+        assert_eq!(app.command_buffer, "goto docs/");
     }
 
     #[test]
@@ -9702,7 +10274,7 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        for ch in "cd d".chars() {
+        for ch in "goto d".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .expect("type path command");
         }
@@ -9710,7 +10282,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("complete common prefix");
 
-        assert_eq!(app.command_buffer, "cd do");
+        assert_eq!(app.command_buffer, "goto do");
     }
 
     #[test]
@@ -9723,7 +10295,7 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        for ch in "cd do".chars() {
+        for ch in "goto do".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .expect("type path command");
         }
@@ -9736,8 +10308,8 @@ mod tests {
             .expect("cycle to second candidate");
         let second = app.command_buffer.clone();
 
-        assert_eq!(first, "cd docs/");
-        assert_eq!(second, "cd downloads/");
+        assert_eq!(first, "goto docs/");
+        assert_eq!(second, "goto downloads/");
     }
 
     #[test]
@@ -9786,6 +10358,36 @@ mod tests {
     }
 
     #[test]
+    /// 驗證一般列表模式用 `l` / `Left` / `Right` 切換目錄後，zoxide 也會同步學習這些位置。
+    fn app_normal_mode_directory_navigation_updates_zoxide() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        fs::create_dir(&alpha).expect("alpha");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .expect("enter directory");
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, alpha);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .expect("go parent");
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, dir.path());
+
+        let tracked = query_zoxide_directories().expect("query zoxide");
+        assert!(
+            tracked.iter().any(|path| path == &alpha),
+            "expected zoxide to contain {}",
+            alpha.display()
+        );
+        assert!(
+            tracked.iter().any(|path| path == dir.path()),
+            "expected zoxide to contain {}",
+            dir.path().display()
+        );
+    }
+
+    #[test]
     /// 驗證 command mode 按下 Tab 時，會直接採用目前最接近的命令提示。
     fn app_command_mode_tab_autocompletes_closest_command_suggestion() {
         let dir = tempdir().expect("tempdir");
@@ -9793,20 +10395,20 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        for ch in "re".chars() {
+        for ch in "zo".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .expect("type re");
+                .expect("type zo");
         }
 
         let suggestions = command_suggestions(&app.command_buffer);
         assert!(!suggestions.is_empty());
-        assert_eq!(suggestions[0].command, "recent");
+        assert_eq!(suggestions[0].command, "zoxide");
         assert_eq!(app.command_suggestion_selected, 0);
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("autocomplete closest suggestion");
 
-        assert_eq!(app.command_buffer, "recent");
+        assert_eq!(app.command_buffer, "zoxide");
         assert_eq!(app.command_suggestion_selected, 0);
     }
 
@@ -10057,6 +10659,31 @@ mod tests {
     }
 
     #[test]
+    /// 驗證兩個開在同一目錄的 panel，其中一個刪除檔案後，另一個也會同步刷新列表。
+    fn app_delete_refreshes_other_panels_in_same_directory() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("shared.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        app.focus_pane_by_id(1);
+
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm trash");
+
+        assert!(!file_path.exists());
+        for pane_id in [1, 2] {
+            let pane = app.panes.get(&pane_id).expect("pane");
+            assert!(
+                pane.entries.iter().all(|entry| entry.path != file_path),
+                "panel {pane_id} still shows deleted file"
+            );
+        }
+    }
+
+    #[test]
     /// 驗證移到 trash 的項目可以透過 restore 命令還原。
     fn app_restore_latest_from_trash_recovers_file() {
         let dir = tempdir().expect("tempdir");
@@ -10283,7 +10910,8 @@ mod tests {
             app.pending_action,
             Some(PendingAction::TaskPanel {
                 pane_id: 1,
-                selected: 0
+                selected: 0,
+                ..
             })
         ));
         assert_eq!(app.status, "tasks: empty");
@@ -10548,6 +11176,43 @@ mod tests {
     }
 
     #[test]
+    /// 驗證按下 `w` 會打開 panel 操作面板，讓第二個按鍵可視化選擇。
+    fn app_w_opens_window_picker() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("open window picker");
+
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::WindowPicker { pane_id: 1 })
+        );
+        assert_eq!(app.status, "panel: choose h/j/k/l/c/o from the panel");
+    }
+
+    #[test]
+    /// 驗證 `wc` 會關閉目前 panel。
+    fn app_window_picker_wc_closes_current_panel() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        assert_eq!(app.focused_pane, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("open window picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .expect("close current panel");
+
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.focused_pane, 1);
+        assert_eq!(app.status, "closed panel 2");
+    }
+
+    #[test]
     /// 驗證仍可用 `'{key}` 直接跳回既有書籤，保留快速單鍵 workflow。
     fn app_bookmark_direct_jump_still_works() {
         let dir = tempdir().expect("tempdir");
@@ -10755,7 +11420,8 @@ mod tests {
             Some(PendingAction::BookmarkList {
                 pane_id: 1,
                 selected: 0,
-                mode: BookmarkListMode::Jump
+                mode: BookmarkListMode::Jump,
+                ..
             })
         ));
 
@@ -10792,7 +11458,8 @@ mod tests {
             Some(PendingAction::BookmarkList {
                 pane_id: 2,
                 selected: 0,
-                mode: BookmarkListMode::Jump
+                mode: BookmarkListMode::Jump,
+                ..
             })
         ));
 
@@ -10829,7 +11496,8 @@ mod tests {
             Some(PendingAction::BookmarkList {
                 pane_id: 1,
                 selected: 0,
-                mode: BookmarkListMode::Delete
+                mode: BookmarkListMode::Delete,
+                ..
             })
         ));
 
@@ -10911,67 +11579,142 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 pane 在切換目錄後，會把先前位置記進 recent 清單。
-    fn pane_directory_changes_are_recorded_in_recent_history() {
+    /// 驗證按下 `Z` 會直接打開 zoxide 目錄列表。
+    fn app_shift_z_opens_zoxide_list() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
-        let src = dir.path().join("src");
         fs::create_dir(&docs).expect("docs");
-        fs::create_dir(&src).expect("src");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.panes
-            .get_mut(&1)
-            .expect("pane")
-            .go_to_path(&docs)
-            .expect("go docs");
-        app.panes
-            .get_mut(&1)
-            .expect("pane")
-            .go_to_path(&src)
-            .expect("go src");
+        app.go_to_path_and_track(1, &docs).expect("go docs");
 
-        let recent = app.panes.get(&1).expect("pane").recent_dirs();
-        assert_eq!(recent.len(), 2);
-        assert_eq!(recent[0], docs);
-        assert_eq!(recent[1], dir.path());
+        app.handle_key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT))
+            .expect("open zoxide list");
+
+        assert!(matches!(
+            &app.pending_action,
+            Some(PendingAction::ZoxideList {
+                pane_id: 1,
+                selected: 0,
+                entries,
+                ..
+            }) if !entries.is_empty()
+        ));
     }
 
     #[test]
-    /// 驗證 `:recent` 會打開目前 pane 的 recent 列表，並可用 Enter 跳回選中的目錄。
-    fn app_recent_command_opens_and_jumps_to_selected_directory() {
+    /// 驗證 task 面板支援 `f` 搜尋，並可只保留符合條件的任務後再查看細節。
+    fn app_task_panel_supports_filtering() {
         let dir = tempdir().expect("tempdir");
-        let docs = dir.path().join("docs");
-        let src = dir.path().join("src");
-        fs::create_dir(&docs).expect("docs");
-        fs::create_dir(&src).expect("src");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.task_log.push(TaskRecord {
+            id: 1,
+            pane_id: 1,
+            kind: "search",
+            title: String::from("alpha task"),
+            detail: String::from("first detail"),
+            state: TaskState::Done,
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: Some(1),
+        });
+        app.task_log.push(TaskRecord {
+            id: 2,
+            pane_id: 1,
+            kind: "search",
+            title: String::from("beta task"),
+            detail: String::from("second detail"),
+            state: TaskState::Running,
+            started_at_unix_ms: 2,
+            finished_at_unix_ms: None,
+        });
+
+        app.open_task_panel();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start task filter");
+        for ch in ['b', 'e', 't', 'a'] {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type task query");
+        }
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock task filter");
+
+        match app.pending_action.as_ref() {
+            Some(PendingAction::TaskPanel {
+                selected, search, ..
+            }) => {
+                assert_eq!(*selected, 0);
+                assert_eq!(search.buffer, "beta");
+                assert!(!search.editing);
+            }
+            other => panic!("unexpected pending action: {other:?}"),
+        }
+        assert_eq!(
+            app.status,
+            "tasks: 1/1 (j/k move, l detail, x cancel, f search, h close)"
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("show filtered task detail");
+        assert_eq!(app.status, "task 2 [search] second detail");
+    }
+
+    #[test]
+    /// 驗證書籤列表支援 `f` 搜尋，並可直接打開過濾後唯一保留的書籤。
+    fn app_bookmark_list_supports_filtering() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+        fs::write(
+            dir.path().join("bookmark.toml"),
+            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+        )
+        .expect("bookmark file");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.panes
-            .get_mut(&1)
-            .expect("pane")
-            .go_to_path(&docs)
-            .expect("go docs");
-        app.panes
-            .get_mut(&1)
-            .expect("pane")
-            .go_to_path(&src)
-            .expect("go src");
-
-        app.execute_command("recent").expect("open recent");
-        assert!(matches!(
-            app.pending_action,
-            Some(PendingAction::RecentList {
-                pane_id: 1,
-                selected: 0
-            })
-        ));
-
+        app.open_bookmark_list();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start bookmark filter");
+        for ch in ['b', 'e', 't', 'a'] {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type bookmark query");
+        }
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("open recent entry");
+            .expect("lock bookmark filter");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open filtered bookmark");
 
-        assert_eq!(app.panes.get(&1).expect("pane").cwd, docs);
-        assert_eq!(app.status, format!("jumped to recent: {}", docs.display()));
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, beta);
+        assert_eq!(app.status, "jumped to bookmark [b]");
+    }
+
+    #[test]
+    /// 驗證 zoxide 列表支援 `f` 搜尋，並可跳到過濾後唯一保留的目錄。
+    fn app_zoxide_list_supports_filtering() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir(&alpha).expect("alpha");
+        fs::create_dir(&beta).expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.go_to_path_and_track(1, &alpha).expect("go alpha");
+        app.go_to_path_and_track(1, &beta).expect("go beta");
+        app.open_zoxide_list();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("start zoxide filter");
+        for ch in ['b', 'e', 't', 'a'] {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type zoxide query");
+        }
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock zoxide filter");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open filtered zoxide path");
+
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, beta);
+        assert_eq!(app.status, format!("jumped via zoxide: {}", beta.display()));
     }
 
     #[test]
@@ -10989,61 +11732,61 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 `:pane <id>` 會把焦點直接切到指定 pane。
-    fn app_pane_command_focuses_target_pane() {
+    /// 驗證 `:panel <id>` 會把焦點直接切到指定 panel。
+    fn app_panel_command_focuses_target_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.split_current(SplitDirection::Vertical).expect("split");
         assert_eq!(app.focused_pane, 2);
-        app.focus_previous_pane();
+        app.focus_pane_by_id(1);
         assert_eq!(app.focused_pane, 1);
 
-        app.execute_command("pane 2").expect("focus pane 2");
+        app.execute_command("panel 2").expect("focus panel 2");
 
         assert_eq!(app.focused_pane, 2);
-        assert_eq!(app.status, "focused pane 2");
+        assert_eq!(app.status, "focused panel 2");
     }
 
     #[test]
-    /// 驗證 `Ctrl+數字` 可直接切換焦點 pane，避免多 pane 時只能依賴 `Ctrl-w hjkl`。
-    fn app_ctrl_digit_focuses_target_pane() {
+    /// 驗證 `Ctrl+數字` 可直接切換焦點 panel。
+    fn app_ctrl_digit_focuses_target_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.split_current(SplitDirection::Vertical).expect("split");
         assert_eq!(app.focused_pane, 2);
-        app.focus_previous_pane();
+        app.focus_pane_by_id(1);
         assert_eq!(app.focused_pane, 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL))
-            .expect("focus pane 2");
+            .expect("focus panel 2");
 
         assert_eq!(app.focused_pane, 2);
-        assert_eq!(app.status, "focused pane 2");
+        assert_eq!(app.status, "focused panel 2");
     }
 
     #[test]
-    /// 驗證多 pane 時直接按數字鍵，也能快速把焦點切到指定 pane。
-    fn app_plain_digit_focuses_target_pane_when_multiple_panes_exist() {
+    /// 驗證多 panel 時直接按數字鍵，也能快速把焦點切到指定 panel。
+    fn app_plain_digit_focuses_target_panel_when_multiple_panels_exist() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.split_current(SplitDirection::Vertical).expect("split");
         assert_eq!(app.focused_pane, 2);
-        app.focus_previous_pane();
+        app.focus_pane_by_id(1);
         assert_eq!(app.focused_pane, 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
-            .expect("focus pane 2");
+            .expect("focus panel 2");
 
         assert_eq!(app.focused_pane, 2);
-        assert_eq!(app.status, "focused pane 2");
+        assert_eq!(app.status, "focused panel 2");
     }
 
     #[test]
-    /// 驗證 `Ctrl+0` 會對應到 pane 10，讓雙位數前的最後一個快捷鍵也可直接使用。
-    fn app_ctrl_zero_focuses_tenth_pane() {
+    /// 驗證 `Ctrl+0` 會對應到 panel 10，讓雙位數前的最後一個快捷鍵也可直接使用。
+    fn app_ctrl_zero_focuses_tenth_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
@@ -11054,10 +11797,10 @@ mod tests {
         app.focus_pane_by_id(1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::CONTROL))
-            .expect("focus pane 10");
+            .expect("focus panel 10");
 
         assert_eq!(app.focused_pane, 10);
-        assert_eq!(app.status, "focused pane 10");
+        assert_eq!(app.status, "focused panel 10");
     }
 
     #[test]
@@ -11081,10 +11824,10 @@ mod tests {
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("lock help search");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("open pane command");
+            .expect("open panel command");
 
         assert!(app.command_mode);
-        assert_eq!(app.command_buffer, "pane ");
+        assert_eq!(app.command_buffer, "panel ");
         assert_eq!(app.status, "command mode");
     }
 
@@ -11201,14 +11944,16 @@ mod tests {
             .expect("tab in help search");
 
         match app.pending_action.as_ref() {
-            Some(PendingAction::HelpPanel { search, selected, .. }) => {
+            Some(PendingAction::HelpPanel {
+                search, selected, ..
+            }) => {
                 assert_eq!(search.buffer, "re");
                 assert!(search.editing);
                 assert_eq!(*selected, 0);
             }
             other => panic!("unexpected pending action: {other:?}"),
         }
-        assert_eq!(app.status, "help search: re (12)");
+        assert_eq!(app.status, "help search: re (18)");
     }
 
     #[test]
@@ -11269,7 +12014,8 @@ mod tests {
             app.pending_action,
             Some(PendingAction::TaskPanel {
                 pane_id: 1,
-                selected: 0
+                selected: 0,
+                ..
             })
         ));
         assert_eq!(app.status, "tasks: empty");
@@ -11831,7 +12577,7 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 `yy` 複製後可以用 `p` 把檔案貼到另一個目錄，且來源會保留。
+    /// 驗證 `y` 複製後可以用 `p` 把檔案貼到另一個目錄，且來源會保留。
     fn app_copy_and_paste_preserves_source_file() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -11842,8 +12588,6 @@ mod tests {
         fs::write(&source_file, "hello").expect("file");
 
         let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("pending copy");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("copy");
 
@@ -11994,8 +12738,6 @@ mod tests {
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("pending copy");
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("copy");
         app.handle_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT))
             .expect("clear copied items");
@@ -12024,8 +12766,6 @@ mod tests {
         fs::write(&target_file, "from target").expect("target file");
 
         let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("pending copy");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("copy");
 
@@ -12117,7 +12857,7 @@ mod tests {
             .expect("pane")
             .reload()
             .expect("reload");
-        app.focus_previous_pane();
+        app.focus_pane_by_id(1);
 
         app.execute_command("move-panel 2").expect("move panel");
 
@@ -12232,7 +12972,7 @@ mod tests {
         app.execute_command("move-panel 9").expect("move panel");
 
         assert!(source_file.exists());
-        assert_eq!(app.status, "unknown pane 9. available: 1");
+        assert_eq!(app.status, "unknown panel 9. available: 1");
     }
 
     #[test]
@@ -12833,36 +13573,15 @@ mod tests {
                 .as_ref()
                 .is_some_and(|search| search.buffer == "re" && search.editing)
         );
-        assert_eq!(app.panes.get(&1).expect("pane").preview_search_query(), Some("re"));
+        assert_eq!(
+            app.panes.get(&1).expect("pane").preview_search_query(),
+            Some("re")
+        );
         assert_eq!(app.status, "preview search: re (2)");
     }
 
     #[test]
-    /// 驗證 preview mode 中按下 `Ctrl-w l` 可以切換到另一個 pane。
-    fn app_preview_mode_supports_ctrl_w_pane_navigation() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("notes.txt"), "preview target").expect("notes");
-
-        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.split_current(SplitDirection::Vertical).expect("split");
-        assert_eq!(app.focused_pane, 2);
-
-        app.open_preview_focus();
-        assert_eq!(app.preview_focus, Some(2));
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
-            .expect("start ctrl-w");
-        assert!(app.awaiting_ctrl_w);
-        assert_eq!(app.status, "Ctrl-w");
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
-            .expect("focus previous pane");
-        assert_eq!(app.focused_pane, 1);
-        assert_eq!(app.preview_focus, Some(2));
-    }
-
-    #[test]
-    /// 驗證 `Ctrl+s` / `Ctrl+v` 會分別建立水平與垂直 pane 分割，作為 `Ctrl-w s/v` 的快捷別名。
+    /// 驗證 `Ctrl+s` / `Ctrl+v` 仍可作為分割 alias 使用。
     fn app_ctrl_split_shortcuts_create_expected_panes() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
@@ -12894,11 +13613,7 @@ mod tests {
         app.open_preview_focus();
         assert_eq!(app.preview_focus, Some(2));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
-            .expect("start ctrl-w");
-        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
-            .expect("focus previous pane");
-
+        app.focus_pane_by_id(1);
         assert_eq!(app.focused_pane, 1);
         assert_eq!(app.preview_focus, Some(2));
 
@@ -13278,8 +13993,6 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
             .expect("commit visual");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("pending copy");
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("copy batch");
 
         let clipboard = app.clipboard.as_ref().expect("clipboard");
@@ -13481,7 +14194,7 @@ mod tests {
                 .expect("pane")
                 .selected_entry()
                 .expect("selected")
-            .name,
+                .name,
             "alpha.txt"
         );
     }
@@ -13500,8 +14213,6 @@ mod tests {
         fs::write(&target_file, "from target").expect("target file");
 
         let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("pending copy");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("copy");
 
@@ -13548,8 +14259,6 @@ mod tests {
         fs::write(&target_file, "from target").expect("target file");
 
         let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("pending copy");
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("copy");
 

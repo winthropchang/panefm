@@ -62,6 +62,8 @@ pub(crate) enum PaneListState<'a> {
     Tasks {
         lines: &'a [TaskPanelLine],
         selected: usize,
+        search: &'a str,
+        editing: bool,
     },
     Trash {
         lines: &'a [TrashPanelLine],
@@ -114,9 +116,9 @@ pub(crate) struct BookmarkPanelLine {
     pub(crate) path: String,
 }
 
-/// 描述 recent 目錄列表彈窗中單一列要顯示的內容。
+/// 描述 zoxide 目錄列表彈窗中單一列要顯示的內容。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecentPanelLine {
+pub(crate) struct ZoxidePanelLine {
     pub(crate) path: String,
 }
 
@@ -397,7 +399,9 @@ pub(crate) fn render_pane(
             } if !lines.is_empty() => {
                 list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
             }
-            PaneListState::Tasks { lines, selected } if !lines.is_empty() => {
+            PaneListState::Tasks {
+                lines, selected, ..
+            } if !lines.is_empty() => {
                 list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
             }
             PaneListState::Help {
@@ -446,6 +450,17 @@ pub(crate) fn render_pane(
             "Help Search",
             search,
         )),
+        Some(PaneListState::Tasks {
+            search,
+            editing: true,
+            ..
+        }) => Some(render_top_right_input(
+            frame,
+            area,
+            theme,
+            "Task Search",
+            search,
+        )),
         _ if list_find_editing => Some(render_top_right_input(
             frame,
             area,
@@ -469,9 +484,10 @@ fn format_pane_title(
     mode_label: &str,
     max_width: usize,
 ) -> String {
-    let prefix = format!("pane #{pane_id}");
+    let prefix = format!("panel #{pane_id}");
     let full_path = cwd.display().to_string();
-    let status_suffix = normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
+    let status_suffix =
+        normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
     let suffix_candidates = [
         if status_suffix.is_empty() {
             format!("[{mode_label}]")
@@ -608,7 +624,9 @@ fn compact_path_for_title(path: &str, max_chars: usize) -> String {
         } else {
             format!("…{separator}{tail}")
         };
-        if candidate.chars().count() <= max_chars && candidate.chars().count() >= best.chars().count() {
+        if candidate.chars().count() <= max_chars
+            && candidate.chars().count() >= best.chars().count()
+        {
             best = candidate;
         }
     }
@@ -1061,6 +1079,46 @@ pub(crate) fn render_bookmark_action_picker(
     );
 }
 
+/// 在畫面底部繪製 panel 操作快捷鍵面板，供 `w` 使用。
+pub(crate) fn render_window_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Panel ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "wh",
+                label: "split left",
+            },
+            ShortcutPanelItem {
+                shortcut: "wj",
+                label: "split down",
+            },
+            ShortcutPanelItem {
+                shortcut: "wk",
+                label: "split up",
+            },
+            ShortcutPanelItem {
+                shortcut: "wl",
+                label: "split right",
+            },
+            ShortcutPanelItem {
+                shortcut: "wc",
+                label: "close panel",
+            },
+            ShortcutPanelItem {
+                shortcut: "wo",
+                label: "keep only current panel",
+            },
+            ShortcutPanelItem {
+                shortcut: "w / Esc",
+                label: "cancel",
+            },
+        ],
+    );
+}
+
 /// 將底部快捷鍵面板項目依目前寬度自動分欄，避免小 pane 時擠成難讀的一長行。
 fn render_shortcut_grid_panel(
     frame: &mut ratatui::Frame<'_>,
@@ -1112,11 +1170,15 @@ fn shortcut_panel_lines(
     let columns = available_width.max(1) / cell_width.max(1);
     let columns = columns.max(1);
 
-    items.chunks(columns)
+    items
+        .chunks(columns)
         .map(|row| {
             let mut spans = Vec::new();
             for (index, item) in row.iter().enumerate() {
-                spans.push(Span::styled(item.shortcut.to_string(), theme.accent_style()));
+                spans.push(Span::styled(
+                    item.shortcut.to_string(),
+                    theme.accent_style(),
+                ));
                 spans.push(Span::raw(" -> "));
                 spans.push(Span::raw(item.label.to_string()));
 
@@ -1145,7 +1207,9 @@ pub(crate) fn render_bookmark_picker(
     selected: usize,
     title: &str,
     empty_message: &str,
-) {
+    search: &str,
+    editing: bool,
+) -> Option<(u16, u16)> {
     let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
     let popup_area = centered_rect(area, 68, popup_height);
 
@@ -1187,23 +1251,27 @@ pub(crate) fn render_bookmark_picker(
         inner,
         &mut list_state,
     );
+
+    editing.then(|| render_top_right_input(frame, popup_area, theme, "Filter", search))
 }
 
-/// 在畫面中央繪製 recent 目錄列表彈窗，供 `:recent` 使用。
-pub(crate) fn render_recent_picker(
+/// 在畫面中央繪製 zoxide 目錄列表彈窗，供 `Z` 與 `:zoxide` 共用。
+pub(crate) fn render_zoxide_picker(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     theme: Theme,
-    lines: &[RecentPanelLine],
+    lines: &[ZoxidePanelLine],
     selected: usize,
-) {
+    search: &str,
+    editing: bool,
+) -> Option<(u16, u16)> {
     let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
     let popup_area = centered_rect(area, 68, popup_height);
 
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .title(Line::from(Span::styled(
-            " Recent ",
+            " Zoxide ",
             theme.accent_style().add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)
@@ -1212,9 +1280,7 @@ pub(crate) fn render_recent_picker(
     frame.render_widget(block, popup_area);
 
     let items = if lines.is_empty() {
-        vec![ListItem::new(Line::from(
-            "沒有 recent 目錄，先切換幾次目錄再回來",
-        ))]
+        vec![ListItem::new(Line::from("zoxide 還沒有學到任何目錄"))]
     } else {
         lines
             .iter()
@@ -1234,6 +1300,8 @@ pub(crate) fn render_recent_picker(
         inner,
         &mut list_state,
     );
+
+    editing.then(|| render_top_right_input(frame, popup_area, theme, "Filter", search))
 }
 
 /// 在指定 pane 區域中央繪製命令輸入視窗，並回傳游標位置。
@@ -1483,7 +1551,11 @@ fn format_permissions_detail(entry: &super::entry::FileEntry) -> String {
     }
 
     let kind = if entry.is_dir { "dir" } else { "file" };
-    let access = if entry.readonly { "readonly" } else { "writable" };
+    let access = if entry.readonly {
+        "readonly"
+    } else {
+        "writable"
+    };
     format!("{kind} {access}")
 }
 
@@ -1566,7 +1638,7 @@ mod tests {
 
         assert_eq!(
             title,
-            "pane #3 /tmp/demo [filter] [mark: 2] [help] [sort: natural]"
+            "panel #3 /tmp/demo [filter] [mark: 2] [help] [sort: natural]"
         );
     }
 
@@ -1585,7 +1657,7 @@ mod tests {
 
         assert_eq!(
             title,
-            "pane #2 /Users/otto/Documents/terminal-file-manager [sort: natural]"
+            "panel #2 /Users/otto/Documents/terminal-file-manager [sort: natural]"
         );
     }
 
@@ -1603,7 +1675,7 @@ mod tests {
         );
 
         assert!(title.chars().count() <= 32);
-        assert!(title.starts_with("pane #12"));
+        assert!(title.starts_with("panel #12"));
         assert!(title.contains("natural"));
         assert!(title.contains("path"));
         assert!(!title.contains("happy-path/dev"));
@@ -1634,7 +1706,7 @@ mod tests {
     fn format_pane_title_supports_linemode_status() {
         let title = format_pane_title(5, Path::new("/tmp/demo"), "", "", "", "linemode: size", 80);
 
-        assert_eq!(title, "pane #5 /tmp/demo [linemode: size]");
+        assert_eq!(title, "panel #5 /tmp/demo [linemode: size]");
     }
 
     #[test]
