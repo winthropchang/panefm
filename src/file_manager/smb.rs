@@ -37,7 +37,7 @@ pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
     if host.is_empty() || share.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "SMB 位址格式錯誤：請使用 connect smb://host/share[/path]，不能只有 IP 或主機名稱",
+            "SMB 位址格式錯誤：請使用 goto smb://host/share[/path]，不能只有 IP 或主機名稱",
         ));
     }
 
@@ -226,7 +226,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "SMB 位址格式錯誤：請使用 connect smb://host/share[/path]，不能只有 IP 或主機名稱"
+            "SMB 位址格式錯誤：請使用 goto smb://host/share[/path]，不能只有 IP 或主機名稱"
         );
     }
 }

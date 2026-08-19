@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::{
+    app::TrashConfirmAction,
     pane::{PaneState, SortDetailKind},
     search::GlobalSearchEntry,
 };
@@ -189,7 +190,7 @@ pub(crate) fn render_pane(
     let panel_suffix = match panel_state {
         Some(PaneListState::Search(_)) => "  [search]",
         Some(PaneListState::Tasks { .. }) => "  [tasks]",
-        Some(PaneListState::Trash { .. }) => "  [trash]",
+        Some(PaneListState::Trash { .. }) => "  [trash d/D u/U]",
         Some(PaneListState::Help { .. }) => "  [help]",
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
@@ -1056,8 +1057,8 @@ pub(crate) fn render_bookmark_action_picker(
         " Bookmark ",
         &[
             ShortcutPanelItem {
-                shortcut: "s",
-                label: "save bookmark (auto key)",
+                shortcut: "a",
+                label: "add bookmark (auto key)",
             },
             ShortcutPanelItem {
                 shortcut: "g",
@@ -1079,6 +1080,34 @@ pub(crate) fn render_bookmark_action_picker(
     );
 }
 
+/// 在畫面底部繪製 `t` 系列 trash 快捷鍵面板。
+pub(crate) fn render_trash_action_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+) {
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Trash ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "t",
+                label: "open trash list",
+            },
+            ShortcutPanelItem {
+                shortcut: "u",
+                label: "undo latest trash",
+            },
+            ShortcutPanelItem {
+                shortcut: "t / Esc",
+                label: "cancel",
+            },
+        ],
+    );
+}
+
 /// 在畫面底部繪製 `g` 系列命令面板，供 `gg` 與 `gt` 這類兩段式操作共用。
 pub(crate) fn render_go_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
     render_shortcut_grid_panel(
@@ -1094,6 +1123,14 @@ pub(crate) fn render_go_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme
             ShortcutPanelItem {
                 shortcut: "t",
                 label: "goto path",
+            },
+            ShortcutPanelItem {
+                shortcut: "d",
+                label: "documents",
+            },
+            ShortcutPanelItem {
+                shortcut: "k",
+                label: "desktop",
             },
             ShortcutPanelItem {
                 shortcut: "Esc",
@@ -1784,6 +1821,47 @@ pub(crate) fn render_confirm_dialog(
     } else {
         (" Confirm Trash ", format!("Move {target_name} to trash?"))
     };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(question),
+            Line::from("Press y to confirm, n or Esc to cancel."),
+        ])
+        .block(
+            Block::default()
+                .title(Line::from(Span::styled(title, theme.danger_title_style())))
+                .borders(Borders::ALL),
+        ),
+        dialog_area,
+    );
+}
+
+/// 繪製 trash 專用的確認視窗，讓 restore/delete 都能顯示正確的說明。
+pub(crate) fn render_trash_confirm_dialog(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    action: &TrashConfirmAction,
+    target_name: &str,
+    entry_count: usize,
+    theme: Theme,
+    config: &AppConfig,
+) {
+    let dialog_area = centered_rect(
+        area,
+        config.ui.dialogs.confirm.width_percent,
+        config.ui.dialogs.confirm.height,
+    );
+    frame.render_widget(Clear, dialog_area);
+
+    let (title, verb) = match action {
+        TrashConfirmAction::RestoreFromPanel { .. } => (" Confirm Restore ", "Restore"),
+        TrashConfirmAction::DeleteFromPanel { .. } => (" Confirm Delete ", "Delete"),
+    };
+    let question = if entry_count <= 1 {
+        format!("{verb} {target_name}?")
+    } else {
+        format!("{verb} {target_name} ({entry_count} items)?")
+    };
+
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(question),

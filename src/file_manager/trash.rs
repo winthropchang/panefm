@@ -135,24 +135,6 @@ impl TrashStore {
             .collect())
     }
 
-    /// 依照指定的 trash 記錄 id 還原對應項目。
-    ///
-    /// 參數：
-    /// - `id: &str`，要還原的 trash 項目 id。
-    ///
-    /// 回傳：`io::Result<Option<RestoreResult>>`。
-    pub(crate) fn restore_by_id(&self, id: &str) -> io::Result<Option<RestoreResult>> {
-        let Some(record) = self
-            .load_records()?
-            .into_iter()
-            .find(|record| record.id == id)
-        else {
-            return Ok(None);
-        };
-
-        self.restore_record(record).map(Some)
-    }
-
     /// 依照指定 id 清單批次還原 trash 項目。
     ///
     /// 參數：
@@ -172,26 +154,6 @@ impl TrashStore {
         Ok(results)
     }
 
-    /// 永久刪除指定 id 的 trash 項目。
-    ///
-    /// 參數：
-    /// - `id: &str`，要永久刪除的 trash 紀錄 id。
-    ///
-    /// 回傳：`io::Result<Option<String>>`。
-    /// - `Ok(Some(name))` 代表成功刪除，並回傳顯示名稱。
-    /// - `Ok(None)` 代表找不到該項目。
-    pub(crate) fn delete_by_id(&self, id: &str) -> io::Result<Option<String>> {
-        let Some(record) = self
-            .load_records()?
-            .into_iter()
-            .find(|record| record.id == id)
-        else {
-            return Ok(None);
-        };
-
-        self.delete_record(record).map(Some)
-    }
-
     /// 依照指定 id 清單批次永久刪除 trash 項目。
     ///
     /// 參數：
@@ -207,20 +169,6 @@ impl TrashStore {
             }
         }
         Ok(deleted_names)
-    }
-
-    /// 永久清空整個 trash。
-    ///
-    /// 參數：無。
-    ///
-    /// 回傳：`io::Result<usize>`，代表實際刪除的項目數。
-    pub(crate) fn clear(&self) -> io::Result<usize> {
-        let ids = self
-            .list_entries()?
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        Ok(self.delete_many_by_ids(&ids)?.len())
     }
 
     /// 將單一 trash 紀錄還原回檔案系統。
@@ -493,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    /// 驗證可以依指定 id 永久刪除 trash 項目，且之後不再能還原。
+    /// 驗證可以依指定 id 清單永久刪除 trash 項目，且之後不再能還原。
     fn trash_store_can_delete_entry_permanently() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("delete-me.txt");
@@ -510,18 +458,17 @@ mod tests {
             .into_iter()
             .next()
             .expect("trash entry");
-        let deleted_name = store
-            .delete_by_id(&entry.id)
-            .expect("delete permanently")
-            .expect("deleted item");
+        let deleted_names = store
+            .delete_many_by_ids(std::slice::from_ref(&entry.id))
+            .expect("delete permanently");
 
-        assert_eq!(deleted_name, "delete-me.txt");
+        assert_eq!(deleted_names, vec![String::from("delete-me.txt")]);
         assert!(store.list_entries().expect("list after delete").is_empty());
         assert!(store.restore_latest().expect("restore latest").is_none());
     }
 
     #[test]
-    /// 驗證可以一次清空整個 trash，並回傳實際清除的數量。
+    /// 驗證可以一次用批次刪除 API 清空整個 trash，並回傳實際清除的數量。
     fn trash_store_can_clear_all_entries() {
         let dir = tempdir().expect("tempdir");
         let first = dir.path().join("first.txt");
@@ -535,7 +482,16 @@ mod tests {
             .trash_path(&second, "second.txt")
             .expect("trash second");
 
-        let cleared = store.clear().expect("clear trash");
+        let ids = store
+            .list_entries()
+            .expect("list entries")
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let cleared = store
+            .delete_many_by_ids(&ids)
+            .expect("clear trash")
+            .len();
 
         assert_eq!(cleared, 2);
         assert!(store.list_entries().expect("list after clear").is_empty());

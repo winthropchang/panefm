@@ -14,6 +14,7 @@ mod search;
 mod smb;
 mod trash;
 mod ui;
+mod zoxide;
 
 use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::process::{Command, Stdio};

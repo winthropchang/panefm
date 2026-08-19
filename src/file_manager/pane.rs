@@ -63,8 +63,6 @@ pub(crate) struct PaneState {
     pub(crate) list_find_query: Option<String>,
     /// 目前在這個 pane 中已被標記的項目路徑。
     pub(crate) marked_paths: BTreeSet<PathBuf>,
-    /// 這個 pane 最近造訪過的目錄，最新的會排在最前面。
-    pub(crate) recent_dirs: Vec<PathBuf>,
 }
 
 /// 描述 pane 目前使用的排序方式。
@@ -193,7 +191,6 @@ impl PaneState {
             preview_current_match: None,
             list_find_query: None,
             marked_paths: BTreeSet::new(),
-            recent_dirs: Vec::new(),
         };
         pane.reload()?;
         Ok(pane)
@@ -506,7 +503,6 @@ impl PaneState {
         if let Some(entry) = self.selected_entry().cloned()
             && entry.is_dir
         {
-            self.record_recent_dir(&self.cwd.clone());
             self.cwd = entry.path.clone();
             self.bookmark_target = match &self.bookmark_target {
                 BookmarkTarget::SmbLocation(current_url) => {
@@ -532,7 +528,6 @@ impl PaneState {
     pub(crate) fn go_parent(&mut self) -> io::Result<()> {
         let current_dir = self.cwd.clone();
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
-            self.record_recent_dir(&current_dir);
             self.cwd = parent;
             self.bookmark_target = match &self.bookmark_target {
                 BookmarkTarget::SmbLocation(current_url) => smb_parent_url(current_url)
@@ -1326,9 +1321,6 @@ impl PaneState {
             return Ok(());
         };
 
-        if parent != self.cwd {
-            self.record_recent_dir(&self.cwd.clone());
-        }
         self.cwd = parent.to_path_buf();
         self.bookmark_target = BookmarkTarget::LocalPath(self.cwd.clone());
         self.filter_query = None;
@@ -1347,9 +1339,6 @@ impl PaneState {
     /// - 失敗時代表目錄不存在或重新載入內容時發生 I/O 錯誤。
     pub(crate) fn go_to_path(&mut self, path: &Path) -> io::Result<()> {
         if path.is_dir() {
-            if path != self.cwd {
-                self.record_recent_dir(&self.cwd.clone());
-            }
             self.cwd = path.to_path_buf();
             self.bookmark_target = BookmarkTarget::LocalPath(self.cwd.clone());
             self.filter_query = None;
@@ -1369,28 +1358,6 @@ impl PaneState {
     /// 判斷目前是否仍處於過濾後的列表狀態。
     pub(crate) fn has_active_filter(&self) -> bool {
         self.filter_query.is_some()
-    }
-
-    /// 回傳這個 pane 最近造訪過的目錄清單。
-    pub(crate) fn recent_dirs(&self) -> &[PathBuf] {
-        &self.recent_dirs
-    }
-
-    /// 把一個目錄記到 recent 清單最前面，並做去重與長度限制。
-    fn record_recent_dir(&mut self, dir: &Path) {
-        if self
-            .recent_dirs
-            .first()
-            .is_some_and(|existing| existing == dir)
-        {
-            return;
-        }
-        self.recent_dirs.retain(|existing| existing != dir);
-        self.recent_dirs.insert(0, dir.to_path_buf());
-        const MAX_RECENT_DIRS: usize = 100;
-        if self.recent_dirs.len() > MAX_RECENT_DIRS {
-            self.recent_dirs.truncate(MAX_RECENT_DIRS);
-        }
     }
 
     /// 切換目前 pane 是否顯示隱藏檔。
