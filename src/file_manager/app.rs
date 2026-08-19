@@ -54,7 +54,8 @@ use super::{
         render_command_palette, render_confirm_dialog, render_filter_input,
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_picker,
-        render_window_picker, render_zoxide_picker,
+        render_trash_action_picker, render_trash_confirm_dialog, render_window_picker,
+        render_zoxide_picker,
     },
     zoxide::{add_directory_to_zoxide, query_zoxide_directories},
 };
@@ -225,6 +226,26 @@ pub(crate) enum BookmarkListMode {
     Delete,
 }
 
+/// 描述目前待確認的 trash 操作種類。
+///
+/// 這裡會把「直接復原最後一筆」與「在 trash 面板內針對項目做刪除/還原」
+/// 統一收斂成同一套確認流程，避免不同入口各自維護一份邏輯。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrashConfirmAction {
+    RestoreFromPanel {
+        pane_id: usize,
+        target_ids: Vec<String>,
+        search: PanelSearchState,
+        selected: usize,
+    },
+    DeleteFromPanel {
+        pane_id: usize,
+        target_ids: Vec<String>,
+        search: PanelSearchState,
+        selected: usize,
+    },
+}
+
 /// 描述暫時面板中的搜尋輸入狀態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PanelSearchState {
@@ -267,10 +288,20 @@ pub(crate) enum PendingAction {
         entry_count: usize,
         operation: ClipboardOperation,
     },
+    ConfirmTrashAction {
+        action: TrashConfirmAction,
+        target_name: String,
+        entry_count: usize,
+        marked_ids: Vec<String>,
+        visual_anchor: Option<usize>,
+    },
     SortPicker {
         pane_id: usize,
     },
     GoPicker {
+        pane_id: usize,
+    },
+    TrashPicker {
         pane_id: usize,
     },
     WindowPicker {
@@ -1001,7 +1032,28 @@ impl App {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_y = false;
+                self.open_trash_picker();
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'T') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
                 self.open_task_panel();
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'C') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.compress_selected_entries()?;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'E') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.extract_selected_archives()?;
                 true
             }
             KeyCode::Char('\'') => {
@@ -1897,6 +1949,43 @@ impl App {
                     self.status = paste_overwrite_confirm_status(&target_name, entry_count);
                 }
             },
+            PendingAction::ConfirmTrashAction {
+                action,
+                target_name,
+                entry_count,
+                marked_ids,
+                visual_anchor,
+            } => match key.code {
+                _ if key_matches_letter_any_case(&key, 'y') || key.code == KeyCode::Enter => {
+                    self.confirm_trash_action(action, target_name, entry_count)?;
+                }
+                KeyCode::Esc => {
+                    self.pending_action = Some(trash_panel_pending_action_from_confirm_action(
+                        &action,
+                        marked_ids,
+                        visual_anchor,
+                    ));
+                    self.status = trash_confirm_cancelled_status(&action, &target_name, entry_count);
+                }
+                _ if key_matches_letter_any_case(&key, 'n') => {
+                    self.pending_action = Some(trash_panel_pending_action_from_confirm_action(
+                        &action,
+                        marked_ids,
+                        visual_anchor,
+                    ));
+                    self.status = trash_confirm_cancelled_status(&action, &target_name, entry_count);
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::ConfirmTrashAction {
+                        action: action.clone(),
+                        target_name: target_name.clone(),
+                        entry_count,
+                        marked_ids,
+                        visual_anchor,
+                    });
+                    self.status = trash_confirm_status(&action, &target_name, entry_count);
+                }
+            },
             PendingAction::GoPicker { pane_id } => match key.code {
                 _ if key_matches_plain_letter(&key, 'g') => {
                     if let Some(count) = self.take_pending_count() {
@@ -1916,6 +2005,18 @@ impl App {
                     self.pending_y = false;
                     self.open_prefilled_command("goto ");
                 }
+                _ if key_matches_plain_letter(&key, 'd') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.go_to_special_directory(GoSpecialDirectory::Documents)?;
+                }
+                _ if key_matches_plain_letter(&key, 'k') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.go_to_special_directory(GoSpecialDirectory::Desktop)?;
+                }
                 KeyCode::Esc => {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -1930,7 +2031,27 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::GoPicker { pane_id });
-                    self.status = String::from("go: choose g/t from the panel");
+                    self.status = String::from("go: choose g/t/d/k from the panel");
+                }
+            },
+            PendingAction::TrashPicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 't') => {
+                    self.focused_pane = pane_id;
+                    self.open_trash_panel()?;
+                }
+                _ if key_matches_plain_letter(&key, 'u') => {
+                    self.focused_pane = pane_id;
+                    self.restore_latest_from_trash()?;
+                }
+                KeyCode::Esc => {
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                    self.status = String::from("normal mode");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::TrashPicker { pane_id });
+                    self.status = String::from("trash: choose t/u from the panel");
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
@@ -2246,47 +2367,50 @@ impl App {
                         });
                         return Ok(true);
                     }
-                    if key_matches_shifted_letter(&key, 'R') {
+                    if key_matches_plain_letter(&key, 'u') {
                         self.pending_g = false;
-                        self.restore_all_trash_entries(&entries)?;
+                        self.start_trash_panel_restore_confirmation(
+                            pane_id,
+                            &entries,
+                            selected,
+                            search,
+                            &marked_ids,
+                            visual_anchor,
+                        )?;
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'U') {
+                        self.pending_g = false;
+                        self.start_trash_panel_restore_all_confirmation(
+                            pane_id,
+                            &entries,
+                            selected,
+                            search,
+                            &marked_ids,
+                            visual_anchor,
+                        )?;
+                        return Ok(true);
+                    }
+                    if key_matches_plain_letter(&key, 'd') {
+                        self.pending_g = false;
+                        self.start_trash_panel_delete_confirmation(
+                            pane_id,
+                            &entries,
+                            selected,
+                            search,
+                            &marked_ids,
+                            visual_anchor,
+                        )?;
                         return Ok(true);
                     }
                     if key_matches_shifted_letter(&key, 'D') {
                         self.pending_g = false;
-                        let target_ids =
-                            self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
-                        if target_ids.len() <= 1 {
-                            self.delete_trash_entry(
-                                pane_id,
-                                &entries,
-                                selected,
-                                search,
-                                marked_ids,
-                                visual_anchor,
-                            )?;
-                        } else {
-                            let selected_entries = entries
-                                .iter()
-                                .filter(|entry| target_ids.iter().any(|id| id == &entry.id))
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            self.clear_filtered_trash_entries(
-                                pane_id,
-                                &selected_entries,
-                                search,
-                                Vec::new(),
-                                None,
-                            )?;
-                        }
-                        return Ok(true);
-                    }
-                    if key_matches_shifted_letter(&key, 'C') {
-                        self.pending_g = false;
-                        self.clear_filtered_trash_entries(
+                        self.start_trash_panel_delete_all_confirmation(
                             pane_id,
                             &entries,
+                            selected,
                             search,
-                            marked_ids,
+                            &marked_ids,
                             visual_anchor,
                         )?;
                         return Ok(true);
@@ -2356,35 +2480,27 @@ impl App {
                         KeyCode::Enter => {
                             self.clear_pending_count();
                             self.pending_g = false;
-                            let target_ids =
-                                self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
-                            if target_ids.len() <= 1 {
-                                self.restore_trash_entry(&entries, selected)?;
-                            } else {
-                                let selected_entries = entries
-                                    .iter()
-                                    .filter(|entry| target_ids.iter().any(|id| id == &entry.id))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                self.restore_all_trash_entries(&selected_entries)?;
-                            }
+                            self.start_trash_panel_restore_confirmation(
+                                pane_id,
+                                &entries,
+                                selected,
+                                search,
+                                &marked_ids,
+                                visual_anchor,
+                            )?;
                             return Ok(true);
                         }
                         _ if key_matches_plain_letter(&key, 'l') => {
                             self.clear_pending_count();
                             self.pending_g = false;
-                            let target_ids =
-                                self.selected_or_marked_trash_ids(&entries, selected, &marked_ids);
-                            if target_ids.len() <= 1 {
-                                self.restore_trash_entry(&entries, selected)?;
-                            } else {
-                                let selected_entries = entries
-                                    .iter()
-                                    .filter(|entry| target_ids.iter().any(|id| id == &entry.id))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                self.restore_all_trash_entries(&selected_entries)?;
-                            }
+                            self.start_trash_panel_restore_confirmation(
+                                pane_id,
+                                &entries,
+                                selected,
+                                search,
+                                &marked_ids,
+                                visual_anchor,
+                            )?;
                             return Ok(true);
                         }
                         KeyCode::Esc => {
@@ -2819,10 +2935,10 @@ impl App {
                     self.status = String::from("normal mode");
                     return Ok(true);
                 }
-                _ if key_matches_plain_letter(&key, 's') => {
+                _ if key_matches_plain_letter(&key, 'a') => {
                     self.clear_pending_count();
                     self.pending_g = false;
-                    self.save_bookmark_with_auto_key(pane_id)?;
+                    self.add_bookmark_with_auto_key(pane_id)?;
                     return Ok(true);
                 }
                 _ if key_matches_plain_letter(&key, 'g') => {
@@ -2859,7 +2975,7 @@ impl App {
                     self.clear_pending_count();
                     self.pending_g = false;
                     self.pending_action = Some(PendingAction::BookmarkPicker { pane_id });
-                    self.status = String::from("bookmark: choose s/g/d/D from the panel");
+                    self.status = String::from("bookmark: choose a/g/d/D from the panel");
                     return Ok(true);
                 }
             },
@@ -4448,23 +4564,18 @@ impl App {
             "search-content" | "grep" => self.open_content_search()?,
             "linemode" => self.open_linemode_picker(),
             "bookmark" => self.open_bookmark_picker(),
-            "bookmark save" => self.save_bookmark_with_auto_key(self.focused_pane)?,
+            "bookmark add" => self.add_bookmark_with_auto_key(self.focused_pane)?,
             "bookmark jump" => self.open_bookmark_list(),
             "bookmark delete" => {
                 self.open_bookmark_list_with_mode(self.focused_pane, BookmarkListMode::Delete);
             }
             "bookmark clear" => self.delete_all_bookmarks()?,
-            "connect" => {
-                self.status = String::from("SMB 連線需要完整位址：connect smb://host/share[/path]");
-            }
             "trash" => self.open_trash_panel()?,
             "tasks" => self.open_task_panel(),
             "help" => self.open_help_panel(),
             "bookmark list" => self.open_bookmark_list(),
             "zoxide" => self.open_zoxide_list(),
-            "restore" => self.restore_latest_from_trash()?,
-            "trash clear" => self.clear_trash()?,
-            "trash restore-all" => self.restore_all_from_trash()?,
+            "trash undo" => self.restore_latest_from_trash()?,
             "delete" => self.start_delete_confirmation(false),
             "delete!" | "delete-permanently" => self.start_delete_confirmation(true),
             "theme" => self.open_theme_picker(),
@@ -4500,8 +4611,6 @@ impl App {
                     self.move_selected_to_path(path.trim())?;
                 } else if let Some(args) = other.strip_prefix("linemode ") {
                     self.apply_line_mode_from_command(args.trim())?;
-                } else if let Some(args) = other.strip_prefix("bookmark set ") {
-                    self.set_bookmark_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark jump ") {
                     self.jump_to_bookmark_from_command(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("bookmark delete ") {
@@ -4510,8 +4619,6 @@ impl App {
                         return Ok(());
                     };
                     self.delete_bookmark(key)?;
-                } else if let Some(target) = other.strip_prefix("connect ") {
-                    self.connect_smb_location(target.trim())?;
                 } else if looks_like_navigation_path(other) {
                     self.change_directory_from_command(other)?;
                 } else {
@@ -4725,7 +4832,7 @@ impl App {
         self.pending_action = Some(PendingAction::GoPicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("go: choose g/t from the panel");
+        self.status = String::from("go: choose g/t/d/k from the panel");
     }
 
     /// 打開底部 panel 操作面板，讓使用者可視化選擇 `w` 的第二個按鍵。
@@ -4749,7 +4856,7 @@ impl App {
         self.pending_action = Some(PendingAction::BookmarkPicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("bookmark: choose s/g/d/D from the panel");
+        self.status = String::from("bookmark: choose a/g/d/D from the panel");
     }
 
     /// 打開 trash 面板，列出目前可還原的項目。
@@ -4767,6 +4874,14 @@ impl App {
         self.help_return = None;
         self.status = trash_panel_status("", self.trash_store.list_entries()?.len(), 0, false, 0);
         Ok(())
+    }
+
+    /// 打開 `t` 系列快捷鍵面板，集中顯示 trash 相關操作入口。
+    pub(crate) fn open_trash_picker(&mut self) {
+        self.pending_action = Some(PendingAction::TrashPicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from("trash: choose t/u from the panel");
     }
 
     /// 打開 F1 功能說明面板，支援 Vim 式滾動與面板內搜尋。
@@ -4894,7 +5009,7 @@ impl App {
     /// - `pane_id: usize`，要儲存位置的 pane 編號。
     ///
     /// 回傳：`io::Result<()>`。
-    fn save_bookmark_with_auto_key(&mut self, pane_id: usize) -> io::Result<()> {
+    fn add_bookmark_with_auto_key(&mut self, pane_id: usize) -> io::Result<()> {
         let Some(key) = self.bookmark_store.next_available_key() else {
             self.status = String::from("bookmark: no available auto key");
             return Ok(());
@@ -4912,15 +5027,6 @@ impl App {
         };
 
         self.jump_to_bookmark_target(self.focused_pane, key, &target)
-    }
-
-    /// 讓 `:bookmark set <key>` 可以直接把目前目錄存成指定書籤。
-    fn set_bookmark_from_command(&mut self, args: &str) -> io::Result<()> {
-        let Some(key) = parse_bookmark_argument(args) else {
-            self.status = String::from("usage: bookmark set <key>");
-            return Ok(());
-        };
-        self.set_bookmark(key)
     }
 
     /// 讓 `:bookmark jump <key>` 可以直接跳到指定書籤。
@@ -5007,13 +5113,13 @@ impl App {
         self.apply_line_mode(self.focused_pane, line_mode)
     }
 
-    /// 讓目前焦點 pane 連到指定的 SMB share；若尚未掛載則先請求系統掛載。
-    fn connect_smb_location(&mut self, target: &str) -> io::Result<()> {
-        self.connect_smb_location_with_mount_root(target, std::path::Path::new("/Volumes"))
+    /// 讓目前焦點 pane 依 `goto smb://...` 進入指定的 SMB share；若尚未掛載則先請求系統掛載。
+    fn goto_smb_location(&mut self, target: &str) -> io::Result<()> {
+        self.goto_smb_location_with_mount_root(target, std::path::Path::new("/Volumes"))
     }
 
-    /// 用指定掛載根目錄測試或連接 SMB share，方便在測試中模擬 macOS 的掛載點。
-    fn connect_smb_location_with_mount_root(
+    /// 用指定掛載根目錄測試或進入 SMB share，方便在測試中模擬 macOS 的掛載點。
+    fn goto_smb_location_with_mount_root(
         &mut self,
         target: &str,
         mount_root: &std::path::Path,
@@ -5048,7 +5154,7 @@ impl App {
                     return Ok(());
                 };
                 pane.set_bookmark_target(BookmarkTarget::SmbLocation(location.url.clone()));
-                self.status = format!("connected smb: {}", location.url);
+                self.status = format!("jumped to smb: {}", location.url);
             }
             ResolvedSmbLocation::NeedsMount { local_path } => {
                 let launch = build_smb_mount_launch(&location);
@@ -5069,7 +5175,7 @@ impl App {
         Ok(())
     }
 
-    /// 依書籤目標型別跳到本機目錄，或自動發起 SMB 連線流程。
+    /// 依書籤目標型別跳到本機目錄，或自動發起 SMB 掛載／進入流程。
     fn jump_to_bookmark_target(
         &mut self,
         pane_id: usize,
@@ -5084,7 +5190,7 @@ impl App {
         )
     }
 
-    /// 依書籤目標型別跳到本機目錄，或用指定掛載根目錄自動發起 SMB 連線流程。
+    /// 依書籤目標型別跳到本機目錄，或用指定掛載根目錄自動發起 SMB 掛載／進入流程。
     fn jump_to_bookmark_target_with_mount_root(
         &mut self,
         pane_id: usize,
@@ -5108,8 +5214,8 @@ impl App {
                 self.status = format!("jumped to bookmark [{key}]");
             }
             BookmarkTarget::SmbLocation(location) => {
-                self.connect_smb_location_with_mount_root(location, mount_root)?;
-                if self.status.starts_with("connected smb:") {
+                self.goto_smb_location_with_mount_root(location, mount_root)?;
+                if self.status.starts_with("jumped to smb:") {
                     self.status = format!("jumped to bookmark [{key}]");
                 } else if self.status.starts_with("已請求系統掛載 SMB：") {
                     self.status = format!("bookmark [{key}] 正在連線：{location}");
@@ -5495,7 +5601,16 @@ impl App {
                 entry_count,
                 ..
             } => paste_overwrite_confirm_status(target_name, *entry_count),
-            PendingAction::GoPicker { .. } => String::from("go: choose g/t from the panel"),
+            PendingAction::ConfirmTrashAction {
+                action,
+                target_name,
+                entry_count,
+                ..
+            } => trash_confirm_status(action, target_name, *entry_count),
+            PendingAction::GoPicker { .. } => String::from("go: choose g/t/d/k from the panel"),
+            PendingAction::TrashPicker { .. } => {
+                String::from("trash: choose t/u from the panel")
+            }
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::WindowPicker { .. } => {
                 String::from("panel: choose h/j/k/l/c/o from the panel")
@@ -5516,7 +5631,7 @@ impl App {
                 task_panel_status(&search.buffer, filtered.len(), *selected, search.editing)
             }
             PendingAction::BookmarkPicker { .. } => {
-                String::from("bookmark: choose s/g/d/D from the panel")
+                String::from("bookmark: choose a/g/d/D from the panel")
             }
             PendingAction::TrashPanel {
                 selected,
@@ -5961,21 +6076,33 @@ impl App {
         added
     }
 
-    /// 回傳 trash 面板目前應套用的目標 id 清單。
-    fn selected_or_marked_trash_ids(
+    /// 從目前可見 trash 項目中，挑出批次操作真正要套用的目標清單。
+    ///
+    /// 規則：
+    /// - 若已經有 `V` 選到的標記，就只處理那些標記。
+    /// - 若目前沒有標記，則直接以搜尋結果中的全部項目當作目標。
+    fn trash_panel_batch_entries<'a>(
         &self,
-        entries: &[TrashListEntry],
-        selected: usize,
+        entries: &'a [TrashListEntry],
         marked_ids: &[String],
-    ) -> Vec<String> {
-        if !marked_ids.is_empty() {
-            return marked_ids.to_vec();
+    ) -> Vec<&'a TrashListEntry> {
+        if marked_ids.is_empty() {
+            return entries.iter().collect();
         }
 
         entries
-            .get(selected)
-            .map(|entry| vec![entry.id.clone()])
-            .unwrap_or_default()
+            .iter()
+            .filter(|entry| marked_ids.iter().any(|id| id == &entry.id))
+            .collect()
+    }
+
+    /// 為一批 trash 項目產生確認視窗要顯示的名稱摘要。
+    fn trash_confirm_target_name(entries: &[&TrashListEntry]) -> String {
+        if entries.len() == 1 {
+            entries[0].display_name.clone()
+        } else {
+            format!("{} items", entries.len())
+        }
     }
 
     /// 回傳 trash 視覺選取狀態列文字。
@@ -5991,6 +6118,210 @@ impl App {
         } else {
             format!("trash visual: selecting {range_count} items ({marked_count} marked)")
         }
+    }
+
+    /// 為目前 `trash` 面板挑出還原目標，並進入確認視窗。
+    ///
+    /// 規則：
+    /// - 若已有 `V` 標記，`u` 會直接還原全部標記項目。
+    /// - 若沒有標記，`u` 才會只還原游標所在的單筆項目。
+    fn start_trash_panel_restore_confirmation(
+        &mut self,
+        pane_id: usize,
+        entries: &[TrashListEntry],
+        selected: usize,
+        search: PanelSearchState,
+        marked_ids: &[String],
+        visual_anchor: Option<usize>,
+    ) -> io::Result<()> {
+        let selected_entries = self.trash_panel_batch_entries(entries, marked_ids);
+        if !marked_ids.is_empty() {
+            if selected_entries.is_empty() {
+                self.status = String::from("trash is empty");
+                return Ok(());
+            }
+            let target_name = Self::trash_confirm_target_name(&selected_entries);
+            let entry_count = selected_entries.len();
+            let action = TrashConfirmAction::RestoreFromPanel {
+                pane_id,
+                target_ids: selected_entries
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect(),
+                search,
+                selected,
+            };
+            self.pending_action = Some(PendingAction::ConfirmTrashAction {
+                action: action.clone(),
+                target_name: target_name.clone(),
+                entry_count,
+                marked_ids: marked_ids.to_vec(),
+                visual_anchor,
+            });
+            self.status = trash_confirm_status(&action, &target_name, entry_count);
+            return Ok(());
+        }
+
+        let Some(entry) = entries.get(selected) else {
+            self.status = String::from("trash is empty");
+            return Ok(());
+        };
+        let action = TrashConfirmAction::RestoreFromPanel {
+            pane_id,
+            target_ids: vec![entry.id.clone()],
+            search,
+            selected,
+        };
+        self.pending_action = Some(PendingAction::ConfirmTrashAction {
+            action: action.clone(),
+            target_name: entry.display_name.clone(),
+            entry_count: 1,
+            marked_ids: marked_ids.to_vec(),
+            visual_anchor,
+        });
+        self.status = trash_confirm_status(&action, &entry.display_name, 1);
+        Ok(())
+    }
+
+    /// 為目前 `trash` 面板挑出批次還原目標，並進入確認視窗。
+    ///
+    /// 若已有 `V` 標記，會只操作標記的項目；否則會操作目前可見結果的全部項目。
+    fn start_trash_panel_restore_all_confirmation(
+        &mut self,
+        pane_id: usize,
+        entries: &[TrashListEntry],
+        selected: usize,
+        search: PanelSearchState,
+        marked_ids: &[String],
+        visual_anchor: Option<usize>,
+    ) -> io::Result<()> {
+        let selected_entries = self.trash_panel_batch_entries(entries, marked_ids);
+        if selected_entries.is_empty() {
+            self.status = String::from("trash is empty");
+            return Ok(());
+        }
+        let target_name = Self::trash_confirm_target_name(&selected_entries);
+        let entry_count = selected_entries.len();
+        let action = TrashConfirmAction::RestoreFromPanel {
+            pane_id,
+            target_ids: selected_entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect(),
+            search,
+            selected,
+        };
+        self.pending_action = Some(PendingAction::ConfirmTrashAction {
+            action: action.clone(),
+            target_name: target_name.clone(),
+            entry_count,
+            marked_ids: marked_ids.to_vec(),
+            visual_anchor,
+        });
+        self.status = trash_confirm_status(&action, &target_name, entry_count);
+        Ok(())
+    }
+
+    /// 為目前 `trash` 面板挑出永久刪除目標，並進入確認視窗。
+    ///
+    /// 規則：
+    /// - 若已有 `V` 標記，`d` 會直接刪除全部標記項目。
+    /// - 若沒有標記，`d` 才會只刪除游標所在的單筆項目。
+    fn start_trash_panel_delete_confirmation(
+        &mut self,
+        pane_id: usize,
+        entries: &[TrashListEntry],
+        selected: usize,
+        search: PanelSearchState,
+        marked_ids: &[String],
+        visual_anchor: Option<usize>,
+    ) -> io::Result<()> {
+        let selected_entries = self.trash_panel_batch_entries(entries, marked_ids);
+        if !marked_ids.is_empty() {
+            if selected_entries.is_empty() {
+                self.status = String::from("trash is empty");
+                return Ok(());
+            }
+            let target_name = Self::trash_confirm_target_name(&selected_entries);
+            let entry_count = selected_entries.len();
+            let action = TrashConfirmAction::DeleteFromPanel {
+                pane_id,
+                target_ids: selected_entries
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect(),
+                search,
+                selected,
+            };
+            self.pending_action = Some(PendingAction::ConfirmTrashAction {
+                action: action.clone(),
+                target_name: target_name.clone(),
+                entry_count,
+                marked_ids: marked_ids.to_vec(),
+                visual_anchor,
+            });
+            self.status = trash_confirm_status(&action, &target_name, entry_count);
+            return Ok(());
+        }
+
+        let Some(entry) = entries.get(selected) else {
+            self.status = String::from("trash is empty");
+            return Ok(());
+        };
+        let action = TrashConfirmAction::DeleteFromPanel {
+            pane_id,
+            target_ids: vec![entry.id.clone()],
+            search,
+            selected,
+        };
+        self.pending_action = Some(PendingAction::ConfirmTrashAction {
+            action: action.clone(),
+            target_name: entry.display_name.clone(),
+            entry_count: 1,
+            marked_ids: marked_ids.to_vec(),
+            visual_anchor,
+        });
+        self.status = trash_confirm_status(&action, &entry.display_name, 1);
+        Ok(())
+    }
+
+    /// 為目前 `trash` 面板挑出批次永久刪除目標，並進入確認視窗。
+    ///
+    /// 若已有 `V` 標記，會只刪除標記項目；否則會刪除目前搜尋結果中的全部項目。
+    fn start_trash_panel_delete_all_confirmation(
+        &mut self,
+        pane_id: usize,
+        entries: &[TrashListEntry],
+        selected: usize,
+        search: PanelSearchState,
+        marked_ids: &[String],
+        visual_anchor: Option<usize>,
+    ) -> io::Result<()> {
+        let selected_entries = self.trash_panel_batch_entries(entries, marked_ids);
+        if selected_entries.is_empty() {
+            self.status = String::from("trash is empty");
+            return Ok(());
+        }
+        let target_name = Self::trash_confirm_target_name(&selected_entries);
+        let entry_count = selected_entries.len();
+        let action = TrashConfirmAction::DeleteFromPanel {
+            pane_id,
+            target_ids: selected_entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect(),
+            search,
+            selected,
+        };
+        self.pending_action = Some(PendingAction::ConfirmTrashAction {
+            action: action.clone(),
+            target_name: target_name.clone(),
+            entry_count,
+            marked_ids: marked_ids.to_vec(),
+            visual_anchor,
+        });
+        self.status = trash_confirm_status(&action, &target_name, entry_count);
+        Ok(())
     }
 
     /// 清除目前焦點 pane 中所有標記。
@@ -6358,177 +6689,121 @@ impl App {
         Ok(())
     }
 
-    /// 還原目前 trash 中的所有項目。
-    pub(crate) fn restore_all_from_trash(&mut self) -> io::Result<()> {
-        let entries = self.trash_store.list_entries()?;
-        let ids = entries
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        let results = self.trash_store.restore_many_by_ids(&ids)?;
+    /// 執行使用者在確認視窗中同意的 trash 操作。
+    fn confirm_trash_action(
+        &mut self,
+        action: TrashConfirmAction,
+        target_name: String,
+        entry_count: usize,
+    ) -> io::Result<()> {
+        match action {
+            TrashConfirmAction::RestoreFromPanel {
+                pane_id,
+                target_ids,
+                search,
+                selected,
+            } => self.restore_trash_ids_in_panel(
+                pane_id,
+                &target_ids,
+                search,
+                selected,
+                &target_name,
+                entry_count,
+            ),
+            TrashConfirmAction::DeleteFromPanel {
+                pane_id,
+                target_ids,
+                search,
+                selected,
+            } => self.delete_trash_ids_in_panel(
+                pane_id,
+                &target_ids,
+                search,
+                selected,
+                &target_name,
+                entry_count,
+            ),
+        }
+    }
 
-        if results.is_empty() {
+    /// 在 trash 面板中批次還原指定 id 清單，並盡量保留原本搜尋上下文。
+    fn restore_trash_ids_in_panel(
+        &mut self,
+        pane_id: usize,
+        target_ids: &[String],
+        search: PanelSearchState,
+        selected: usize,
+        target_name: &str,
+        entry_count: usize,
+    ) -> io::Result<()> {
+        if target_ids.is_empty() {
             self.status = String::from("trash is empty");
             return Ok(());
         }
 
+        let results = self.trash_store.restore_many_by_ids(target_ids)?;
         self.reload_all_panes()?;
         if let Some(first) = results.first() {
-            let _ = self.reveal_path_and_track(self.focused_pane, &first.restored_path);
+            let _ = self.reveal_path_and_track(pane_id, &first.restored_path);
         }
-        if results.len() == 1 {
-            self.status = format!("restored {}", results[0].display_name);
+        self.reopen_trash_panel_after_mutation(pane_id, search, selected)?;
+        if results.is_empty() {
+            self.status = format!("trash item no longer exists: {target_name}");
+        } else if entry_count <= 1 {
+            self.status = format!("restored {target_name}");
         } else {
             self.status = format!("restored {} items", results.len());
         }
         Ok(())
     }
 
-    /// 永久清空整個 trash。
-    pub(crate) fn clear_trash(&mut self) -> io::Result<()> {
-        let cleared = self.trash_store.clear()?;
-        if cleared == 0 {
-            self.status = String::from("trash is empty");
-        } else {
-            self.status = format!("cleared {cleared} trash items");
-        }
-        Ok(())
-    }
-
-    /// 依照 trash 面板中目前選到的項目，執行還原。
-    fn restore_trash_entry(
-        &mut self,
-        entries: &[TrashListEntry],
-        selected: usize,
-    ) -> io::Result<()> {
-        let Some(entry) = entries.get(selected) else {
-            self.status = String::from("trash is empty");
-            return Ok(());
-        };
-
-        match self.trash_store.restore_by_id(&entry.id)? {
-            Some(result) => {
-                self.reload_all_panes()?;
-                let _ = self.reveal_path_and_track(self.focused_pane, &result.restored_path);
-                self.pending_action = None;
-                self.status = format!("restored {}", result.display_name);
-            }
-            None => {
-                self.pending_action = Some(PendingAction::TrashPanel {
-                    pane_id: self.focused_pane,
-                    selected: selected.saturating_sub(1),
-                    search: PanelSearchState {
-                        buffer: String::new(),
-                        editing: false,
-                    },
-                    marked_ids: Vec::new(),
-                    visual_anchor: None,
-                });
-                self.status = String::from("trash item no longer exists");
-            }
-        }
-        Ok(())
-    }
-
-    /// 依照 trash 面板中目前篩選後的結果，批次還原全部項目。
-    fn restore_all_trash_entries(&mut self, entries: &[TrashListEntry]) -> io::Result<()> {
-        if entries.is_empty() {
-            self.status = String::from("trash is empty");
-            return Ok(());
-        }
-
-        let ids = entries
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>();
-        let results = self.trash_store.restore_many_by_ids(&ids)?;
-        self.reload_all_panes()?;
-        self.pending_action = None;
-        if results.len() == 1 {
-            self.status = format!("restored {}", results[0].display_name);
-        } else {
-            self.status = format!("restored {} items", results.len());
-        }
-        Ok(())
-    }
-
-    /// 永久刪除 trash 面板中目前選到的單一項目。
-    fn delete_trash_entry(
+    /// 在 trash 面板中永久刪除指定 id 清單，並保留目前搜尋上下文。
+    fn delete_trash_ids_in_panel(
         &mut self,
         pane_id: usize,
-        entries: &[TrashListEntry],
+        target_ids: &[String],
+        search: PanelSearchState,
         selected: usize,
-        search: PanelSearchState,
-        marked_ids: Vec<String>,
-        visual_anchor: Option<usize>,
+        target_name: &str,
+        entry_count: usize,
     ) -> io::Result<()> {
-        let Some(entry) = entries.get(selected) else {
-            self.status = String::from("trash is empty");
-            return Ok(());
-        };
-
-        match self.trash_store.delete_by_id(&entry.id)? {
-            Some(display_name) => {
-                let remaining_count = entries.len().saturating_sub(1);
-                let next_selected = if remaining_count == 0 {
-                    0
-                } else {
-                    selected.min(remaining_count.saturating_sub(1))
-                };
-                self.pending_action = Some(PendingAction::TrashPanel {
-                    pane_id,
-                    selected: next_selected,
-                    search,
-                    marked_ids,
-                    visual_anchor,
-                });
-                self.status = format!("deleted permanently {display_name}");
-            }
-            None => {
-                self.pending_action = Some(PendingAction::TrashPanel {
-                    pane_id,
-                    selected: selected.saturating_sub(1),
-                    search,
-                    marked_ids,
-                    visual_anchor,
-                });
-                self.status = String::from("trash item no longer exists");
-            }
-        }
-        Ok(())
-    }
-
-    /// 永久刪除 trash 面板中目前篩選到的所有項目。
-    fn clear_filtered_trash_entries(
-        &mut self,
-        pane_id: usize,
-        entries: &[TrashListEntry],
-        search: PanelSearchState,
-        marked_ids: Vec<String>,
-        visual_anchor: Option<usize>,
-    ) -> io::Result<()> {
-        if entries.is_empty() {
+        if target_ids.is_empty() {
             self.status = String::from("trash is empty");
             return Ok(());
         }
 
-        let ids = entries
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>();
-        let deleted_names = self.trash_store.delete_many_by_ids(&ids)?;
-        self.pending_action = Some(PendingAction::TrashPanel {
-            pane_id,
-            selected: 0,
-            search,
-            marked_ids,
-            visual_anchor,
-        });
-        if deleted_names.len() == 1 {
-            self.status = format!("deleted permanently {}", deleted_names[0]);
+        let deleted_names = self.trash_store.delete_many_by_ids(target_ids)?;
+        self.reopen_trash_panel_after_mutation(pane_id, search, selected)?;
+        if deleted_names.is_empty() {
+            self.status = format!("trash item no longer exists: {target_name}");
+        } else if entry_count <= 1 {
+            self.status = format!("deleted permanently {target_name}");
         } else {
             self.status = format!("deleted permanently {} items", deleted_names.len());
         }
+        Ok(())
+    }
+
+    /// 在 trash 異動完成後重建面板狀態，避免游標跳到錯誤位置。
+    fn reopen_trash_panel_after_mutation(
+        &mut self,
+        pane_id: usize,
+        search: PanelSearchState,
+        selected: usize,
+    ) -> io::Result<()> {
+        let visible_count = trash_panel_entries(&self.trash_store, &search.buffer)?.len();
+        let next_selected = if visible_count == 0 {
+            0
+        } else {
+            selected.min(visible_count.saturating_sub(1))
+        };
+        self.pending_action = Some(PendingAction::TrashPanel {
+            pane_id,
+            selected: next_selected,
+            search,
+            marked_ids: Vec::new(),
+            visual_anchor: None,
+        });
         Ok(())
     }
 
@@ -7425,6 +7700,10 @@ impl App {
     /// 回傳：`io::Result<()>`。
     /// - 成功時代表目前 pane 已切到指定目錄，或定位到指定檔案。
     pub(crate) fn change_directory_from_command(&mut self, target: &str) -> io::Result<()> {
+        if target.trim_start().starts_with("smb://") {
+            return self.goto_smb_location(target.trim());
+        }
+
         let Some(target_path) = self.resolve_path_argument(target) else {
             self.status = String::from("usage: goto <path>");
             return Ok(());
@@ -7436,6 +7715,40 @@ impl App {
             }
             Err(error) => {
                 self.status = format!("path jump failed: {} ({error})", target_path.display());
+            }
+        }
+        Ok(())
+    }
+
+    /// 讓 `g` 系列快捷鍵可以快速跳到常用的系統目錄。
+    ///
+    /// 參數：
+    /// - `directory: GoSpecialDirectory`，要跳去的預設目錄種類。
+    ///
+    /// 回傳：`io::Result<()>`。
+    /// - 成功時代表已切到目標目錄。
+    /// - 若系統上不存在該目錄，會在狀態列顯示原因。
+    fn go_to_special_directory(&mut self, directory: GoSpecialDirectory) -> io::Result<()> {
+        let Some(target_path) = special_directory_path(directory) else {
+            self.status = format!("{} not available on this system", directory.label());
+            return Ok(());
+        };
+
+        if !target_path.exists() {
+            self.status = format!("{} missing: {}", directory.label(), target_path.display());
+            return Ok(());
+        }
+
+        match self.go_to_path_and_track(self.focused_pane, &target_path) {
+            Ok(()) => {
+                self.status = format!("jumped to {}: {}", directory.label(), target_path.display());
+            }
+            Err(error) => {
+                self.status = format!(
+                    "{} jump failed: {} ({error})",
+                    directory.label(),
+                    target_path.display()
+                );
             }
         }
         Ok(())
@@ -7576,28 +7889,20 @@ impl App {
         self.layout.render_rects(outer[0], &mut pane_rects);
         let mut cursor_position = None;
         for (&pane_id, &rect) in &pane_rects {
-            let trash_lines = if let Some(PendingAction::TrashPanel {
-                pane_id: action_pane_id,
-                selected,
-                search,
-                marked_ids,
-                visual_anchor,
-                ..
-            }) = &self.pending_action
+            let trash_overlay_state =
+                trash_panel_overlay_state_from_pending_action(&self.pending_action, pane_id);
+            let trash_lines = if let Some((selected, search, marked_ids, visual_anchor)) =
+                trash_overlay_state.as_ref()
             {
-                if *action_pane_id == pane_id {
-                    Some(
-                        trash_panel_lines(
-                            &self.trash_store,
-                            &search.buffer,
-                            marked_ids,
-                            visual_anchor.map(|anchor| (anchor, *selected)),
-                        )
-                        .unwrap_or_default(),
+                Some(
+                    trash_panel_lines(
+                        &self.trash_store,
+                        &search.buffer,
+                        marked_ids,
+                        visual_anchor.map(|anchor| (anchor, *selected)),
                     )
-                } else {
-                    None
-                }
+                    .unwrap_or_default(),
+                )
             } else {
                 None
             };
@@ -7747,23 +8052,13 @@ impl App {
                             preview_current_match: search.preview_current_match,
                         }),
                     )
-                } else if let Some(PendingAction::TrashPanel {
-                    pane_id: action_pane_id,
-                    selected,
-                    search,
-                    ..
-                }) = &self.pending_action
-                {
-                    if *action_pane_id == pane_id {
-                        Some(PaneListState::Trash {
-                            lines: trash_lines.as_deref().unwrap_or(&[]),
-                            selected: *selected,
-                            search: &search.buffer,
-                            editing: search.editing,
-                        })
-                    } else {
-                        None
-                    }
+                } else if let Some((selected, search, ..)) = trash_overlay_state.as_ref() {
+                    Some(PaneListState::Trash {
+                        lines: trash_lines.as_deref().unwrap_or(&[]),
+                        selected: *selected,
+                        search: &search.buffer,
+                        editing: search.editing,
+                    })
                 } else if let Some(PendingAction::TaskPanel {
                     pane_id: action_pane_id,
                     selected,
@@ -7908,7 +8203,7 @@ impl App {
             Span::raw(" dialog  "),
             Span::styled(":create", self.theme.accent_style()),
             Span::raw("  "),
-            Span::styled(":restore", self.theme.accent_style()),
+            Span::styled(":trash undo", self.theme.accent_style()),
             Span::raw("  "),
             Span::styled(":preview-search", self.theme.accent_style()),
             Span::raw("  "),
@@ -8009,8 +8304,30 @@ impl App {
                     &self.config,
                 );
             }
+            Some(PendingAction::ConfirmTrashAction {
+                action,
+                target_name,
+                entry_count,
+                ..
+            }) => {
+                let confirm_area = trash_confirm_panel_id(action)
+                    .and_then(|pane_id| pane_rects.get(&pane_id).copied())
+                    .unwrap_or(frame.area());
+                render_trash_confirm_dialog(
+                    frame,
+                    confirm_area,
+                    action,
+                    target_name,
+                    *entry_count,
+                    self.theme,
+                    &self.config,
+                );
+            }
             Some(PendingAction::GoPicker { .. }) => {
                 render_go_picker(frame, frame.area(), self.theme);
+            }
+            Some(PendingAction::TrashPicker { .. }) => {
+                render_trash_action_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::SortPicker { .. }) => {
                 super::ui::render_sort_picker(frame, frame.area(), self.theme);
@@ -8398,6 +8715,53 @@ fn command_home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+/// 描述 `g` 面板可快速跳轉的系統常用目錄。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoSpecialDirectory {
+    Documents,
+    Desktop,
+}
+
+impl GoSpecialDirectory {
+    /// 回傳狀態列與提示訊息會使用的目錄名稱。
+    ///
+    /// 參數：無。
+    /// 回傳：`&'static str`。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Documents => "Documents",
+            Self::Desktop => "Desktop",
+        }
+    }
+
+    /// 回傳相對於使用者家目錄的預設子目錄名稱。
+    ///
+    /// 參數：無。
+    /// 回傳：`&'static str`。
+    fn relative_name(self) -> &'static str {
+        match self {
+            Self::Documents => "Documents",
+            Self::Desktop => "Desktop",
+        }
+    }
+}
+
+/// 根據目前平台的使用者家目錄，推算常用系統目錄位置。
+///
+/// 設計上先統一使用家目錄底下的標準資料夾名稱，
+/// 讓 macOS 與 Windows 都能走同一套邏輯，之後若要擴充其他平台也容易集中修改。
+///
+/// 參數：
+/// - `directory: GoSpecialDirectory`，要解析的常用目錄種類。
+///
+/// 回傳：`Option<PathBuf>`。
+/// - 有找到家目錄時回傳完整路徑。
+/// - 若環境沒有提供家目錄資訊則回傳 `None`。
+fn special_directory_path(directory: GoSpecialDirectory) -> Option<PathBuf> {
+    let home = command_home_dir()?;
+    Some(home.join(directory.relative_name()))
 }
 
 /// 判斷 regex 批次改名某一列目前屬於可改名、無變化還是無效名稱。
@@ -8861,8 +9225,20 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":goto <path>",
             "gt",
-            "讓目前 panel 直接跳到指定路徑，支援相對路徑、絕對路徑與 Windows 磁碟機路徑",
+            "讓目前 panel 直接跳到指定路徑，支援相對路徑、絕對路徑、Windows 磁碟機路徑與 smb:// share",
             HelpAction::Command("goto "),
+        ),
+        help_entry(
+            ":goto document",
+            "gd",
+            "快速跳到 Documents 目錄",
+            HelpAction::Command("goto ~/Documents"),
+        ),
+        help_entry(
+            ":goto desktop",
+            "gk",
+            "快速跳到 Desktop 目錄",
+            HelpAction::Command("goto ~/Desktop"),
         ),
         help_entry(
             ":bookmark",
@@ -8871,10 +9247,10 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("bookmark"),
         ),
         help_entry(
-            ":bookmark save",
-            "bs",
+            ":bookmark add",
+            "ba",
             "自動挑選下一個可用代號，把目前 panel 的位置存成書籤",
-            HelpAction::Command("bookmark save"),
+            HelpAction::Command("bookmark add"),
         ),
         help_entry(
             ":bookmark jump",
@@ -8899,12 +9275,6 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "bD",
             "直接刪除全部書籤",
             HelpAction::Command("bookmark clear"),
-        ),
-        help_entry(
-            ":bookmark set",
-            "",
-            "手動指定代號儲存書籤，適合想自行固定快捷鍵時使用",
-            HelpAction::Command("bookmark set "),
         ),
         help_entry(
             ":linemode",
@@ -9051,20 +9421,14 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("cancel-cut"),
         ),
         help_entry(
-            ":connect smb://host/share",
-            "",
-            "讓目前 panel 連到 SMB share；mac 若尚未掛載會先請求系統掛載",
-            HelpAction::Command("connect "),
-        ),
-        help_entry(
             ":compress",
-            "",
+            "C",
             "把目前選取或標記的項目壓成 zip；多選時預設檔名為 archive.zip",
             HelpAction::Command("compress"),
         ),
         help_entry(
             ":extract",
-            "",
+            "E",
             "解開目前選取或標記的壓縮檔，支援 zip、tar.gz、tar、gz",
             HelpAction::Command("extract"),
         ),
@@ -9106,38 +9470,26 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":trash",
-            "",
-            "打開 trash 面板，查看並還原已移入 trash 的項目",
+            "tt",
+            "打開 trash 面板，查看已移入 trash 的項目，並用 d/D/u/U 操作",
             HelpAction::Command("trash"),
         ),
         help_entry(
             ":tasks",
-            "t",
+            "T",
             "打開目前 panel 的任務面板，查看最近的 search / jump / open / smb 任務狀態",
             HelpAction::Command("tasks"),
         ),
         help_entry(
-            ":restore",
-            "",
-            "還原最近一次移到 trash 的項目",
-            HelpAction::Command("restore"),
+            ":trash undo",
+            "tu",
+            "快速還原最近一次移到 trash 的檔案或資料夾",
+            HelpAction::Command("trash undo"),
         ),
         help_entry(
-            ":trash restore-all",
-            "trash:R",
-            "在 trash 面板中還原目前篩選結果的全部項目",
-            HelpAction::Command("trash restore-all"),
-        ),
-        help_entry(
-            ":trash clear",
-            "trash:C",
-            "永久刪除 trash 內目前篩選結果的全部項目",
-            HelpAction::Command("trash clear"),
-        ),
-        help_entry(
-            ":trash mark",
-            "trash:V",
-            "在 trash 面板中用 Vim 風格選取多個項目後一起還原或刪除",
+            ":trash panel actions",
+            "trash:d, trash:D, trash:u, trash:U",
+            "在 trash 面板中刪除單筆、刪除全部、還原單筆或還原全部；都會先顯示確認視窗",
             HelpAction::Command("trash"),
         ),
         help_entry(
@@ -9569,7 +9921,7 @@ fn trash_panel_status(
         String::from("trash: empty")
     } else {
         format!(
-            "trash: {}/{} [marked: {}] (Enter restore, V mark, R all, D delete, C clear, f search)",
+            "trash: {}/{} [marked: {}] (Enter/u restore, U all, d delete, D all, V mark, f search)",
             selected + 1,
             count,
             marked_count
@@ -9628,6 +9980,119 @@ fn paste_overwrite_cancelled_status(target_name: &str, entry_count: usize) -> St
         format!("paste cancelled: {target_name}")
     } else {
         format!("paste cancelled: {target_name} ({entry_count} items)")
+    }
+}
+
+/// 依照 trash 確認操作種類，回傳確認視窗與狀態列要顯示的文字。
+fn trash_confirm_status(action: &TrashConfirmAction, target_name: &str, entry_count: usize) -> String {
+    let verb = match action {
+        TrashConfirmAction::RestoreFromPanel { .. } => "restore",
+        TrashConfirmAction::DeleteFromPanel { .. } => "delete",
+    };
+    if entry_count <= 1 {
+        format!("confirm {verb} {target_name}: y/n")
+    } else {
+        format!("confirm {verb} {target_name} ({entry_count} items): y/n")
+    }
+}
+
+/// 當使用者取消 trash 確認視窗時，回傳應顯示的狀態列訊息。
+fn trash_confirm_cancelled_status(
+    action: &TrashConfirmAction,
+    target_name: &str,
+    entry_count: usize,
+) -> String {
+    let verb = match action {
+        TrashConfirmAction::RestoreFromPanel { .. } => "restore",
+        TrashConfirmAction::DeleteFromPanel { .. } => "delete",
+    };
+    if entry_count <= 1 {
+        format!("{verb} cancelled: {target_name}")
+    } else {
+        format!("{verb} cancelled: {target_name} ({entry_count} items)")
+    }
+}
+
+/// 取出 trash 確認操作所屬的 panel 編號，讓確認視窗可以畫回原本的列表內。
+fn trash_confirm_panel_id(action: &TrashConfirmAction) -> Option<usize> {
+    match action {
+        TrashConfirmAction::RestoreFromPanel { pane_id, .. }
+        | TrashConfirmAction::DeleteFromPanel { pane_id, .. } => Some(*pane_id),
+    }
+}
+
+/// 從 trash 確認操作還原出原本的 trash 面板狀態，讓取消或重繪時能留在同一個列表。
+fn trash_panel_pending_action_from_confirm_action(
+    action: &TrashConfirmAction,
+    marked_ids: Vec<String>,
+    visual_anchor: Option<usize>,
+) -> PendingAction {
+    match action {
+        TrashConfirmAction::RestoreFromPanel {
+            pane_id,
+            search,
+            selected,
+            ..
+        }
+        | TrashConfirmAction::DeleteFromPanel {
+            pane_id,
+            search,
+            selected,
+            ..
+        } => PendingAction::TrashPanel {
+            pane_id: *pane_id,
+            selected: *selected,
+            search: search.clone(),
+            marked_ids,
+            visual_anchor,
+        },
+    }
+}
+
+/// 取出目前 pending action 對應的 trash 面板狀態，讓 confirm 視窗打開時底層仍可維持 trash 列表。
+fn trash_panel_overlay_state_from_pending_action(
+    pending_action: &Option<PendingAction>,
+    pane_id: usize,
+) -> Option<(usize, PanelSearchState, Vec<String>, Option<usize>)> {
+    match pending_action {
+        Some(PendingAction::TrashPanel {
+            pane_id: action_pane_id,
+            selected,
+            search,
+            marked_ids,
+            visual_anchor,
+        }) if *action_pane_id == pane_id => Some((
+            *selected,
+            search.clone(),
+            marked_ids.clone(),
+            *visual_anchor,
+        )),
+        Some(PendingAction::ConfirmTrashAction {
+            action,
+            marked_ids,
+            visual_anchor,
+            ..
+        }) => match action {
+            TrashConfirmAction::RestoreFromPanel {
+                pane_id: action_pane_id,
+                search,
+                selected,
+                ..
+            }
+            | TrashConfirmAction::DeleteFromPanel {
+                pane_id: action_pane_id,
+                search,
+                selected,
+                ..
+            } if *action_pane_id == pane_id => Some((
+                *selected,
+                search.clone(),
+                marked_ids.clone(),
+                *visual_anchor,
+            )),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -9948,19 +10413,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, OnceLock};
 
     use tempfile::tempdir;
 
     use super::{
         App, BookmarkListMode, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
-        PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord, TaskState,
-        VisualSelectionState, command_suggestion_navigation, command_suggestions,
-        command_suggestions_for_buffer, ctrl_digit_target_pane_id, help_entries,
-        is_windows_drive_path, key_matches_ctrl_letter, key_matches_ctrl_shift_letter,
-        key_matches_letter_any_case, key_matches_plain_letter, key_matches_shifted_letter,
-        looks_like_navigation_path, plain_digit_target_pane_id, query_zoxide_directories,
-        rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
-        rename_word_end, typed_char_from_key,
+        PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode,
+        TaskRecord, TaskState, TrashConfirmAction, VisualSelectionState,
+        command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
+        ctrl_digit_target_pane_id, help_entries, is_windows_drive_path,
+        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
+        key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
+        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end,
+        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action,
+        typed_char_from_key,
     };
     use crate::{
         config::{
@@ -9978,6 +10446,8 @@ mod tests {
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{fs, thread, time::Duration};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn default_loaded_config() -> LoadedConfig {
         LoadedConfig {
@@ -10198,7 +10668,7 @@ mod tests {
             app.pending_action,
             Some(PendingAction::GoPicker { pane_id: 1 })
         ));
-        assert_eq!(app.status, "go: choose g/t from the panel");
+        assert_eq!(app.status, "go: choose g/t/d/k from the panel");
     }
 
     #[test]
@@ -10215,6 +10685,90 @@ mod tests {
         assert!(app.command_mode);
         assert_eq!(app.command_buffer, "goto ");
         assert_eq!(app.status, "command mode");
+    }
+
+    #[test]
+    /// 驗證 `gd` 會直接切到使用者的 Documents 目錄。
+    fn app_gd_jumps_to_documents_directory() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let dir = tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let documents = home.join("Documents");
+        fs::create_dir_all(&documents).expect("documents");
+
+        let original_home = std::env::var_os("HOME");
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+
+        let result = (|| {
+            let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+                .expect("open go picker");
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+                .expect("jump documents");
+            assert_eq!(app.panes.get(&1).expect("pane").cwd, documents);
+        })();
+
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    /// 驗證 `gk` 會直接切到使用者的 Desktop 目錄。
+    fn app_gk_jumps_to_desktop_directory() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let dir = tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let desktop = home.join("Desktop");
+        fs::create_dir_all(&desktop).expect("desktop");
+
+        let original_home = std::env::var_os("HOME");
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+
+        let result = (|| {
+            let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+                .expect("open go picker");
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+                .expect("jump desktop");
+            assert_eq!(app.panes.get(&1).expect("pane").cwd, desktop);
+        })();
+
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+
+        result
     }
 
     #[test]
@@ -10564,14 +11118,14 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 command mode 在使用者已輸入參數時，Enter 會直接執行而不覆蓋成預設模板。
-    fn app_command_mode_enter_executes_command_with_arguments() {
+    /// 驗證 command mode 在使用者已輸入 `goto smb://...` 時，Enter 會直接執行而不覆蓋成預設模板。
+    fn app_command_mode_enter_executes_goto_smb_with_arguments() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        for ch in "connect smb://192.0.2.10/tfm-test-share/docs".chars() {
+        for ch in "goto smb://192.0.2.10/tfm-test-share/docs".chars() {
             let modifiers = if ch.is_ascii_uppercase() {
                 KeyModifiers::SHIFT
             } else {
@@ -10593,23 +11147,23 @@ mod tests {
     }
 
     #[test]
-    /// 驗證帶參數的指令提示只會補上命令前綴，不會把範例參數塞進輸入框。
-    fn app_command_mode_autocomplete_uses_connect_prefix_instead_of_example_arguments() {
+    /// 驗證帶參數的指令提示只會補上 `goto ` 前綴，不會把範例參數塞進輸入框。
+    fn app_command_mode_autocomplete_uses_goto_prefix_instead_of_example_arguments() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT))
             .expect("open command mode");
-        for ch in "con".chars() {
+        for ch in "go".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .expect("type partial command");
         }
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("autocomplete connect");
+            .expect("autocomplete goto");
 
         assert!(app.command_mode);
-        assert_eq!(app.command_buffer, "connect ");
+        assert_eq!(app.command_buffer, "goto ");
     }
 
     #[test]
@@ -10763,15 +11317,24 @@ mod tests {
         ));
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("restore from panel");
+            .expect("open restore confirm");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmTrashAction { .. })
+        ));
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm restore from panel");
 
         assert!(file_path.exists());
-        assert!(app.pending_action.is_none());
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel { .. })
+        ));
         assert_eq!(app.status, "restored panel-restore.txt");
     }
 
     #[test]
-    /// 驗證 trash 面板可用 `D` 永久刪除目前選到的項目，且面板仍保持開啟。
+    /// 驗證 trash 面板可用 `d` 永久刪除目前選到的項目，且會先進確認視窗。
     fn app_trash_panel_can_delete_selected_entry_permanently() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("purge-me.txt");
@@ -10783,7 +11346,13 @@ mod tests {
             .expect("confirm trash");
 
         app.open_trash_panel().expect("open trash panel");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("open delete confirm");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmTrashAction { .. })
+        ));
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("delete selected trash entry");
 
         assert!(matches!(
@@ -10795,8 +11364,46 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 trash 面板可用 `C` 永久刪除目前篩選結果的全部項目。
-    fn app_trash_panel_can_clear_filtered_entries() {
+    /// 驗證 trash 面板在確認刪除時仍保留原本列表狀態，取消後會回到同一個 trash 面板。
+    fn app_trash_panel_delete_confirm_cancel_returns_to_same_trash_panel() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("cancel-delete.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm trash");
+
+        app.open_trash_panel().expect("open trash panel");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("open delete confirm");
+
+        let (selected, search, marked_ids, visual_anchor) =
+            trash_panel_overlay_state_from_pending_action(&app.pending_action, 1)
+                .expect("trash overlay state");
+        assert_eq!(selected, 0);
+        assert_eq!(search.buffer, "");
+        assert!(marked_ids.is_empty());
+        assert_eq!(visual_anchor, None);
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel delete confirm");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel {
+                pane_id: 1,
+                selected: 0,
+                ..
+            })
+        ));
+        assert_eq!(app.status, "delete cancelled: cancel-delete.txt");
+    }
+
+    #[test]
+    /// 驗證 trash 面板可用 `D` 永久刪除目前篩選結果的全部項目，且會先確認。
+    fn app_trash_panel_shift_d_deletes_filtered_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
         let beta = dir.path().join("beta.txt");
@@ -10826,8 +11433,14 @@ mod tests {
             .expect("type filter");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("lock trash filter");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
-            .expect("clear filtered trash");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+            .expect("open delete all confirm");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmTrashAction { .. })
+        ));
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm clear filtered trash");
 
         assert!(matches!(
             app.pending_action,
@@ -10840,7 +11453,7 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 trash 面板可用 `V` 標記多個項目，並透過 Enter 一次還原。
+    /// 驗證 trash 面板可用 `V` 標記多個項目，並透過 `U` 一次還原。
     fn app_trash_panel_visual_mark_restore_multiple_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
@@ -10863,13 +11476,105 @@ mod tests {
             .expect("extend visual mark");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
             .expect("commit visual mark");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("restore marked items");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT))
+            .expect("open restore all confirm");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmTrashAction { .. })
+        ));
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm restore marked items");
 
         assert!(alpha.exists());
         assert!(beta.exists());
-        assert!(app.pending_action.is_none());
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel { .. })
+        ));
         assert_eq!(app.status, "restored 2 items");
+    }
+
+    #[test]
+    /// 驗證 trash 面板在已有 `V` 標記時，按 `u` 也會一次還原全部標記項目。
+    fn app_trash_panel_visual_mark_lower_u_restores_multiple_entries() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("lower-u-alpha.txt");
+        let beta = dir.path().join("lower-u-beta.txt");
+        fs::write(&alpha, "alpha").expect("alpha");
+        fs::write(&beta, "beta").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm first");
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm second");
+
+        app.open_trash_panel().expect("open trash");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .expect("start visual mark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("extend visual mark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .expect("commit visual mark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .expect("open restore confirm");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmTrashAction { .. })
+        ));
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm restore marked items");
+
+        assert!(alpha.exists());
+        assert!(beta.exists());
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel { .. })
+        ));
+        assert_eq!(app.status, "restored 2 items");
+    }
+
+    #[test]
+    /// 驗證 trash 面板在已有 `V` 標記時，按 `d` 也會一次刪除全部標記項目。
+    fn app_trash_panel_visual_mark_lower_d_deletes_multiple_entries() {
+        let dir = tempdir().expect("tempdir");
+        let alpha = dir.path().join("lower-d-alpha.txt");
+        let beta = dir.path().join("lower-d-beta.txt");
+        fs::write(&alpha, "alpha").expect("alpha");
+        fs::write(&beta, "beta").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm first");
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm second");
+
+        app.open_trash_panel().expect("open trash");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .expect("start visual mark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("extend visual mark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .expect("commit visual mark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("open delete confirm");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ConfirmTrashAction { .. })
+        ));
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm delete marked items");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel { .. })
+        ));
+        assert_eq!(app.trash_store.list_entries().expect("list").len(), 0);
+        assert_eq!(app.status, "deleted permanently 2 items");
     }
 
     #[test]
@@ -10902,42 +11607,38 @@ mod tests {
     }
 
     #[test]
-    /// 驗證從 trash 打開 help 並按 Enter 執行命令後，會回到最近的 trash 列表上下文。
-    fn app_help_panel_enter_from_trash_executes_and_returns_to_trash() {
+    /// 驗證從 trash 打開 help 並執行 `:trash undo` 後，會回到最近的 trash 列表上下文。
+    fn app_help_panel_enter_from_trash_executes_undo_and_returns_to_trash() {
         let dir = tempdir().expect("tempdir");
-        let file_path = dir.path().join("clear-via-help.txt");
+        let file_path = dir.path().join("undo-via-help.txt");
         fs::write(&file_path, "hello").expect("file");
-        let clear_index = help_entries("")
+        let undo_index = help_entries("")
             .iter()
-            .position(|entry| entry.line.command == ":trash clear")
-            .expect("trash clear help entry");
+            .position(|entry| entry.line.command == ":trash undo")
+            .expect("trash undo help entry");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.start_delete_confirmation(false);
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm trash");
+        assert!(!file_path.exists());
 
         app.open_trash_panel().expect("open trash");
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
             .expect("open help from trash");
-        for _ in 0..clear_index {
+        for _ in 0..undo_index {
             app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-                .expect("move to trash clear help entry");
+                .expect("move to trash undo help entry");
         }
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("execute trash clear from help");
+            .expect("execute trash undo from help");
 
         assert!(matches!(
             app.pending_action,
             Some(PendingAction::TrashPanel { .. })
         ));
-        assert!(
-            app.trash_store
-                .list_entries()
-                .expect("trash entries")
-                .is_empty()
-        );
-        assert_eq!(app.status, "cleared 1 trash items");
+        assert!(file_path.exists());
+        assert_eq!(app.status, "restored undo-via-help.txt");
     }
 
     #[test]
@@ -11186,7 +11887,7 @@ mod tests {
     }
 
     #[test]
-    /// 驗證按下 `b` 會先打開書籤功能面板，再用 `s` 自動分配代號存書籤。
+    /// 驗證按下 `b` 會先打開書籤功能面板，再用 `a` 自動分配代號存書籤。
     fn app_bookmark_picker_saves_with_auto_key() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -11206,8 +11907,8 @@ mod tests {
             Some(PendingAction::BookmarkPicker { pane_id: 1 })
         );
 
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
-            .expect("save bookmark");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("add bookmark");
 
         assert_eq!(app.status, format!("bookmark [a] = {}", docs.display()));
         assert!(
@@ -11382,16 +12083,16 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 SMB 連線成功後存下書籤，會把 `smb://...` 寫進 `bookmark.toml`，而不是掛載後的本機路徑。
-    fn app_bookmark_set_persists_smb_location_after_connect() {
+    /// 驗證經由 `goto smb://...` 進入 SMB 後存下書籤，會把 `smb://...` 寫進 `bookmark.toml`，而不是掛載後的本機路徑。
+    fn app_bookmark_set_persists_smb_location_after_goto() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
         let share_docs = mount_root.join("shared").join("docs");
         fs::create_dir_all(&share_docs).expect("share docs");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.connect_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
-            .expect("connect smb");
+        app.goto_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+            .expect("goto smb");
         app.set_bookmark('s').expect("set bookmark");
 
         let bookmark_file =
@@ -11401,8 +12102,8 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 SMB 書籤在跳轉時會自動走 SMB 連線流程，成功後直接切到目標目錄。
-    fn app_jump_to_smb_bookmark_connects_and_enters_target() {
+    /// 驗證 SMB 書籤在跳轉時會自動走 SMB 掛載／進入流程，成功後直接切到目標目錄。
+    fn app_jump_to_smb_bookmark_enters_target() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
         let share_docs = mount_root.join("shared").join("docs");
@@ -11888,53 +12589,6 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 `:trash restore-all` 可一次還原全部 trash 項目。
-    fn app_restore_all_from_trash_recovers_every_entry() {
-        let dir = tempdir().expect("tempdir");
-        let alpha = dir.path().join("alpha.txt");
-        let beta = dir.path().join("beta.txt");
-        fs::write(&alpha, "alpha").expect("alpha");
-        fs::write(&beta, "beta").expect("beta");
-
-        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation(false);
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("confirm alpha");
-        app.start_delete_confirmation(false);
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("confirm beta");
-
-        app.restore_all_from_trash().expect("restore all");
-
-        assert!(alpha.exists());
-        assert!(beta.exists());
-        assert_eq!(app.status, "restored 2 items");
-    }
-
-    #[test]
-    /// 驗證 `:trash clear` 可永久清空全部 trash 項目。
-    fn app_clear_trash_removes_all_entries() {
-        let dir = tempdir().expect("tempdir");
-        let alpha = dir.path().join("alpha.txt");
-        let beta = dir.path().join("beta.txt");
-        fs::write(&alpha, "alpha").expect("alpha");
-        fs::write(&beta, "beta").expect("beta");
-
-        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.start_delete_confirmation(false);
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("confirm alpha");
-        app.start_delete_confirmation(false);
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .expect("confirm beta");
-
-        app.clear_trash().expect("clear trash");
-
-        assert!(app.trash_store.list_entries().expect("entries").is_empty());
-        assert_eq!(app.status, "cleared 2 trash items");
-    }
-
-    #[test]
     /// 驗證 F1 說明面板可以打開，並在面板內用 `f` 進行搜尋。
     fn app_help_panel_supports_filtering() {
         let dir = tempdir().expect("tempdir");
@@ -11965,7 +12619,7 @@ mod tests {
             }
             other => panic!("unexpected pending action: {other:?}"),
         }
-        assert_eq!(app.status, "help: res (3)");
+        assert_eq!(app.status, "help: res (1)");
     }
 
     #[test]
@@ -11995,7 +12649,7 @@ mod tests {
             }
             other => panic!("unexpected pending action: {other:?}"),
         }
-        assert_eq!(app.status, "help search: re (18)");
+        assert_eq!(app.status, "help search: re (16)");
     }
 
     #[test]
@@ -12044,13 +12698,29 @@ mod tests {
     }
 
     #[test]
-    /// 驗證按下 `t` 會直接打開目前 pane 的 task 面板。
-    fn app_t_opens_task_panel() {
+    /// 驗證按下 `t` 會先打開 trash 快捷鍵面板。
+    fn app_t_opens_trash_picker() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
-            .expect("open tasks with t");
+            .expect("open trash picker with t");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPicker { pane_id: 1 })
+        ));
+        assert_eq!(app.status, "trash: choose t/u from the panel");
+    }
+
+    #[test]
+    /// 驗證按下 `T` 會直接打開目前 pane 的 task 面板。
+    fn app_shift_t_opens_task_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
+            .expect("open tasks with T");
 
         assert!(matches!(
             app.pending_action,
@@ -12061,21 +12731,6 @@ mod tests {
             })
         ));
         assert_eq!(app.status, "tasks: empty");
-    }
-
-    #[test]
-    /// 驗證 task 面板已開啟時，再按一次 `t` 會直接關閉回 normal mode。
-    fn app_t_toggles_task_panel_closed() {
-        let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
-            .expect("open tasks with t");
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
-            .expect("close tasks with t");
-
-        assert!(app.pending_action.is_none());
-        assert_eq!(app.status, "normal mode");
     }
 
     #[test]
@@ -12214,7 +12869,7 @@ mod tests {
             .position(|entry| entry.line.command == ":delete")
             .expect("delete help index");
         assert_eq!(delete_entry.line.shortcut, "d");
-        assert!(trash_entry.line.shortcut.is_empty());
+        assert_eq!(trash_entry.line.shortcut, "tt");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.open_help_panel();
@@ -12965,8 +13620,8 @@ mod tests {
     }
 
     #[test]
-    /// 驗證已掛載的 SMB share 可以直接切進目前 pane。
-    fn app_connect_smb_location_enters_mounted_share() {
+    /// 驗證已掛載的 SMB share 可以直接經由 `goto smb://...` 切進目前 pane。
+    fn app_goto_smb_location_enters_mounted_share() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
         let share_root = mount_root.join("shared");
@@ -12974,24 +13629,24 @@ mod tests {
         fs::write(share_root.join("docs").join("report.txt"), "hello").expect("report");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.connect_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
-            .expect("connect smb");
+        app.goto_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+            .expect("goto smb");
 
         let pane = app.current_pane_mut().expect("pane");
         assert_eq!(pane.cwd, share_root.join("docs"));
-        assert_eq!(app.status, "connected smb: smb://192.0.2.10/shared/docs");
+        assert_eq!(app.status, "jumped to smb: smb://192.0.2.10/shared/docs");
     }
 
     #[test]
-    /// 驗證尚未掛載的 SMB share 會先發出系統掛載請求。
-    fn app_connect_smb_location_requests_mount_when_share_missing() {
+    /// 驗證尚未掛載的 SMB share 在 `goto smb://...` 時會先發出系統掛載請求。
+    fn app_goto_smb_location_requests_mount_when_share_missing() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
         fs::create_dir_all(&mount_root).expect("mount root");
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.connect_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
-            .expect("connect smb");
+        app.goto_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+            .expect("goto smb");
 
         assert!(app.pending_launch.is_some());
         assert_eq!(
@@ -14808,5 +15463,51 @@ mod tests {
                 current: 0,
             })
         );
+    }
+
+    #[test]
+    /// 驗證 trash 確認視窗會記住原本所屬的 panel，讓 UI 能畫回同一個列表內。
+    fn trash_confirm_panel_id_returns_source_panel() {
+        let action = TrashConfirmAction::DeleteFromPanel {
+            pane_id: 7,
+            target_ids: vec![String::from("trash-id")],
+            search: PanelSearchState {
+                buffer: String::from("demo"),
+                editing: false,
+            },
+            selected: 2,
+        };
+
+        assert_eq!(trash_confirm_panel_id(&action), Some(7));
+    }
+
+    #[test]
+    /// 驗證 trash 確認視窗也能還原底層列表需要的搜尋與標記狀態。
+    fn trash_confirm_overlay_state_preserves_trash_context() {
+        let pending = PendingAction::ConfirmTrashAction {
+            action: TrashConfirmAction::RestoreFromPanel {
+                pane_id: 3,
+                target_ids: vec![String::from("trash-id")],
+                search: PanelSearchState {
+                    buffer: String::from("abc"),
+                    editing: false,
+                },
+                selected: 2,
+            },
+            target_name: String::from("alpha.txt"),
+            entry_count: 1,
+            marked_ids: vec![String::from("trash-id"), String::from("trash-id-2")],
+            visual_anchor: Some(1),
+        };
+
+        let (selected, search, marked_ids, visual_anchor) =
+            trash_panel_overlay_state_from_pending_action(&Some(pending), 3)
+                .expect("overlay state");
+
+        assert_eq!(selected, 2);
+        assert_eq!(search.buffer, "abc");
+        assert!(!search.editing);
+        assert_eq!(marked_ids.len(), 2);
+        assert_eq!(visual_anchor, Some(1));
     }
 }
