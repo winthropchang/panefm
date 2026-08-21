@@ -81,9 +81,42 @@ pub struct AppConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiConfig {
     pub theme_preset: ThemePreset,
+    pub icons: IconsConfig,
     pub poll_rate: Duration,
     pub preview: PreviewConfig,
     pub dialogs: DialogsConfig,
+}
+
+/// 表示檔案列表圖示的顯示設定。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IconsConfig {
+    /// 是否在檔名左側顯示跨平台 Unicode 圖示。
+    pub enabled: bool,
+    /// 圖示字元風格；`nerd-font` 接近 mature-reference，`ascii` 不依賴特殊字型。
+    pub style: IconStyle,
+}
+
+/// 表示列表圖示所使用的字元集合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconStyle {
+    NerdFont,
+    Ascii,
+}
+
+impl IconStyle {
+    /// 將設定檔中的文字轉成圖示風格。
+    ///
+    /// 參數：
+    /// - `name: &str`，設定檔中的圖示風格名稱。
+    ///
+    /// 回傳：`Option<IconStyle>`，名稱有效時回傳對應風格。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "nerd-font" | "nerdfont" | "nerd" => Some(Self::NerdFont),
+            "ascii" | "plain" => Some(Self::Ascii),
+            _ => None,
+        }
+    }
 }
 
 /// 表示 pane 預設行為相關的設定群組。
@@ -177,7 +210,11 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             ui: UiConfig {
-                theme_preset: ThemePreset::Default,
+                theme_preset: ThemePreset::CatppuccinMocha,
+                icons: IconsConfig {
+                    enabled: true,
+                    style: IconStyle::NerdFont,
+                },
                 poll_rate: Duration::from_millis(150),
                 preview: PreviewConfig {
                     height: 8,
@@ -190,7 +227,7 @@ impl Default for AppConfig {
                     },
                     theme_picker: DialogConfig {
                         width_percent: 42,
-                        height: 8,
+                        height: 20,
                     },
                 },
             },
@@ -229,6 +266,73 @@ pub struct LoadedConfig {
     pub source: Option<PathBuf>,
 }
 
+/// 將目前選取的主題名稱同步寫入設定檔。
+///
+/// 參數：
+/// - `path: &Path`，要更新的 `config.toml` 路徑。
+/// - `preset: ThemePreset`，要保存的主題預設值。
+///
+/// 回傳：`Result<()>`，成功寫入或建立設定檔時回傳 `Ok(())`。
+///
+/// 這個函數只修改 `[ui]` 區塊中的 `theme` 欄位，其他設定、註解與格式都會保留。
+pub fn persist_theme(path: &Path, preset: ThemePreset) -> Result<()> {
+    let theme_line = format!("theme = \"{}\"", preset.name());
+    let contents = if path.exists() {
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut output = String::new();
+    let mut in_ui = false;
+    let mut replaced = false;
+    let mut has_ui = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_ui = trimmed == "[ui]";
+            has_ui |= in_ui;
+        }
+
+        if in_ui && trimmed.starts_with("theme") && trimmed[5..].trim_start().starts_with('=') {
+            let indentation = &line[..line.len() - line.trim_start().len()];
+            output.push_str(indentation);
+            output.push_str(&theme_line);
+            output.push('\n');
+            replaced = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    if !replaced {
+        if has_ui {
+            let mut lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
+            let insert_at = lines
+                .iter()
+                .position(|line| line.trim() == "[ui]")
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            lines.insert(insert_at, theme_line);
+            output = lines.join("\n");
+            output.push('\n');
+        } else {
+            output = format!("[ui]\n{theme_line}\n{output}");
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    }
+    fs::write(path, output)
+        .with_context(|| format!("failed to write config file {}", path.display()))?;
+    Ok(())
+}
+
 /// 表示新版設定檔的原始格式。
 ///
 /// 新版配置會盡量按功能分區，讓未來擴充時不容易失控。
@@ -260,9 +364,17 @@ struct LegacyAppConfigFile {
 #[derive(Debug, Default, Deserialize)]
 struct UiConfigFile {
     theme: Option<String>,
+    icons: Option<IconsConfigFile>,
     poll_rate_ms: Option<u64>,
     preview: Option<PreviewConfigFile>,
     dialog: Option<DialogsConfigFile>,
+}
+
+/// 表示 `[ui.icons]` 在 TOML 中的可選設定欄位。
+#[derive(Debug, Default, Deserialize)]
+struct IconsConfigFile {
+    enabled: Option<bool>,
+    style: Option<String>,
 }
 
 /// 表示 `pane` 區塊的原始設定格式。
@@ -538,6 +650,16 @@ fn apply_ui_config(config: &mut AppConfig, ui: UiConfigFile) -> Result<()> {
         config.ui.poll_rate = Duration::from_millis(poll_rate_ms);
     }
 
+    if let Some(icons) = ui.icons {
+        if let Some(enabled) = icons.enabled {
+            config.ui.icons.enabled = enabled;
+        }
+        if let Some(style) = icons.style {
+            config.ui.icons.style = IconStyle::from_name(&style)
+                .with_context(|| format!("unknown ui.icons.style: {}", style.trim()))?;
+        }
+    }
+
     if let Some(preview) = ui.preview {
         apply_preview_config(&mut config.ui.preview, preview)?;
     }
@@ -754,6 +876,37 @@ mod tests {
     use super::*;
 
     #[test]
+    /// 驗證保存主題時只更新 `[ui]` 的 `theme`，並保留其他設定與註解。
+    fn persist_theme_updates_only_ui_theme() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# keep this comment\n[ui]\ntheme = \"dracula\"\npoll_rate_ms = 90\n\n[pane]\ntheme = \"not-a-ui-theme\"\n",
+        )
+        .expect("write config");
+
+        persist_theme(&path, ThemePreset::Nord).expect("persist theme");
+
+        let contents = fs::read_to_string(path).expect("read config");
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("theme = \"nord\""));
+        assert!(contents.contains("poll_rate_ms = 90"));
+        assert!(contents.contains("[pane]\ntheme = \"not-a-ui-theme\""));
+    }
+
+    #[test]
+    /// 驗證沒有設定檔時保存主題會建立最小可讀的 `config.toml`。
+    fn persist_theme_creates_missing_config() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        persist_theme(&path, ThemePreset::Kanagawa).expect("persist theme");
+
+        assert_eq!(fs::read_to_string(path).expect("read config"), "[ui]\ntheme = \"kanagawa\"\n");
+    }
+
+    #[test]
     /// 驗證當找不到設定檔時，系統會回退到預設設定。
     fn load_config_returns_defaults_when_missing() {
         let dir = tempdir().expect("tempdir");
@@ -774,6 +927,9 @@ mod tests {
 [ui]
 theme = "forest"
 poll_rate_ms = 90
+
+[ui.icons]
+enabled = false
 
 [ui.preview]
 height = 11
@@ -810,7 +966,8 @@ cancel_search_on_leave = false
 
         let loaded = load_config(dir.path()).expect("config");
 
-        assert_eq!(loaded.config.ui.theme_preset, ThemePreset::Forest);
+        assert_eq!(loaded.config.ui.theme_preset, ThemePreset::Everforest);
+        assert!(!loaded.config.ui.icons.enabled);
         assert_eq!(loaded.config.ui.poll_rate, Duration::from_millis(90));
         assert_eq!(loaded.config.ui.preview.height, 11);
         assert_eq!(loaded.config.ui.preview.focus_list_height, 5);
@@ -862,7 +1019,7 @@ height = 9
 
         let loaded = load_config(dir.path()).expect("config");
 
-        assert_eq!(loaded.config.ui.theme_preset, ThemePreset::Ocean);
+        assert_eq!(loaded.config.ui.theme_preset, ThemePreset::Nord);
         assert_eq!(loaded.config.ui.poll_rate, Duration::from_millis(80));
         assert!(loaded.config.pane.show_hidden);
         assert_eq!(loaded.config.pane.default_sort, StartupSort::Extension);
@@ -963,5 +1120,24 @@ fast_move_step = 0
                 .to_string()
                 .contains("navigation.fast_move_step must be greater than 0")
         );
+    }
+
+    #[test]
+    /// 驗證字體設定不再是程式設定的一部分，避免使用者誤以為 TUI 能改外部 Terminal 字體。
+    fn load_config_ignores_removed_font_settings() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[ui.font]
+enabled = true
+family = "Some Font"
+size = 42
+"#,
+        )
+        .expect("config file");
+
+        let loaded = load_config(dir.path()).expect("config should remain compatible");
+        assert_eq!(loaded.config, AppConfig::default());
     }
 }

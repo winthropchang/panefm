@@ -1,12 +1,15 @@
+# terminal-file-manager 的本機設定檔。
+#
+# 這份檔案會優先於預設值讀取；若要停用檔案圖示，將 enabled 改成 false。
+
 [ui]
-theme = "catppuccin-mocha"
+theme = "kanagawa"
 poll_rate_ms = 120
 
 [ui.icons]
-# 是否在檔名左側顯示檔案類型文字圖示。
+# 在檔名左側顯示目錄、程式碼、圖片、壓縮檔等類型文字圖示。
 enabled = true
-# nerd-font 接近 mature-reference 的圖示樣式，需要 Terminal 使用 Nerd Font。
-# ascii 不需要特殊字型，會顯示 [D] [F] [S] [I] [A] [X]。
+# 若 Terminal 沒有 Nerd Font，改成 "ascii" 可避免圖示顯示成方框。
 style = "nerd-font"
 
 [ui.preview]

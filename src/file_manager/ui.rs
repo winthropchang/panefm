@@ -8,7 +8,7 @@ use ratatui::{
 use std::path::Path;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, IconStyle},
     theme::{Theme, ThemePreset},
 };
 
@@ -163,7 +163,7 @@ pub(crate) fn render_pane(
     visual_range: Option<(usize, usize)>,
     panel_state: Option<PaneListState<'_>>,
     theme: Theme,
-    _config: &AppConfig,
+    config: &AppConfig,
     editor_state: Option<InlineEditorState<'_>>,
     picker_state: Option<InlinePickerState<'_>>,
     list_find_buffer: Option<&str>,
@@ -336,12 +336,17 @@ pub(crate) fn render_pane(
             PaneListState::RegexRename { lines, .. } => lines
                 .iter()
                 .map(|line| {
-                    ListItem::new(Line::from(format!(
-                        "{:<22} -> {:<22}  {}",
-                        truncate_text(&line.original_name, 22),
-                        truncate_text(&line.new_name, 22),
-                        line.status
-                    )))
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!(
+                            "{:<22} -> {:<22}  ",
+                            truncate_text(&line.original_name, 22),
+                            truncate_text(&line.new_name, 22)
+                        )),
+                        Span::styled(
+                            line.status.clone(),
+                            regex_rename_status_style(theme, &line.status),
+                        ),
+                    ]))
                 })
                 .collect(),
         }
@@ -370,6 +375,8 @@ pub(crate) fn render_pane(
                         detail_kind,
                         content_width,
                         theme,
+                        config.ui.icons.enabled,
+                        config.ui.icons.style,
                         pane.list_find_query(),
                         find_match_position.filter(|_| entry.0 == pane.selected),
                     ))
@@ -473,6 +480,22 @@ pub(crate) fn render_pane(
     };
 
     editor_cursor.or(panel_cursor)
+}
+
+/// 根據 regex 批次改名預覽狀態套用主題語意色。
+///
+/// 參數：
+/// - `theme: Theme`，目前使用中的主題色盤。
+/// - `status: &str`，預覽列右側的狀態文字。
+///
+/// 回傳：`Style`，供狀態文字直接套用的顏色樣式。
+fn regex_rename_status_style(theme: Theme, status: &str) -> Style {
+    match status {
+        "ready" => theme.success_style(),
+        "unchanged" => theme.muted_style(),
+        "conflict" | "invalid" => theme.danger_style(),
+        _ => Style::default(),
+    }
 }
 
 /// 組合 pane 標題列文字，讓 pane 編號固定顯示在最前面，方便搭配數字切換。
@@ -1080,34 +1103,6 @@ pub(crate) fn render_bookmark_action_picker(
     );
 }
 
-/// 在畫面底部繪製 `t` 系列 trash 快捷鍵面板。
-pub(crate) fn render_trash_action_picker(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    theme: Theme,
-) {
-    render_shortcut_grid_panel(
-        frame,
-        area,
-        theme,
-        " Trash ",
-        &[
-            ShortcutPanelItem {
-                shortcut: "t",
-                label: "open trash list",
-            },
-            ShortcutPanelItem {
-                shortcut: "u",
-                label: "undo latest trash",
-            },
-            ShortcutPanelItem {
-                shortcut: "t / Esc",
-                label: "cancel",
-            },
-        ],
-    );
-}
-
 /// 在畫面底部繪製 `g` 系列命令面板，供 `gg` 與 `gt` 這類兩段式操作共用。
 pub(crate) fn render_go_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
     render_shortcut_grid_panel(
@@ -1131,6 +1126,49 @@ pub(crate) fn render_go_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme
             ShortcutPanelItem {
                 shortcut: "k",
                 label: "desktop",
+            },
+            ShortcutPanelItem {
+                shortcut: "Esc",
+                label: "cancel",
+            },
+        ],
+    );
+}
+
+/// 在畫面底部繪製 `t` 系列命令面板，供主題與 Trash 命令共用。
+///
+/// 參數：
+/// - `frame: &mut ratatui::Frame<'_>`，目前的畫面物件。
+/// - `area: Rect`，可繪製的終端範圍。
+/// - `theme: Theme`，目前使用中的主題色盤。
+///
+/// 回傳：`()`, 直接把快捷鍵說明畫到底部面板。
+pub(crate) fn render_theme_command_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+) {
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Theme / Trash ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "l",
+                label: "theme list",
+            },
+            ShortcutPanelItem {
+                shortcut: "n",
+                label: "theme next",
+            },
+            ShortcutPanelItem {
+                shortcut: "t",
+                label: "trash",
+            },
+            ShortcutPanelItem {
+                shortcut: "u",
+                label: "trash undo",
             },
             ShortcutPanelItem {
                 shortcut: "Esc",
@@ -1456,6 +1494,8 @@ fn render_entry_line(
     detail_kind: SortDetailKind,
     width: usize,
     theme: Theme,
+    icons_enabled: bool,
+    icon_style: IconStyle,
     list_find_query: Option<&str>,
     list_find_position: Option<(usize, usize)>,
 ) -> Line<'static> {
@@ -1468,7 +1508,13 @@ fn render_entry_line(
     } else {
         ""
     };
-    let name = entry.display_name();
+    let icon = if icons_enabled {
+        format!("{} ", entry_icon(entry, icon_style))
+    } else {
+        String::new()
+    };
+    let display_name = entry.display_name();
+    let name = format!("{icon}{display_name}");
     let badge = list_find_position.map(|(current, total)| format!("[{current}/{total}]"));
     let detail = format_sort_detail(entry, detail_kind);
     let badge_len = badge
@@ -1482,7 +1528,15 @@ fn render_entry_line(
         if !marker.is_empty() {
             spans.push(Span::raw(marker.to_string()));
         }
-        spans.extend(highlight_name_spans(&name, list_find_query, theme));
+        if !icon.is_empty() {
+            spans.push(Span::styled(icon, entry_style(entry, theme)));
+        }
+        spans.extend(highlight_name_spans(
+            &display_name,
+            list_find_query,
+            theme,
+            entry_style(entry, theme),
+        ));
         if let Some(badge) = badge {
             spans.push(Span::raw(" ".to_string()));
             spans.push(Span::styled(
@@ -1504,7 +1558,15 @@ fn render_entry_line(
     if !marker.is_empty() {
         spans.push(Span::raw(marker.to_string()));
     }
-    spans.extend(highlight_name_spans(&name, list_find_query, theme));
+    if !icon.is_empty() {
+        spans.push(Span::styled(icon, entry_style(entry, theme)));
+    }
+    spans.extend(highlight_name_spans(
+        &display_name,
+        list_find_query,
+        theme,
+        entry_style(entry, theme),
+    ));
     if let Some(badge) = badge {
         spans.push(Span::raw(" ".to_string()));
         spans.push(Span::styled(
@@ -1522,10 +1584,114 @@ fn render_entry_line(
     Line::from(spans)
 }
 
+/// 根據檔案種類產生列表中的圖示。
+///
+/// 參數：
+/// - `entry: &FileEntry`，目前要顯示的檔案或資料夾。
+///
+/// 回傳：`&'static str`，不依賴 Nerd Font 的跨平台 Unicode 圖示。
+fn entry_icon(entry: &super::entry::FileEntry, style: IconStyle) -> &'static str {
+    if style == IconStyle::Ascii {
+        return ascii_entry_icon(entry);
+    }
+    if entry.is_dir {
+        return "";
+    }
+    match file_category(entry) {
+        FileCategory::Image => "",
+        FileCategory::Archive => "",
+        FileCategory::Source => "",
+        FileCategory::Executable => "",
+        FileCategory::File => "",
+    }
+}
+
+/// 產生不依賴 Nerd Font 的純 ASCII 圖示，供跨平台 fallback 使用。
+fn ascii_entry_icon(entry: &super::entry::FileEntry) -> &'static str {
+    if entry.is_dir {
+        return "[D]";
+    }
+    match file_category(entry) {
+        FileCategory::Image => "[I]",
+        FileCategory::Archive => "[A]",
+        FileCategory::Source => "[S]",
+        FileCategory::Executable => "[X]",
+        FileCategory::File => "[F]",
+    }
+}
+
+/// 表示列表需要區分的檔案類別。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileCategory {
+    File,
+    Executable,
+    Image,
+    Archive,
+    Source,
+}
+
+/// 依照平台可取得的權限與副檔名判斷檔案類別。
+///
+/// Windows 沒有 Unix mode bits，因此會使用常見可執行副檔名作為 fallback。
+fn file_category(entry: &super::entry::FileEntry) -> FileCategory {
+    let extension = entry
+        .path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if entry
+        .unix_mode
+        .is_some_and(|mode| mode & 0o111 != 0)
+        || matches!(extension.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1")
+    {
+        return FileCategory::Executable;
+    }
+    if matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico"
+    ) {
+        return FileCategory::Image;
+    }
+    if matches!(
+        extension.as_str(),
+        "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "tgz"
+    ) {
+        return FileCategory::Archive;
+    }
+    if matches!(
+        extension.as_str(),
+        "rs" | "toml" | "json" | "yaml" | "yml" | "js" | "ts" | "py" | "go"
+            | "c" | "h" | "cpp" | "java" | "swift" | "rb" | "sh"
+    ) {
+        return FileCategory::Source;
+    }
+    FileCategory::File
+}
+
+/// 取得檔案類別對應的主題文字樣式。
+fn entry_style(entry: &super::entry::FileEntry, theme: Theme) -> ratatui::style::Style {
+    if entry.is_dir {
+        return ratatui::style::Style::default().fg(theme.directory);
+    }
+    match file_category(entry) {
+        FileCategory::Executable => ratatui::style::Style::default().fg(theme.executable),
+        FileCategory::Image => ratatui::style::Style::default().fg(theme.image),
+        FileCategory::Archive => ratatui::style::Style::default().fg(theme.archive),
+        FileCategory::Source => ratatui::style::Style::default().fg(theme.source),
+        FileCategory::File => ratatui::style::Style::default(),
+    }
+}
+
 /// 依照目前的 list find 查詢，把檔名切成一般片段與高亮片段。
-fn highlight_name_spans(name: &str, query: Option<&str>, theme: Theme) -> Vec<Span<'static>> {
+fn highlight_name_spans(
+    name: &str,
+    query: Option<&str>,
+    theme: Theme,
+    base_style: ratatui::style::Style,
+) -> Vec<Span<'static>> {
     let Some(query) = query.filter(|value| !value.is_empty()) else {
-        return vec![Span::raw(name.to_string())];
+        return vec![Span::styled(name.to_string(), base_style)];
     };
 
     let lower_name = name.to_lowercase();
@@ -1541,7 +1707,7 @@ fn highlight_name_spans(name: &str, query: Option<&str>, theme: Theme) -> Vec<Sp
         if let Some(prefix) = name.get(byte_start..match_start)
             && !prefix.is_empty()
         {
-            spans.push(Span::raw(prefix.to_string()));
+            spans.push(Span::styled(prefix.to_string(), base_style));
         }
         if let Some(matched) = name.get(match_start..match_end) {
             spans.push(Span::styled(
@@ -1557,11 +1723,11 @@ fn highlight_name_spans(name: &str, query: Option<&str>, theme: Theme) -> Vec<Sp
     if let Some(suffix) = name.get(byte_start..)
         && !suffix.is_empty()
     {
-        spans.push(Span::raw(suffix.to_string()));
+            spans.push(Span::styled(suffix.to_string(), base_style));
     }
 
     if spans.is_empty() {
-        vec![Span::raw(name.to_string())]
+        vec![Span::styled(name.to_string(), base_style)]
     } else {
         spans
     }
@@ -1669,11 +1835,49 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_pane_title, format_permissions_detail, format_size_short};
+    use super::{
+        entry_icon, file_category, format_pane_title, format_permissions_detail, format_size_short,
+        regex_rename_status_style, FileCategory, IconStyle,
+    };
     use std::path::Path;
     use std::time::SystemTime;
 
     use crate::file_manager::entry::FileEntry;
+    use crate::theme::Theme;
+
+    fn test_entry(name: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: Path::new(name).to_path_buf(),
+            is_dir,
+            size: 0,
+            child_count: None,
+            modified: SystemTime::UNIX_EPOCH,
+            created: SystemTime::UNIX_EPOCH,
+            readonly: false,
+            unix_mode: None,
+        }
+    }
+
+    #[test]
+    /// 驗證 regex 預覽右側狀態會依 ready、unchanged 與錯誤類型套用主題顏色。
+    fn regex_rename_status_uses_theme_semantic_colors() {
+        let theme = Theme::default_theme();
+        assert_eq!(regex_rename_status_style(theme, "ready").fg, Some(theme.executable));
+        assert_eq!(regex_rename_status_style(theme, "unchanged").fg, Some(theme.muted));
+        assert_eq!(regex_rename_status_style(theme, "conflict").fg, Some(theme.danger));
+        assert_eq!(regex_rename_status_style(theme, "invalid").fg, Some(theme.danger));
+    }
+
+    #[test]
+    /// 驗證列表會依照目錄與常見副檔名分辨檔案類別與圖示。
+    fn entry_kind_uses_cross_platform_categories() {
+        assert_eq!(entry_icon(&test_entry("src", true), IconStyle::Ascii), "[D]");
+        assert_eq!(file_category(&test_entry("main.rs", false)), FileCategory::Source);
+        assert_eq!(file_category(&test_entry("photo.png", false)), FileCategory::Image);
+        assert_eq!(file_category(&test_entry("backup.zip", false)), FileCategory::Archive);
+        assert_eq!(file_category(&test_entry("tool.exe", false)), FileCategory::Executable);
+    }
 
     #[test]
     /// 驗證大小格式會轉成人類較容易閱讀的單位顯示。
@@ -1959,7 +2163,7 @@ pub(crate) fn render_theme_picker(
         .block(
             Block::default()
                 .title(Line::from(Span::styled(
-                    " Theme Picker ",
+                    " Theme List ",
                     theme.accent_style().add_modifier(Modifier::BOLD),
                 )))
                 .borders(Borders::ALL),

@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui_themes::ThemeName as PaletteThemeName;
 
 /// 表示可被使用者選擇的主題預設名稱。
 ///
@@ -6,20 +7,46 @@ use ratatui::style::{Color, Modifier, Style};
 /// 讓命令模式、設定檔與主題選擇視窗都能用相同名稱操作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemePreset {
-    Default,
-    Forest,
-    Ocean,
+    Dracula,
+    OneDarkPro,
+    Nord,
+    CatppuccinMocha,
+    CatppuccinLatte,
+    GruvboxDark,
+    GruvboxLight,
+    TokyoNight,
+    SolarizedDark,
+    SolarizedLight,
+    MonokaiPro,
+    RosePine,
+    Kanagawa,
+    Everforest,
+    Cyberpunk,
+    MidnightCommander,
 }
 
 impl ThemePreset {
     /// 內建所有主題預設值的固定清單。
     ///
     /// 參數：無。
-    /// 回傳：`[ThemePreset; 3]`，依序列出所有可用主題。
-    pub const ALL: [ThemePreset; 3] = [
-        ThemePreset::Default,
-        ThemePreset::Forest,
-        ThemePreset::Ocean,
+    /// 回傳：`[ThemePreset; 16]`，依序列出所有可用主題。
+    pub const ALL: [ThemePreset; 16] = [
+        ThemePreset::Dracula,
+        ThemePreset::OneDarkPro,
+        ThemePreset::Nord,
+        ThemePreset::CatppuccinMocha,
+        ThemePreset::CatppuccinLatte,
+        ThemePreset::GruvboxDark,
+        ThemePreset::GruvboxLight,
+        ThemePreset::TokyoNight,
+        ThemePreset::SolarizedDark,
+        ThemePreset::SolarizedLight,
+        ThemePreset::MonokaiPro,
+        ThemePreset::RosePine,
+        ThemePreset::Kanagawa,
+        ThemePreset::Everforest,
+        ThemePreset::Cyberpunk,
+        ThemePreset::MidnightCommander,
     ];
 
     /// 取得主題預設值對應的字串名稱。
@@ -28,12 +55,8 @@ impl ThemePreset {
     /// - `self: ThemePreset`，目前的主題預設值。
     ///
     /// 回傳：`&'static str`，可用於命令模式或設定檔的名稱。
-    pub const fn name(self) -> &'static str {
-        match self {
-            ThemePreset::Default => "default",
-            ThemePreset::Forest => "forest",
-            ThemePreset::Ocean => "ocean",
-        }
+    pub fn name(self) -> &'static str {
+        PaletteThemeName::from(self).slug()
     }
 
     /// 依照字串名稱嘗試解析主題預設值。
@@ -45,11 +68,12 @@ impl ThemePreset {
     /// - `Some(...)` 代表成功對應到主題。
     /// - `None` 代表輸入名稱不在支援清單內。
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "default" => Some(Self::Default),
-            "forest" => Some(Self::Forest),
-            "ocean" => Some(Self::Ocean),
-            _ => None,
+        let normalized = name.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "default" => Some(Self::CatppuccinMocha),
+            "forest" => Some(Self::Everforest),
+            "ocean" => Some(Self::Nord),
+            _ => normalized.parse::<PaletteThemeName>().ok().map(Self::from),
         }
     }
 
@@ -60,11 +84,25 @@ impl ThemePreset {
     ///
     /// 回傳：`ThemePreset`，依照固定順序切換後的主題。
     pub const fn next(self) -> Self {
-        match self {
-            ThemePreset::Default => ThemePreset::Forest,
-            ThemePreset::Forest => ThemePreset::Ocean,
-            ThemePreset::Ocean => ThemePreset::Default,
-        }
+        let index = match self {
+            ThemePreset::Dracula => 0,
+            ThemePreset::OneDarkPro => 1,
+            ThemePreset::Nord => 2,
+            ThemePreset::CatppuccinMocha => 3,
+            ThemePreset::CatppuccinLatte => 4,
+            ThemePreset::GruvboxDark => 5,
+            ThemePreset::GruvboxLight => 6,
+            ThemePreset::TokyoNight => 7,
+            ThemePreset::SolarizedDark => 8,
+            ThemePreset::SolarizedLight => 9,
+            ThemePreset::MonokaiPro => 10,
+            ThemePreset::RosePine => 11,
+            ThemePreset::Kanagawa => 12,
+            ThemePreset::Everforest => 13,
+            ThemePreset::Cyberpunk => 14,
+            ThemePreset::MidnightCommander => 15,
+        };
+        Self::ALL[(index + 1) % Self::ALL.len()]
     }
 }
 
@@ -84,6 +122,11 @@ pub struct Theme {
     pub preview_current_line_bg: Color,
     pub preview_current_line_fg: Color,
     pub danger: Color,
+    pub directory: Color,
+    pub executable: Color,
+    pub image: Color,
+    pub archive: Color,
+    pub source: Color,
 }
 
 impl Theme {
@@ -108,6 +151,11 @@ impl Theme {
         preview_current_line_bg: Color,
         preview_current_line_fg: Color,
         danger: Color,
+        directory: Color,
+        executable: Color,
+        image: Color,
+        archive: Color,
+        source: Color,
     ) -> Self {
         Self {
             accent,
@@ -120,6 +168,11 @@ impl Theme {
             preview_current_line_bg,
             preview_current_line_fg,
             danger,
+            directory,
+            executable,
+            image,
+            archive,
+            source,
         }
     }
 
@@ -127,57 +180,24 @@ impl Theme {
     ///
     /// 參數：無。
     /// 回傳：`Theme`，作為程式啟動時的預設色盤。
-    pub const fn default_theme() -> Self {
-        Self::new(
-            Color::Yellow,
-            Color::Green,
-            Color::DarkGray,
-            Color::Gray,
-            Color::Black,
-            Color::Yellow,
-            Color::Rgb(255, 0, 0),
-            Color::Rgb(90, 84, 28),
-            Color::Black,
-            Color::LightRed,
-        )
+    pub fn default_theme() -> Self {
+        Self::from(ThemePreset::CatppuccinMocha)
     }
 
     /// 建立偏綠色調的森林主題。
     ///
     /// 參數：無。
     /// 回傳：`Theme`，適合較自然風格的配色。
-    pub const fn forest_theme() -> Self {
-        Self::new(
-            Color::LightGreen,
-            Color::Green,
-            Color::Gray,
-            Color::Rgb(90, 90, 90),
-            Color::White,
-            Color::Yellow,
-            Color::Rgb(255, 0, 0),
-            Color::Rgb(82, 92, 44),
-            Color::Black,
-            Color::LightRed,
-        )
+    pub fn forest_theme() -> Self {
+        Self::from(ThemePreset::Everforest)
     }
 
     /// 建立偏藍色調的海洋主題。
     ///
     /// 參數：無。
     /// 回傳：`Theme`，適合較冷色與清爽風格的配色。
-    pub const fn ocean_theme() -> Self {
-        Self::new(
-            Color::LightCyan,
-            Color::Cyan,
-            Color::Gray,
-            Color::Rgb(70, 80, 95),
-            Color::White,
-            Color::Yellow,
-            Color::Rgb(255, 0, 0),
-            Color::Rgb(88, 88, 42),
-            Color::Black,
-            Color::LightRed,
-        )
+    pub fn ocean_theme() -> Self {
+        Self::from(ThemePreset::Nord)
     }
 
     /// 產生強調色對應的文字樣式。
@@ -245,6 +265,26 @@ impl Theme {
             .fg(self.danger)
             .add_modifier(Modifier::BOLD)
     }
+
+    /// 產生錯誤或無法執行通知使用的文字樣式。
+    ///
+    /// 參數：
+    /// - `self: Theme`，目前使用中的主題色盤。
+    ///
+    /// 回傳：`Style`，使用目前主題定義的危險色，讓錯誤在狀態列中容易辨識。
+    pub fn danger_style(self) -> Style {
+        Style::default().fg(self.danger)
+    }
+
+    /// 產生成功或可套用狀態使用的文字樣式。
+    ///
+    /// 參數：
+    /// - `self: Theme`，目前使用中的主題色盤。
+    ///
+    /// 回傳：`Style`，使用主題提供的成功色，讓可執行項目容易辨識。
+    pub fn success_style(self) -> Style {
+        Style::default().fg(self.executable)
+    }
 }
 
 /// 將主題預設值轉成對應的實際色盤。
@@ -261,10 +301,82 @@ impl From<ThemePreset> for Theme {
     ///
     /// 回傳：`Theme`，對應的色盤資料。
     fn from(value: ThemePreset) -> Self {
+        let palette = PaletteThemeName::from(value).palette();
+        Self::new(
+            palette.accent,
+            palette.info,
+            palette.muted,
+            palette.selection,
+            palette.fg,
+            palette.warning,
+            palette.error,
+            palette.selection,
+            palette.fg,
+            palette.error,
+            palette.info,
+            palette.success,
+            palette.secondary,
+            palette.warning,
+            palette.accent,
+        )
+    }
+}
+
+/// 將本專案的主題識別值轉成外部色盤套件使用的主題名稱。
+///
+/// 參數：
+/// - `value: ThemePreset`，本專案目前選取的主題。
+///
+/// 回傳：`PaletteThemeName`，由 `ratatui-themes` 提供的成熟色盤識別值。
+impl From<ThemePreset> for PaletteThemeName {
+    fn from(value: ThemePreset) -> Self {
         match value {
-            ThemePreset::Default => Theme::default_theme(),
-            ThemePreset::Forest => Theme::forest_theme(),
-            ThemePreset::Ocean => Theme::ocean_theme(),
+            ThemePreset::Dracula => Self::Dracula,
+            ThemePreset::OneDarkPro => Self::OneDarkPro,
+            ThemePreset::Nord => Self::Nord,
+            ThemePreset::CatppuccinMocha => Self::CatppuccinMocha,
+            ThemePreset::CatppuccinLatte => Self::CatppuccinLatte,
+            ThemePreset::GruvboxDark => Self::GruvboxDark,
+            ThemePreset::GruvboxLight => Self::GruvboxLight,
+            ThemePreset::TokyoNight => Self::TokyoNight,
+            ThemePreset::SolarizedDark => Self::SolarizedDark,
+            ThemePreset::SolarizedLight => Self::SolarizedLight,
+            ThemePreset::MonokaiPro => Self::MonokaiPro,
+            ThemePreset::RosePine => Self::RosePine,
+            ThemePreset::Kanagawa => Self::Kanagawa,
+            ThemePreset::Everforest => Self::Everforest,
+            ThemePreset::Cyberpunk => Self::Cyberpunk,
+            ThemePreset::MidnightCommander => Self::MidnightCommander,
+        }
+    }
+}
+
+/// 將外部色盤套件的主題名稱轉回本專案使用的識別值。
+///
+/// 參數：
+/// - `value: PaletteThemeName`，由 `ratatui-themes` 解析出的主題名稱。
+///
+/// 回傳：`ThemePreset`，本專案可儲存、切換與渲染的主題識別值。
+impl From<PaletteThemeName> for ThemePreset {
+    fn from(value: PaletteThemeName) -> Self {
+        match value {
+            PaletteThemeName::Dracula => Self::Dracula,
+            PaletteThemeName::OneDarkPro => Self::OneDarkPro,
+            PaletteThemeName::Nord => Self::Nord,
+            PaletteThemeName::CatppuccinMocha => Self::CatppuccinMocha,
+            PaletteThemeName::CatppuccinLatte => Self::CatppuccinLatte,
+            PaletteThemeName::GruvboxDark => Self::GruvboxDark,
+            PaletteThemeName::GruvboxLight => Self::GruvboxLight,
+            PaletteThemeName::TokyoNight => Self::TokyoNight,
+            PaletteThemeName::SolarizedDark => Self::SolarizedDark,
+            PaletteThemeName::SolarizedLight => Self::SolarizedLight,
+            PaletteThemeName::MonokaiPro => Self::MonokaiPro,
+            PaletteThemeName::RosePine => Self::RosePine,
+            PaletteThemeName::Kanagawa => Self::Kanagawa,
+            PaletteThemeName::Everforest => Self::Everforest,
+            PaletteThemeName::Cyberpunk => Self::Cyberpunk,
+            PaletteThemeName::MidnightCommander => Self::MidnightCommander,
+            _ => Self::Dracula,
         }
     }
 }
@@ -302,5 +414,13 @@ mod tests {
         for preset in ThemePreset::ALL {
             assert_eq!(ThemePreset::from_name(preset.name()), Some(preset));
         }
+    }
+
+    #[test]
+    /// 驗證舊版設定名稱仍能對應到新的成熟主題，避免更新後既有設定失效。
+    fn legacy_theme_names_remain_compatible() {
+        assert_eq!(ThemePreset::from_name("default"), Some(ThemePreset::CatppuccinMocha));
+        assert_eq!(ThemePreset::from_name("forest"), Some(ThemePreset::Everforest));
+        assert_eq!(ThemePreset::from_name("ocean"), Some(ThemePreset::Nord));
     }
 }

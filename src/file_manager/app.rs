@@ -16,13 +16,14 @@ use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 use regex::Regex;
 
 use crate::{
-    config::{AppConfig, LoadedConfig, StartupSort},
+    config::{AppConfig, LoadedConfig, StartupSort, persist_theme},
     theme::{Theme, ThemePreset},
 };
 
@@ -53,8 +54,9 @@ use super::{
         TrashPanelLine, ZoxidePanelLine, render_bookmark_action_picker, render_bookmark_picker,
         render_command_palette, render_confirm_dialog, render_filter_input,
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
-        render_paste_overwrite_dialog, render_preview_search_input, render_theme_picker,
-        render_trash_action_picker, render_trash_confirm_dialog, render_window_picker,
+        render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
+        render_theme_picker,
+        render_trash_confirm_dialog, render_window_picker,
         render_zoxide_picker,
     },
     zoxide::{add_directory_to_zoxide, query_zoxide_directories},
@@ -301,9 +303,6 @@ pub(crate) enum PendingAction {
     GoPicker {
         pane_id: usize,
     },
-    TrashPicker {
-        pane_id: usize,
-    },
     WindowPicker {
         pane_id: usize,
     },
@@ -312,6 +311,9 @@ pub(crate) enum PendingAction {
     },
     ThemePicker {
         selected: usize,
+    },
+    ThemeCommandPicker {
+        pane_id: usize,
     },
     TrashPanel {
         pane_id: usize,
@@ -385,6 +387,7 @@ pub(crate) enum PendingAction {
 #[derive(Debug)]
 pub(crate) struct App {
     pub(crate) config: AppConfig,
+    pub(crate) config_source: PathBuf,
     pub(crate) theme: Theme,
     pub(crate) theme_preset: ThemePreset,
     pub(crate) trash_store: TrashStore,
@@ -453,6 +456,9 @@ impl App {
     pub(crate) fn new(cwd: PathBuf, loaded_config: LoadedConfig) -> io::Result<Self> {
         let trash_store = TrashStore::new(&cwd)?;
         let LoadedConfig { config, source } = loaded_config;
+        let config_source = source
+            .clone()
+            .unwrap_or_else(|| cwd.join("config.toml"));
         let bookmark_store = BookmarkStore::load(bookmark_file_path(&cwd, source.as_deref()))
             .map_err(|error| io::Error::other(error.to_string()))?;
         let _ = add_directory_to_zoxide(&cwd);
@@ -468,6 +474,7 @@ impl App {
 
         Ok(Self {
             config,
+            config_source,
             theme: theme_preset.into(),
             theme_preset,
             trash_store,
@@ -687,7 +694,7 @@ impl App {
             self.pending_y = false;
             return Ok(true);
         }
-        if key_matches_shifted_letter(&key, 'V') {
+        if key_matches_plain_letter(&key, 'v') || key_matches_shifted_letter(&key, 'V') {
             self.open_visual_selection()?;
             self.pending_g = false;
             self.pending_y = false;
@@ -1032,7 +1039,7 @@ impl App {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.pending_y = false;
-                self.open_trash_picker();
+                self.open_theme_command_picker();
                 true
             }
             _ if key_matches_shifted_letter(&key, 'T') => {
@@ -1239,7 +1246,7 @@ impl App {
         if self.capture_pending_count_digit(&key) {
             return Ok(true);
         }
-        if key_matches_shifted_letter(&key, 'V') {
+        if key_matches_plain_letter(&key, 'v') || key_matches_shifted_letter(&key, 'V') {
             self.clear_pending_count();
             self.commit_visual_selection()?;
             return Ok(true);
@@ -1894,6 +1901,13 @@ impl App {
                 target_name,
                 permanent,
             } => match key.code {
+                _ if key_matches_plain_letter(&key, 'd') => {
+                    self.status = if permanent {
+                        format!("delete cancelled: {target_name}")
+                    } else {
+                        format!("trash cancelled: {target_name}")
+                    };
+                }
                 _ if key_matches_letter_any_case(&key, 'y') => {
                     self.confirm_delete(pane_id, &target_name, permanent)?;
                 }
@@ -1956,6 +1970,20 @@ impl App {
                 marked_ids,
                 visual_anchor,
             } => match key.code {
+                _ if key_matches_plain_letter(&key, 'd')
+                    && matches!(&action, TrashConfirmAction::DeleteFromPanel { .. }) =>
+                {
+                    self.pending_action = Some(trash_panel_pending_action_from_confirm_action(
+                        &action,
+                        marked_ids,
+                        visual_anchor,
+                    ));
+                    self.status = trash_confirm_cancelled_status(
+                        &action,
+                        &target_name,
+                        entry_count,
+                    );
+                }
                 _ if key_matches_letter_any_case(&key, 'y') || key.code == KeyCode::Enter => {
                     self.confirm_trash_action(action, target_name, entry_count)?;
                 }
@@ -2034,7 +2062,7 @@ impl App {
                     self.status = String::from("go: choose g/t/d/k from the panel");
                 }
             },
-            PendingAction::TrashPicker { pane_id } => match key.code {
+            PendingAction::ThemeCommandPicker { pane_id } => match key.code {
                 _ if key_matches_plain_letter(&key, 't') => {
                     self.focused_pane = pane_id;
                     self.open_trash_panel()?;
@@ -2043,6 +2071,12 @@ impl App {
                     self.focused_pane = pane_id;
                     self.restore_latest_from_trash()?;
                 }
+                _ if key_matches_plain_letter(&key, 'l') => {
+                    self.open_theme_picker();
+                }
+                _ if key_matches_plain_letter(&key, 'n') => {
+                    self.cycle_theme();
+                }
                 KeyCode::Esc => {
                     self.status = String::from("normal mode");
                 }
@@ -2050,8 +2084,8 @@ impl App {
                     self.status = String::from("normal mode");
                 }
                 _ => {
-                    self.pending_action = Some(PendingAction::TrashPicker { pane_id });
-                    self.status = String::from("trash: choose t/u from the panel");
+                    self.pending_action = Some(PendingAction::ThemeCommandPicker { pane_id });
+                    self.status = String::from("theme/trash: choose l/n/t/u from the panel");
                 }
             },
             PendingAction::SortPicker { pane_id } => match key.code {
@@ -2336,7 +2370,7 @@ impl App {
                         );
                         return Ok(true);
                     }
-                    if key_matches_shifted_letter(&key, 'V') {
+                    if key_matches_plain_letter(&key, 'v') || key_matches_shifted_letter(&key, 'V') {
                         self.pending_g = false;
                         if let Some(anchor) = visual_anchor.take() {
                             let added = self.commit_trash_visual_selection(
@@ -4578,7 +4612,7 @@ impl App {
             "trash undo" => self.restore_latest_from_trash()?,
             "delete" => self.start_delete_confirmation(false),
             "delete!" | "delete-permanently" => self.start_delete_confirmation(true),
-            "theme" => self.open_theme_picker(),
+            "theme list" => self.open_theme_picker(),
             "theme next" => self.cycle_theme(),
             "panel" | "pane" => {
                 self.status = format!(
@@ -4588,7 +4622,7 @@ impl App {
             }
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
-            "rename-regex" => {
+            "rename-regex" | "reg" => {
                 self.status = String::from("usage: rename-regex <pattern> <replace>");
             }
             "" => self.status = String::from("normal mode"),
@@ -4599,7 +4633,10 @@ impl App {
                     self.change_directory_from_command(path.trim())?;
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;
-                } else if let Some(args) = other.strip_prefix("rename-regex ") {
+                } else if let Some(args) = other
+                    .strip_prefix("rename-regex ")
+                    .or_else(|| other.strip_prefix("reg "))
+                {
                     self.start_regex_rename_from_command(args)?;
                 } else if let Some(args) = other.strip_prefix("move-panel ") {
                     self.move_selected_to_pane_id(args.trim())?;
@@ -4876,12 +4913,15 @@ impl App {
         Ok(())
     }
 
-    /// 打開 `t` 系列快捷鍵面板，集中顯示 trash 相關操作入口。
-    pub(crate) fn open_trash_picker(&mut self) {
-        self.pending_action = Some(PendingAction::TrashPicker {
+    /// 打開 `t` 系列命令面板，讓使用者選擇主題或 Trash 功能。
+    ///
+    /// 參數：無，功能固定作用於目前取得焦點的 panel。
+    /// 回傳：`()`, 只更新目前的互動狀態與提示文字。
+    pub(crate) fn open_theme_command_picker(&mut self) {
+        self.pending_action = Some(PendingAction::ThemeCommandPicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("trash: choose t/u from the panel");
+        self.status = String::from("theme/trash: choose l/n/t/u from the panel");
     }
 
     /// 打開 F1 功能說明面板，支援 Vim 式滾動與面板內搜尋。
@@ -5608,8 +5648,8 @@ impl App {
                 ..
             } => trash_confirm_status(action, target_name, *entry_count),
             PendingAction::GoPicker { .. } => String::from("go: choose g/t/d/k from the panel"),
-            PendingAction::TrashPicker { .. } => {
-                String::from("trash: choose t/u from the panel")
+            PendingAction::ThemeCommandPicker { .. } => {
+                String::from("theme/trash: choose l/n/t/u from the panel")
             }
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::WindowPicker { .. } => {
@@ -5720,7 +5760,15 @@ impl App {
     pub(crate) fn apply_theme(&mut self, preset: ThemePreset) {
         self.theme_preset = preset;
         self.theme = preset.into();
-        self.status = format!("theme: {}", preset.name());
+        self.config.ui.theme_preset = preset;
+        match persist_theme(&self.config_source, preset) {
+            Ok(()) => {
+                self.status = format!("theme: {}", preset.name());
+            }
+            Err(error) => {
+                self.status = format!("theme: {} (save failed: {error})", preset.name());
+            }
+        }
     }
 
     /// 開始重新命名流程，建立一個待輸入的新名稱互動。
@@ -8156,12 +8204,14 @@ impl App {
             Span::styled("b", self.theme.accent_style()),
             Span::raw(" bookmark  "),
             Span::styled("t", self.theme.accent_style()),
+            Span::raw(" theme/trash  "),
+            Span::styled("T", self.theme.accent_style()),
             Span::raw(" tasks  "),
             Span::styled("~ / F1", self.theme.accent_style()),
             Span::raw(" help  "),
             Span::styled("'", self.theme.accent_style()),
             Span::raw(" jump  "),
-            Span::styled("V", self.theme.accent_style()),
+            Span::styled("v", self.theme.accent_style()),
             Span::raw(" visual mark  "),
             Span::styled("y", self.theme.accent_style()),
             Span::raw(" file copy  "),
@@ -8221,7 +8271,17 @@ impl App {
         } else {
             self.status.clone()
         };
-        frame.render_widget(Paragraph::new(status_text), outer[2]);
+        let status_style = if self.command_mode {
+            Style::default()
+        } else if status_is_error(&status_text) {
+            self.theme.danger_style()
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(status_text).style(status_style),
+            outer[2],
+        );
 
         if self.command_mode
             && let Some(area) = pane_rects.get(&self.focused_pane)
@@ -8326,8 +8386,8 @@ impl App {
             Some(PendingAction::GoPicker { .. }) => {
                 render_go_picker(frame, frame.area(), self.theme);
             }
-            Some(PendingAction::TrashPicker { .. }) => {
-                render_trash_action_picker(frame, frame.area(), self.theme);
+            Some(PendingAction::ThemeCommandPicker { .. }) => {
+                render_theme_command_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::SortPicker { .. }) => {
                 super::ui::render_sort_picker(frame, frame.area(), self.theme);
@@ -9120,6 +9180,34 @@ fn zoxide_list_status(query: &str, count: usize, selected: usize, editing: bool)
     }
 }
 
+/// 判斷狀態列文字是否代表錯誤或目前操作無法執行。
+///
+/// 參數：
+/// - `status: &str`，目前要顯示在畫面底部的狀態訊息。
+///
+/// 回傳：`bool`。
+/// - `true` 代表應使用主題的危險色顯示。
+/// - `false` 代表一般通知，維持預設文字顏色。
+///
+/// 這裡集中判斷訊息前綴，避免在每一個產生錯誤的操作中額外傳遞 UI 顏色狀態。
+fn status_is_error(status: &str) -> bool {
+    let normalized = status.trim().to_ascii_lowercase();
+    [
+        "error",
+        "failed",
+        "invalid",
+        "usage:",
+        "unknown",
+        "cannot",
+        "nothing selected",
+        "panel no longer exists",
+        "rename-regex: resolve conflicts",
+        "rename-regex: nothing to apply",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
 /// 描述 help 面板中某一列按下 Enter 後要執行的行為。
 #[derive(Clone, Copy)]
 enum HelpAction {
@@ -9201,7 +9289,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":rename-regex",
             "R",
-            "對目前選取或標記項目建立 regex 批次改名預覽，Enter 套用、Esc 取消",
+            "對目前選取或標記項目建立 regex 批次改名預覽；也可使用 :reg，預覽顯示 ready 才能套用",
             HelpAction::Command("rename-regex"),
         ),
         help_entry(
@@ -9553,14 +9641,14 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("only"),
         ),
         help_entry(
-            ":theme",
-            "",
-            "打開主題選擇面板",
-            HelpAction::Command("theme"),
+            ":theme list",
+            "tl",
+            "打開主題列表；游標會停在目前使用中的主題",
+            HelpAction::Command("theme list"),
         ),
         help_entry(
             ":theme next",
-            "",
+            "tn",
             "直接切到下一個主題",
             HelpAction::Command("theme next"),
         ),
@@ -9636,7 +9724,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(":sort random", ",r", "隨機排序目前列表", HelpAction::Sort),
         help_entry(":hidden", ".", "切換是否顯示隱藏檔", HelpAction::Hidden),
-        help_entry(":visual", "V", "進入視覺範圍標記模式", HelpAction::Visual),
+        help_entry(":visual", "v", "進入視覺範圍標記模式，使用 j/k 移動，再按 v 或 Esc 結束", HelpAction::Visual),
         help_entry(
             ":quit",
             "q",
@@ -10447,6 +10535,17 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{fs, thread, time::Duration};
 
+    #[test]
+    /// 驗證狀態列只會把錯誤類訊息判斷為危險色，一般通知不會被誤標紅。
+    fn status_is_error_distinguishes_errors_from_notifications() {
+        assert!(super::status_is_error("failed to open file"));
+        assert!(super::status_is_error("usage: reg <pattern> <replace>"));
+        assert!(super::status_is_error("rename-regex: resolve conflicts before apply"));
+        assert!(!super::status_is_error("opened directory"));
+        assert!(!super::status_is_error("rename-regex: renamed 2 items"));
+        assert!(!super::status_is_error("trash cancelled: note.txt"));
+    }
+
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn default_loaded_config() -> LoadedConfig {
@@ -11252,6 +11351,23 @@ mod tests {
         assert!(!file_path.exists());
         assert!(app.pending_action.is_none());
         assert_eq!(app.status, "trashed delete-me.txt");
+    }
+
+    #[test]
+    /// 驗證刪除確認視窗再次按 `d` 會關閉視窗，而不會執行刪除或移入 trash。
+    fn app_delete_confirmation_d_closes_without_deleting() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("keep-me.txt");
+        fs::write(&file_path, "hello").expect("file");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.start_delete_confirmation(false);
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("close delete confirmation");
+
+        assert!(file_path.exists());
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "trash cancelled: keep-me.txt");
     }
 
     #[test]
@@ -12698,19 +12814,70 @@ mod tests {
     }
 
     #[test]
-    /// 驗證按下 `t` 會先打開 trash 快捷鍵面板。
-    fn app_t_opens_trash_picker() {
+    /// 驗證按下 `t` 會先打開 `t` 系列快捷鍵面板。
+    fn app_t_opens_theme_command_picker() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
-            .expect("open trash picker with t");
+            .expect("open theme command picker with t");
 
         assert!(matches!(
             app.pending_action,
-            Some(PendingAction::TrashPicker { pane_id: 1 })
+            Some(PendingAction::ThemeCommandPicker { pane_id: 1 })
         ));
-        assert_eq!(app.status, "trash: choose t/u from the panel");
+        assert_eq!(app.status, "theme/trash: choose l/n/t/u from the panel");
+    }
+
+    #[test]
+    /// 驗證 `tt` 會直接進入 Trash 列表，不再多開一層選單。
+    fn app_tt_opens_trash_panel_directly() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open t picker");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open trash panel");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::TrashPanel { pane_id: 1, .. })
+        ));
+    }
+
+    #[test]
+    /// 驗證 `tl` 會從 `t` 系列面板打開標題為 Theme List 的主題列表。
+    fn app_tl_opens_theme_list() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open t picker");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("open theme list");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ThemePicker { selected: 3 })
+        ));
+    }
+
+    #[test]
+    /// 驗證 `tn` 會從 `t` 系列面板切換下一個主題並保存設定。
+    fn app_tn_cycles_theme() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open t picker");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("cycle theme");
+
+        assert_eq!(app.theme_preset, ThemePreset::CatppuccinLatte);
+        assert!(std::fs::read_to_string(dir.path().join("config.toml"))
+            .expect("read config")
+            .contains("theme = \"catppuccin-latte\""));
     }
 
     #[test]
@@ -12895,9 +13062,9 @@ mod tests {
 
         app.cycle_theme();
 
-        assert_eq!(app.theme_preset, ThemePreset::Forest);
-        assert_eq!(app.theme, ThemePreset::Forest.into());
-        assert_eq!(app.status, "theme: forest");
+        assert_eq!(app.theme_preset, ThemePreset::CatppuccinLatte);
+        assert_eq!(app.theme, ThemePreset::CatppuccinLatte.into());
+        assert_eq!(app.status, "theme: catppuccin-latte");
     }
 
     #[test]
@@ -12910,7 +13077,7 @@ mod tests {
 
         assert_eq!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 0 })
+            Some(PendingAction::ThemePicker { selected: 3 })
         );
     }
 
@@ -12922,9 +13089,9 @@ mod tests {
 
         app.set_theme_by_name("ocean");
 
-        assert_eq!(app.theme_preset, ThemePreset::Ocean);
-        assert_eq!(app.theme, ThemePreset::Ocean.into());
-        assert_eq!(app.status, "theme: ocean");
+        assert_eq!(app.theme_preset, ThemePreset::Nord);
+        assert_eq!(app.theme, ThemePreset::Nord.into());
+        assert_eq!(app.status, "theme: nord");
     }
 
     #[test]
@@ -12937,9 +13104,9 @@ mod tests {
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("apply theme");
 
-        assert_eq!(app.theme_preset, ThemePreset::Ocean);
-        assert_eq!(app.theme, ThemePreset::Ocean.into());
-        assert_eq!(app.status, "theme: ocean");
+        assert_eq!(app.theme_preset, ThemePreset::Nord);
+        assert_eq!(app.theme, ThemePreset::Nord.into());
+        assert_eq!(app.status, "theme: nord");
     }
 
     #[test]
@@ -12957,8 +13124,52 @@ mod tests {
         app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
             .expect("apply theme with l");
-        assert_eq!(app.theme_preset, ThemePreset::Ocean);
-        assert_eq!(app.status, "theme: ocean");
+        assert_eq!(app.theme_preset, ThemePreset::Nord);
+        assert_eq!(app.status, "theme: nord");
+    }
+
+    #[test]
+    /// 驗證主題選擇視窗支援 `j/k` 上下移動，且索引會停在有效範圍內。
+    fn app_theme_picker_supports_j_and_k_navigation() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::ThemePicker { selected: 3 });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::ThemePicker { selected: 4 })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("move up");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::ThemePicker { selected: 3 })
+        );
+    }
+
+    #[test]
+    /// 驗證主題選擇視窗支援 `Ctrl-d/u` 半頁移動，方便快速瀏覽完整主題清單。
+    fn app_theme_picker_supports_ctrl_page_navigation() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::ThemePicker { selected: 0 });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("move one page down");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::ThemePicker { selected: 10 })
+        );
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("move one page up");
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::ThemePicker { selected: 0 })
+        );
     }
 
     #[test]
@@ -13093,6 +13304,35 @@ mod tests {
         assert!(dir.path().join("file_alpha.md").exists());
         assert!(dir.path().join("file_beta.md").exists());
         assert_eq!(app.status, "rename-regex: renamed 2 items");
+    }
+
+    #[test]
+    /// 驗證從命令輸入介面送出 `reg` 後，預覽面板再次按 Enter 會實際完成改名。
+    fn app_regex_rename_command_ui_enter_applies_preview() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("alpha.txt");
+        let target = dir.path().join("alpha.md");
+        fs::write(&source, "a").expect("source");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT))
+            .expect("open regex command");
+        assert!(app.command_mode);
+        app.command_buffer = String::from("reg '^(.*)\\.txt$' '$1.md'");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("submit regex command");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::RegexRename { .. })
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("apply regex preview");
+
+        assert!(!source.exists());
+        assert!(target.exists());
+        assert_eq!(app.status, "rename-regex: renamed 1 item");
     }
 
     #[test]
@@ -14751,6 +14991,25 @@ mod tests {
         assert!(app.visual_selection.is_none());
         assert_eq!(pane.marked_count(), 3);
         assert_eq!(app.status, "marked 3 items");
+    }
+
+    #[test]
+    /// 驗證小寫 `v` 可以進入、移動並結束 visual selection。
+    fn app_lowercase_v_controls_visual_selection() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("open visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend visual");
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("close visual");
+
+        assert!(app.visual_selection.is_none());
+        assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 2);
     }
 
     #[test]

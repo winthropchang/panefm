@@ -18,7 +18,7 @@ cargo run
 
 執行時會自動把對應平台的 `fzf` 解包到本機快取目錄後使用，不需要另外安裝。
 
-開發規範請參考 [DEVELOPMENT_GUIDELINES.md](/Users/otto/Documents/terminal-file-manager/DEVELOPMENT_GUIDELINES.md)。
+之後接手開發、開新對話續做、查看目前功能與開發紀錄，請優先閱讀 [PROJECT_HANDOFF.md](/Users/otto/Documents/terminal-file-manager/PROJECT_HANDOFF.md)。
 
 The app loads config from the first existing path in this order:
 
@@ -62,14 +62,20 @@ The app loads config from the first existing path in this order:
 - `Ctrl-w o`: keep only current pane
 - `d`: move the selected file or directory to the internal trash
 - `D`: permanently delete the selected or marked entries after confirmation
+- `v`: enter visual selection mode; use `j/k` to extend the range, then press `v` or `Esc` to finish
 - `r`: open rename dialog for the selected item
+- `R`: open regex batch rename command input; after entering the pattern and replacement, press `Enter` again in the preview to apply
+- `:rename-regex <pattern> <replace>` (short alias: `:reg <pattern> <replace>`), for example `:reg '^(.*)\\.txt$' '$1.md'`
 - `:rename`: open rename dialog for the selected item
 - `:create`, `:create <path>`
 - `:copy`, `:cut`, `:paste`
 - `:restore`: restore the most recently trashed item
 - `:split`, `:vsplit`, `:close`, `:only`
-- `:theme`: open the theme picker
-- `:theme next`, `:theme default`, `:theme forest`, `:theme ocean`
+- `t`, then `l`: open the `Theme List` picker
+- `t`, then `n`: switch to the next theme
+- `t`, then `t`: open the trash actions
+- `t`, then `u`: restore the most recently trashed item
+- `:theme list`, `:theme next`, `:theme <name>`
 - `q`: quit
 
 ## Test
@@ -99,7 +105,7 @@ Available keys:
 
 ```toml
 [ui]
-theme = "default" # or forest / ocean
+theme = "catppuccin-mocha" # also: dracula, nord, tokyo-night, gruvbox-dark, everforest...
 poll_rate_ms = 150
 
 [ui.preview]
@@ -112,7 +118,7 @@ height = 5
 
 [ui.dialog.theme_picker]
 width_percent = 42
-height = 8
+height = 20
 
 [pane]
 show_hidden = false
@@ -132,6 +138,9 @@ panel_page_step = 10
 [behavior]
 cancel_search_on_leave = true
 ```
+
+字體與字體大小由 Windows Terminal、iTerm2 或其他外部 Terminal 控制，TUI 不會
+嘗試修改這些設定；請直接在外部 Terminal 的設定中調整。
 
 Custom `Open with` actions belong in `plugins.toml` next to `config.toml`:
 
