@@ -312,6 +312,7 @@ pub(crate) enum PendingAction {
     },
     ThemePicker {
         selected: usize,
+        original: ThemePreset,
     },
     ThemeCommandPicker {
         pane_id: usize,
@@ -2321,62 +2322,59 @@ impl App {
                     self.status = String::from("linemode: choose a key from the panel");
                 }
             },
-            PendingAction::ThemePicker { mut selected } => match key.code {
+            PendingAction::ThemePicker {
+                mut selected,
+                original,
+            } => match key.code {
                 KeyCode::Down => {
                     selected = (selected + 1) % ThemePreset::ALL.len();
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 _ if key_matches_plain_letter(&key, 'j') => {
                     selected = (selected + 1) % ThemePreset::ALL.len();
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 KeyCode::Up => {
                     selected = (selected + ThemePreset::ALL.len() - 1) % ThemePreset::ALL.len();
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 _ if key_matches_plain_letter(&key, 'k') => {
                     selected = (selected + ThemePreset::ALL.len() - 1) % ThemePreset::ALL.len();
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 _ if key_matches_shifted_letter(&key, 'J') => {
                     selected = (selected + self.take_large_move_step())
                         .min(ThemePreset::ALL.len().saturating_sub(1));
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 _ if key_matches_shifted_letter(&key, 'K') => {
                     selected = selected.saturating_sub(self.take_large_move_step());
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 _ if key_matches_ctrl_letter(&key, 'd') => {
                     selected = (selected + self.take_panel_page_step())
                         .min(ThemePreset::ALL.len().saturating_sub(1));
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 _ if key_matches_ctrl_letter(&key, 'u') => {
                     selected = selected.saturating_sub(self.take_panel_page_step());
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = format!("theme picker: {}", ThemePreset::ALL[selected].name());
+                    self.preview_theme_picker_selection(selected, original);
                 }
                 KeyCode::Enter => self.apply_theme(ThemePreset::ALL[selected]),
                 _ if key_matches_plain_letter(&key, 'l') => {
                     self.apply_theme(ThemePreset::ALL[selected])
                 }
                 KeyCode::Esc => {
+                    self.theme = original.into();
                     self.status = String::from("theme picker cancelled");
                 }
                 _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                    self.theme = original.into();
                     self.status = String::from("theme picker cancelled");
                 }
                 _ => {
-                    self.pending_action = Some(PendingAction::ThemePicker { selected });
-                    self.status = String::from("theme picker: use j/k move, l apply, h close");
+                    self.pending_action = Some(PendingAction::ThemePicker { selected, original });
+                    self.status = String::from("theme picker: use j/k preview, l apply, h cancel");
                 }
             },
             PendingAction::TrashPanel {
@@ -4956,12 +4954,27 @@ impl App {
 
     /// 打開主題選擇視窗，並將選項焦點設在目前主題。
     pub(crate) fn open_theme_picker(&mut self) {
+        let original = self.theme_preset;
         let selected = ThemePreset::ALL
             .iter()
-            .position(|preset| *preset == self.theme_preset)
+            .position(|preset| *preset == original)
             .unwrap_or(0);
-        self.pending_action = Some(PendingAction::ThemePicker { selected });
-        self.status = String::from("theme picker: use j/k move, l apply, h close");
+        self.pending_action = Some(PendingAction::ThemePicker { selected, original });
+        self.status = String::from("theme picker: use j/k preview, l apply, h cancel");
+    }
+
+    /// 即時預覽主題列表目前選到的色盤，但不會寫入設定檔。
+    ///
+    /// 參數：
+    /// - `selected: usize`，`ThemePreset::ALL` 中目前選取的索引。
+    /// - `original: ThemePreset`，開啟列表前使用的主題，供取消操作時還原。
+    ///
+    /// 回傳：`()`，函數會更新畫面主題並保留主題列表狀態。
+    fn preview_theme_picker_selection(&mut self, selected: usize, original: ThemePreset) {
+        let preset = ThemePreset::ALL[selected];
+        self.theme = preset.into();
+        self.pending_action = Some(PendingAction::ThemePicker { selected, original });
+        self.status = format!("theme preview: {}", preset.name());
     }
 
     /// 打開底部排序面板，等待使用者輸入排序快捷鍵。
@@ -5776,7 +5789,7 @@ impl App {
             PendingAction::LineModePicker { .. } => {
                 String::from("linemode: choose a key from the panel")
             }
-            PendingAction::ThemePicker { selected } => {
+            PendingAction::ThemePicker { selected, .. } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
             }
             PendingAction::TaskPanel {
@@ -8584,7 +8597,7 @@ impl App {
             Some(PendingAction::BookmarkPicker { .. }) => {
                 render_bookmark_action_picker(frame, frame.area(), self.theme);
             }
-            Some(PendingAction::ThemePicker { selected }) => {
+            Some(PendingAction::ThemePicker { selected, .. }) => {
                 render_theme_picker(frame, frame.area(), self.theme, *selected, &self.config);
             }
             Some(PendingAction::BookmarkList {
@@ -10782,7 +10795,7 @@ mod tests {
             pane::{LineMode, SortMode},
             search::{GlobalSearchEntry, GlobalSearchEvent},
         },
-        theme::ThemePreset,
+        theme::{Theme, ThemePreset},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{fs, thread, time::Duration};
@@ -13174,7 +13187,7 @@ mod tests {
 
         assert!(matches!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 3 })
+            Some(PendingAction::ThemePicker { selected: 3, .. })
         ));
     }
 
@@ -13394,7 +13407,10 @@ mod tests {
 
         assert_eq!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 3 })
+            Some(PendingAction::ThemePicker {
+                selected: 3,
+                original: ThemePreset::CatppuccinMocha,
+            })
         );
     }
 
@@ -13416,7 +13432,10 @@ mod tests {
     fn app_theme_picker_confirm_applies_selected_theme() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
+        app.pending_action = Some(PendingAction::ThemePicker {
+            selected: 2,
+            original: ThemePreset::CatppuccinMocha,
+        });
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("apply theme");
@@ -13431,14 +13450,20 @@ mod tests {
     fn app_theme_picker_supports_h_and_l_core_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
+        app.pending_action = Some(PendingAction::ThemePicker {
+            selected: 2,
+            original: ThemePreset::CatppuccinMocha,
+        });
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
             .expect("close theme picker");
         assert!(app.pending_action.is_none());
         assert_eq!(app.status, "theme picker cancelled");
 
-        app.pending_action = Some(PendingAction::ThemePicker { selected: 2 });
+        app.pending_action = Some(PendingAction::ThemePicker {
+            selected: 2,
+            original: ThemePreset::CatppuccinMocha,
+        });
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
             .expect("apply theme with l");
         assert_eq!(app.theme_preset, ThemePreset::Nord);
@@ -13450,21 +13475,33 @@ mod tests {
     fn app_theme_picker_supports_j_and_k_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.pending_action = Some(PendingAction::ThemePicker { selected: 3 });
+        app.pending_action = Some(PendingAction::ThemePicker {
+            selected: 3,
+            original: ThemePreset::CatppuccinMocha,
+        });
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
             .expect("move down");
         assert_eq!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 4 })
+            Some(PendingAction::ThemePicker {
+                selected: 4,
+                original: ThemePreset::CatppuccinMocha,
+            })
         );
+        assert_eq!(app.theme, ThemePreset::CatppuccinLatte.into());
+        assert_eq!(app.theme_preset, ThemePreset::CatppuccinMocha);
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
             .expect("move up");
         assert_eq!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 3 })
+            Some(PendingAction::ThemePicker {
+                selected: 3,
+                original: ThemePreset::CatppuccinMocha,
+            })
         );
+        assert_eq!(app.theme, ThemePreset::CatppuccinMocha.into());
     }
 
     #[test]
@@ -13472,21 +13509,53 @@ mod tests {
     fn app_theme_picker_supports_ctrl_page_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.pending_action = Some(PendingAction::ThemePicker { selected: 0 });
+        app.pending_action = Some(PendingAction::ThemePicker {
+            selected: 0,
+            original: ThemePreset::CatppuccinMocha,
+        });
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
             .expect("move one page down");
         assert_eq!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 10 })
+            Some(PendingAction::ThemePicker {
+                selected: 10,
+                original: ThemePreset::CatppuccinMocha,
+            })
         );
+        assert_eq!(app.theme, ThemePreset::MonokaiPro.into());
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
             .expect("move one page up");
         assert_eq!(
             app.pending_action,
-            Some(PendingAction::ThemePicker { selected: 0 })
+            Some(PendingAction::ThemePicker {
+                selected: 0,
+                original: ThemePreset::CatppuccinMocha,
+            })
         );
+        assert_eq!(app.theme, ThemePreset::Dracula.into());
+    }
+
+    #[test]
+    /// 驗證即時預覽後按下 Esc 會還原開啟列表前的主題，且不會修改已保存的主題。
+    fn app_theme_picker_cancel_restores_original_theme() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let original = app.theme_preset;
+
+        app.open_theme_picker();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("preview next theme");
+        assert_ne!(app.theme, Theme::from(original));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel theme preview");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.theme, Theme::from(original));
+        assert_eq!(app.theme_preset, original);
+        assert_eq!(app.config.ui.theme_preset, original);
     }
 
     #[test]
