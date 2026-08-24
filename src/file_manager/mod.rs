@@ -3,6 +3,7 @@ mod archive;
 mod bookmark;
 mod copy;
 mod entry;
+mod fd;
 mod fzf;
 mod layout;
 mod open;

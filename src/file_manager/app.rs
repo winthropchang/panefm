@@ -168,12 +168,10 @@ impl SearchMode {
     }
 
     /// 回傳搜尋輸入框標題。
-    fn panel_title(self, editing: bool) -> &'static str {
-        match (self, editing) {
-            (SearchMode::Path, true) => " Global Search (insert) ",
-            (SearchMode::Path, false) => " Global Search (normal) ",
-            (SearchMode::Content, true) => " Content Search (insert) ",
-            (SearchMode::Content, false) => " Content Search (normal) ",
+    fn panel_title(self, _editing: bool) -> &'static str {
+        match self {
+            SearchMode::Path => " Global search file by fd ",
+            SearchMode::Content => " Global search content by rg ",
         }
     }
 }
@@ -8630,13 +8628,9 @@ impl App {
                     if search.pane_id != pane_id || search.buffer != query {
                         continue;
                     }
+                    // 搜尋結果採穩定串流列表：既有內容不重排，新資料只加到尾端。
+                    // 這可避免使用者正在移動時，游標所在畫面行被新批次推來推去。
                     search.results.append(&mut entries);
-                    search.results.sort_by(|left, right| {
-                        left.relative_path
-                            .to_lowercase()
-                            .cmp(&right.relative_path.to_lowercase())
-                            .then_with(|| left.relative_path.cmp(&right.relative_path))
-                    });
                     search.results.truncate(200);
                     search.selected = search.selected.min(search.results.len().saturating_sub(1));
                     search.searched = true;
@@ -8677,21 +8671,27 @@ impl App {
                     query,
                     tool,
                 } => {
-                    let task_id = self
+                    let search_context = self
                         .global_search
                         .as_ref()
                         .filter(|search| search.pane_id == pane_id && search.buffer == query)
-                        .and_then(|search| search.task_id);
+                        .map(|search| (search.task_id, search.mode));
                     self.global_search = None;
                     self.cancel_global_search_worker();
-                    if let Some(task_id) = task_id.or(self.active_global_search_task_id.take()) {
+                    let task_id = search_context
+                        .and_then(|(task_id, _)| task_id)
+                        .or(self.active_global_search_task_id.take());
+                    if let Some(task_id) = task_id {
                         self.finish_task(task_id, TaskState::Failed, format!("missing {tool}"));
                     }
                     self.pending_action = Some(PendingAction::ToolPanel {
                         pane_id,
                         selected: 0,
                     });
-                    self.status = format!("content search requires {tool}");
+                    let mode = search_context
+                        .map(|(_, mode)| mode)
+                        .unwrap_or(SearchMode::Path);
+                    self.status = missing_search_tool_status(mode, &tool);
                 }
             }
         }
@@ -10440,6 +10440,17 @@ fn global_search_status(
     }
 }
 
+/// 產生搜尋引擎缺少外部工具時的狀態列訊息。
+///
+/// 參數：
+/// - `mode: SearchMode`，目前執行的是檔名搜尋或內容搜尋。
+/// - `tool: &str`，缺少的外部工具名稱，例如 `fd` 或 `rg`。
+///
+/// 回傳：`String`，包含搜尋類型、工具名稱與 `:status` 操作提示。
+fn missing_search_tool_status(mode: SearchMode, tool: &str) -> String {
+    format!("{} requires {tool}; run :status", mode.status_label())
+}
+
 /// 把 `fzf` 回傳的相對路徑文字轉回實際檔案系統路徑。
 fn jump_selection_to_path(root_dir: &PathBuf, selection: &str) -> PathBuf {
     let mut target = root_dir.clone();
@@ -10665,10 +10676,10 @@ mod tests {
         command_suggestions, command_suggestions_for_buffer, ctrl_digit_target_pane_id,
         help_entries, is_windows_drive_path, key_matches_ctrl_letter,
         key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, looks_like_navigation_path, plain_digit_target_pane_id,
-        query_zoxide_directories, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end, trash_confirm_panel_id,
-        trash_panel_overlay_state_from_pending_action, typed_char_from_key,
+        key_matches_shifted_letter, looks_like_navigation_path, missing_search_tool_status,
+        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end,
+        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -10680,7 +10691,7 @@ mod tests {
             layout::{LayoutNode, SplitDirection},
             open::LaunchMode,
             pane::{LineMode, SortMode},
-            search::GlobalSearchEntry,
+            search::{GlobalSearchEntry, GlobalSearchEvent},
         },
         theme::ThemePreset,
     };
@@ -10698,6 +10709,36 @@ mod tests {
         assert!(!super::status_is_error("opened directory"));
         assert!(!super::status_is_error("rename-regex: renamed 2 items"));
         assert!(!super::status_is_error("trash cancelled: note.txt"));
+    }
+
+    #[test]
+    /// 驗證缺少搜尋工具時會顯示正確搜尋類型，並引導使用者打開 status 面板。
+    fn missing_search_tool_status_names_mode_and_dependency_panel() {
+        assert_eq!(
+            missing_search_tool_status(SearchMode::Path, "fd"),
+            "global search requires fd; run :status"
+        );
+        assert_eq!(
+            missing_search_tool_status(SearchMode::Content, "rg"),
+            "content search requires rg; run :status"
+        );
+    }
+
+    #[test]
+    /// 驗證檔名與內容搜尋標題會明確顯示用途及實際使用的外部工具。
+    fn search_panel_titles_name_search_tool() {
+        assert_eq!(
+            SearchMode::Path.panel_title(true),
+            " Global search file by fd "
+        );
+        assert_eq!(
+            SearchMode::Content.panel_title(true),
+            " Global search content by rg "
+        );
+        assert_eq!(
+            SearchMode::Content.panel_title(false),
+            " Global search content by rg "
+        );
     }
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -14881,6 +14922,109 @@ mod tests {
         assert_eq!(search.mode, SearchMode::Content);
         assert!(search.editing);
         assert_eq!(app.status, "content search (insert): type query and Enter");
+    }
+
+    #[test]
+    /// 驗證 `s` 與 `S` 的結果仍在串流載入時，只要列表已有內容就能立即用游標鍵與 Vim 鍵移動。
+    fn app_search_lists_move_immediately_while_loading() {
+        let dir = tempdir().expect("tempdir");
+
+        for mode in [SearchMode::Path, SearchMode::Content] {
+            let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+            app.global_search = Some(GlobalSearchState {
+                pane_id: 1,
+                root_dir: dir.path().to_path_buf(),
+                mode,
+                buffer: String::from("target"),
+                editing: false,
+                loading: true,
+                searched: true,
+                selected: 0,
+                results: ["alpha.txt", "beta.txt", "gamma.txt"]
+                    .into_iter()
+                    .map(|name| GlobalSearchEntry {
+                        path: dir.path().join(name),
+                        relative_path: name.to_string(),
+                        is_dir: false,
+                        match_line_number: None,
+                        match_column: None,
+                        match_preview: None,
+                    })
+                    .collect(),
+                preview_scroll: None,
+                preview_current_match: None,
+                task_id: None,
+            });
+
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .expect("move down while loading");
+            assert_eq!(app.global_search.as_ref().expect("search").selected, 1);
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .expect("vim move down while loading");
+            assert_eq!(app.global_search.as_ref().expect("search").selected, 2);
+
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                .expect("move up while loading");
+            assert_eq!(app.global_search.as_ref().expect("search").selected, 1);
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+                .expect("vim move up while loading");
+            assert_eq!(app.global_search.as_ref().expect("search").selected, 0);
+        }
+    }
+
+    #[test]
+    /// 驗證 `s` 與 `S` 收到新批次時只會追加到下方，不會重排既有列表或移動游標。
+    fn app_search_stream_appends_without_reordering_existing_rows() {
+        let dir = tempdir().expect("tempdir");
+        for mode in [SearchMode::Path, SearchMode::Content] {
+            let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+            app.global_search = Some(GlobalSearchState {
+                pane_id: 1,
+                root_dir: dir.path().to_path_buf(),
+                mode,
+                buffer: String::from("txt"),
+                editing: false,
+                loading: true,
+                searched: true,
+                selected: 0,
+                results: vec![GlobalSearchEntry {
+                    path: dir.path().join("beta.txt"),
+                    relative_path: String::from("beta.txt"),
+                    is_dir: false,
+                    match_line_number: None,
+                    match_column: None,
+                    match_preview: None,
+                }],
+                preview_scroll: None,
+                preview_current_match: None,
+                task_id: None,
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.global_search_rx = Some(receiver);
+            sender
+                .send(GlobalSearchEvent::Chunk {
+                    pane_id: 1,
+                    query: String::from("txt"),
+                    entries: vec![GlobalSearchEntry {
+                        path: dir.path().join("alpha.txt"),
+                        relative_path: String::from("alpha.txt"),
+                        is_dir: false,
+                        match_line_number: None,
+                        match_column: None,
+                        match_preview: None,
+                    }],
+                })
+                .expect("send result chunk");
+
+            app.poll_background_tasks();
+
+            let search = app.global_search.as_ref().expect("search");
+            assert_eq!(search.selected, 0);
+            assert_eq!(search.results[0].relative_path, "beta.txt");
+            assert_eq!(search.results[1].relative_path, "alpha.txt");
+        }
     }
 
     #[test]

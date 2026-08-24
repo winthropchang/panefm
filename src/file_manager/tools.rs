@@ -3,7 +3,11 @@ use std::{
     path::Path,
 };
 
-/// 回傳三個外部工具的安裝狀態，供缺少依賴時顯示給使用者。
+/// 表示一個外部工具目前是否可由系統 `PATH` 找到。
+///
+/// 欄位：
+/// - `name: &'static str`，顯示在依賴面板中的工具名稱。
+/// - `installed: bool`，`true` 代表目前可執行，`false` 代表尚未安裝。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolStatus {
     pub(crate) name: &'static str,
@@ -15,9 +19,13 @@ pub(crate) fn find_system_command(name: &str) -> Option<OsString> {
     find_command_in_path(OsStr::new(name), std::env::var_os("PATH").as_deref())
 }
 
-/// 產生 fzf、rg、zoxide 的完整安裝狀態列表。
+/// 產生 fd、fzf、rg、zoxide 的完整安裝狀態列表。
+///
+/// 參數：無。
+///
+/// 回傳：`Vec<ToolStatus>`，依固定顯示順序排列的工具安裝狀態。
 pub(crate) fn external_tool_statuses() -> Vec<ToolStatus> {
-    ["fzf", "rg", "zoxide"]
+    ["fd", "fzf", "rg", "zoxide"]
         .into_iter()
         .map(|name| ToolStatus {
             name,
@@ -28,7 +36,7 @@ pub(crate) fn external_tool_statuses() -> Vec<ToolStatus> {
 
 /// 將狀態列表轉成適合狀態列顯示的單行訊息。
 pub(crate) fn missing_tool_message(tool: &str) -> String {
-    format!("missing dependency: {tool}; install fzf, ripgrep (rg), and zoxide")
+    format!("missing dependency: {tool}; run :status to check fd, fzf, ripgrep (rg), and zoxide")
 }
 
 /// 在指定 PATH 中找出第一個可執行檔，Windows 會依序嘗試常見副檔名。
@@ -89,6 +97,7 @@ mod tests {
     fn missing_message_names_installable_tools() {
         let message = missing_tool_message("rg");
         assert!(message.contains("rg"));
+        assert!(message.contains("fd"));
         assert!(message.contains("ripgrep"));
         assert!(message.contains("zoxide"));
     }
@@ -98,7 +107,7 @@ mod tests {
         let statuses = external_tool_statuses();
         assert_eq!(
             statuses.iter().map(|tool| tool.name).collect::<Vec<_>>(),
-            vec!["fzf", "rg", "zoxide"]
+            vec!["fd", "fzf", "rg", "zoxide"]
         );
     }
 }

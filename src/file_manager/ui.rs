@@ -220,9 +220,7 @@ pub(crate) fn render_pane(
         let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
         let (preview_title, preview_lines) = match panel_state {
             Some(PaneListState::Search(search_state))
-                if !search_state.loading
-                    && !search_state.results.is_empty()
-                    && search_state.preview_query.is_some() =>
+                if !search_state.results.is_empty() && search_state.preview_query.is_some() =>
             {
                 let selected = search_state
                     .selected
@@ -282,17 +280,17 @@ pub(crate) fn render_pane(
     pane.set_list_viewport_height(list_viewport_height);
     let items: Vec<ListItem<'static>> = if let Some(panel_state) = panel_state {
         match panel_state {
-            PaneListState::Search(search_state) if search_state.loading => {
-                vec![ListItem::new(Line::from("Loading search results..."))]
+            PaneListState::Search(search_state) => {
+                if let Some(message) = search_empty_message(&search_state) {
+                    vec![ListItem::new(Line::from(message))]
+                } else {
+                    search_state
+                        .results
+                        .iter()
+                        .map(|entry| ListItem::new(Line::from(entry.relative_path.clone())))
+                        .collect()
+                }
             }
-            PaneListState::Search(search_state) if search_state.results.is_empty() => {
-                vec![ListItem::new(Line::from("No matches"))]
-            }
-            PaneListState::Search(search_state) => search_state
-                .results
-                .iter()
-                .map(|entry| ListItem::new(Line::from(entry.relative_path.clone())))
-                .collect(),
             PaneListState::Tasks { lines, .. } if lines.is_empty() => {
                 vec![ListItem::new(Line::from("No tasks yet"))]
             }
@@ -411,14 +409,8 @@ pub(crate) fn render_pane(
     if let Some(panel_state) = panel_state {
         let mut list_state = ListState::default();
         match panel_state {
-            PaneListState::Search(search_state)
-                if !search_state.loading && !search_state.results.is_empty() =>
-            {
-                list_state.select(Some(
-                    search_state
-                        .selected
-                        .min(search_state.results.len().saturating_sub(1)),
-                ));
+            PaneListState::Search(search_state) if !search_state.results.is_empty() => {
+                list_state.select(search_list_selected_index(&search_state));
             }
             PaneListState::Trash {
                 lines, selected, ..
@@ -501,6 +493,38 @@ pub(crate) fn render_pane(
     };
 
     editor_cursor.or(panel_cursor)
+}
+
+/// 回傳搜尋列表在尚未收到任何結果時應顯示的提示文字。
+///
+/// 參數：
+/// - `state: &SearchListState`，目前搜尋列表的結果與載入狀態。
+///
+/// 回傳：`Some(&str)` 代表列表要顯示提示；`None` 代表已有結果，應直接顯示結果。
+fn search_empty_message(state: &SearchListState<'_>) -> Option<&'static str> {
+    if !state.results.is_empty() {
+        None
+    } else if state.loading {
+        Some("Loading search results...")
+    } else {
+        Some("No matches")
+    }
+}
+
+/// 計算 global search 列表目前應該反白的項目索引。
+///
+/// 參數：
+/// - `search_state: &SearchListState<'_>`，包含串流結果與目前游標位置的搜尋列表資料。
+///
+/// 回傳：`Option<usize>`。
+/// - 列表已有內容時回傳合法索引；即使背景工作仍在載入，也會立即顯示游標。
+/// - 列表尚無內容時回傳 `None`。
+fn search_list_selected_index(search_state: &SearchListState<'_>) -> Option<usize> {
+    (!search_state.results.is_empty()).then(|| {
+        search_state
+            .selected
+            .min(search_state.results.len().saturating_sub(1))
+    })
 }
 
 /// 根據 regex 批次改名預覽狀態套用主題語意色。
@@ -1869,13 +1893,15 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileCategory, IconStyle, entry_icon, file_category, format_pane_title,
+        FileCategory, IconStyle, SearchListState, entry_icon, file_category, format_pane_title,
         format_permissions_detail, format_size_short, regex_rename_status_style,
+        search_empty_message, search_list_selected_index,
     };
     use std::path::Path;
     use std::time::SystemTime;
 
     use crate::file_manager::entry::FileEntry;
+    use crate::file_manager::search::GlobalSearchEntry;
     use crate::theme::Theme;
 
     fn test_entry(name: &str, is_dir: bool) -> FileEntry {
@@ -1890,6 +1916,64 @@ mod tests {
             readonly: false,
             unix_mode: None,
         }
+    }
+
+    #[test]
+    /// 驗證搜尋仍在背景載入時，只要已有結果就不會再用 Loading 訊息蓋住列表。
+    fn search_results_are_visible_while_loading() {
+        let entry = GlobalSearchEntry {
+            path: Path::new("result.txt").to_path_buf(),
+            relative_path: String::from("result.txt"),
+            is_dir: false,
+            match_line_number: Some(1),
+            match_column: Some(1),
+            match_preview: Some(String::from("887")),
+        };
+        let results = vec![entry];
+        let state = SearchListState {
+            results: &results,
+            selected: 0,
+            loading: true,
+            preview_query: None,
+            preview_scroll: None,
+            preview_current_match: None,
+        };
+
+        assert_eq!(search_empty_message(&state), None);
+        assert_eq!(search_list_selected_index(&state), Some(0));
+    }
+
+    #[test]
+    /// 驗證背景搜尋仍在回傳資料時，列表會立即顯示目前游標，而不是等待 Done 事件。
+    fn search_cursor_is_visible_and_clamped_while_loading() {
+        let results = vec![
+            GlobalSearchEntry {
+                path: Path::new("first.txt").to_path_buf(),
+                relative_path: String::from("first.txt"),
+                is_dir: false,
+                match_line_number: None,
+                match_column: None,
+                match_preview: None,
+            },
+            GlobalSearchEntry {
+                path: Path::new("second.txt").to_path_buf(),
+                relative_path: String::from("second.txt"),
+                is_dir: false,
+                match_line_number: None,
+                match_column: None,
+                match_preview: None,
+            },
+        ];
+        let state = SearchListState {
+            results: &results,
+            selected: 99,
+            loading: true,
+            preview_query: None,
+            preview_scroll: None,
+            preview_current_match: None,
+        };
+
+        assert_eq!(search_list_selected_index(&state), Some(1));
     }
 
     #[test]

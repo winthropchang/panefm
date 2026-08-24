@@ -1,5 +1,6 @@
+use serde::Deserialize;
 use std::{
-    fs::File,
+    ffi::OsString,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,13 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-use std::io;
-
-use ignore::WalkBuilder;
-use serde::Deserialize;
-
-use super::rg::rg_command;
+use super::{fd::fd_command, rg::rg_command};
 
 /// 表示 global search 面板中的單一搜尋結果。
 ///
@@ -77,99 +72,7 @@ pub(crate) enum GlobalSearchEvent {
     },
 }
 
-#[cfg(test)]
-/// 遞迴掃描指定根目錄下的檔案與資料夾，建立 global search 的候選資料集。
-///
-/// 參數：
-/// - `root: &Path`，要遞迴搜尋的根目錄。
-/// - `show_hidden: bool`，是否要把隱藏檔一起納入結果。
-///
-/// 回傳：`io::Result<Vec<GlobalSearchEntry>>`。
-/// - 成功時回傳已排序好的搜尋候選清單。
-/// - 失敗時回傳掃描目錄時遇到的 I/O 錯誤。
-pub(crate) fn collect_search_entries(
-    root: &Path,
-    show_hidden: bool,
-) -> io::Result<Vec<GlobalSearchEntry>> {
-    let mut entries = Vec::new();
-    let walker = WalkBuilder::new(root).hidden(!show_hidden).build();
-
-    for entry in walker {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-        let is_dir = file_type.is_dir();
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let relative_path = if is_dir {
-            format!("{relative}/")
-        } else {
-            relative
-        };
-
-        entries.push(GlobalSearchEntry {
-            path: path.to_path_buf(),
-            relative_path,
-            is_dir,
-            match_line_number: None,
-            match_column: None,
-            match_preview: None,
-        });
-    }
-
-    entries.sort_by(|left, right| {
-        left.relative_path
-            .to_lowercase()
-            .cmp(&right.relative_path.to_lowercase())
-            .then_with(|| left.relative_path.cmp(&right.relative_path))
-    });
-
-    Ok(entries)
-}
-
-#[cfg(test)]
-/// 依照使用者輸入的查詢文字，過濾目前可顯示的 global search 結果。
-///
-/// 參數：
-/// - `entries: &[GlobalSearchEntry]`，完整候選資料集。
-/// - `query: &str`，目前搜尋框中的文字。
-/// - `limit: usize`，最多要回傳多少筆結果，避免畫面過重。
-///
-/// 回傳：`Vec<GlobalSearchEntry>`，已過濾好的搜尋結果。
-pub(crate) fn filter_search_entries(
-    entries: &[GlobalSearchEntry],
-    query: &str,
-    limit: usize,
-) -> Vec<GlobalSearchEntry> {
-    let trimmed = query.trim();
-    let query_lower = trimmed.to_lowercase();
-
-    entries
-        .iter()
-        .filter(|entry| {
-            if query_lower.is_empty() {
-                true
-            } else {
-                entry.relative_path.to_lowercase().contains(&query_lower)
-            }
-        })
-        .take(limit.max(1))
-        .cloned()
-        .collect()
-}
-
-/// 以分批方式掃描搜尋結果，找到一批符合項目就立即透過 channel 傳回。
+/// 使用外部 `fd` 遞迴搜尋檔案名稱，並把命中結果即時送回主執行緒。
 ///
 /// 參數：
 /// - `pane_id: usize`，這次搜尋所屬的 pane。
@@ -177,7 +80,7 @@ pub(crate) fn filter_search_entries(
 /// - `show_hidden: bool`，是否把隱藏檔一起納入搜尋。
 /// - `query: &str`，目前要比對的搜尋文字。
 /// - `limit: usize`，最多回傳多少筆結果。
-/// - `chunk_size: usize`，每次分批回傳的結果數量。
+/// - `_chunk_size: usize`，保留既有呼叫介面的批次大小；`fd` 結果會逐筆回傳。
 /// - `cancelled: Arc<AtomicBool>`，主執行緒可用來要求背景搜尋提早停止。
 /// - `sender: Sender<GlobalSearchEvent>`，用來回傳搜尋進度的 channel。
 ///
@@ -188,36 +91,74 @@ pub(crate) fn stream_search_entries(
     show_hidden: bool,
     query: &str,
     limit: usize,
-    chunk_size: usize,
+    _chunk_size: usize,
     cancelled: Arc<AtomicBool>,
     sender: Sender<GlobalSearchEvent>,
 ) {
-    let walker = WalkBuilder::new(root).hidden(!show_hidden).build();
-    let query_lower = query.trim().to_lowercase();
-    let mut batch = Vec::new();
-    let mut matched = 0usize;
-    let mut last_flush_at = Instant::now();
+    let mut command = match build_fd_search_command(root, show_hidden, query) {
+        Ok(command) => command,
+        Err(_) => {
+            let _ = sender.send(GlobalSearchEvent::MissingTool {
+                pane_id,
+                query: query.to_string(),
+                tool: String::from("fd"),
+            });
+            return;
+        }
+    };
+    let Ok(mut child) = command.spawn() else {
+        let _ = sender.send(GlobalSearchEvent::MissingTool {
+            pane_id,
+            query: query.to_string(),
+            tool: String::from("fd"),
+        });
+        return;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
 
-    for entry in walker {
+    let mut reader = BufReader::new(stdout);
+    let mut path_bytes = Vec::new();
+    let max_results = limit.max(1);
+    let mut matched = 0usize;
+
+    loop {
         if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
             return;
         }
 
-        let Ok(entry) = entry else {
-            continue;
+        path_bytes.clear();
+        let Ok(read) = reader.read_until(0, &mut path_bytes) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
         };
-        let path = entry.path();
-        if path == root {
+        if read == 0 {
+            break;
+        }
+        if path_bytes.last() == Some(&0) {
+            path_bytes.pop();
+        }
+        if path_bytes.is_empty() {
             continue;
         }
 
-        let Some(file_type) = entry.file_type() else {
-            continue;
+        let fd_path = path_buf_from_fd_output(std::mem::take(&mut path_bytes));
+        let relative_fd_path = fd_path.strip_prefix(".").unwrap_or(fd_path.as_path());
+        let path = if fd_path.is_absolute() {
+            fd_path
+        } else {
+            root.join(relative_fd_path)
         };
-        let is_dir = file_type.is_dir();
+        let is_dir = path.is_dir();
         let relative = path
             .strip_prefix(root)
-            .unwrap_or(path)
+            .unwrap_or(path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
         let relative_path = if is_dir {
@@ -226,32 +167,32 @@ pub(crate) fn stream_search_entries(
             relative
         };
 
-        if !query_lower.is_empty() && !relative_path.to_lowercase().contains(&query_lower) {
-            continue;
+        let event = GlobalSearchEvent::Chunk {
+            pane_id,
+            query: query.to_string(),
+            entries: vec![GlobalSearchEntry {
+                path,
+                relative_path,
+                is_dir,
+                match_line_number: None,
+                match_column: None,
+                match_preview: None,
+            }],
+        };
+        if sender.send(event).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
         }
 
-        batch.push(GlobalSearchEntry {
-            path: path.to_path_buf(),
-            relative_path,
-            is_dir,
-            match_line_number: None,
-            match_column: None,
-            match_preview: None,
-        });
         matched += 1;
-
-        if should_flush_batch(&batch, chunk_size, &mut last_flush_at) {
-            flush_search_batch(pane_id, query, &mut batch, &cancelled, &sender);
-        }
-
-        if matched >= limit.max(1) {
+        if matched >= max_results {
+            let _ = child.kill();
             break;
         }
     }
 
-    if !batch.is_empty() {
-        flush_search_batch(pane_id, query, &mut batch, &cancelled, &sender);
-    }
+    let _ = child.wait();
 
     if cancelled.load(Ordering::Relaxed) {
         return;
@@ -262,12 +203,66 @@ pub(crate) fn stream_search_entries(
     });
 }
 
-/// 以分批方式掃描檔案內容，找到至少一個文字命中的檔案就立即回傳。
+/// 建立檔名搜尋使用的 `fd` 命令，並讓輸出可安全地逐筆解析。
+///
+/// 參數：
+/// - `root: &Path`，搜尋起始目錄。
+/// - `show_hidden: bool`，是否包含隱藏檔案與目錄。
+/// - `query: &str`，要比對的檔案名稱文字。
+///
+/// 回傳：`std::io::Result<Command>`，成功時可直接啟動的 `fd` 命令。
+fn build_fd_search_command(
+    root: &Path,
+    show_hidden: bool,
+    query: &str,
+) -> Result<Command, std::io::Error> {
+    let program = fd_command().map_err(|error| std::io::Error::other(error.to_string()))?;
+    let mut command = Command::new(program);
+    command
+        .arg("--color")
+        .arg("never")
+        // NUL 分隔可正確處理包含空格、換行或其他特殊字元的檔名。
+        .arg("--print0")
+        .arg("--ignore-case")
+        .arg("--fixed-strings");
+
+    if show_hidden {
+        command.arg("--hidden");
+    }
+
+    // 從 root 內輸出相對路徑，避免 macOS 把 `/var` 正規化為 `/private/var`，
+    // 也能在 Windows 保留使用者原本輸入的磁碟與路徑形式。
+    command.current_dir(root).arg("--").arg(query).arg(".");
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    Ok(command)
+}
+
+#[cfg(unix)]
+/// 將 `fd` 的原始路徑 bytes 轉為 Unix/macOS 可完整保留的 `PathBuf`。
+fn path_buf_from_fd_output(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+
+    PathBuf::from(OsString::from_vec(bytes))
+}
+
+#[cfg(windows)]
+/// 將 Windows 版 `fd` 的 UTF-8 輸出轉為 `PathBuf`。
+fn path_buf_from_fd_output(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(not(any(unix, windows)))]
+/// 在其他未正式支援的平台上，以 lossy UTF-8 方式轉換 `fd` 輸出。
+fn path_buf_from_fd_output(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// 使用外部 `rg` 搜尋檔案內容，找到至少一個文字命中的檔案就立即回傳。
 ///
 /// 規則：
 /// - 只搜尋檔案，不回傳資料夾。
 /// - 以不分大小寫方式比對內容。
-/// - 若檔案含有 NUL byte，視為 binary 檔並略過，避免把大量二進位資料灌進搜尋。
+/// - 不提供內建搜尋 fallback；缺少或無法啟動 `rg` 時，通知主程式顯示依賴狀態。
 pub(crate) fn stream_content_search_entries(
     pane_id: usize,
     root: &Path,
@@ -287,7 +282,7 @@ pub(crate) fn stream_content_search_entries(
         return;
     }
 
-    match stream_content_search_entries_with_rg(
+    if !stream_content_search_entries_with_rg(
         pane_id,
         root,
         show_hidden,
@@ -297,90 +292,17 @@ pub(crate) fn stream_content_search_entries(
         cancelled.clone(),
         &sender,
     ) {
-        Some(true) => return,
-        None => {
-            let _ = sender.send(GlobalSearchEvent::MissingTool {
-                pane_id,
-                query: query.to_string(),
-                tool: String::from("rg"),
-            });
-            return;
-        }
-        Some(false) => {}
-    }
-
-    let walker = WalkBuilder::new(root).hidden(!show_hidden).build();
-    let query_lower = trimmed.to_lowercase();
-    let mut batch = Vec::new();
-    let mut matched = 0usize;
-    let content_chunk_size = chunk_size.clamp(8, 64);
-    let mut last_flush_at = Instant::now();
-
-    for entry in walker {
-        if cancelled.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            continue;
-        }
-
-        let Some((match_line_number, match_column, match_preview)) =
-            find_query_match_in_file(path, &query_lower, &cancelled)
-        else {
-            continue;
-        };
-
-        let relative_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        batch.push(GlobalSearchEntry {
-            path: path.to_path_buf(),
-            relative_path,
-            is_dir: false,
-            match_line_number: Some(match_line_number),
-            match_column: Some(match_column),
-            match_preview: Some(match_preview),
+        let _ = sender.send(GlobalSearchEvent::MissingTool {
+            pane_id,
+            query: query.to_string(),
+            tool: String::from("rg"),
         });
-        matched += 1;
-
-        if should_flush_batch(&batch, content_chunk_size, &mut last_flush_at) {
-            flush_search_batch(pane_id, query, &mut batch, &cancelled, &sender);
-        }
-
-        if matched >= limit.max(1) {
-            break;
-        }
     }
-
-    if !batch.is_empty() {
-        flush_search_batch(pane_id, query, &mut batch, &cancelled, &sender);
-    }
-
-    if cancelled.load(Ordering::Relaxed) {
-        return;
-    }
-    let _ = sender.send(GlobalSearchEvent::Done {
-        pane_id,
-        query: query.to_string(),
-    });
 }
 
-/// 優先使用 ripgrep 做內容搜尋；若成功啟動並完成，回傳 `true`。
+/// 啟動 ripgrep 並串流解析內容搜尋結果。
+///
+/// 回傳：`bool`，成功完成或被使用者取消時為 `true`；無法使用 `rg` 時為 `false`。
 fn stream_content_search_entries_with_rg(
     pane_id: usize,
     root: &Path,
@@ -390,25 +312,24 @@ fn stream_content_search_entries_with_rg(
     chunk_size: usize,
     cancelled: Arc<AtomicBool>,
     sender: &Sender<GlobalSearchEvent>,
-) -> Option<bool> {
+) -> bool {
     let mut command = match build_rg_content_search_command(root, show_hidden, query, limit) {
         Ok(command) => command,
-        Err(_) => return None,
+        Err(_) => return false,
     };
     let Ok(mut child) = command.spawn() else {
-        return Some(false);
+        return false;
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Some(false);
+        return false;
     };
 
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     let mut batch = Vec::new();
     let mut last_flush_at = Instant::now();
-    let mut sent_anything = false;
     let max_results = limit.max(1);
     let content_chunk_size = chunk_size.clamp(8, 64);
     let mut matched = 0usize;
@@ -418,14 +339,14 @@ fn stream_content_search_entries_with_rg(
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            return Some(true);
+            return true;
         }
 
         line.clear();
         let Ok(read) = reader.read_line(&mut line) else {
             let _ = child.kill();
             let _ = child.wait();
-            return Some(false);
+            return false;
         };
         if read == 0 {
             break;
@@ -480,10 +401,10 @@ fn stream_content_search_entries_with_rg(
             match_column,
             match_preview,
         });
-        sent_anything = true;
         matched += 1;
 
-        if should_flush_batch(&batch, content_chunk_size, &mut last_flush_at) {
+        // 第一筆命中立刻送出，讓 TUI 不必等待批次計時或第二筆結果。
+        if matched == 1 || should_flush_batch(&batch, content_chunk_size, &mut last_flush_at) {
             flush_search_batch(pane_id, query, &mut batch, &cancelled, sender);
         }
         if matched >= max_results {
@@ -498,10 +419,10 @@ fn stream_content_search_entries_with_rg(
     }
 
     let Ok(status) = child.wait() else {
-        return Some(false);
+        return false;
     };
     if cancelled.load(Ordering::Relaxed) {
-        return Some(true);
+        return true;
     }
 
     // rg 在沒找到結果時會回傳 exit code 1，這仍是正常完成。
@@ -510,10 +431,10 @@ fn stream_content_search_entries_with_rg(
             pane_id,
             query: query.to_string(),
         });
-        return Some(true);
+        return true;
     }
 
-    Some(sent_anything)
+    false
 }
 
 /// 建立給 ripgrep 使用的內容搜尋命令。
@@ -527,6 +448,9 @@ fn build_rg_content_search_command(
     let mut command = Command::new(program);
     command
         .arg("--json")
+        // stdout 會被 pipe 接收；沒有這個選項時，rg 可能累積輸出後才 flush，
+        // 讓前端明明已經找到結果，卻要等很久才看得到第一筆。
+        .arg("--line-buffered")
         .arg("--no-messages")
         .arg("--fixed-strings")
         .arg("--ignore-case")
@@ -538,7 +462,11 @@ fn build_rg_content_search_command(
         .arg("/");
 
     if show_hidden {
-        command.arg("--hidden");
+        command
+            .arg("--hidden")
+            // 隱藏檔仍然搜尋，但不要把 Git 內部物件與索引當成使用者內容。
+            .arg("--glob")
+            .arg("!.git");
     }
 
     command.arg("--").arg(query).arg(root);
@@ -563,44 +491,6 @@ fn normalize_match_preview(raw: &str) -> String {
     preview
 }
 
-/// 在單一檔案中找出第一個命中位置，並回傳行號、欄位與摘要。
-fn find_query_match_in_file(
-    path: &Path,
-    query_lower: &str,
-    cancelled: &AtomicBool,
-) -> Option<(usize, usize, String)> {
-    let Ok(file) = File::open(path) else {
-        return None;
-    };
-    let mut reader = BufReader::new(file);
-    let mut buffer = Vec::new();
-    let mut line_number = 0usize;
-
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        buffer.clear();
-        let Ok(read) = reader.read_until(b'\n', &mut buffer) else {
-            return None;
-        };
-        if read == 0 {
-            return None;
-        }
-        line_number += 1;
-        if buffer.contains(&0) {
-            return None;
-        }
-        let line = String::from_utf8_lossy(&buffer);
-        let line_lower = line.to_lowercase();
-        if let Some(byte_index) = line_lower.find(query_lower) {
-            let column = line[..byte_index].chars().count().saturating_add(1);
-            return Some((line_number, column, normalize_match_preview(&line)));
-        }
-    }
-}
-
 /// 判斷目前累積的搜尋結果是否應立刻回傳給主執行緒。
 fn should_flush_batch(
     batch: &[GlobalSearchEntry],
@@ -622,7 +512,19 @@ fn should_flush_batch(
     }
 }
 
-/// 把目前批次中的搜尋結果排序後送回主執行緒。
+/// 把目前批次中的搜尋結果依收到順序送回主執行緒。
+///
+/// 不在這裡排序，才能確保 `S` 的既有列表不會因後續結果而重新排列；
+/// 主執行緒會把每個批次穩定追加到列表下方。
+///
+/// 參數：
+/// - `pane_id: usize`，接收這批結果的 panel 編號。
+/// - `query: &str`，用來辨識目前搜尋工作的查詢文字。
+/// - `batch: &mut Vec<GlobalSearchEntry>`，依外部工具回傳順序累積的結果；送出後會清空。
+/// - `cancelled: &AtomicBool`，背景搜尋的取消旗標。
+/// - `sender: &Sender<GlobalSearchEvent>`，將批次傳回主執行緒的 channel。
+///
+/// 回傳：`()`，此函數只負責送出事件，不產生額外回傳值。
 fn flush_search_batch(
     pane_id: usize,
     query: &str,
@@ -630,12 +532,6 @@ fn flush_search_batch(
     cancelled: &AtomicBool,
     sender: &Sender<GlobalSearchEvent>,
 ) {
-    batch.sort_by(|left, right| {
-        left.relative_path
-            .to_lowercase()
-            .cmp(&right.relative_path.to_lowercase())
-            .then_with(|| left.relative_path.cmp(&right.relative_path))
-    });
     if cancelled.load(Ordering::Relaxed) {
         return;
     }
@@ -654,39 +550,65 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        GlobalSearchEvent, build_rg_content_search_command, collect_search_entries,
-        filter_search_entries, stream_content_search_entries,
+        GlobalSearchEvent, build_fd_search_command, build_rg_content_search_command,
+        stream_content_search_entries, stream_search_entries,
     };
     use crate::file_manager::search::normalize_match_preview;
 
     #[test]
-    /// 驗證 global search 會遞迴收集巢狀目錄中的檔案與資料夾。
-    fn collect_search_entries_reads_nested_tree() {
+    /// 驗證檔名搜尋的第一筆命中會獨立送出，不會等待批次填滿或完整掃描結束。
+    fn stream_search_entries_emits_first_match_immediately() {
         let dir = tempdir().expect("tempdir");
-        fs::create_dir(dir.path().join("src")).expect("src");
-        fs::write(dir.path().join("src").join("main.rs"), "fn main() {}").expect("main");
+        fs::write(dir.path().join("887-first.txt"), "first").expect("first");
+        fs::write(dir.path().join("887-second.txt"), "second").expect("second");
 
-        let entries = collect_search_entries(dir.path(), false).expect("entries");
-        let names: Vec<String> = entries
-            .into_iter()
-            .map(|entry| entry.relative_path)
-            .collect();
+        let (tx, rx) = mpsc::channel();
+        stream_search_entries(
+            1,
+            dir.path(),
+            false,
+            "887",
+            20,
+            100,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
 
-        assert!(names.contains(&String::from("src/")));
-        assert!(names.contains(&String::from("src/main.rs")));
+        let events = rx.try_iter().collect::<Vec<_>>();
+        let chunks = events
+            .iter()
+            .filter_map(|event| match event {
+                GlobalSearchEvent::Chunk { entries, .. } => Some(entries),
+                GlobalSearchEvent::Done { .. } | GlobalSearchEvent::MissingTool { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1);
+        assert_eq!(chunks.iter().map(|entries| entries.len()).sum::<usize>(), 2);
+        assert!(matches!(
+            events.last(),
+            Some(GlobalSearchEvent::Done { .. })
+        ));
     }
 
     #[test]
-    /// 驗證 global search 過濾時會以不分大小寫方式比對路徑。
-    fn filter_search_entries_matches_case_insensitively() {
+    /// 驗證檔名搜尋會使用 fd 的固定字串、不分大小寫與安全路徑分隔選項。
+    fn build_fd_search_command_uses_streaming_safe_options() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("Readme.md"), "doc").expect("readme");
+        let command = build_fd_search_command(dir.path(), true, "887").expect("fd command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
 
-        let entries = collect_search_entries(dir.path(), false).expect("entries");
-        let matches = filter_search_entries(&entries, "read", 20);
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].relative_path, "Readme.md");
+        assert!(args.iter().any(|arg| arg == "--print0"));
+        assert!(args.iter().any(|arg| arg == "--ignore-case"));
+        assert!(args.iter().any(|arg| arg == "--fixed-strings"));
+        assert!(args.iter().any(|arg| arg == "--hidden"));
+        assert_eq!(args[args.len() - 2], "887");
+        assert_eq!(args.last().map(String::as_str), Some("."));
+        assert_eq!(command.get_current_dir(), Some(dir.path()));
     }
 
     #[test]
@@ -756,6 +678,7 @@ mod tests {
 
         assert!(!chunk_sizes.is_empty());
         assert_eq!(chunk_sizes.iter().sum::<usize>(), 2);
+        assert_eq!(chunk_sizes[0], 1);
         assert!(matches!(
             events.last(),
             Some(GlobalSearchEvent::Done { .. })
@@ -781,6 +704,27 @@ mod tests {
         assert!(hidden_index < separator_index);
         assert_eq!(args[separator_index + 1], "needle");
         assert!(args.iter().any(|arg| arg == "--json"));
+        assert!(args.iter().any(|arg| arg == "--line-buffered"));
+        let glob_index = args
+            .iter()
+            .position(|arg| arg == "--glob")
+            .expect("git exclusion glob");
+        assert_eq!(args[glob_index + 1], "!.git");
+    }
+
+    #[test]
+    /// 驗證未開啟隱藏檔時，不會額外加入 Git 排除規則，避免改變既有設定語意。
+    fn build_rg_content_search_command_does_not_add_hidden_glob_when_disabled() {
+        let dir = tempdir().expect("tempdir");
+        let command =
+            build_rg_content_search_command(dir.path(), false, "needle", 50).expect("command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(!args.iter().any(|arg| arg == "--hidden"));
+        assert!(!args.iter().any(|arg| arg == "--glob"));
     }
 
     #[test]
