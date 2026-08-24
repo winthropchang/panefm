@@ -177,8 +177,7 @@
   本機 plugin 設定
 - `/Users/otto/Documents/terminal-file-manager/bookmark.toml`
   使用者書籤資料
-- `/Users/otto/Documents/terminal-file-manager/vendor`
-  內建第三方 binary 資產，例如 `fzf`、`zoxide`
+- `fzf`、`rg`、`zoxide` 必須由使用者安裝並放在系統 `PATH` 中；程式不再攜帶第三方 binary。
 
 ## 5. 目前設定檔與資料檔規則
 
@@ -424,7 +423,7 @@
 - 搜尋範圍是目前 panel root 之下的遞迴檔案與目錄
 - 已修正過 `Esc` 無法返回、第一次快第二次慢、TTY 互動異常等問題
 - 目前整合方式改成讓 `fzf` 自己透過命令產生候選，而不是直接把候選資料硬 pipe 到 `stdin`
-- 專案已內建 `fzf` binary，不要求使用者自行安裝
+- `fzf` 使用系統 `PATH`；未安裝時會顯示缺少依賴提示
 
 ### 6.15 Zoxide
 
@@ -432,8 +431,7 @@
 - `Z` / `:zoxide` 可打開 zoxide 列表
 - zoxide 資料庫會學習 pane 導航後的目錄
 - zoxide 列表支援 `f` filter
-- 專案已內建 `zoxide` binary，不要求使用者自行安裝
-- 已修正 bundled zoxide 寫入競態問題，避免平行測試或首次解包時讀到半寫入 binary
+- `zoxide` 使用系統 `PATH`；未安裝時會顯示缺少依賴提示
 
 ### 6.16 Goto
 
@@ -519,8 +517,9 @@
 - open / reveal 走平台分流
 - SMB 方向已考慮 Windows UNC
 - archive 功能採跨平台設計方向
-- `fzf` 已內建 macOS / Windows binary
-- `zoxide` 已內建 macOS / Windows binary
+- `fzf`、`rg`、`zoxide` 完全使用系統 `PATH` 中的命令，未安裝時啟動狀態會列出缺少項目
+- 缺少任一工具時，使用相關功能會在目前 focus panel 顯示依賴列表；`j/k` 移動、`Esc` 關閉
+- `vendor` 已不再是編譯或執行必要條件，刪除後可直接縮小原始碼與執行檔體積
 
 ### 8.3 還需要的確認
 
@@ -608,8 +607,8 @@
 
 ### 2026-08-20 最近完成的重點
 
-- bundled zoxide support 已整理完成並 commit
-- 修正 bundled zoxide 首次解包 / 平行測試時可能讀到半寫入 binary 的競態問題
+- 舊版曾有 bundled zoxide；目前已移除，改為只使用系統 `PATH`
+- 缺少 `fzf`、`rg` 或 `zoxide` 時會開啟依賴狀態列表
 - 修正 trash panel 中 `V` 多選後，`u / d` 只處理游標項目的 bug
 - 目前 `u / d` 若存在標記，會批次處理標記項目
 

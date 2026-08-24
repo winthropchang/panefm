@@ -47,6 +47,7 @@ use super::{
         ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location,
         resolve_smb_location_with_mount_root,
     },
+    tools::external_tool_statuses,
     trash::{TrashListEntry, TrashStore},
     ui::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
@@ -55,8 +56,7 @@ use super::{
         render_command_palette, render_confirm_dialog, render_filter_input,
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
-        render_theme_picker,
-        render_trash_confirm_dialog, render_window_picker,
+        render_theme_picker, render_trash_confirm_dialog, render_window_picker,
         render_zoxide_picker,
     },
     zoxide::{add_directory_to_zoxide, query_zoxide_directories},
@@ -347,6 +347,10 @@ pub(crate) enum PendingAction {
         entries: Vec<PathBuf>,
         search: PanelSearchState,
     },
+    ToolPanel {
+        pane_id: usize,
+        selected: usize,
+    },
     CopyPicker {
         pane_id: usize,
         target: OpenTarget,
@@ -456,9 +460,7 @@ impl App {
     pub(crate) fn new(cwd: PathBuf, loaded_config: LoadedConfig) -> io::Result<Self> {
         let trash_store = TrashStore::new(&cwd)?;
         let LoadedConfig { config, source } = loaded_config;
-        let config_source = source
-            .clone()
-            .unwrap_or_else(|| cwd.join("config.toml"));
+        let config_source = source.clone().unwrap_or_else(|| cwd.join("config.toml"));
         let bookmark_store = BookmarkStore::load(bookmark_file_path(&cwd, source.as_deref()))
             .map_err(|error| io::Error::other(error.to_string()))?;
         let _ = add_directory_to_zoxide(&cwd);
@@ -470,6 +472,19 @@ impl App {
         let startup_status = match source {
             Some(path) => format!("loaded config: {}", path.display()),
             None => String::from("normal mode"),
+        };
+        let missing_tools = external_tool_statuses()
+            .into_iter()
+            .filter(|tool| !tool.installed)
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        let startup_status = if missing_tools.is_empty() {
+            startup_status
+        } else {
+            format!(
+                "{startup_status}; missing dependencies: {}",
+                missing_tools.join(", ")
+            )
         };
 
         Ok(Self {
@@ -1896,6 +1911,33 @@ impl App {
         };
 
         match action {
+            PendingAction::ToolPanel {
+                pane_id,
+                mut selected,
+            } => {
+                let tools = external_tool_statuses();
+                let len = tools.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => {
+                        self.status = String::from("dependency panel closed");
+                    }
+                    _ if key_matches_plain_letter(&key, 'j') || key.code == KeyCode::Down => {
+                        selected = if len == 0 {
+                            0
+                        } else {
+                            (selected + 1).min(len - 1)
+                        };
+                        self.pending_action = Some(PendingAction::ToolPanel { pane_id, selected });
+                    }
+                    _ if key_matches_plain_letter(&key, 'k') || key.code == KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.pending_action = Some(PendingAction::ToolPanel { pane_id, selected });
+                    }
+                    _ => {
+                        self.pending_action = Some(PendingAction::ToolPanel { pane_id, selected });
+                    }
+                }
+            }
             PendingAction::ConfirmDelete {
                 pane_id,
                 target_name,
@@ -1978,11 +2020,8 @@ impl App {
                         marked_ids,
                         visual_anchor,
                     ));
-                    self.status = trash_confirm_cancelled_status(
-                        &action,
-                        &target_name,
-                        entry_count,
-                    );
+                    self.status =
+                        trash_confirm_cancelled_status(&action, &target_name, entry_count);
                 }
                 _ if key_matches_letter_any_case(&key, 'y') || key.code == KeyCode::Enter => {
                     self.confirm_trash_action(action, target_name, entry_count)?;
@@ -1993,7 +2032,8 @@ impl App {
                         marked_ids,
                         visual_anchor,
                     ));
-                    self.status = trash_confirm_cancelled_status(&action, &target_name, entry_count);
+                    self.status =
+                        trash_confirm_cancelled_status(&action, &target_name, entry_count);
                 }
                 _ if key_matches_letter_any_case(&key, 'n') => {
                     self.pending_action = Some(trash_panel_pending_action_from_confirm_action(
@@ -2001,7 +2041,8 @@ impl App {
                         marked_ids,
                         visual_anchor,
                     ));
-                    self.status = trash_confirm_cancelled_status(&action, &target_name, entry_count);
+                    self.status =
+                        trash_confirm_cancelled_status(&action, &target_name, entry_count);
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::ConfirmTrashAction {
@@ -2370,7 +2411,8 @@ impl App {
                         );
                         return Ok(true);
                     }
-                    if key_matches_plain_letter(&key, 'v') || key_matches_shifted_letter(&key, 'V') {
+                    if key_matches_plain_letter(&key, 'v') || key_matches_shifted_letter(&key, 'V')
+                    {
                         self.pending_g = false;
                         if let Some(anchor) = visual_anchor.take() {
                             let added = self.commit_trash_visual_selection(
@@ -2895,6 +2937,22 @@ impl App {
                                 }
                                 return Ok(true);
                             }
+                        }
+                        _ if key_matches_shifted_letter(&key, 'X') => {
+                            self.clear_pending_count();
+                            self.pending_g = false;
+                            let cancelled = self.cancel_running_tasks_for_pane(pane_id);
+                            self.status = if cancelled == 0 {
+                                String::from("no cancellable running tasks")
+                            } else {
+                                format!("cancelled {cancelled} tasks")
+                            };
+                            self.pending_action = Some(PendingAction::TaskPanel {
+                                pane_id,
+                                selected,
+                                search,
+                            });
+                            return Ok(true);
                         }
                         _ if key_matches_plain_letter(&key, 'g') => {
                             if self.pending_g {
@@ -4606,6 +4664,7 @@ impl App {
             "bookmark clear" => self.delete_all_bookmarks()?,
             "trash" => self.open_trash_panel()?,
             "tasks" => self.open_task_panel(),
+            "status" => self.open_tool_panel(),
             "help" => self.open_help_panel(),
             "bookmark list" => self.open_bookmark_list(),
             "zoxide" => self.open_zoxide_list(),
@@ -4991,8 +5050,18 @@ impl App {
             }
             Err(error) => {
                 self.status = format!("zoxide failed: {error}");
+                self.open_tool_panel();
             }
         }
+    }
+
+    /// 在目前 focus panel 顯示外部工具安裝狀態，讓使用者知道缺少哪些依賴。
+    pub(crate) fn open_tool_panel(&mut self) {
+        self.pending_action = Some(PendingAction::ToolPanel {
+            pane_id: self.focused_pane,
+            selected: 0,
+        });
+        self.status = String::from("dependencies: j/k move, Esc close");
     }
 
     /// 處理等待書籤按鍵時的輸入。
@@ -5693,6 +5762,7 @@ impl App {
                 help_entries(&search.buffer).len(),
                 search.editing,
             ),
+            PendingAction::ToolPanel { .. } => String::from("dependencies: j/k move, Esc close"),
             PendingAction::BookmarkList {
                 selected,
                 mode,
@@ -6533,6 +6603,39 @@ impl App {
         } else {
             self.status = format!("task {task_id} not found");
         }
+    }
+
+    /// 取消目前 panel 中所有仍可取消的背景任務。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，要清理任務的 panel 編號。
+    ///
+    /// 回傳：`usize`，實際送出取消要求的任務數量。
+    fn cancel_running_tasks_for_pane(&mut self, pane_id: usize) -> usize {
+        let task_ids = self
+            .task_log
+            .iter()
+            .filter(|task| task.pane_id == pane_id && matches!(task.state, TaskState::Running))
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+
+        let mut cancelled = 0;
+        for task_id in task_ids {
+            let was_running = self
+                .task_log
+                .iter()
+                .any(|task| task.id == task_id && matches!(task.state, TaskState::Running));
+            self.cancel_task_by_id(task_id);
+            if was_running
+                && self
+                    .task_log
+                    .iter()
+                    .any(|task| task.id == task_id && matches!(task.state, TaskState::Cancelled))
+            {
+                cancelled += 1;
+            }
+        }
+        cancelled
     }
 
     /// 取得目前 pane 對應的任務清單，最新的排在最上面。
@@ -7935,6 +8038,7 @@ impl App {
 
         let mut pane_rects = BTreeMap::new();
         self.layout.render_rects(outer[0], &mut pane_rects);
+        let tool_statuses = external_tool_statuses();
         let mut cursor_position = None;
         for (&pane_id, &rect) in &pane_rects {
             let trash_overlay_state =
@@ -8139,6 +8243,19 @@ impl App {
                     } else {
                         None
                     }
+                } else if let Some(PendingAction::ToolPanel {
+                    pane_id: action_pane_id,
+                    selected,
+                }) = &self.pending_action
+                {
+                    if *action_pane_id == pane_id {
+                        Some(PaneListState::Tools {
+                            statuses: &tool_statuses,
+                            selected: *selected,
+                        })
+                    } else {
+                        None
+                    }
                 } else if let Some(PendingAction::RegexRename {
                     pane_id: action_pane_id,
                     selected,
@@ -8278,10 +8395,7 @@ impl App {
         } else {
             Style::default()
         };
-        frame.render_widget(
-            Paragraph::new(status_text).style(status_style),
-            outer[2],
-        );
+        frame.render_widget(Paragraph::new(status_text).style(status_style), outer[2]);
 
         if self.command_mode
             && let Some(area) = pane_rects.get(&self.focused_pane)
@@ -8457,6 +8571,7 @@ impl App {
             Some(PendingAction::TrashPanel { .. })
             | Some(PendingAction::TaskPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
+            | Some(PendingAction::ToolPanel { .. })
             | Some(PendingAction::CopyPicker { .. })
             | Some(PendingAction::OpenPicker { .. })
             | Some(PendingAction::RegexRename { .. }) => {}
@@ -8556,6 +8671,27 @@ impl App {
                         completed_search_task = Some((task_id, 0));
                     }
                     finished = true;
+                }
+                GlobalSearchEvent::MissingTool {
+                    pane_id,
+                    query,
+                    tool,
+                } => {
+                    let task_id = self
+                        .global_search
+                        .as_ref()
+                        .filter(|search| search.pane_id == pane_id && search.buffer == query)
+                        .and_then(|search| search.task_id);
+                    self.global_search = None;
+                    self.cancel_global_search_worker();
+                    if let Some(task_id) = task_id.or(self.active_global_search_task_id.take()) {
+                        self.finish_task(task_id, TaskState::Failed, format!("missing {tool}"));
+                    }
+                    self.pending_action = Some(PendingAction::ToolPanel {
+                        pane_id,
+                        selected: 0,
+                    });
+                    self.status = format!("content search requires {tool}");
                 }
             }
         }
@@ -9565,8 +9701,14 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":tasks",
             "T",
-            "打開目前 panel 的任務面板，查看最近的 search / jump / open / smb 任務狀態",
+            "打開目前 panel 的任務面板；x 取消選取任務，X 取消所有可取消任務",
             HelpAction::Command("tasks"),
+        ),
+        help_entry(
+            ":status",
+            "",
+            "顯示 fzf、rg、zoxide 是否已安裝並可從系統 PATH 使用",
+            HelpAction::Command("status"),
         ),
         help_entry(
             ":trash undo",
@@ -9724,7 +9866,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(":sort random", ",r", "隨機排序目前列表", HelpAction::Sort),
         help_entry(":hidden", ".", "切換是否顯示隱藏檔", HelpAction::Hidden),
-        help_entry(":visual", "v", "進入視覺範圍標記模式，使用 j/k 移動，再按 v 或 Esc 結束", HelpAction::Visual),
+        help_entry(
+            ":visual",
+            "v",
+            "進入視覺範圍標記模式，使用 j/k 移動，再按 v 或 Esc 結束",
+            HelpAction::Visual,
+        ),
         help_entry(
             ":quit",
             "q",
@@ -9812,6 +9959,7 @@ fn command_suggestions(query: &str) -> Vec<CommandSuggestionLine> {
         suggestions.push(CommandSuggestionLine {
             command: command.to_string(),
             display_command: entry.line.command,
+            shortcut: entry.line.shortcut,
             description: entry.line.description,
         });
     }
@@ -9944,6 +10092,7 @@ fn path_completion_suggestions(
                 CommandSuggestionLine {
                     command: format!("{}{}", context.replacement_prefix, completed),
                     display_command: display_name,
+                    shortcut: String::new(),
                     description: String::new(),
                 },
             ))
@@ -10046,7 +10195,7 @@ fn task_panel_status(query: &str, count: usize, selected: usize, editing: bool) 
         }
     } else {
         format!(
-            "tasks: {}/{} (j/k move, l detail, x cancel, f search, h close)",
+            "tasks: {}/{} (j/k move, x cancel, X cancel all, f search, h close)",
             selected + 1,
             count
         )
@@ -10072,7 +10221,11 @@ fn paste_overwrite_cancelled_status(target_name: &str, entry_count: usize) -> St
 }
 
 /// 依照 trash 確認操作種類，回傳確認視窗與狀態列要顯示的文字。
-fn trash_confirm_status(action: &TrashConfirmAction, target_name: &str, entry_count: usize) -> String {
+fn trash_confirm_status(
+    action: &TrashConfirmAction,
+    target_name: &str,
+    entry_count: usize,
+) -> String {
     let verb = match action {
         TrashConfirmAction::RestoreFromPanel { .. } => "restore",
         TrashConfirmAction::DeleteFromPanel { .. } => "delete",
@@ -10507,16 +10660,15 @@ mod tests {
 
     use super::{
         App, BookmarkListMode, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
-        PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode,
-        TaskRecord, TaskState, TrashConfirmAction, VisualSelectionState,
-        command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
-        ctrl_digit_target_pane_id, help_entries, is_windows_drive_path,
-        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
-        key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
-        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end,
-        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action,
-        typed_char_from_key,
+        PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord,
+        TaskState, TrashConfirmAction, VisualSelectionState, command_suggestion_navigation,
+        command_suggestions, command_suggestions_for_buffer, ctrl_digit_target_pane_id,
+        help_entries, is_windows_drive_path, key_matches_ctrl_letter,
+        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
+        key_matches_shifted_letter, looks_like_navigation_path, plain_digit_target_pane_id,
+        query_zoxide_directories, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end, trash_confirm_panel_id,
+        trash_panel_overlay_state_from_pending_action, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -10540,7 +10692,9 @@ mod tests {
     fn status_is_error_distinguishes_errors_from_notifications() {
         assert!(super::status_is_error("failed to open file"));
         assert!(super::status_is_error("usage: reg <pattern> <replace>"));
-        assert!(super::status_is_error("rename-regex: resolve conflicts before apply"));
+        assert!(super::status_is_error(
+            "rename-regex: resolve conflicts before apply"
+        ));
         assert!(!super::status_is_error("opened directory"));
         assert!(!super::status_is_error("rename-regex: renamed 2 items"));
         assert!(!super::status_is_error("trash cancelled: note.txt"));
@@ -10936,6 +11090,7 @@ mod tests {
         assert!(!suggestions.is_empty());
         assert_eq!(suggestions[0].command, "goto docs/");
         assert_eq!(suggestions[0].display_command, "docs/");
+        assert!(suggestions[0].shortcut.is_empty());
         assert!(suggestions[0].description.is_empty());
     }
 
@@ -11098,6 +11253,7 @@ mod tests {
         let suggestions = command_suggestions(&app.command_buffer);
         assert!(!suggestions.is_empty());
         assert_eq!(suggestions[0].command, "zoxide");
+        assert_eq!(suggestions[0].shortcut, "Z");
         assert_eq!(app.command_suggestion_selected, 0);
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
@@ -12509,7 +12665,7 @@ mod tests {
         }
         assert_eq!(
             app.status,
-            "tasks: 1/1 (j/k move, l detail, x cancel, f search, h close)"
+            "tasks: 1/1 (j/k move, x cancel, X cancel all, f search, h close)"
         );
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
@@ -12605,6 +12761,27 @@ mod tests {
 
         assert_eq!(app.focused_pane, 2);
         assert_eq!(app.status, "focused panel 2");
+    }
+
+    #[test]
+    /// 驗證 `:status` 會在目前 focus panel 顯示外部工具狀態，且 Enter 可關閉查詢面板。
+    fn app_status_command_opens_dependency_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.execute_command("status").expect("open status panel");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::ToolPanel {
+                pane_id: 1,
+                selected: 0
+            })
+        ));
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("close status panel");
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "dependency panel closed");
     }
 
     #[test]
@@ -12875,9 +13052,11 @@ mod tests {
             .expect("cycle theme");
 
         assert_eq!(app.theme_preset, ThemePreset::CatppuccinLatte);
-        assert!(std::fs::read_to_string(dir.path().join("config.toml"))
-            .expect("read config")
-            .contains("theme = \"catppuccin-latte\""));
+        assert!(
+            std::fs::read_to_string(dir.path().join("config.toml"))
+                .expect("read config")
+                .contains("theme = \"catppuccin-latte\"")
+        );
     }
 
     #[test]
@@ -14851,6 +15030,72 @@ mod tests {
         assert!(app.global_search_cancelled.is_none());
         assert!(cancelled.load(Ordering::Relaxed));
         assert_eq!(app.status, format!("cancelled task {task_id}"));
+    }
+
+    #[test]
+    /// 驗證 task 面板中的 `X` 會取消目前 panel 內所有可取消的任務。
+    fn app_task_panel_shift_x_cancels_all_running_tasks() {
+        let dir = tempdir().expect("tempdir");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let task_id = app.push_task(
+            1,
+            "search",
+            String::from("content search: needle"),
+            format!("root: {}", dir.path().display()),
+        );
+        app.global_search = Some(GlobalSearchState {
+            pane_id: 1,
+            root_dir: dir.path().to_path_buf(),
+            mode: SearchMode::Content,
+            buffer: String::from("needle"),
+            editing: false,
+            loading: true,
+            searched: false,
+            selected: 0,
+            results: Vec::new(),
+            preview_scroll: None,
+            preview_current_match: None,
+            task_id: Some(task_id),
+        });
+        app.active_global_search_task_id = Some(task_id);
+        app.global_search_cancelled = Some(cancelled.clone());
+        app.open_task_panel();
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .expect("cancel all tasks");
+
+        assert_eq!(
+            app.task_log
+                .iter()
+                .find(|task| task.id == task_id)
+                .map(|task| task.state),
+            Some(TaskState::Cancelled)
+        );
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(app.status, "cancelled 1 tasks");
+    }
+
+    #[test]
+    /// 驗證建立項目後，所有開啟相同目錄的 panel 都會同步看到新項目。
+    fn app_mutation_refreshes_sibling_panels_with_same_directory() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        let first_panel = app.ordered_pane_ids()[0];
+        let second_panel = app.ordered_pane_ids()[1];
+
+        app.confirm_create_entry(second_panel, "shared.txt")
+            .expect("create shared file");
+
+        for pane_id in [first_panel, second_panel] {
+            let pane = app.panes.get(&pane_id).expect("pane");
+            assert!(
+                pane.entries
+                    .iter()
+                    .any(|entry| entry.display_name() == "shared.txt")
+            );
+        }
     }
 
     #[test]

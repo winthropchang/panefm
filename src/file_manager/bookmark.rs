@@ -336,7 +336,11 @@ mod tests {
 
         assert!(store.remove('a').expect("remove bookmark"));
         assert_eq!(store.get('a'), None);
-        assert!(!fs::read_to_string(file).expect("bookmark file").contains("/tmp/demo"));
+        assert!(
+            !fs::read_to_string(file)
+                .expect("bookmark file")
+                .contains("/tmp/demo")
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::io;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 
-use super::rg::bundled_rg_command;
+use super::rg::rg_command;
 
 /// 表示 global search 面板中的單一搜尋結果。
 ///
@@ -69,6 +69,11 @@ pub(crate) enum GlobalSearchEvent {
     Done {
         pane_id: usize,
         query: String,
+    },
+    MissingTool {
+        pane_id: usize,
+        query: String,
+        tool: String,
     },
 }
 
@@ -282,7 +287,7 @@ pub(crate) fn stream_content_search_entries(
         return;
     }
 
-    if stream_content_search_entries_with_rg(
+    match stream_content_search_entries_with_rg(
         pane_id,
         root,
         show_hidden,
@@ -292,7 +297,16 @@ pub(crate) fn stream_content_search_entries(
         cancelled.clone(),
         &sender,
     ) {
-        return;
+        Some(true) => return,
+        None => {
+            let _ = sender.send(GlobalSearchEvent::MissingTool {
+                pane_id,
+                query: query.to_string(),
+                tool: String::from("rg"),
+            });
+            return;
+        }
+        Some(false) => {}
     }
 
     let walker = WalkBuilder::new(root).hidden(!show_hidden).build();
@@ -376,17 +390,18 @@ fn stream_content_search_entries_with_rg(
     chunk_size: usize,
     cancelled: Arc<AtomicBool>,
     sender: &Sender<GlobalSearchEvent>,
-) -> bool {
-    let Ok(mut command) = build_rg_content_search_command(root, show_hidden, query, limit) else {
-        return false;
+) -> Option<bool> {
+    let mut command = match build_rg_content_search_command(root, show_hidden, query, limit) {
+        Ok(command) => command,
+        Err(_) => return None,
     };
     let Ok(mut child) = command.spawn() else {
-        return false;
+        return Some(false);
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return false;
+        return Some(false);
     };
 
     let mut reader = BufReader::new(stdout);
@@ -403,14 +418,14 @@ fn stream_content_search_entries_with_rg(
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            return true;
+            return Some(true);
         }
 
         line.clear();
         let Ok(read) = reader.read_line(&mut line) else {
             let _ = child.kill();
             let _ = child.wait();
-            return false;
+            return Some(false);
         };
         if read == 0 {
             break;
@@ -483,10 +498,10 @@ fn stream_content_search_entries_with_rg(
     }
 
     let Ok(status) = child.wait() else {
-        return false;
+        return Some(false);
     };
     if cancelled.load(Ordering::Relaxed) {
-        return true;
+        return Some(true);
     }
 
     // rg 在沒找到結果時會回傳 exit code 1，這仍是正常完成。
@@ -495,10 +510,10 @@ fn stream_content_search_entries_with_rg(
             pane_id,
             query: query.to_string(),
         });
-        return true;
+        return Some(true);
     }
 
-    sent_anything
+    Some(sent_anything)
 }
 
 /// 建立給 ripgrep 使用的內容搜尋命令。
@@ -508,7 +523,7 @@ fn build_rg_content_search_command(
     query: &str,
     _limit: usize,
 ) -> Result<Command, std::io::Error> {
-    let program = bundled_rg_command().unwrap_or_else(|_| "rg".into());
+    let program = rg_command().map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut command = Command::new(program);
     command
         .arg("--json")
@@ -735,7 +750,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 GlobalSearchEvent::Chunk { entries, .. } => Some(entries.len()),
-                GlobalSearchEvent::Done { .. } => None,
+                GlobalSearchEvent::Done { .. } | GlobalSearchEvent::MissingTool { .. } => None,
             })
             .collect::<Vec<_>>();
 

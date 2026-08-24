@@ -419,8 +419,14 @@ mod tests {
     #[test]
     /// 驗證舊版設定名稱仍能對應到新的成熟主題，避免更新後既有設定失效。
     fn legacy_theme_names_remain_compatible() {
-        assert_eq!(ThemePreset::from_name("default"), Some(ThemePreset::CatppuccinMocha));
-        assert_eq!(ThemePreset::from_name("forest"), Some(ThemePreset::Everforest));
+        assert_eq!(
+            ThemePreset::from_name("default"),
+            Some(ThemePreset::CatppuccinMocha)
+        );
+        assert_eq!(
+            ThemePreset::from_name("forest"),
+            Some(ThemePreset::Everforest)
+        );
         assert_eq!(ThemePreset::from_name("ocean"), Some(ThemePreset::Nord));
     }
 }

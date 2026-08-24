@@ -1,7 +1,6 @@
 mod app;
 mod archive;
 mod bookmark;
-mod bundled;
 mod copy;
 mod entry;
 mod fzf;
@@ -12,6 +11,7 @@ mod platform;
 mod rg;
 mod search;
 mod smb;
+mod tools;
 mod trash;
 mod ui;
 mod zoxide;
@@ -40,7 +40,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::config::load_config;
 
 use self::app::{App, FzfJumpRequest, RenameMode};
-use self::fzf::bundled_fzf_command;
+use self::fzf::fzf_command;
 use self::open::{LaunchMode, LaunchSpec};
 
 /// 啟動檔案管理器模組的完整執行流程。
@@ -129,7 +129,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 Ok(selected_line) => {
                     app.apply_fzf_jump_selection(request, selected_line.as_deref())
                 }
-                Err(error) => app.status = format!("jump failed: {error}"),
+                Err(error) => {
+                    app.status = format!("jump failed: {error}");
+                    app.open_tool_panel();
+                }
             }
             last_cursor_mode = None;
         }
@@ -144,7 +147,7 @@ fn run_fzf_jump(
     request: &FzfJumpRequest,
 ) -> Result<Option<String>> {
     let jump_started_at = Instant::now();
-    let fzf_command = bundled_fzf_command()?;
+    let fzf_command = fzf_command()?;
 
     disable_raw_mode()?;
     leave_tui_mode(terminal.backend_mut())?;

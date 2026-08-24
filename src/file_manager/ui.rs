@@ -16,6 +16,7 @@ use super::{
     app::TrashConfirmAction,
     pane::{PaneState, SortDetailKind},
     search::GlobalSearchEntry,
+    tools::ToolStatus,
 };
 
 /// 描述底部快捷鍵面板中的單一項目。
@@ -78,6 +79,10 @@ pub(crate) enum PaneListState<'a> {
         search: &'a str,
         editing: bool,
     },
+    Tools {
+        statuses: &'a [ToolStatus],
+        selected: usize,
+    },
     RegexRename {
         lines: &'a [RegexRenamePanelLine],
         selected: usize,
@@ -136,6 +141,7 @@ pub(crate) struct RegexRenamePanelLine {
 pub(crate) struct CommandSuggestionLine {
     pub(crate) command: String,
     pub(crate) display_command: String,
+    pub(crate) shortcut: String,
     pub(crate) description: String,
 }
 
@@ -192,6 +198,7 @@ pub(crate) fn render_pane(
         Some(PaneListState::Tasks { .. }) => "  [tasks]",
         Some(PaneListState::Trash { .. }) => "  [trash d/D u/U]",
         Some(PaneListState::Help { .. }) => "  [help]",
+        Some(PaneListState::Tools { .. }) => "  [dependencies Esc]",
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
     };
@@ -330,6 +337,17 @@ pub(crate) fn render_pane(
                     )))
                 })
                 .collect(),
+            PaneListState::Tools { statuses, .. } => statuses
+                .iter()
+                .map(|tool| {
+                    let state = if tool.installed {
+                        "已安裝"
+                    } else {
+                        "未安裝"
+                    };
+                    ListItem::new(Line::from(format!("{:<10} {state}", tool.name)))
+                })
+                .collect(),
             PaneListState::RegexRename { lines, .. } if lines.is_empty() => {
                 vec![ListItem::new(Line::from("沒有可預覽的改名項目"))]
             }
@@ -416,6 +434,9 @@ pub(crate) fn render_pane(
                 lines, selected, ..
             } if !lines.is_empty() => {
                 list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
+            }
+            PaneListState::Tools { statuses, selected } if !statuses.is_empty() => {
+                list_state.select(Some(selected.min(statuses.len().saturating_sub(1))));
             }
             PaneListState::RegexRename { lines, selected } if !lines.is_empty() => {
                 list_state.select(Some(selected.min(lines.len().saturating_sub(1))));
@@ -1439,8 +1460,9 @@ pub(crate) fn render_command_palette(
                     line.display_command.clone()
                 } else {
                     format!(
-                        "{:<22}  {}",
+                        "{:<22}  {:<8}  {}",
                         truncate_text(&line.display_command, 22),
+                        line.shortcut,
                         line.description
                     )
                 };
@@ -1640,9 +1662,7 @@ fn file_category(entry: &super::entry::FileEntry) -> FileCategory {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if entry
-        .unix_mode
-        .is_some_and(|mode| mode & 0o111 != 0)
+    if entry.unix_mode.is_some_and(|mode| mode & 0o111 != 0)
         || matches!(extension.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1")
     {
         return FileCategory::Executable;
@@ -1661,8 +1681,21 @@ fn file_category(entry: &super::entry::FileEntry) -> FileCategory {
     }
     if matches!(
         extension.as_str(),
-        "rs" | "toml" | "json" | "yaml" | "yml" | "js" | "ts" | "py" | "go"
-            | "c" | "h" | "cpp" | "java" | "swift" | "rb" | "sh"
+        "rs" | "toml"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "js"
+            | "ts"
+            | "py"
+            | "go"
+            | "c"
+            | "h"
+            | "cpp"
+            | "java"
+            | "swift"
+            | "rb"
+            | "sh"
     ) {
         return FileCategory::Source;
     }
@@ -1723,7 +1756,7 @@ fn highlight_name_spans(
     if let Some(suffix) = name.get(byte_start..)
         && !suffix.is_empty()
     {
-            spans.push(Span::styled(suffix.to_string(), base_style));
+        spans.push(Span::styled(suffix.to_string(), base_style));
     }
 
     if spans.is_empty() {
@@ -1836,8 +1869,8 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        entry_icon, file_category, format_pane_title, format_permissions_detail, format_size_short,
-        regex_rename_status_style, FileCategory, IconStyle,
+        FileCategory, IconStyle, entry_icon, file_category, format_pane_title,
+        format_permissions_detail, format_size_short, regex_rename_status_style,
     };
     use std::path::Path;
     use std::time::SystemTime;
@@ -1863,20 +1896,47 @@ mod tests {
     /// 驗證 regex 預覽右側狀態會依 ready、unchanged 與錯誤類型套用主題顏色。
     fn regex_rename_status_uses_theme_semantic_colors() {
         let theme = Theme::default_theme();
-        assert_eq!(regex_rename_status_style(theme, "ready").fg, Some(theme.executable));
-        assert_eq!(regex_rename_status_style(theme, "unchanged").fg, Some(theme.muted));
-        assert_eq!(regex_rename_status_style(theme, "conflict").fg, Some(theme.danger));
-        assert_eq!(regex_rename_status_style(theme, "invalid").fg, Some(theme.danger));
+        assert_eq!(
+            regex_rename_status_style(theme, "ready").fg,
+            Some(theme.executable)
+        );
+        assert_eq!(
+            regex_rename_status_style(theme, "unchanged").fg,
+            Some(theme.muted)
+        );
+        assert_eq!(
+            regex_rename_status_style(theme, "conflict").fg,
+            Some(theme.danger)
+        );
+        assert_eq!(
+            regex_rename_status_style(theme, "invalid").fg,
+            Some(theme.danger)
+        );
     }
 
     #[test]
     /// 驗證列表會依照目錄與常見副檔名分辨檔案類別與圖示。
     fn entry_kind_uses_cross_platform_categories() {
-        assert_eq!(entry_icon(&test_entry("src", true), IconStyle::Ascii), "[D]");
-        assert_eq!(file_category(&test_entry("main.rs", false)), FileCategory::Source);
-        assert_eq!(file_category(&test_entry("photo.png", false)), FileCategory::Image);
-        assert_eq!(file_category(&test_entry("backup.zip", false)), FileCategory::Archive);
-        assert_eq!(file_category(&test_entry("tool.exe", false)), FileCategory::Executable);
+        assert_eq!(
+            entry_icon(&test_entry("src", true), IconStyle::Ascii),
+            "[D]"
+        );
+        assert_eq!(
+            file_category(&test_entry("main.rs", false)),
+            FileCategory::Source
+        );
+        assert_eq!(
+            file_category(&test_entry("photo.png", false)),
+            FileCategory::Image
+        );
+        assert_eq!(
+            file_category(&test_entry("backup.zip", false)),
+            FileCategory::Archive
+        );
+        assert_eq!(
+            file_category(&test_entry("tool.exe", false)),
+            FileCategory::Executable
+        );
     }
 
     #[test]

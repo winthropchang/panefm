@@ -903,7 +903,10 @@ mod tests {
 
         persist_theme(&path, ThemePreset::Kanagawa).expect("persist theme");
 
-        assert_eq!(fs::read_to_string(path).expect("read config"), "[ui]\ntheme = \"kanagawa\"\n");
+        assert_eq!(
+            fs::read_to_string(path).expect("read config"),
+            "[ui]\ntheme = \"kanagawa\"\n"
+        );
     }
 
     #[test]

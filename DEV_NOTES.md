@@ -337,3 +337,14 @@
 3. 明天先做 Windows 真機測試，把實際問題帶回來。
 4. Windows 若沒有大問題，下一步直接做列表導航 / 快速定位優化。
 5. global search 的深層效能優化依然重要，但可以排在單目錄導航體驗之後。
+
+## 2026-08-24 搜尋、task 與 panel 一致性補強
+
+- `S` 內容搜尋優先使用系統 PATH 中的 `rg`；修正 `rg` 命令建立流程，避免參數錯誤導致退回慢速逐檔掃描。
+- 找不到 `rg` 時不再靜默當成「沒有搜尋結果」，會停止目前搜尋 task，並在 focus panel 顯示依賴狀態面板。
+- task 面板保留 `x` 取消目前任務，新增 `X` 取消目前 panel 中所有可取消的 running task。
+- 多 panel 同一目錄的建立、刪除、trash、rename、貼上與壓縮流程都使用 `reload_all_panes()` 同步刷新；新增回歸測試保護同目錄 panel。
+- trash 原本已支援批次還原、批次永久刪除與清空列表，本輪補確認測試未因搜尋與 task 改動退化。
+- task 面板說明與 Help 已同步顯示 `x / X` 操作。
+- 本輪驗證：`cargo test -q` 通過 295 tests，`cargo check` 通過。
+- 尚未完成：Windows 真機驗證，明天優先測試外部工具 PATH、SMB、Open/Reveal、archive 與快捷鍵輸入。

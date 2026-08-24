@@ -3,48 +3,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
 
-#[cfg(not(test))]
-use super::bundled::tfm_data_root_dir;
-use super::bundled::{ensure_executable_permissions, tfm_cache_root_dir};
+use super::tools::{find_system_command, missing_tool_message};
 
-/// 目前內建的 `zoxide` 版本字串。
-pub(crate) const BUNDLED_ZOXIDE_VERSION: &str = "0.10.0";
-
-/// 產生原子寫入暫存檔名稱時使用的遞增序號。
-static BUNDLED_ZOXIDE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// 描述單一平台對應的內建 `zoxide` asset。
-#[derive(Clone, Copy)]
-struct BundledZoxideAsset {
-    platform_dir: &'static str,
-    executable_name: &'static str,
-    bytes: &'static [u8],
-}
-
-/// 取得目前平台應使用的內建 `zoxide` 可執行檔路徑。
-///
-/// 參數：無。
-///
-/// 回傳：`Result<OsString>`。
-/// - 成功時回傳已存在於本機快取目錄中的 `zoxide` 路徑。
-/// - 失敗時代表目前平台尚未內建對應 binary，或寫入快取時發生錯誤。
-pub(crate) fn bundled_zoxide_command() -> Result<OsString> {
-    let Some(asset) = current_bundled_asset() else {
-        return Err(anyhow::anyhow!(
-            "bundled zoxide is not available for this platform: {} {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ));
-    };
-
-    let binary_path = bundled_zoxide_cache_path(asset)?;
-    ensure_bundled_zoxide_ready(asset, &binary_path)?;
-    Ok(binary_path.into_os_string())
+/// 取得系統安裝的 `zoxide` 命令；本程式不再攜帶第三方 binary。
+pub(crate) fn zoxide_command() -> Result<OsString> {
+    find_system_command("zoxide")
+        .ok_or_else(|| anyhow::anyhow!("{}", missing_tool_message("zoxide")))
 }
 
 /// 回傳 terminal-file-manager 專屬的 zoxide 資料目錄。
@@ -64,9 +32,16 @@ pub(crate) fn zoxide_data_dir() -> Result<PathBuf> {
     }
 
     #[cfg(not(test))]
-    {
-        Ok(tfm_data_root_dir()?.join("zoxide"))
-    }
+    Ok(std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join("Library").join("Application Support"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("terminal-file-manager")
+        .join("zoxide"))
 }
 
 /// 把指定目錄寫進 zoxide 資料庫，讓之後 `Z` / `:zoxide` 能依 frecency 排序跳轉。
@@ -88,7 +63,7 @@ fn add_directory_to_zoxide_with_data_dir(path: &Path, data_dir: &Path) -> Result
         return Ok(());
     }
 
-    let command = bundled_zoxide_command()?;
+    let command = zoxide_command()?;
     fs::create_dir_all(&data_dir).context("create zoxide data directory")?;
 
     let status = Command::new(command)
@@ -119,7 +94,7 @@ pub(crate) fn query_zoxide_directories() -> Result<Vec<PathBuf>> {
 
 /// 用指定資料目錄查詢 zoxide 資料庫，供正式流程與測試共用。
 fn query_zoxide_directories_with_data_dir(data_dir: &Path) -> Result<Vec<PathBuf>> {
-    let command = bundled_zoxide_command()?;
+    let command = zoxide_command()?;
     fs::create_dir_all(&data_dir).context("create zoxide data directory")?;
 
     let output = Command::new(command)
@@ -145,166 +120,14 @@ fn query_zoxide_directories_with_data_dir(data_dir: &Path) -> Result<Vec<PathBuf
         .collect())
 }
 
-/// 回傳目前執行平台對應的內建 `zoxide` asset。
-fn current_bundled_asset() -> Option<BundledZoxideAsset> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some(BUNDLED_DARWIN_ARM64),
-        ("macos", "x86_64") => Some(BUNDLED_DARWIN_AMD64),
-        ("windows", "aarch64") => Some(BUNDLED_WINDOWS_ARM64),
-        ("windows", "x86_64") => Some(BUNDLED_WINDOWS_AMD64),
-        _ => None,
-    }
-}
-
-/// 計算目前平台內建 `zoxide` 在本機快取中的最終路徑。
-fn bundled_zoxide_cache_path(asset: BundledZoxideAsset) -> Result<PathBuf> {
-    Ok(tfm_cache_root_dir()?
-        .join("bin")
-        .join("zoxide")
-        .join(format!("v{BUNDLED_ZOXIDE_VERSION}"))
-        .join(asset.platform_dir)
-        .join(asset.executable_name))
-}
-
-/// 確保內建 `zoxide` 已解包到本機快取目錄。
-fn ensure_bundled_zoxide_ready(asset: BundledZoxideAsset, target_path: &Path) -> Result<()> {
-    let needs_write = match fs::metadata(target_path) {
-        Ok(metadata) => metadata.len() != asset.bytes.len() as u64,
-        Err(_) => true,
-    };
-
-    if !needs_write {
-        return Ok(());
-    }
-
-    let parent = target_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("bundled zoxide target path has no parent"))?;
-    fs::create_dir_all(parent).context("create bundled zoxide cache directory")?;
-    write_bundled_binary_atomically(target_path, asset.bytes)?;
-    Ok(())
-}
-
-/// 以原子替換方式寫入內建 `zoxide` binary，避免平行測試讀到半寫入檔案。
-///
-/// 流程：
-/// - 先在同目錄寫入唯一名稱的暫存檔
-/// - 補上可執行權限
-/// - 最後用 `rename` 一次替換正式檔案
-fn write_bundled_binary_atomically(target_path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = target_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("bundled zoxide target path has no parent"))?;
-    let sequence = BUNDLED_ZOXIDE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp_name = format!(
-        ".{}.tmp-{}-{}",
-        target_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("zoxide"),
-        std::process::id(),
-        sequence
-    );
-    let temp_path = parent.join(temp_name);
-
-    fs::write(&temp_path, bytes).context("write temporary bundled zoxide binary")?;
-    ensure_executable_permissions(&temp_path)?;
-
-    if let Err(error) = fs::rename(&temp_path, target_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error).context("replace bundled zoxide binary atomically");
-    }
-
-    Ok(())
-}
-
-const BUNDLED_DARWIN_ARM64: BundledZoxideAsset = BundledZoxideAsset {
-    platform_dir: "darwin_arm64",
-    executable_name: "zoxide",
-    bytes: include_bytes!("../../vendor/zoxide/v0.10.0/darwin_arm64/zoxide"),
-};
-
-const BUNDLED_DARWIN_AMD64: BundledZoxideAsset = BundledZoxideAsset {
-    platform_dir: "darwin_amd64",
-    executable_name: "zoxide",
-    bytes: include_bytes!("../../vendor/zoxide/v0.10.0/darwin_amd64/zoxide"),
-};
-
-const BUNDLED_WINDOWS_ARM64: BundledZoxideAsset = BundledZoxideAsset {
-    platform_dir: "windows_arm64",
-    executable_name: "zoxide.exe",
-    bytes: include_bytes!("../../vendor/zoxide/v0.10.0/windows_arm64/zoxide.exe"),
-};
-
-const BUNDLED_WINDOWS_AMD64: BundledZoxideAsset = BundledZoxideAsset {
-    platform_dir: "windows_amd64",
-    executable_name: "zoxide.exe",
-    bytes: include_bytes!("../../vendor/zoxide/v0.10.0/windows_amd64/zoxide.exe"),
-};
-
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BUNDLED_ZOXIDE_VERSION, add_directory_to_zoxide_with_data_dir, bundled_zoxide_cache_path,
-        current_bundled_asset, ensure_bundled_zoxide_ready, query_zoxide_directories_with_data_dir,
-        write_bundled_binary_atomically, zoxide_data_dir,
+        add_directory_to_zoxide_with_data_dir, query_zoxide_directories_with_data_dir,
+        zoxide_data_dir,
     };
-
-    #[test]
-    fn supported_platform_builds_versioned_cache_path() {
-        if let Some(asset) = current_bundled_asset() {
-            let cache_path = bundled_zoxide_cache_path(asset).expect("cache path");
-            let path_text = cache_path.to_string_lossy();
-            assert!(path_text.contains("terminal-file-manager"));
-            assert!(path_text.contains(&format!("v{BUNDLED_ZOXIDE_VERSION}")));
-            assert!(path_text.contains(asset.platform_dir));
-            assert!(path_text.ends_with(asset.executable_name));
-        }
-    }
-
-    #[test]
-    fn ensure_bundled_zoxide_ready_writes_binary_to_target_path() {
-        let Some(asset) = current_bundled_asset() else {
-            return;
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let target_path = dir.path().join(asset.executable_name);
-        ensure_bundled_zoxide_ready(asset, &target_path).expect("extract bundled zoxide");
-
-        let metadata = std::fs::metadata(&target_path).expect("metadata");
-        assert_eq!(metadata.len(), asset.bytes.len() as u64);
-    }
-
-    #[test]
-    fn write_bundled_binary_atomically_replaces_target_without_temp_leftovers() {
-        let Some(asset) = current_bundled_asset() else {
-            return;
-        };
-
-        let dir = tempdir().expect("tempdir");
-        let target_path = dir.path().join(asset.executable_name);
-
-        std::fs::write(&target_path, b"old").expect("seed old file");
-        write_bundled_binary_atomically(&target_path, asset.bytes).expect("atomic write");
-
-        let metadata = std::fs::metadata(&target_path).expect("metadata");
-        assert_eq!(metadata.len(), asset.bytes.len() as u64);
-
-        let temp_files = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".tmp-")
-            })
-            .count();
-        assert_eq!(temp_files, 0);
-    }
 
     #[test]
     fn zoxide_data_dir_is_not_empty() {

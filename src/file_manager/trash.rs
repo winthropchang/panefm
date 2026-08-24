@@ -488,10 +488,7 @@ mod tests {
             .into_iter()
             .map(|entry| entry.id)
             .collect::<Vec<_>>();
-        let cleared = store
-            .delete_many_by_ids(&ids)
-            .expect("clear trash")
-            .len();
+        let cleared = store.delete_many_by_ids(&ids).expect("clear trash").len();
 
         assert_eq!(cleared, 2);
         assert!(store.list_entries().expect("list after clear").is_empty());

@@ -8,15 +8,17 @@ Minimal terminal file manager prototype built with Rust, `ratatui`, and `crosste
 cargo run
 ```
 
-`z` / `:jump` 使用內建的 `fzf` binary。
-目前專案已內含：
+`z` / `:jump` 使用系統 `PATH` 中已安裝的 `fzf`；找不到時會顯示缺少依賴提示。
+目前內建 fallback 已包含：
 
 - macOS `arm64`
 - macOS `amd64`
 - Windows `arm64`
 - Windows `amd64`
 
-執行時會自動把對應平台的 `fzf` 解包到本機快取目錄後使用，不需要另外安裝。
+只有找不到系統命令時，才會把對應平台的 binary 解包到本機快取目錄後使用，因此已安裝工具時不會重複解包。
+
+`rg` 與 `zoxide` 也使用系統 `PATH` 中的命令。程式不再攜帶或解包這三個第三方 binary，啟動時會列出缺少的依賴。
 
 之後接手開發、開新對話續做、查看目前功能與開發紀錄，請優先閱讀 [PROJECT_HANDOFF.md](/Users/otto/Documents/terminal-file-manager/PROJECT_HANDOFF.md)。
 
@@ -45,7 +47,7 @@ The app loads config from the first existing path in this order:
 - `f`: open the filter box on the right side and filter results while typing
   - first `Esc`: hide the input box but keep the filtered result list
   - second `Esc`: clear the filter and return to the normal list
-- `z`: use bundled `fzf` to recursively jump to a file or directory under the current pane root
+- `z`: use system `fzf` to recursively jump to a file or directory under the current pane root
 - `.`: toggle hidden files and directories
 - `,`: open the sort panel
   - `,m` / `,M`: sort by modified time (forward / reverse)
