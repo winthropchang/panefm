@@ -18,7 +18,8 @@ use ratatui::{
 use crate::theme::Theme;
 
 use super::{
-    bookmark::BookmarkTarget, entry::FileEntry, search::GlobalSearchEntry, trash::TrashStore,
+    bookmark::BookmarkTarget, entry::FileEntry, fuzzy::fuzzy_matched_indices,
+    search::GlobalSearchEntry, trash::TrashStore,
 };
 
 /// 表示單一 pane 的完整瀏覽狀態。
@@ -1425,14 +1426,19 @@ impl PaneState {
     fn refresh_visible_entries(&mut self) {
         self.visible_indices = match &self.filter_query {
             Some(query) => {
-                let query = query.to_lowercase();
-                self.entries
+                let candidates: Vec<usize> = self
+                    .entries
                     .iter()
                     .enumerate()
                     .filter(|(_, entry)| self.show_hidden || !is_hidden_name(&entry.name))
-                    .filter(|(_, entry)| entry.name.to_lowercase().contains(&query))
                     .map(|(index, _)| index)
-                    .collect()
+                    .collect();
+                fuzzy_matched_indices(&candidates, query, |index| {
+                    self.entries[*index].name.clone()
+                })
+                .into_iter()
+                .map(|matched_index| candidates[matched_index])
+                .collect()
             }
             None => self
                 .entries

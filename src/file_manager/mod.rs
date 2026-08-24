@@ -4,6 +4,7 @@ mod bookmark;
 mod copy;
 mod entry;
 mod fd;
+mod fuzzy;
 mod fzf;
 mod layout;
 mod open;

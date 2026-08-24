@@ -32,6 +32,7 @@ use super::{
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
     debug_timing_log, debug_timing_message,
+    fuzzy::{fuzzy_matched_indices, fuzzy_matched_indices_by_fields},
     layout::{LayoutNode, SplitDirection, SplitPlacement},
     open::{
         LaunchSpec, OpenAction, OpenPickerAction, OpenPickerOption, OpenTarget,
@@ -146,6 +147,8 @@ pub(crate) struct GlobalSearchState {
     pub(crate) searched: bool,
     pub(crate) selected: usize,
     pub(crate) results: Vec<GlobalSearchEntry>,
+    /// 只過濾已回傳結果的模糊 filter，不會重新執行 `fd` 或 `rg` 搜尋。
+    pub(crate) filter: PanelSearchState,
     pub(crate) preview_scroll: Option<usize>,
     pub(crate) preview_current_match: Option<usize>,
     pub(crate) task_id: Option<usize>,
@@ -247,7 +250,7 @@ pub(crate) enum TrashConfirmAction {
 }
 
 /// 描述暫時面板中的搜尋輸入狀態。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PanelSearchState {
     pub(crate) buffer: String,
     pub(crate) editing: bool,
@@ -1470,6 +1473,30 @@ impl App {
             return Ok(true);
         }
 
+        if search.filter.editing {
+            match key.code {
+                KeyCode::Char(_) => {
+                    if let Some(c) = typed_char_from_key(&key) {
+                        search.filter.buffer.push(c);
+                    }
+                    search.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    search.filter.buffer.pop();
+                    search.selected = 0;
+                }
+                KeyCode::Esc | KeyCode::Enter => {
+                    search.filter.editing = false;
+                }
+                _ => {}
+            }
+            let visible = filtered_global_search_entries(&search.results, &search.filter.buffer);
+            search.selected = search.selected.min(visible.len().saturating_sub(1));
+            self.status = global_search_filter_status(&search.filter, visible.len());
+            self.global_search = Some(search);
+            return Ok(true);
+        }
+
         if self.preview_focus == Some(search.pane_id) && matches!(search.mode, SearchMode::Content)
         {
             match key.code {
@@ -1568,8 +1595,8 @@ impl App {
         match key.code {
             KeyCode::Down => {
                 let count = self.take_count_or_one();
-                search.selected =
-                    (search.selected + count).min(search.results.len().saturating_sub(1));
+                let visible_len = global_search_visible_len(&search);
+                search.selected = (search.selected + count).min(visible_len.saturating_sub(1));
                 search.preview_scroll = None;
                 search.preview_current_match = None;
                 self.status = global_search_status(
@@ -1584,8 +1611,8 @@ impl App {
             }
             _ if key_matches_plain_letter(&key, 'j') => {
                 let count = self.take_count_or_one();
-                search.selected =
-                    (search.selected + count).min(search.results.len().saturating_sub(1));
+                let visible_len = global_search_visible_len(&search);
+                search.selected = (search.selected + count).min(visible_len.saturating_sub(1));
                 search.preview_scroll = None;
                 search.preview_current_match = None;
                 self.status = global_search_status(
@@ -1600,8 +1627,8 @@ impl App {
             }
             _ if key_matches_shifted_letter(&key, 'J') => {
                 let step = self.take_large_move_step();
-                search.selected =
-                    (search.selected + step).min(search.results.len().saturating_sub(1));
+                let visible_len = global_search_visible_len(&search);
+                search.selected = (search.selected + step).min(visible_len.saturating_sub(1));
                 search.preview_scroll = None;
                 search.preview_current_match = None;
                 self.status = global_search_status(
@@ -1646,8 +1673,8 @@ impl App {
             }
             _ if key_matches_ctrl_letter(&key, 'd') => {
                 let step = self.take_panel_page_step();
-                search.selected =
-                    (search.selected + step).min(search.results.len().saturating_sub(1));
+                let visible_len = global_search_visible_len(&search);
+                search.selected = (search.selected + step).min(visible_len.saturating_sub(1));
                 search.preview_scroll = None;
                 search.preview_current_match = None;
                 self.status = global_search_status(
@@ -1696,7 +1723,7 @@ impl App {
                     if let Some(count) = self.take_pending_count() {
                         search.selected = count
                             .saturating_sub(1)
-                            .min(search.results.len().saturating_sub(1));
+                            .min(global_search_visible_len(&search).saturating_sub(1));
                     } else {
                         search.selected = 0;
                     }
@@ -1725,13 +1752,13 @@ impl App {
             }
             _ if key_matches_shifted_letter(&key, 'G') => {
                 if let Some(count) = self.take_pending_count() {
-                    if !search.results.is_empty() {
+                    if global_search_visible_len(&search) > 0 {
                         search.selected = count
                             .saturating_sub(1)
-                            .min(search.results.len().saturating_sub(1));
+                            .min(global_search_visible_len(&search).saturating_sub(1));
                     }
-                } else if !search.results.is_empty() {
-                    search.selected = search.results.len() - 1;
+                } else if global_search_visible_len(&search) > 0 {
+                    search.selected = global_search_visible_len(&search) - 1;
                 }
                 search.preview_scroll = None;
                 search.preview_current_match = None;
@@ -1762,6 +1789,16 @@ impl App {
                 );
                 self.global_search = Some(search);
             }
+            _ if key_matches_plain_letter(&key, 'f') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.preview_focus = None;
+                search.filter.editing = true;
+                search.selected = 0;
+                self.status =
+                    global_search_filter_status(&search.filter, global_search_visible_len(&search));
+                self.global_search = Some(search);
+            }
             KeyCode::Enter => {
                 self.clear_pending_count();
                 self.pending_g = false;
@@ -1787,7 +1824,21 @@ impl App {
             KeyCode::Esc => {
                 self.clear_pending_count();
                 self.pending_g = false;
-                self.cancel_global_search();
+                if search.filter.buffer.is_empty() {
+                    self.cancel_global_search();
+                } else {
+                    search.filter = PanelSearchState::default();
+                    search.selected = 0;
+                    self.status = global_search_status(
+                        search.mode,
+                        &search.buffer,
+                        search.results.len(),
+                        false,
+                        search.searched,
+                        search.loading,
+                    );
+                    self.global_search = Some(search);
+                }
             }
             _ if key_matches_plain_letter(&key, 'h') => {
                 self.clear_pending_count();
@@ -6010,6 +6061,7 @@ impl App {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            filter: PanelSearchState::default(),
             preview_scroll: None,
             preview_current_match: None,
             task_id: None,
@@ -6037,6 +6089,7 @@ impl App {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            filter: PanelSearchState::default(),
             preview_scroll: None,
             preview_current_match: None,
             task_id: None,
@@ -7401,7 +7454,8 @@ impl App {
 
     /// 將目前 global search 選到的結果打開到原 pane 中，並把游標移到該項目。
     fn open_global_search_result(&mut self, search: GlobalSearchState) -> io::Result<()> {
-        let Some(entry) = search.results.get(search.selected).cloned() else {
+        let visible = filtered_global_search_entries(&search.results, &search.filter.buffer);
+        let Some(entry) = visible.get(search.selected).cloned() else {
             self.status = String::from("global search: no result selected");
             self.global_search = Some(search);
             return Ok(());
@@ -7429,7 +7483,8 @@ impl App {
 
     /// 依照目前內容搜尋選到的檔案，計算搜尋 preview 的狀態列文字。
     fn search_preview_status_for(&self, search: &GlobalSearchState) -> String {
-        let Some(entry) = search.results.get(search.selected) else {
+        let visible = filtered_global_search_entries(&search.results, &search.filter.buffer);
+        let Some(entry) = visible.get(search.selected) else {
             return global_search_status(
                 search.mode,
                 &search.buffer,
@@ -7459,7 +7514,8 @@ impl App {
 
     /// 在 global search 的 preview focus 模式中，跳到下一個或上一個命中位置。
     fn move_search_preview_match(&self, search: &mut GlobalSearchState, forward: bool) {
-        let Some(entry) = search.results.get(search.selected) else {
+        let visible = filtered_global_search_entries(&search.results, &search.filter.buffer);
+        let Some(entry) = visible.get(search.selected) else {
             search.preview_scroll = None;
             return;
         };
@@ -8115,6 +8171,13 @@ impl App {
             } else {
                 None
             };
+            let global_search_results = self
+                .global_search
+                .as_ref()
+                .filter(|search| search.pane_id == pane_id)
+                .map(|search| {
+                    filtered_global_search_entries(&search.results, &search.filter.buffer)
+                });
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 let rename_buffer = match &self.pending_action {
                     Some(PendingAction::Rename {
@@ -8193,7 +8256,7 @@ impl App {
                 let panel_state = if let Some(search) = self.global_search.as_ref() {
                     (search.pane_id == pane_id && (search.loading || search.searched)).then_some(
                         PaneListState::Search(SearchListState {
-                            results: &search.results,
+                            results: global_search_results.as_deref().unwrap_or(&[]),
                             selected: search.selected,
                             loading: search.loading && self.config.search.show_loading,
                             preview_query: matches!(search.mode, SearchMode::Content)
@@ -8434,16 +8497,24 @@ impl App {
         if let Some(search) = &self.global_search
             && let Some(area) = pane_rects.get(&search.pane_id)
         {
-            let search_cursor = render_global_search_panel(
-                frame,
-                *area,
-                self.theme,
-                search.mode.panel_title(search.editing),
-                &search.buffer,
-                search.editing,
-            );
-            if search.editing && cursor_position.is_none() {
-                cursor_position = Some(search_cursor);
+            if search.editing {
+                let search_cursor = render_global_search_panel(
+                    frame,
+                    *area,
+                    self.theme,
+                    search.mode.panel_title(true),
+                    &search.buffer,
+                    true,
+                );
+                if cursor_position.is_none() {
+                    cursor_position = Some(search_cursor);
+                }
+            } else if search.filter.editing {
+                let filter_cursor =
+                    render_filter_input(frame, *area, self.theme, &search.filter.buffer);
+                if cursor_position.is_none() {
+                    cursor_position = Some(filter_cursor);
+                }
             }
         }
 
@@ -8595,7 +8666,7 @@ impl App {
             _ if self
                 .global_search
                 .as_ref()
-                .is_some_and(|search| search.editing) =>
+                .is_some_and(|search| search.editing || search.filter.editing) =>
             {
                 Some(RenameMode::Insert)
             }
@@ -8632,7 +8703,9 @@ impl App {
                     // 這可避免使用者正在移動時，游標所在畫面行被新批次推來推去。
                     search.results.append(&mut entries);
                     search.results.truncate(200);
-                    search.selected = search.selected.min(search.results.len().saturating_sub(1));
+                    search.selected = search
+                        .selected
+                        .min(global_search_visible_len(search).saturating_sub(1));
                     search.searched = true;
                     self.status = global_search_status(
                         search.mode,
@@ -8754,22 +8827,12 @@ fn bookmark_panel_lines(entries: Vec<BookmarkEntry>) -> Vec<BookmarkPanelLine> {
 
 /// 依照搜尋字串過濾書籤清單，讓書籤列表也能使用 `f` 做即時篩選。
 fn filtered_bookmark_entries(entries: Vec<BookmarkEntry>, query: &str) -> Vec<BookmarkEntry> {
-    let trimmed = query.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return entries;
-    }
-
-    entries
-        .into_iter()
-        .filter(|entry| {
-            entry.key.to_string().to_lowercase().contains(&trimmed)
-                || entry
-                    .target
-                    .display_text()
-                    .to_lowercase()
-                    .contains(&trimmed)
-        })
-        .collect()
+    fuzzy_matched_indices_by_fields(&entries, query, |entry| {
+        vec![entry.key.to_string(), entry.target.display_text()]
+    })
+    .into_iter()
+    .map(|index| entries[index].clone())
+    .collect()
 }
 
 /// 依書籤列表模式回傳彈窗標題與空狀態訊息。
@@ -8792,36 +8855,41 @@ fn zoxide_panel_lines(entries: Vec<PathBuf>) -> Vec<ZoxidePanelLine> {
 
 /// 依照搜尋字串過濾 zoxide 回傳的目錄列表，保留路徑中包含關鍵字的項目。
 fn filtered_zoxide_entries(entries: &[PathBuf], query: &str) -> Vec<PathBuf> {
-    let trimmed = query.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return entries.to_vec();
-    }
-
-    entries
-        .iter()
-        .filter(|path| path.display().to_string().to_lowercase().contains(&trimmed))
-        .cloned()
+    fuzzy_matched_indices(entries, query, |path| path.display().to_string())
+        .into_iter()
+        .map(|index| entries[index].clone())
         .collect()
 }
 
 /// 依照搜尋字串過濾 task 清單，方便在任務很多時快速縮小範圍。
 fn filtered_task_entries(tasks: &[TaskRecord], query: &str) -> Vec<TaskRecord> {
-    let trimmed = query.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return tasks.to_vec();
-    }
+    fuzzy_matched_indices_by_fields(tasks, query, |task| {
+        vec![
+            task_state_label(task.state).to_string(),
+            task.title.clone(),
+            task.detail.clone(),
+            task.kind.to_string(),
+        ]
+    })
+    .into_iter()
+    .map(|index| tasks[index].clone())
+    .collect()
+}
 
-    tasks
-        .iter()
-        .filter(|task| {
-            task_state_label(task.state)
-                .to_lowercase()
-                .contains(&trimmed)
-                || task.title.to_lowercase().contains(&trimmed)
-                || task.detail.to_lowercase().contains(&trimmed)
-                || task.kind.to_lowercase().contains(&trimmed)
-        })
-        .cloned()
+/// 以共用模糊 matcher 過濾 `fd` 或 `rg` 已回傳的搜尋結果。
+///
+/// 參數：
+/// - `entries: &[GlobalSearchEntry]`，背景搜尋目前已串流回主執行緒的原始結果。
+/// - `query: &str`，結果面板中按 `f` 後輸入的模糊查詢。
+///
+/// 回傳：`Vec<GlobalSearchEntry>`，依模糊分數排序的可見結果副本；原始串流順序不會被修改。
+fn filtered_global_search_entries(
+    entries: &[GlobalSearchEntry],
+    query: &str,
+) -> Vec<GlobalSearchEntry> {
+    fuzzy_matched_indices(entries, query, |entry| entry.relative_path.clone())
+        .into_iter()
+        .map(|index| entries[index].clone())
         .collect()
 }
 
@@ -9365,24 +9433,16 @@ struct HelpEntry {
 
 /// 先依搜尋條件過濾 trash 原始資料，再提供給面板使用。
 fn trash_panel_entries(trash_store: &TrashStore, query: &str) -> io::Result<Vec<TrashListEntry>> {
-    let trimmed = query.trim().to_lowercase();
     let entries = trash_store.list_entries()?;
-    if trimmed.is_empty() {
-        return Ok(entries);
-    }
-
-    Ok(entries
-        .into_iter()
-        .filter(|entry| {
-            entry.display_name.to_lowercase().contains(&trimmed)
-                || entry
-                    .original_path
-                    .display()
-                    .to_string()
-                    .to_lowercase()
-                    .contains(&trimmed)
-        })
-        .collect())
+    Ok(fuzzy_matched_indices_by_fields(&entries, query, |entry| {
+        vec![
+            entry.display_name.clone(),
+            entry.original_path.display().to_string(),
+        ]
+    })
+    .into_iter()
+    .map(|index| entries[index].clone())
+    .collect())
 }
 
 /// 將目前 trash store 中的項目轉成面板可直接顯示的列內容。
@@ -9707,7 +9767,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":status",
             "",
-            "顯示 fzf、rg、zoxide 是否已安裝並可從系統 PATH 使用",
+            "顯示 fd、fzf、rg、zoxide 是否已安裝並可從系統 PATH 使用",
             HelpAction::Command("status"),
         ),
         help_entry(
@@ -9725,13 +9785,13 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":search",
             "s",
-            "遞迴搜尋目前目錄下的檔名與路徑",
+            "用 fd 遞迴搜尋檔名與路徑；結果列表可按 f 做模糊過濾",
             HelpAction::Command("search"),
         ),
         help_entry(
             ":search-content",
             "S",
-            "遞迴搜尋目前目錄下檔案內容",
+            "用 rg 遞迴搜尋檔案內容；結果列表可按 f 做模糊過濾",
             HelpAction::Command("search-content"),
         ),
         help_entry(
@@ -9800,7 +9860,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "打開這個功能說明面板",
             HelpAction::Command("help"),
         ),
-        help_entry(":filter", "f", "即時過濾目前列表內容", HelpAction::Filter),
+        help_entry(
+            ":filter",
+            "f",
+            "用不連續字元即時模糊過濾目前列表，並依相關性排序",
+            HelpAction::Filter,
+        ),
         help_entry(":sort", ",", "打開排序方式快捷鍵面板", HelpAction::Sort),
         help_entry(
             ":sort modified",
@@ -9880,19 +9945,16 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
     ];
 
-    let trimmed = query.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return entries;
-    }
-
-    entries
-        .into_iter()
-        .filter(|entry| {
-            entry.line.command.to_lowercase().contains(&trimmed)
-                || entry.line.shortcut.to_lowercase().contains(&trimmed)
-                || entry.line.description.to_lowercase().contains(&trimmed)
-        })
-        .collect()
+    fuzzy_matched_indices_by_fields(&entries, query, |entry| {
+        vec![
+            entry.line.command.clone(),
+            entry.line.shortcut.clone(),
+            entry.line.description.clone(),
+        ]
+    })
+    .into_iter()
+    .map(|index| entries[index].clone())
+    .collect()
 }
 
 /// 只取出 help 面板渲染需要的列內容。
@@ -10440,6 +10502,32 @@ fn global_search_status(
     }
 }
 
+/// 回傳 global search 套用結果模糊 filter 後的可見筆數。
+///
+/// 參數：
+/// - `search: &GlobalSearchState`，目前 `s` 或 `S` 搜尋面板的完整狀態。
+///
+/// 回傳：`usize`，目前可供游標移動與開啟的結果數量。
+fn global_search_visible_len(search: &GlobalSearchState) -> usize {
+    filtered_global_search_entries(&search.results, &search.filter.buffer).len()
+}
+
+/// 依照 global search 的模糊 filter 狀態產生狀態列訊息。
+///
+/// 參數：
+/// - `filter: &PanelSearchState`，filter 查詢與是否仍在輸入中的狀態。
+/// - `matches: usize`，套用模糊 filter 後的可見結果數量。
+///
+/// 回傳：`String`，供狀態列顯示目前查詢、模式與命中數。
+fn global_search_filter_status(filter: &PanelSearchState, matches: usize) -> String {
+    let mode = if filter.editing { "insert" } else { "locked" };
+    if filter.buffer.is_empty() {
+        format!("fuzzy filter ({mode}): all ({matches})")
+    } else {
+        format!("fuzzy filter ({mode}): {} ({matches})", filter.buffer)
+    }
+}
+
 /// 產生搜尋引擎缺少外部工具時的狀態列訊息。
 ///
 /// 參數：
@@ -10674,12 +10762,13 @@ mod tests {
         PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord,
         TaskState, TrashConfirmAction, VisualSelectionState, command_suggestion_navigation,
         command_suggestions, command_suggestions_for_buffer, ctrl_digit_target_pane_id,
-        help_entries, is_windows_drive_path, key_matches_ctrl_letter,
-        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, looks_like_navigation_path, missing_search_tool_status,
-        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end,
-        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action, typed_char_from_key,
+        filtered_global_search_entries, help_entries, is_windows_drive_path,
+        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
+        key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
+        missing_search_tool_status, plain_digit_target_pane_id, query_zoxide_directories,
+        rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
+        rename_word_end, trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action,
+        typed_char_from_key,
     };
     use crate::{
         config::{
@@ -12953,7 +13042,12 @@ mod tests {
             }
             other => panic!("unexpected pending action: {other:?}"),
         }
-        assert_eq!(app.status, "help: res (1)");
+        let matches = help_entries("res").len();
+        assert!(
+            matches > 1,
+            "fuzzy filter should find non-contiguous matches"
+        );
+        assert_eq!(app.status, format!("help: res ({matches})"));
     }
 
     #[test]
@@ -12983,7 +13077,10 @@ mod tests {
             }
             other => panic!("unexpected pending action: {other:?}"),
         }
-        assert_eq!(app.status, "help search: re (16)");
+        assert_eq!(
+            app.status,
+            format!("help search: re ({})", help_entries("re").len())
+        );
     }
 
     #[test]
@@ -14329,6 +14426,32 @@ mod tests {
     }
 
     #[test]
+    /// 驗證一般檔案列表的 `f` 使用共用模糊比對，不要求查詢字元在檔名中連續出現。
+    fn app_file_list_filter_matches_fuzzy_character_sequence() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("file-manager-app.rs"), "app").expect("app");
+        fs::write(dir.path().join("sample.txt"), "sample").expect("sample");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open fuzzy filter");
+        for ch in ['f', 'm', 'a'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type fuzzy filter");
+        }
+
+        let visible: Vec<String> = app
+            .panes
+            .get(&1)
+            .expect("pane")
+            .visible_entries()
+            .into_iter()
+            .map(|entry| entry.display_name())
+            .collect();
+        assert_eq!(visible, vec![String::from("file-manager-app.rs")]);
+    }
+
+    #[test]
     /// 驗證按下 `.` 後會顯示隱藏檔，並可與 filter 一起使用。
     fn app_toggle_hidden_reveals_hidden_entries_and_works_with_filter() {
         let dir = tempdir().expect("tempdir");
@@ -14951,6 +15074,7 @@ mod tests {
                         match_preview: None,
                     })
                     .collect(),
+                filter: PanelSearchState::default(),
                 preview_scroll: None,
                 preview_current_match: None,
                 task_id: None,
@@ -14972,6 +15096,109 @@ mod tests {
                 .expect("vim move up while loading");
             assert_eq!(app.global_search.as_ref().expect("search").selected, 0);
         }
+    }
+
+    #[test]
+    /// 驗證 `s` 與 `S` 的結果面板都能按 `f` 開啟模糊 filter，並以不連續字元縮小結果。
+    fn app_search_result_panels_support_fuzzy_filtering() {
+        let dir = tempdir().expect("tempdir");
+
+        for mode in [SearchMode::Path, SearchMode::Content] {
+            let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+            app.global_search = Some(GlobalSearchState {
+                pane_id: 1,
+                root_dir: dir.path().to_path_buf(),
+                mode,
+                buffer: String::from("source"),
+                editing: false,
+                loading: false,
+                searched: true,
+                selected: 0,
+                results: ["src/file_manager/app.rs", "docs/sample.txt", "README.md"]
+                    .into_iter()
+                    .map(|name| GlobalSearchEntry {
+                        path: dir.path().join(name),
+                        relative_path: name.to_string(),
+                        is_dir: false,
+                        match_line_number: None,
+                        match_column: None,
+                        match_preview: None,
+                    })
+                    .collect(),
+                filter: PanelSearchState::default(),
+                preview_scroll: None,
+                preview_current_match: None,
+                task_id: None,
+            });
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+                .expect("open result filter");
+            for ch in ['f', 'm', 'a'] {
+                app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                    .expect("type fuzzy result filter");
+            }
+
+            let search = app.global_search.as_ref().expect("search");
+            assert!(search.filter.editing);
+            assert_eq!(search.filter.buffer, "fma");
+            let visible = filtered_global_search_entries(&search.results, &search.filter.buffer);
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].relative_path, "src/file_manager/app.rs");
+        }
+    }
+
+    #[test]
+    /// 驗證從模糊過濾後的搜尋列表按 Enter，會開啟目前可見結果而非原始索引項目。
+    fn app_search_filter_opens_filtered_selection() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
+        fs::write(dir.path().join("beta.txt"), "beta").expect("beta");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.global_search = Some(GlobalSearchState {
+            pane_id: 1,
+            root_dir: dir.path().to_path_buf(),
+            mode: SearchMode::Path,
+            buffer: String::from("txt"),
+            editing: false,
+            loading: false,
+            searched: true,
+            selected: 0,
+            results: ["alpha.txt", "beta.txt"]
+                .into_iter()
+                .map(|name| GlobalSearchEntry {
+                    path: dir.path().join(name),
+                    relative_path: name.to_string(),
+                    is_dir: false,
+                    match_line_number: None,
+                    match_column: None,
+                    match_preview: None,
+                })
+                .collect(),
+            filter: PanelSearchState::default(),
+            preview_scroll: None,
+            preview_current_match: None,
+            task_id: None,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open result filter");
+        for ch in ['b', 't'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type result filter");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("lock result filter");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open filtered result");
+
+        assert!(app.global_search.is_none());
+        assert_eq!(
+            app.panes
+                .get(&1)
+                .and_then(|pane| pane.selected_entry())
+                .map(|entry| entry.display_name()),
+            Some(String::from("beta.txt"))
+        );
     }
 
     #[test]
@@ -14997,6 +15224,7 @@ mod tests {
                     match_column: None,
                     match_preview: None,
                 }],
+                filter: PanelSearchState::default(),
                 preview_scroll: None,
                 preview_current_match: None,
                 task_id: None,
@@ -15152,6 +15380,7 @@ mod tests {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            filter: PanelSearchState::default(),
             preview_scroll: None,
             preview_current_match: None,
             task_id: Some(task_id),
@@ -15198,6 +15427,7 @@ mod tests {
             searched: false,
             selected: 0,
             results: Vec::new(),
+            filter: PanelSearchState::default(),
             preview_scroll: None,
             preview_current_match: None,
             task_id: Some(task_id),
@@ -15274,6 +15504,7 @@ mod tests {
                 match_column: Some(1),
                 match_preview: Some(String::from("target")),
             }],
+            filter: PanelSearchState::default(),
             preview_scroll: None,
             preview_current_match: None,
             task_id: Some(task_id),
