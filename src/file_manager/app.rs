@@ -60,10 +60,10 @@ use super::{
     zoxide::{ZoxideTracker, query_zoxide_directories},
 };
 
-#[cfg(all(target_os = "windows", not(test)))]
+#[cfg(all(any(target_os = "windows", target_os = "macos"), not(test)))]
 use super::smb::resolve_smb_location;
 
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(any(all(not(target_os = "windows"), not(target_os = "macos")), test))]
 use super::smb::resolve_smb_location_with_mount_root;
 
 /// 表示 rename 輸入框目前採用的編輯模式。
@@ -5302,6 +5302,9 @@ impl App {
         target: &str,
         mount_root: &std::path::Path,
     ) -> io::Result<()> {
+        #[cfg(all(any(target_os = "windows", target_os = "macos"), not(test)))]
+        let _ = mount_root;
+
         let location = match parse_smb_location(target) {
             Ok(location) => location,
             Err(error) => {
@@ -5310,10 +5313,10 @@ impl App {
             }
         };
 
-        #[cfg(all(target_os = "windows", not(test)))]
+        #[cfg(all(any(target_os = "windows", target_os = "macos"), not(test)))]
         let resolved = resolve_smb_location(&location);
 
-        #[cfg(any(not(target_os = "windows"), test))]
+        #[cfg(any(all(not(target_os = "windows"), not(target_os = "macos")), test))]
         let resolved = resolve_smb_location_with_mount_root(&location, mount_root);
 
         match resolved {

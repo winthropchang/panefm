@@ -6,6 +6,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     time::SystemTime,
 };
 
@@ -21,6 +22,9 @@ use super::{
     bookmark::BookmarkTarget, entry::FileEntry, fuzzy::fuzzy_matched_indices,
     search::GlobalSearchEntry, trash::TrashStore,
 };
+
+/// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
+static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 表示單一 pane 的完整瀏覽狀態。
 ///
@@ -2171,14 +2175,62 @@ fn copy_path_into_dir(
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
     let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
+    if overwrite {
+        copy_path_transactional(source_path, &target_path, true)?;
+    } else {
+        copy_path_direct_with_cleanup(source_path, &target_path, |source, target| {
+            if source.is_dir() {
+                copy_dir_recursive(source, target)
+            } else {
+                copy_file_and_verify(source, target)
+            }
+        })?;
+    }
 
     if source_path.is_dir() {
-        copy_dir_recursive(source_path, &target_path)?;
         Ok(format!("{}/", target_path_file_name(&target_path)))
     } else {
-        fs::copy(source_path, &target_path)?;
         Ok(target_path_file_name(&target_path))
     }
+}
+
+/// 直接複製到正式目標，失敗時清除本次建立的部分內容。
+///
+/// 一般貼上採用這條路徑，與 mature-reference 在 macOS/Windows 的本機檔案引擎一致，
+/// 不額外要求 SMB 伺服器允許 rename；目標名稱由上層保證原本不存在。
+///
+/// 參數：
+/// - `source_path: &Path`，來源檔案或資料夾。
+/// - `target_path: &Path`，本次新建立的正式目標路徑。
+/// - `copy_to_target: F`，實際寫入函數，型別為 `FnOnce(&Path, &Path) -> io::Result<()>`。
+///
+/// 回傳：`io::Result<()>`；失敗時會盡力移除已建立的部分目標，避免佔用檔名。
+fn copy_path_direct_with_cleanup<F>(
+    source_path: &Path,
+    target_path: &Path,
+    copy_to_target: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    if target_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("paste target already exists: {}", target_path.display()),
+        ));
+    }
+    if let Err(error) = copy_to_target(source_path, target_path) {
+        let _ = remove_transfer_path(target_path);
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "copy {} to {} failed: {error}",
+                source_path.display(),
+                target_path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// 將單一路徑移動到目標資料夾。
@@ -2198,6 +2250,9 @@ fn move_path_into_dir(
     })?;
     let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
 
+    if overwrite && target_path.exists() {
+        remove_existing_target(&target_path)?;
+    }
     fs::rename(source_path, &target_path)?;
 
     if target_path.is_dir() {
@@ -2211,7 +2266,8 @@ fn move_path_into_dir(
 ///
 /// 規則：
 /// - `overwrite = false` 時，沿用原本的 `copy`, `copy 2` 命名策略。
-/// - `overwrite = true` 且來源與目標不是同一個實體時，若目標存在就先刪掉它。
+/// - `overwrite = true` 且來源與目標不是同一個實體時，回傳原始名稱；
+///   既有目標要由呼叫端依照複製或移動操作的安全規則處理。
 /// - 若來源本來就在同一個目錄，為了避免覆蓋自己，會退回不覆蓋策略。
 fn target_path_for_paste(
     source_path: &Path,
@@ -2230,11 +2286,163 @@ fn target_path_for_paste(
         ));
     }
 
-    if direct_target.exists() {
-        remove_existing_target(&direct_target)?;
+    Ok(direct_target)
+}
+
+/// 先把來源完整複製到目標目錄內的暫存路徑，成功後才切換成正式名稱。
+///
+/// 參數：
+/// - `source_path: &Path`，要複製的來源檔案或資料夾。
+/// - `target_path: &Path`，使用者最後應看見的正式目標路徑。
+/// - `overwrite: bool`，`true` 代表允許在傳輸完成後替換既有目標。
+///
+/// 回傳：`io::Result<()>`；成功時正式路徑已完整可用，失敗時不會留下
+/// 只有部分內容的正式檔名，並會盡力清除內部暫存路徑。
+fn copy_path_transactional(
+    source_path: &Path,
+    target_path: &Path,
+    overwrite: bool,
+) -> io::Result<()> {
+    copy_path_transactional_with(source_path, target_path, overwrite, |source, staged| {
+        if source.is_dir() {
+            copy_dir_recursive(source, staged)
+        } else {
+            copy_file_and_verify(source, staged)
+        }
+    })
+}
+
+/// 執行可注入複製器的交易式複製核心，讓失敗清理規則可以被單元測試完整驗證。
+///
+/// 參數：
+/// - `source_path: &Path`，來源路徑。
+/// - `target_path: &Path`，正式目標路徑。
+/// - `overwrite: bool`，是否允許替換既有目標。
+/// - `copy_to_staged: F`，把來源寫入暫存路徑的函數，型別為
+///   `FnOnce(&Path, &Path) -> io::Result<()>`。
+///
+/// 回傳：`io::Result<()>`，成功時已提交正式名稱；失敗時保留原目標並清理暫存資料。
+fn copy_path_transactional_with<F>(
+    source_path: &Path,
+    target_path: &Path,
+    overwrite: bool,
+    copy_to_staged: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let staged_path = unique_transfer_path(target_path, "part");
+    if let Err(error) = copy_to_staged(source_path, &staged_path) {
+        let _ = remove_transfer_path(&staged_path);
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "copy {} to {} failed: {error}",
+                source_path.display(),
+                target_path.display()
+            ),
+        ));
     }
 
-    Ok(direct_target)
+    if let Err(error) = commit_staged_copy(&staged_path, target_path, overwrite) {
+        let _ = remove_transfer_path(&staged_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+/// 複製單一檔案並比對來源與暫存檔大小，避免把不完整的 SMB 傳輸提交成正式檔案。
+///
+/// 參數：
+/// - `source_path: &Path`，來源檔案。
+/// - `staged_path: &Path`，與正式目標位於相同目錄的暫存檔。
+///
+/// 回傳：`io::Result<()>`；成功代表複製 API 回報位元組數與兩端檔案大小一致。
+fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()> {
+    let expected_size = fs::metadata(source_path)?.len();
+    let copied_size = fs::copy(source_path, staged_path)?;
+    let staged_size = fs::metadata(staged_path)?.len();
+    if copied_size != expected_size || staged_size != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "incomplete copy: expected {expected_size} bytes, copied {copied_size}, stored {staged_size}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 將已完成的暫存內容切換成正式名稱，覆蓋時先備份舊目標以便失敗回復。
+///
+/// 參數：
+/// - `staged_path: &Path`，已完整寫入的暫存路徑。
+/// - `target_path: &Path`，正式目標路徑。
+/// - `overwrite: bool`，是否允許替換既有目標。
+///
+/// 回傳：`io::Result<()>`；提交失敗時會盡力把舊目標從備份改回原名。
+fn commit_staged_copy(staged_path: &Path, target_path: &Path, overwrite: bool) -> io::Result<()> {
+    if target_path.exists() && !overwrite {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("paste target already exists: {}", target_path.display()),
+        ));
+    }
+
+    let backup_path = target_path
+        .exists()
+        .then(|| unique_transfer_path(target_path, "backup"));
+    if let Some(backup_path) = &backup_path {
+        fs::rename(target_path, backup_path)?;
+    }
+
+    if let Err(error) = fs::rename(staged_path, target_path) {
+        if let Some(backup_path) = &backup_path {
+            let _ = fs::rename(backup_path, target_path);
+        }
+        return Err(io::Error::new(
+            error.kind(),
+            format!("finish paste to {} failed: {error}", target_path.display()),
+        ));
+    }
+
+    if let Some(backup_path) = backup_path {
+        remove_transfer_path(&backup_path)?;
+    }
+    Ok(())
+}
+
+/// 在正式目標旁產生不衝突的隱藏暫存路徑。
+///
+/// 參數：
+/// - `target_path: &Path`，正式目標路徑，用來取得相同父目錄。
+/// - `role: &str`，暫存用途，例如 `part` 或 `backup`。
+///
+/// 回傳：`PathBuf`，目前不存在且可供本次傳輸使用的路徑。
+fn unique_transfer_path(target_path: &Path, role: &str) -> PathBuf {
+    let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    loop {
+        let sequence = TRANSFER_TEMP_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let candidate = parent.join(format!(
+            ".panefm-transfer-{}-{sequence}.{role}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+}
+
+/// 刪除交易式複製使用的檔案或資料夾暫存路徑。
+///
+/// 參數：`path: &Path`，要清除的內部暫存路徑。
+/// 回傳：`io::Result<()>`；路徑不存在視為已完成清理。
+fn remove_transfer_path(path: &Path) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    remove_existing_target(path)
 }
 
 /// 刪除貼上覆蓋前已存在的目標路徑。
@@ -2519,7 +2727,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{PaneState, SortMode};
+    use super::{PaneState, SortMode, copy_path_direct_with_cleanup, copy_path_transactional_with};
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
     use crate::theme::Theme;
@@ -2694,6 +2902,125 @@ mod tests {
         assert!(dir.path().join("docs copy 2").is_dir());
         assert!(dir.path().join("docs copy").join("note.txt").exists());
         assert!(dir.path().join("docs copy 2").join("note.txt").exists());
+    }
+
+    #[test]
+    /// 驗證交易式複製成功後只留下正式檔名，不會把內部暫存檔暴露在目標目錄。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若正式內容錯誤或 `.panefm-transfer-*` 暫存路徑殘留則測試失敗。
+    fn transactional_copy_commits_complete_file_without_temp_residue() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target_dir = dir.path().join("target");
+        let target = target_dir.join("source.zip");
+        fs::create_dir(&target_dir).expect("target dir");
+        fs::write(&source, b"complete zip bytes").expect("source");
+
+        super::copy_path_transactional(&source, &target, false).expect("transactional copy");
+
+        assert_eq!(
+            fs::read(&target).expect("target content"),
+            b"complete zip bytes"
+        );
+        assert!(!directory_has_transfer_temp(&target_dir));
+    }
+
+    #[test]
+    /// 模擬 SMB 寫入部分內容後失敗，驗證正式檔名與暫存檔都不會殘留。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若失敗後仍佔用正式檔名，Finder 下一次複製可能被迫產生 `copy` 名稱。
+    fn transactional_copy_failure_removes_partial_staged_file() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target = dir.path().join("target.zip");
+        fs::write(&source, b"complete zip bytes").expect("source");
+
+        let result = copy_path_transactional_with(&source, &target, false, |_, staged| {
+            fs::write(staged, b"partial")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated SMB disconnect",
+            ))
+        });
+
+        assert_eq!(
+            result.expect_err("copy must fail").kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert!(!target.exists());
+        assert!(!directory_has_transfer_temp(dir.path()));
+    }
+
+    #[test]
+    /// 模擬一般 SMB 複製直接寫入部分正式內容後失敗，驗證該檔名會被立即清除。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若部分檔案仍存在，Finder 後續複製就可能自動改成 `copy` 名稱。
+    fn direct_copy_failure_removes_partial_target() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target = dir.path().join("target.zip");
+        fs::write(&source, b"complete zip bytes").expect("source");
+
+        let result = copy_path_direct_with_cleanup(&source, &target, |_, target| {
+            fs::write(target, b"partial")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated SMB disconnect",
+            ))
+        });
+
+        assert_eq!(
+            result.expect_err("copy must fail").kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    /// 驗證覆蓋傳輸在新內容尚未完成前不會刪除既有目標檔案。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若模擬傳輸失敗後舊內容被刪除或改寫則測試失敗。
+    fn transactional_overwrite_failure_preserves_existing_target() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target = dir.path().join("target.zip");
+        fs::write(&source, b"new content").expect("source");
+        fs::write(&target, b"existing content").expect("existing target");
+
+        let result = copy_path_transactional_with(&source, &target, true, |_, staged| {
+            fs::write(staged, b"partial new content")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated SMB timeout",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&target).expect("preserved target"),
+            b"existing content"
+        );
+        assert!(!directory_has_transfer_temp(dir.path()));
+    }
+
+    /// 檢查測試目錄中是否仍存在交易式複製的內部暫存路徑。
+    ///
+    /// 參數：`path: &Path`，要掃描的測試目錄。
+    /// 回傳：`bool`；找到 `.panefm-transfer-*` 名稱時回傳 `true`。
+    fn directory_has_transfer_temp(path: &std::path::Path) -> bool {
+        fs::read_dir(path)
+            .expect("read test directory")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".panefm-transfer-")
+            })
     }
 
     #[test]

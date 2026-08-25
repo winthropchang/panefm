@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(all(target_os = "macos", not(test)))]
+use std::process::Command;
+
 use super::open::{LaunchMode, LaunchSpec};
 
 /// 描述已解析的 SMB 位置資訊。
@@ -58,21 +61,114 @@ pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
     })
 }
 
-/// 將 SMB 位置依 Windows 規則轉成 UNC 路徑，供 pane 直接嘗試進入。
-#[cfg(target_os = "windows")]
+/// 將 SMB 位置依目前平台規則解析成實際可存取路徑。
+///
+/// Windows 直接使用 UNC；macOS 會讀取 mount table 並同時核對 host 與 share，
+/// 避免同名 share 被系統掛載成 `/Volumes/name-1` 時誤用另一個掛載點。
+///
+/// 參數：`location: &SmbLocation`，已解析的 SMB 位址。
+/// 回傳：`ResolvedSmbLocation`，包含可直接進入的路徑或需要掛載的預期位置。
+#[cfg(all(any(target_os = "windows", target_os = "macos"), not(test)))]
 pub(crate) fn resolve_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
     #[cfg(target_os = "windows")]
     {
         ResolvedSmbLocation::Ready(windows_unc_path(location))
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        resolve_smb_location_with_mount_root(location, Path::new("/Volumes"))
+        resolve_macos_smb_location(location)
     }
 }
 
+/// 從 macOS 的 mount table 找出 host 與 share 都相符的 SMB 掛載點。
+///
+/// 參數：`location: &SmbLocation`，使用者輸入的 SMB 位址。
+/// 回傳：`ResolvedSmbLocation`；找到正確掛載點時會再接上 SMB 子路徑。
+#[cfg(all(target_os = "macos", not(test)))]
+fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
+    let mounted_root = Command::new("mount")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| find_macos_smb_mount(&output, &location.host, &location.share));
+
+    let Some(share_root) = mounted_root else {
+        return ResolvedSmbLocation::NeedsMount {
+            local_path: Path::new("/Volumes")
+                .join(&location.share)
+                .join(&location.subpath),
+        };
+    };
+    let local_path = if location.subpath.as_os_str().is_empty() {
+        share_root
+    } else {
+        share_root.join(&location.subpath)
+    };
+    ResolvedSmbLocation::Ready(local_path)
+}
+
+/// 解析 macOS `mount` 輸出，找出指定 SMB host/share 對應的本機掛載目錄。
+///
+/// 例如 `//user@server/share on /Volumes/share-1 (smbfs, ...)` 會回傳
+/// `/Volumes/share-1`，而不是只依 share 名稱猜測 `/Volumes/share`。
+///
+/// 參數：
+/// - `mount_output: &str`，`mount` 命令的完整標準輸出。
+/// - `expected_host: &str`，SMB 主機名稱或 IP。
+/// - `expected_share: &str`，SMB share 名稱。
+///
+/// 回傳：`Option<PathBuf>`；找不到完全相符的 SMB 掛載時回傳 `None`。
+fn find_macos_smb_mount(
+    mount_output: &str,
+    expected_host: &str,
+    expected_share: &str,
+) -> Option<PathBuf> {
+    mount_output.lines().find_map(|line| {
+        let (source, mounted) = line.split_once(" on ")?;
+        let mounted_path = mounted.split_once(" (")?.0;
+        let remote = source.strip_prefix("//")?;
+        let (authority, share) = remote.split_once('/')?;
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let decoded_share = percent_decode(share).unwrap_or_else(|_| share.to_string());
+
+        (host.eq_ignore_ascii_case(expected_host)
+            && decoded_share.eq_ignore_ascii_case(expected_share))
+        .then(|| PathBuf::from(decode_mount_field(mounted_path)))
+    })
+}
+
+/// 解開 mount 輸出欄位中的八進位跳脫，例如 `\040` 代表空白。
+///
+/// 參數：`input: &str`，mount table 中的單一路徑欄位。
+/// 回傳：`String`，可交給 `PathBuf` 使用的本機路徑。
+fn decode_mount_field(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..=index + 3]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'7'))
+        {
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            output.push(value);
+            index += 4;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
 /// 用指定掛載根目錄解析 SMB 位置，主要提供測試與 Unix 類平台使用。
+#[cfg(any(test, all(not(target_os = "windows"), not(target_os = "macos"))))]
 pub(crate) fn resolve_smb_location_with_mount_root(
     location: &SmbLocation,
     mount_root: &Path,
@@ -174,11 +270,17 @@ fn percent_decode(input: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::tempdir;
 
-    use super::{ResolvedSmbLocation, parse_smb_location, resolve_smb_location_with_mount_root};
+    use super::{
+        ResolvedSmbLocation, decode_mount_field, find_macos_smb_mount, parse_smb_location,
+        resolve_smb_location_with_mount_root,
+    };
 
     #[test]
     fn parse_smb_location_extracts_share_and_subpath() {
@@ -227,6 +329,33 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "SMB 位址格式錯誤：請使用 goto smb://host/share[/path]，不能只有 IP 或主機名稱"
+        );
+    }
+
+    #[test]
+    /// 驗證 macOS 有同名 share 時，會依 host 選擇真正對應的 `-1` 掛載點。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若只依 share 名稱誤選其他伺服器的掛載點則測試失敗。
+    fn macos_mount_parser_matches_host_and_share() {
+        let output = "//otto@old-server/shared on /Volumes/shared (smbfs, nodev)\n\
+                      //domain;otto@192.0.2.10/shared on /Volumes/shared-1 (smbfs, nodev)\n";
+
+        assert_eq!(
+            find_macos_smb_mount(output, "192.0.2.10", "shared"),
+            Some(PathBuf::from("/Volumes/shared-1"))
+        );
+    }
+
+    #[test]
+    /// 驗證 mount table 的空白跳脫可以還原，避免含空白的掛載目錄無法進入。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 `\040` 沒有還原成空白則測試失敗。
+    fn mount_field_decoder_restores_octal_escapes() {
+        assert_eq!(
+            decode_mount_field("/Volumes/Company\\040Share"),
+            "/Volumes/Company Share"
         );
     }
 }
