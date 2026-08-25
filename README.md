@@ -59,7 +59,7 @@ PaneFM 內可輸入 `:status` 查看目前缺少哪些工具。
 ### 從原始碼安裝
 
 ```bash
-git clone https://github.com/<your-account>/panefm.git
+git clone https://github.com/winthropchang/panefm.git
 cd panefm
 cargo build --release
 ```
@@ -75,9 +75,8 @@ cargo build --release
 panefm
 ```
 
-GitHub 倉庫建立後，請把上方 `<your-account>` 換成實際帳號。未來建立正式
-GitHub Release 後，預計提供 Homebrew 與 Windows 套件管理器安裝；目前尚未發布，
-因此 README 不會提供無法使用的 `brew install panefm` 或 WinGet 命令。
+未來建立正式 GitHub Release 後，預計提供 Homebrew 與 Windows 套件管理器安裝；
+目前尚未發布，因此 README 不會提供無法使用的 `brew install panefm` 或 WinGet 命令。
 
 ## 快速開始
 
