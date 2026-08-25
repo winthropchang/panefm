@@ -7,5 +7,9 @@
 /config.toml
 /plugins.toml
 
+# 個人開發接續與 AI 對話交接紀錄；只保留在本機，不放進公開 repository。
+/DEV_NOTES.md
+/PROJECT_HANDOFF.md
+
 # 檔案管理操作可能產生的交易暫存檔。
 .panefm-transfer-*
