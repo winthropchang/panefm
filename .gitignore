@@ -1,3 +1,11 @@
 /target
 .DS_Store
 .tfm/
+
+# 使用者狀態與本機設定；公開 repository 只追蹤對應的 `.example` 範例。
+/bookmark.toml
+/config.toml
+/plugins.toml
+
+# 檔案管理操作可能產生的交易暫存檔。
+.panefm-transfer-*
