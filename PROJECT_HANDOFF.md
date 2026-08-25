@@ -1,6 +1,6 @@
 # Project Handoff
 
-這份文件是 `terminal-file-manager` 之後的單一交接文件。
+這份文件是 `PaneFM` 之後的單一交接文件。
 
 之後如果開新對話，要先讀這份文件，再開始開發。
 它的用途是把以下幾種資訊集中在同一個地方：
@@ -18,7 +18,16 @@
 
 ## 1. 專案定位
 
-`terminal-file-manager` 是一個以個人高效率操作為核心的 terminal 檔案管理器。
+`PaneFM` 是一個以個人高效率操作為核心的 terminal 檔案管理器。
+
+### 1.1 專案名稱、發佈與圖示決策
+
+- 正式專案名稱與 Cargo 套件名稱為 `PaneFM` / `panefm`。
+- PaneFM 定位為透過 Terminal 執行的 CLI/TUI 工具，未來預計提供 Homebrew 與 Windows 套件管理器安裝。
+- CLI 套件不把圖示嵌入 macOS 或 Windows 執行檔，避免增加沒有實際用途的建置流程與相依套件。
+- `assets/panefm-icon.svg` 與 `assets/panefm-icon.png` 保留給 GitHub、README 與 Release 品牌顯示。
+- 只有未來真的製作 macOS `.app`、Windows 桌面捷徑或圖形化安裝程式時，才另外產生並使用 `.icns` / `.ico`。
+- Homebrew 與 Windows 套件管理器尚未發布；必須先建立公開 GitHub 倉庫與 Release，再加入對應 formula / manifest。
 
 主要設計方向：
 

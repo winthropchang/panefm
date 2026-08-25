@@ -1,7 +1,8 @@
 [package]
-name = "terminal-file-manager"
+name = "panefm"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, pane-first terminal file manager with Vim-style controls"
 
 [dependencies]
 anyhow = "1.0"

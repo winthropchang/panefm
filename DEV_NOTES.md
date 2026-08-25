@@ -1,6 +1,14 @@
 # 開發接續筆記
 
-這份筆記用來記錄目前 `terminal-file-manager` 的互動規則、已完成功能與後續建議，讓之後繼續開發時可以快速接上。
+這份筆記用來記錄目前 `PaneFM` 的互動規則、已完成功能與後續建議，讓之後繼續開發時可以快速接上。
+
+## PaneFM 命名與發佈決策（2026-08-25）
+
+- 專案正式名稱確定為 `PaneFM`，Cargo package 與執行檔名稱為 `panefm`。
+- 發佈方向是 macOS Homebrew 與 Windows 套件管理器，不以桌面 App 為主要安裝方式。
+- 純 Terminal 程式不內嵌 `.icns` / `.ico`，只保留 SVG 與 PNG 作為 GitHub 專案圖示。
+- README 已重寫為公開專案首頁版本，包含定位、功能、相依工具、原始碼安裝、快速操作、設定與 plugin 說明。
+- Homebrew formula、Windows package manifest 與可下載的 GitHub Release 尚未建立，README 不可宣稱目前已能直接用套件管理器安裝。
 
 ## 目前已完成的重點
 

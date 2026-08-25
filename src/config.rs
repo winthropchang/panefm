@@ -510,6 +510,10 @@ pub fn load_config(base_dir: &Path) -> Result<LoadedConfig> {
 fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    if let Some(path) = env::var_os("PANE_FM_CONFIG") {
+        paths.push(PathBuf::from(path));
+    }
+
     if let Some(path) = env::var_os("TFM_CONFIG") {
         paths.push(PathBuf::from(path));
     }
@@ -517,20 +521,33 @@ fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
     paths.push(base_dir.join("config.toml"));
 
     if let Some(xdg_home) = env::var_os("XDG_CONFIG_HOME") {
-        paths.push(
-            PathBuf::from(xdg_home)
-                .join("terminal-file-manager")
-                .join("config.toml"),
-        );
+        let xdg_home = PathBuf::from(xdg_home);
+        paths.push(app_config_file(&xdg_home, "panefm", "config.toml"));
+        paths.push(app_config_file(
+            &xdg_home,
+            "terminal-file-manager",
+            "config.toml",
+        ));
     }
 
     if let Some(home) = env::var_os("HOME") {
-        paths.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("terminal-file-manager")
-                .join("config.toml"),
-        );
+        let config_home = PathBuf::from(home).join(".config");
+        paths.push(app_config_file(&config_home, "panefm", "config.toml"));
+        paths.push(app_config_file(
+            &config_home,
+            "terminal-file-manager",
+            "config.toml",
+        ));
+    }
+
+    if let Some(app_data) = env::var_os("APPDATA") {
+        let app_data = PathBuf::from(app_data);
+        paths.push(app_config_file(&app_data, "panefm", "config.toml"));
+        paths.push(app_config_file(
+            &app_data,
+            "terminal-file-manager",
+            "config.toml",
+        ));
     }
 
     paths
@@ -546,6 +563,10 @@ fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
 fn plugins_search_paths(base_dir: &Path, config_source: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    if let Some(path) = env::var_os("PANE_FM_PLUGINS") {
+        paths.push(PathBuf::from(path));
+    }
+
     if let Some(path) = env::var_os("TFM_PLUGINS") {
         paths.push(PathBuf::from(path));
     }
@@ -559,23 +580,48 @@ fn plugins_search_paths(base_dir: &Path, config_source: Option<&Path>) -> Vec<Pa
     }
 
     if let Some(xdg_home) = env::var_os("XDG_CONFIG_HOME") {
-        paths.push(
-            PathBuf::from(xdg_home)
-                .join("terminal-file-manager")
-                .join("plugins.toml"),
-        );
+        let xdg_home = PathBuf::from(xdg_home);
+        paths.push(app_config_file(&xdg_home, "panefm", "plugins.toml"));
+        paths.push(app_config_file(
+            &xdg_home,
+            "terminal-file-manager",
+            "plugins.toml",
+        ));
     }
 
     if let Some(home) = env::var_os("HOME") {
-        paths.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("terminal-file-manager")
-                .join("plugins.toml"),
-        );
+        let config_home = PathBuf::from(home).join(".config");
+        paths.push(app_config_file(&config_home, "panefm", "plugins.toml"));
+        paths.push(app_config_file(
+            &config_home,
+            "terminal-file-manager",
+            "plugins.toml",
+        ));
+    }
+
+    if let Some(app_data) = env::var_os("APPDATA") {
+        let app_data = PathBuf::from(app_data);
+        paths.push(app_config_file(&app_data, "panefm", "plugins.toml"));
+        paths.push(app_config_file(
+            &app_data,
+            "terminal-file-manager",
+            "plugins.toml",
+        ));
     }
 
     paths
+}
+
+/// 建立應用程式設定檔的完整候選路徑。
+///
+/// 參數：
+/// - `config_root: &Path`，平台提供的設定根目錄，例如 XDG config home 或 `%APPDATA%`。
+/// - `app_name: &str`，應用程式設定子目錄名稱。
+/// - `file_name: &str`，要尋找的設定檔名稱。
+///
+/// 回傳：`PathBuf`，格式為 `<config_root>/<app_name>/<file_name>`。
+fn app_config_file(config_root: &Path, app_name: &str, file_name: &str) -> PathBuf {
+    config_root.join(app_name).join(file_name)
 }
 
 /// 將新版分區設定套用到執行期設定。
@@ -874,6 +920,25 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    /// 驗證 PaneFM 在 macOS、Windows 與 XDG 平台都能用相同規則建立設定路徑。
+    fn app_config_file_uses_brand_directory_and_requested_file() {
+        assert_eq!(
+            app_config_file(Path::new("/settings"), "panefm", "config.toml"),
+            Path::new("/settings").join("panefm").join("config.toml")
+        );
+        assert_eq!(
+            app_config_file(
+                Path::new("C:/Users/Otto/AppData/Roaming"),
+                "panefm",
+                "plugins.toml",
+            ),
+            Path::new("C:/Users/Otto/AppData/Roaming")
+                .join("panefm")
+                .join("plugins.toml")
+        );
+    }
 
     #[test]
     /// 驗證保存主題時只更新 `[ui]` 的 `theme`，並保留其他設定與註解。

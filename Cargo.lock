@@ -966,6 +966,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "panefm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "flate2",
+ "ignore",
+ "nucleo-matcher",
+ "ratatui",
+ "ratatui-themes",
+ "regex",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
+ "tar",
+ "tempfile",
+ "toml",
+ "zip",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1580,28 +1602,6 @@ dependencies = [
  "rustix",
  "signal-hook",
  "windows-sys",
-]
-
-[[package]]
-name = "terminal-file-manager"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "flate2",
- "ignore",
- "nucleo-matcher",
- "ratatui",
- "ratatui-themes",
- "regex",
- "serde",
- "serde_json",
- "shlex 1.3.0",
- "tar",
- "tempfile",
- "toml",
- "zip",
 ]
 
 [[package]]

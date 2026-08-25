@@ -1,6 +1,6 @@
 # Development Guidelines
 
-這份文件是 `terminal-file-manager` 的開發規範。
+這份文件是 `PaneFM` 的開發規範。
 
 之後每次新增、修改或重構功能時，都必須先對照這份文件，確認設計沒有違反規則，再開始實作。
 

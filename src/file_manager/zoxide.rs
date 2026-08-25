@@ -72,7 +72,7 @@ pub(crate) fn zoxide_command() -> Result<OsString> {
         .ok_or_else(|| anyhow::anyhow!("{}", missing_tool_message("zoxide")))
 }
 
-/// 回傳 terminal-file-manager 專屬的 zoxide 資料目錄。
+/// 回傳 PaneFM 專屬的 zoxide 資料目錄。
 ///
 /// 這裡會交給 `_ZO_DATA_DIR` 使用，讓 zoxide 的學習資料與使用者系統 shell 分開，
 /// 避免互相污染，也讓 app 打包後可以獨立搬移與測試。
@@ -83,22 +83,40 @@ pub(crate) fn zoxide_data_dir() -> Result<PathBuf> {
             .replace("ThreadId(", "")
             .replace(')', "");
         return Ok(std::env::temp_dir()
-            .join("terminal-file-manager-tests")
+            .join("panefm-tests")
             .join("zoxide")
             .join(thread_id));
     }
 
     #[cfg(not(test))]
-    Ok(std::env::var_os("LOCALAPPDATA")
+    let data_root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .map(|home| home.join("Library").join("Application Support"))
         })
-        .unwrap_or_else(std::env::temp_dir)
-        .join("terminal-file-manager")
-        .join("zoxide"))
+        .unwrap_or_else(std::env::temp_dir);
+
+    #[cfg(not(test))]
+    Ok(preferred_zoxide_data_dir(&data_root))
+}
+
+/// 選擇 PaneFM 的 zoxide 資料目錄，並相容改名前已存在的學習資料。
+///
+/// 參數：
+/// - `data_root: &Path`，平台提供的應用程式資料根目錄。
+///
+/// 回傳：`PathBuf`。舊目錄存在且新目錄尚未建立時回傳舊目錄，其他情況回傳新版目錄。
+fn preferred_zoxide_data_dir(data_root: &Path) -> PathBuf {
+    let current = data_root.join("panefm").join("zoxide");
+    let legacy = data_root.join("terminal-file-manager").join("zoxide");
+
+    if !current.exists() && legacy.exists() {
+        legacy
+    } else {
+        current
+    }
 }
 
 /// 把指定目錄寫進 zoxide 資料庫，讓之後 `Z` / `:zoxide` 能依 frecency 排序跳轉。
@@ -181,12 +199,12 @@ fn query_zoxide_directories_with_data_dir(data_dir: &Path) -> Result<Vec<PathBuf
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::mpsc};
+    use std::{fs, path::PathBuf, sync::mpsc};
 
     use tempfile::tempdir;
 
     use super::{
-        ZoxideTracker, add_directory_to_zoxide_with_data_dir,
+        ZoxideTracker, add_directory_to_zoxide_with_data_dir, preferred_zoxide_data_dir,
         query_zoxide_directories_with_data_dir, zoxide_data_dir,
     };
 
@@ -194,6 +212,20 @@ mod tests {
     fn zoxide_data_dir_is_not_empty() {
         let data_dir = zoxide_data_dir().expect("data dir");
         assert!(!data_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    /// 驗證改名後仍會沿用既有 zoxide 資料，新資料存在時則優先使用 PaneFM 目錄。
+    fn preferred_zoxide_data_dir_preserves_legacy_learning_data() {
+        let dir = tempdir().expect("tempdir");
+        let legacy = dir.path().join("terminal-file-manager").join("zoxide");
+        fs::create_dir_all(&legacy).expect("legacy zoxide data");
+
+        assert_eq!(preferred_zoxide_data_dir(dir.path()), legacy);
+
+        let current = dir.path().join("panefm").join("zoxide");
+        fs::create_dir_all(&current).expect("current zoxide data");
+        assert_eq!(preferred_zoxide_data_dir(dir.path()), current);
     }
 
     #[test]

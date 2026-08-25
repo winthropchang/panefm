@@ -4,7 +4,7 @@ pub mod theme;
 
 use anyhow::Result;
 
-/// 啟動整個 terminal file manager。
+/// 啟動整個 PaneFM terminal file manager。
 ///
 /// 參數：無。
 /// 回傳：`Result<()>`。
