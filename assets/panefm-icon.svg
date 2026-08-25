@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">PaneFM icon</title>
+  <desc id="desc">A folder containing two terminal file manager panels and a block cursor.</desc>
+  <path fill="#20C7D9" d="M48 112c0-26.5 21.5-48 48-48h112l48 48h160c26.5 0 48 21.5 48 48v256c0 26.5-21.5 48-48 48H96c-26.5 0-48-21.5-48-48V112Z"/>
+  <path fill="#17212B" d="M72 184c0-17.7 14.3-32 32-32h120c17.7 0 32 14.3 32 32v224c0 17.7-14.3 32-32 32H104c-17.7 0-32-14.3-32-32V184Zm200 0c0-17.7 14.3-32 32-32h104c17.7 0 32 14.3 32 32v224c0 17.7-14.3 32-32 32H304c-17.7 0-32-14.3-32-32V184Z"/>
+  <path fill="#20C7D9" d="M96 208h136v48H96zM296 208h120v24H296zM296 264h88v20h-88zM296 312h104v20H296z"/>
+  <path fill="none" stroke="#20C7D9" stroke-linecap="square" stroke-linejoin="miter" stroke-width="18" d="m104 344 28 24-28 24"/>
+  <path fill="#FFB020" d="M152 344h24v48h-24z"/>
+</svg>
