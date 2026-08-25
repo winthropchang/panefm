@@ -66,18 +66,21 @@ pub(crate) enum PaneListState<'a> {
         selected: usize,
         search: &'a str,
         editing: bool,
+        cursor: usize,
     },
     Trash {
         lines: &'a [TrashPanelLine],
         selected: usize,
         search: &'a str,
         editing: bool,
+        cursor: usize,
     },
     Help {
         lines: &'a [HelpPanelLine],
         selected: usize,
         search: &'a str,
         editing: bool,
+        cursor: usize,
     },
     Tools {
         statuses: &'a [ToolStatus],
@@ -174,6 +177,7 @@ pub(crate) fn render_pane(
     picker_state: Option<InlinePickerState<'_>>,
     list_find_buffer: Option<&str>,
     list_find_editing: bool,
+    text_input_cursor: usize,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
@@ -452,6 +456,7 @@ pub(crate) fn render_pane(
         Some(PaneListState::Trash {
             search,
             editing: true,
+            cursor,
             ..
         }) => Some(render_top_right_input(
             frame,
@@ -459,10 +464,12 @@ pub(crate) fn render_pane(
             theme,
             "Trash Search",
             search,
+            cursor,
         )),
         Some(PaneListState::Help {
             search,
             editing: true,
+            cursor,
             ..
         }) => Some(render_top_right_input(
             frame,
@@ -470,10 +477,12 @@ pub(crate) fn render_pane(
             theme,
             "Help Search",
             search,
+            cursor,
         )),
         Some(PaneListState::Tasks {
             search,
             editing: true,
+            cursor,
             ..
         }) => Some(render_top_right_input(
             frame,
@@ -481,6 +490,7 @@ pub(crate) fn render_pane(
             theme,
             "Task Search",
             search,
+            cursor,
         )),
         _ if list_find_editing => Some(render_top_right_input(
             frame,
@@ -488,6 +498,7 @@ pub(crate) fn render_pane(
             theme,
             "Find next",
             list_find_buffer.unwrap_or_default(),
+            text_input_cursor,
         )),
         _ => None,
     };
@@ -914,6 +925,7 @@ fn render_top_right_input(
     theme: Theme,
     title: &str,
     buffer: &str,
+    cursor: usize,
 ) -> (u16, u16) {
     let width = area.width.min(32).max(18);
     let input_area = Rect {
@@ -938,7 +950,11 @@ fn render_top_right_input(
     );
 
     (
-        input_inner.x.saturating_add(buffer.chars().count() as u16),
+        input_inner.x.saturating_add(
+            cursor
+                .min(buffer.chars().count())
+                .min(input_inner.width as usize) as u16,
+        ),
         input_inner.y,
     )
 }
@@ -949,8 +965,9 @@ pub(crate) fn render_filter_input(
     area: Rect,
     theme: Theme,
     buffer: &str,
+    cursor: usize,
 ) -> (u16, u16) {
-    render_top_right_input(frame, area, theme, " Filter ", buffer)
+    render_top_right_input(frame, area, theme, " Filter ", buffer, cursor)
 }
 
 /// 在畫面右上方繪製 preview search 輸入框，並回傳游標應該停留的位置。
@@ -959,8 +976,9 @@ pub(crate) fn render_preview_search_input(
     area: Rect,
     theme: Theme,
     buffer: &str,
+    cursor: usize,
 ) -> (u16, u16) {
-    render_top_right_input(frame, area, theme, " Preview Search ", buffer)
+    render_top_right_input(frame, area, theme, " Preview Search ", buffer, cursor)
 }
 
 /// 在目前 pane 上方疊出 global search 輸入框，只顯示查詢文字。
@@ -979,6 +997,7 @@ pub(crate) fn render_global_search_panel(
     theme: Theme,
     title: &str,
     buffer: &str,
+    cursor: usize,
     _editing: bool,
 ) -> (u16, u16) {
     let width = area.width.min(40).max(24);
@@ -1001,9 +1020,11 @@ pub(crate) fn render_global_search_panel(
     frame.render_widget(Paragraph::new(buffer.to_string()).block(block), panel_area);
 
     (
-        input_inner
-            .x
-            .saturating_add(buffer.chars().count().min(input_inner.width as usize) as u16),
+        input_inner.x.saturating_add(
+            cursor
+                .min(buffer.chars().count())
+                .min(input_inner.width as usize) as u16,
+        ),
         input_inner.y,
     )
 }
@@ -1353,6 +1374,7 @@ pub(crate) fn render_bookmark_picker(
     empty_message: &str,
     search: &str,
     editing: bool,
+    cursor: usize,
 ) -> Option<(u16, u16)> {
     let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
     let popup_area = centered_rect(area, 68, popup_height);
@@ -1396,7 +1418,7 @@ pub(crate) fn render_bookmark_picker(
         &mut list_state,
     );
 
-    editing.then(|| render_top_right_input(frame, popup_area, theme, "Filter", search))
+    editing.then(|| render_top_right_input(frame, popup_area, theme, "Filter", search, cursor))
 }
 
 /// 在畫面中央繪製 zoxide 目錄列表彈窗，供 `Z` 與 `:zoxide` 共用。
@@ -1408,6 +1430,7 @@ pub(crate) fn render_zoxide_picker(
     selected: usize,
     search: &str,
     editing: bool,
+    cursor: usize,
 ) -> Option<(u16, u16)> {
     let popup_height = (lines.len().min(10) as u16).saturating_add(4).max(6);
     let popup_area = centered_rect(area, 68, popup_height);
@@ -1445,7 +1468,7 @@ pub(crate) fn render_zoxide_picker(
         &mut list_state,
     );
 
-    editing.then(|| render_top_right_input(frame, popup_area, theme, "Filter", search))
+    editing.then(|| render_top_right_input(frame, popup_area, theme, "Filter", search, cursor))
 }
 
 /// 在指定 pane 區域中央繪製命令輸入視窗，並回傳游標位置。
@@ -1456,6 +1479,7 @@ pub(crate) fn render_command_palette(
     buffer: &str,
     suggestions: &[CommandSuggestionLine],
     selected: usize,
+    cursor: usize,
 ) -> (u16, u16) {
     let popup_height = (suggestions.len().min(6) as u16).saturating_add(3).max(3);
     let popup_area = centered_rect(area, 70, popup_height);
@@ -1508,9 +1532,8 @@ pub(crate) fn render_command_palette(
         inner
             .x
             .saturating_add(
-                buffer
-                    .chars()
-                    .count()
+                cursor
+                    .min(buffer.chars().count())
                     .min(inner.width.saturating_sub(1) as usize) as u16,
             )
             .saturating_add(1),

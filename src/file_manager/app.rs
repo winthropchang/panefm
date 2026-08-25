@@ -76,6 +76,17 @@ pub(crate) enum RenameMode {
     Normal,
 }
 
+/// 表示共用文字輸入器處理按鍵後的結果。
+///
+/// 各輸入 UI 只需要處理自己的 Enter 與關閉行為；字元插入、刪除、游標移動及
+/// Vim 模式切換都由這個結果統一描述，避免不同介面各自實作後產生操作差異。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEditResult {
+    Changed,
+    Consumed,
+    PassThrough,
+}
+
 /// 表示目前剪貼簿保存的是複製還是剪下操作。
 ///
 /// 這個模式會決定 `p` 貼上時，是保留來源還是把來源移動到新位置。
@@ -405,6 +416,10 @@ pub(crate) struct App {
     pub(crate) status: String,
     pub(crate) command_mode: bool,
     pub(crate) command_buffer: String,
+    /// 所有非 inline 文字輸入 UI 共用的 Vim 編輯模式。
+    pub(crate) text_input_mode: RenameMode,
+    /// 所有非 inline 文字輸入 UI 共用的字元游標位置，不是 UTF-8 byte offset。
+    pub(crate) text_input_cursor: usize,
     pub(crate) command_suggestion_selected: usize,
     pub(crate) command_completion_cycle: Option<CommandCompletionCycle>,
     pub(crate) pending_count: Option<usize>,
@@ -508,6 +523,8 @@ impl App {
             status: startup_status,
             command_mode: false,
             command_buffer: String::new(),
+            text_input_mode: RenameMode::Insert,
+            text_input_cursor: 0,
             command_suggestion_selected: 0,
             command_completion_cycle: None,
             pending_count: None,
@@ -605,12 +622,125 @@ impl App {
     fn open_prefilled_command(&mut self, prefill: impl Into<String>) {
         self.command_mode = true;
         self.command_buffer = prefill.into();
+        self.begin_text_input_at_end();
         self.command_suggestion_selected = 0;
         self.command_completion_cycle = None;
         self.status = String::from("command mode");
         self.pending_g = false;
         self.pending_y = false;
         self.pending_bookmark = None;
+    }
+
+    /// 讓新開啟的文字輸入 UI 從 Insert 模式開始，並把游標放到文字尾端。
+    ///
+    /// 參數：無，文字內容會從目前的 `command_buffer` 取得；其他輸入框可在設定
+    /// buffer 後直接重設這兩個欄位。
+    /// 回傳：`()`, 只更新共用文字編輯狀態。
+    fn begin_text_input_at_end(&mut self) {
+        self.text_input_mode = RenameMode::Insert;
+        self.text_input_cursor = self.command_buffer.chars().count();
+    }
+
+    /// 使用共用 Vim 規則編輯指定字串。
+    ///
+    /// 參數：
+    /// - `buffer: &mut String`，目前輸入框的 UTF-8 文字。
+    /// - `key: &KeyEvent`，正規化後要處理的鍵盤事件。
+    ///
+    /// 回傳：`TextEditResult`，指出內容已改變、按鍵已被模式處理，或應交回 UI
+    /// 處理 Enter、Tab 與 Normal 模式下第二次 Esc 等業務行為。
+    fn edit_text_buffer(&mut self, buffer: &mut String, key: &KeyEvent) -> TextEditResult {
+        self.text_input_cursor = self.text_input_cursor.min(buffer.chars().count());
+        match self.text_input_mode {
+            RenameMode::Insert => match key.code {
+                KeyCode::Char(_) => {
+                    if let Some(character) = typed_char_from_key(key) {
+                        insert_char(buffer, &mut self.text_input_cursor, character);
+                        TextEditResult::Changed
+                    } else {
+                        TextEditResult::Consumed
+                    }
+                }
+                KeyCode::Backspace => {
+                    backspace_char(buffer, &mut self.text_input_cursor);
+                    TextEditResult::Changed
+                }
+                KeyCode::Delete => {
+                    delete_char_at(buffer, self.text_input_cursor);
+                    TextEditResult::Changed
+                }
+                KeyCode::Left => {
+                    self.text_input_cursor = self.text_input_cursor.saturating_sub(1);
+                    TextEditResult::Consumed
+                }
+                KeyCode::Right => {
+                    self.text_input_cursor = move_cursor_right(buffer, self.text_input_cursor);
+                    TextEditResult::Consumed
+                }
+                KeyCode::Home => {
+                    self.text_input_cursor = 0;
+                    TextEditResult::Consumed
+                }
+                KeyCode::End => {
+                    self.text_input_cursor = buffer.chars().count();
+                    TextEditResult::Consumed
+                }
+                KeyCode::Esc => {
+                    self.text_input_mode = RenameMode::Normal;
+                    self.text_input_cursor = normal_cursor(buffer, self.text_input_cursor);
+                    TextEditResult::Consumed
+                }
+                _ => TextEditResult::PassThrough,
+            },
+            RenameMode::Normal => {
+                if key_matches_shifted_letter(key, 'A') {
+                    self.text_input_cursor = buffer.chars().count();
+                    self.text_input_mode = RenameMode::Insert;
+                    return TextEditResult::Consumed;
+                }
+                match key.code {
+                    KeyCode::Left => {
+                        self.text_input_cursor = self.text_input_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Right => {
+                        self.text_input_cursor = normal_move_right(buffer, self.text_input_cursor);
+                    }
+                    KeyCode::Home | KeyCode::Char('0') => self.text_input_cursor = 0,
+                    KeyCode::End | KeyCode::Char('$') => {
+                        self.text_input_cursor = rename_line_end_cursor(buffer)
+                    }
+                    _ if key_matches_plain_letter(key, 'h') => {
+                        self.text_input_cursor = self.text_input_cursor.saturating_sub(1)
+                    }
+                    _ if key_matches_plain_letter(key, 'l') => {
+                        self.text_input_cursor = normal_move_right(buffer, self.text_input_cursor)
+                    }
+                    _ if key_matches_plain_letter(key, 'w') => {
+                        self.text_input_cursor =
+                            rename_next_word_start(buffer, self.text_input_cursor)
+                    }
+                    _ if key_matches_plain_letter(key, 'b') => {
+                        self.text_input_cursor =
+                            rename_previous_word_start(buffer, self.text_input_cursor)
+                    }
+                    _ if key_matches_plain_letter(key, 'e') => {
+                        self.text_input_cursor = rename_word_end(buffer, self.text_input_cursor)
+                    }
+                    _ if key_matches_plain_letter(key, 'i') => {
+                        self.text_input_mode = RenameMode::Insert
+                    }
+                    _ if key_matches_plain_letter(key, 'a') => {
+                        self.text_input_cursor = move_cursor_right(buffer, self.text_input_cursor);
+                        self.text_input_mode = RenameMode::Insert;
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
+                        return TextEditResult::PassThrough;
+                    }
+                    _ => {}
+                }
+                TextEditResult::Consumed
+            }
+        }
     }
 
     /// 處理一般輸入事件的總入口。
@@ -1382,23 +1512,20 @@ impl App {
             return Ok(true);
         };
 
+        let edit_result = self.edit_text_buffer(&mut search.buffer, &key);
+        if matches!(edit_result, TextEditResult::Changed) {
+            self.apply_preview_search_buffer(&search);
+            self.status =
+                preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
+            self.preview_search = Some(search);
+            return Ok(true);
+        }
+        if matches!(edit_result, TextEditResult::Consumed) {
+            self.preview_search = Some(search);
+            return Ok(true);
+        }
+
         match key.code {
-            KeyCode::Char(_) => {
-                if let Some(c) = typed_char_from_key(&key) {
-                    search.buffer.push(c);
-                }
-                self.apply_preview_search_buffer(&search);
-                self.status =
-                    preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
-                self.preview_search = Some(search);
-            }
-            KeyCode::Backspace => {
-                search.buffer.pop();
-                self.apply_preview_search_buffer(&search);
-                self.status =
-                    preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
-                self.preview_search = Some(search);
-            }
             KeyCode::Esc | KeyCode::Enter => {
                 search.editing = false;
                 self.status = if search.buffer.is_empty() {
@@ -1427,23 +1554,28 @@ impl App {
         };
 
         if search.editing {
+            let edit_result = self.edit_text_buffer(&mut search.buffer, &key);
+            if matches!(edit_result, TextEditResult::Changed) {
+                search.searched = false;
+                search.loading = false;
+                search.selected = 0;
+                search.results.clear();
+                self.status = global_search_status(
+                    search.mode,
+                    &search.buffer,
+                    search.results.len(),
+                    search.editing,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+                return Ok(true);
+            }
+            if matches!(edit_result, TextEditResult::Consumed) {
+                self.global_search = Some(search);
+                return Ok(true);
+            }
             match key.code {
-                KeyCode::Char(_) => {
-                    if let Some(c) = typed_char_from_key(&key) {
-                        search.buffer.push(c);
-                    }
-                    search.searched = false;
-                    search.loading = false;
-                    search.selected = 0;
-                    search.results.clear();
-                }
-                KeyCode::Backspace => {
-                    search.buffer.pop();
-                    search.searched = false;
-                    search.loading = false;
-                    search.selected = 0;
-                    search.results.clear();
-                }
                 KeyCode::Enter => {
                     if matches!(search.mode, SearchMode::Content) && search.buffer.trim().is_empty()
                     {
@@ -1482,17 +1614,21 @@ impl App {
         }
 
         if search.filter.editing {
+            let edit_result = self.edit_text_buffer(&mut search.filter.buffer, &key);
+            if matches!(edit_result, TextEditResult::Changed) {
+                search.selected = 0;
+                let visible =
+                    filtered_global_search_entries(&search.results, &search.filter.buffer);
+                search.selected = search.selected.min(visible.len().saturating_sub(1));
+                self.status = global_search_filter_status(&search.filter, visible.len());
+                self.global_search = Some(search);
+                return Ok(true);
+            }
+            if matches!(edit_result, TextEditResult::Consumed) {
+                self.global_search = Some(search);
+                return Ok(true);
+            }
             match key.code {
-                KeyCode::Char(_) => {
-                    if let Some(c) = typed_char_from_key(&key) {
-                        search.filter.buffer.push(c);
-                    }
-                    search.selected = 0;
-                }
-                KeyCode::Backspace => {
-                    search.filter.buffer.pop();
-                    search.selected = 0;
-                }
                 KeyCode::Esc | KeyCode::Enter => {
                     search.filter.editing = false;
                 }
@@ -1784,6 +1920,8 @@ impl App {
             _ if key_matches_plain_letter(&key, 'i') || key_matches_plain_letter(&key, 's') => {
                 self.clear_pending_count();
                 search.editing = true;
+                self.text_input_mode = RenameMode::Insert;
+                self.text_input_cursor = search.buffer.chars().count();
                 search.preview_scroll = None;
                 search.preview_current_match = None;
                 self.pending_g = false;
@@ -1802,6 +1940,8 @@ impl App {
                 self.pending_g = false;
                 self.preview_focus = None;
                 search.filter.editing = true;
+                self.text_input_mode = RenameMode::Insert;
+                self.text_input_cursor = search.filter.buffer.chars().count();
                 search.selected = 0;
                 self.status =
                     global_search_filter_status(&search.filter, global_search_visible_len(&search));
@@ -1877,23 +2017,20 @@ impl App {
             return Ok(true);
         };
 
+        let edit_result = self.edit_text_buffer(&mut search.buffer, &key);
+        if matches!(edit_result, TextEditResult::Changed) {
+            self.apply_list_find_buffer(&search);
+            self.status =
+                list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
+            self.list_find = Some(search);
+            return Ok(true);
+        }
+        if matches!(edit_result, TextEditResult::Consumed) {
+            self.list_find = Some(search);
+            return Ok(true);
+        }
+
         match key.code {
-            KeyCode::Char(_) => {
-                if let Some(c) = typed_char_from_key(&key) {
-                    search.buffer.push(c);
-                }
-                self.apply_list_find_buffer(&search);
-                self.status =
-                    list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
-                self.list_find = Some(search);
-            }
-            KeyCode::Backspace => {
-                search.buffer.pop();
-                self.apply_list_find_buffer(&search);
-                self.status =
-                    list_find_status(&search.buffer, self.list_find_match_count(search.pane_id));
-                self.list_find = Some(search);
-            }
             KeyCode::Enter => {
                 self.apply_list_find_buffer(&search);
                 self.status = list_find_locked_status(
@@ -1921,29 +2058,23 @@ impl App {
             return Ok(true);
         };
 
+        let edit_result = self.edit_text_buffer(&mut filter.buffer, &key);
+        if matches!(edit_result, TextEditResult::Changed) {
+            self.apply_filter_buffer(&filter);
+            self.status = if filter.buffer.is_empty() {
+                String::from("filter: all")
+            } else {
+                format!("filter: {}", filter.buffer)
+            };
+            self.filter = Some(filter);
+            return Ok(true);
+        }
+        if matches!(edit_result, TextEditResult::Consumed) {
+            self.filter = Some(filter);
+            return Ok(true);
+        }
+
         match key.code {
-            KeyCode::Char(_) => {
-                if let Some(c) = typed_char_from_key(&key) {
-                    filter.buffer.push(c);
-                }
-                self.apply_filter_buffer(&filter);
-                self.status = if filter.buffer.is_empty() {
-                    String::from("filter: all")
-                } else {
-                    format!("filter: {}", filter.buffer)
-                };
-                self.filter = Some(filter);
-            }
-            KeyCode::Backspace => {
-                filter.buffer.pop();
-                self.apply_filter_buffer(&filter);
-                self.status = if filter.buffer.is_empty() {
-                    String::from("filter: all")
-                } else {
-                    format!("filter: {}", filter.buffer)
-                };
-                self.filter = Some(filter);
-            }
             KeyCode::Esc | KeyCode::Enter => {
                 filter.editing = false;
                 self.status = if filter.buffer.is_empty() {
@@ -1963,9 +2094,41 @@ impl App {
 
     /// 處理暫時互動視窗的按鍵事件。
     pub(crate) fn handle_pending_action_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(action) = self.pending_action.take() else {
+        let Some(mut action) = self.pending_action.take() else {
             return Ok(true);
         };
+
+        let panel_edit_result = match &mut action {
+            PendingAction::TrashPanel {
+                selected, search, ..
+            }
+            | PendingAction::HelpPanel {
+                selected, search, ..
+            }
+            | PendingAction::TaskPanel {
+                selected, search, ..
+            }
+            | PendingAction::BookmarkList {
+                selected, search, ..
+            }
+            | PendingAction::ZoxideList {
+                selected, search, ..
+            } if search.editing => {
+                let result = self.edit_text_buffer(&mut search.buffer, &key);
+                if matches!(result, TextEditResult::Changed) {
+                    *selected = 0;
+                }
+                Some(result)
+            }
+            _ => None,
+        };
+        if panel_edit_result.is_some_and(|result| {
+            matches!(result, TextEditResult::Changed | TextEditResult::Consumed)
+        }) {
+            self.status = self.status_for_pending_action(&action)?;
+            self.pending_action = Some(action);
+            return Ok(true);
+        }
 
         match action {
             PendingAction::ToolPanel {
@@ -2395,16 +2558,6 @@ impl App {
                 let len = entries.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(_) => {
-                            if let Some(c) = typed_char_from_key(&key) {
-                                search.buffer.push(c);
-                            }
-                            selected = 0;
-                        }
-                        KeyCode::Backspace => {
-                            search.buffer.pop();
-                            selected = 0;
-                        }
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
@@ -2583,6 +2736,8 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'f') => {
                             self.clear_pending_count();
                             search.editing = true;
+                            self.text_input_mode = RenameMode::Insert;
+                            self.text_input_cursor = search.buffer.chars().count();
                             self.pending_g = false;
                         }
                         _ if key_matches_ctrl_letter(&key, 'd') => {
@@ -2700,16 +2855,6 @@ impl App {
                 let filtered_len = filtered_entries.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(_) => {
-                            if let Some(c) = typed_char_from_key(&key) {
-                                search.buffer.push(c);
-                            }
-                            selected = 0;
-                        }
-                        KeyCode::Backspace => {
-                            search.buffer.pop();
-                            selected = 0;
-                        }
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
@@ -2786,6 +2931,8 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'f') => {
                             self.clear_pending_count();
                             search.editing = true;
+                            self.text_input_mode = RenameMode::Insert;
+                            self.text_input_cursor = search.buffer.chars().count();
                             self.pending_g = false;
                         }
                         _ if key_matches_ctrl_letter(&key, 'd') => {
@@ -2867,16 +3014,6 @@ impl App {
                 let len = filtered_tasks.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(_) => {
-                            if let Some(c) = typed_char_from_key(&key) {
-                                search.buffer.push(c);
-                            }
-                            selected = 0;
-                        }
-                        KeyCode::Backspace => {
-                            search.buffer.pop();
-                            selected = 0;
-                        }
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
@@ -2966,6 +3103,8 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'f') => {
                             self.clear_pending_count();
                             search.editing = true;
+                            self.text_input_mode = RenameMode::Insert;
+                            self.text_input_cursor = search.buffer.chars().count();
                             self.pending_g = false;
                         }
                         _ if key_matches_plain_letter(&key, 'x')
@@ -3136,16 +3275,6 @@ impl App {
                 let len = filtered_entries.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(_) => {
-                            if let Some(c) = typed_char_from_key(&key) {
-                                search.buffer.push(c);
-                            }
-                            selected = 0;
-                        }
-                        KeyCode::Backspace => {
-                            search.buffer.pop();
-                            selected = 0;
-                        }
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
@@ -3256,6 +3385,8 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'f') => {
                             self.clear_pending_count();
                             search.editing = true;
+                            self.text_input_mode = RenameMode::Insert;
+                            self.text_input_cursor = search.buffer.chars().count();
                             self.pending_g = false;
                         }
                         _ if key_matches_plain_letter(&key, 'g') => {
@@ -3349,16 +3480,6 @@ impl App {
                 let len = filtered_entries.len();
                 if search.editing {
                     match key.code {
-                        KeyCode::Char(_) => {
-                            if let Some(c) = typed_char_from_key(&key) {
-                                search.buffer.push(c);
-                            }
-                            selected = 0;
-                        }
-                        KeyCode::Backspace => {
-                            search.buffer.pop();
-                            selected = 0;
-                        }
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
@@ -3451,6 +3572,8 @@ impl App {
                         _ if key_matches_plain_letter(&key, 'f') => {
                             self.clear_pending_count();
                             search.editing = true;
+                            self.text_input_mode = RenameMode::Insert;
+                            self.text_input_cursor = search.buffer.chars().count();
                             self.pending_g = false;
                         }
                         _ if key_matches_plain_letter(&key, 'g') => {
@@ -4449,21 +4572,25 @@ impl App {
         let path_completion_active =
             command_path_completion_context(self.current_pane_cwd(), &self.command_buffer)
                 .is_some();
-        if path_completion_active
+        if self.text_input_mode == RenameMode::Insert
+            && path_completion_active
             && (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
             && !suggestions.is_empty()
         {
             self.apply_path_completion_tab_cycle(key.code == KeyCode::BackTab, &suggestions);
             return Ok(true);
         }
-        if !path_completion_active
+        if self.text_input_mode == RenameMode::Insert
+            && !path_completion_active
             && (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
             && !suggestions.is_empty()
         {
             self.apply_command_completion_tab(key.code == KeyCode::BackTab, &suggestions);
             return Ok(true);
         }
-        if let Some(direction) = command_suggestion_navigation(&key) {
+        if self.text_input_mode == RenameMode::Insert
+            && let Some(direction) = command_suggestion_navigation(&key)
+        {
             if !suggestions.is_empty() {
                 match direction {
                     SuggestionNavigation::Next => {
@@ -4480,6 +4607,19 @@ impl App {
             return Ok(true);
         }
 
+        let mut buffer = std::mem::take(&mut self.command_buffer);
+        let edit_result = self.edit_text_buffer(&mut buffer, &key);
+        self.command_buffer = buffer;
+        match edit_result {
+            TextEditResult::Changed => {
+                self.command_suggestion_selected = 0;
+                self.command_completion_cycle = None;
+                return Ok(true);
+            }
+            TextEditResult::Consumed => return Ok(true),
+            TextEditResult::PassThrough => {}
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.command_mode = false;
@@ -4487,11 +4627,6 @@ impl App {
                 self.command_suggestion_selected = 0;
                 self.command_completion_cycle = None;
                 self.status = String::from("normal mode");
-            }
-            KeyCode::Backspace => {
-                self.command_buffer.pop();
-                self.command_suggestion_selected = 0;
-                self.command_completion_cycle = None;
             }
             KeyCode::Enter => {
                 let selected_suggestion = suggestions
@@ -4510,19 +4645,13 @@ impl App {
                     && !path_like_input
                 {
                     self.command_buffer = suggestion;
+                    self.text_input_cursor = self.command_buffer.chars().count();
                 } else {
                     let command = std::mem::take(&mut self.command_buffer);
                     self.command_mode = false;
                     self.command_suggestion_selected = 0;
                     self.command_completion_cycle = None;
                     self.execute_command(command.trim())?;
-                }
-            }
-            KeyCode::Char(_) => {
-                if let Some(c) = typed_char_from_key(&key) {
-                    self.command_buffer.push(c);
-                    self.command_suggestion_selected = 0;
-                    self.command_completion_cycle = None;
                 }
             }
             _ => {}
@@ -4557,6 +4686,7 @@ impl App {
 
         if suggestions.len() == 1 {
             self.command_buffer = suggestions[0].command.clone();
+            self.text_input_cursor = self.command_buffer.chars().count();
             self.command_suggestion_selected = 0;
             self.command_completion_cycle = None;
             return;
@@ -4571,6 +4701,7 @@ impl App {
         );
         if common_prefix.chars().count() > current.chars().count() {
             self.command_buffer = common_prefix;
+            self.text_input_cursor = self.command_buffer.chars().count();
             self.command_suggestion_selected = 0;
             self.command_completion_cycle = None;
             return;
@@ -4596,6 +4727,7 @@ impl App {
 
         self.command_suggestion_selected = selected;
         self.command_buffer = suggestions[selected].command.clone();
+        self.text_input_cursor = self.command_buffer.chars().count();
         self.command_completion_cycle = Some(CommandCompletionCycle {
             suggestions: suggestions.to_vec(),
         });
@@ -4626,6 +4758,7 @@ impl App {
             .command
             .trim_start_matches(':')
             .to_string();
+        self.text_input_cursor = self.command_buffer.chars().count();
         self.command_completion_cycle = None;
     }
 
@@ -6058,6 +6191,8 @@ impl App {
 
     /// 打開 filter 輸入框，並以目前焦點 pane 作為過濾目標。
     pub(crate) fn open_filter_input(&mut self) {
+        self.text_input_mode = RenameMode::Insert;
+        self.text_input_cursor = 0;
         let filter = FilterState {
             pane_id: self.focused_pane,
             buffer: String::new(),
@@ -6075,6 +6210,8 @@ impl App {
             return Ok(());
         };
 
+        self.text_input_mode = RenameMode::Insert;
+        self.text_input_cursor = 0;
         let search = GlobalSearchState {
             pane_id: self.focused_pane,
             root_dir: pane.cwd.clone(),
@@ -6103,6 +6240,8 @@ impl App {
             return Ok(());
         };
 
+        self.text_input_mode = RenameMode::Insert;
+        self.text_input_cursor = 0;
         let search = GlobalSearchState {
             pane_id: self.focused_pane,
             root_dir: pane.cwd.clone(),
@@ -6141,6 +6280,8 @@ impl App {
 
     /// 打開 preview search 輸入框，並清空上一次的搜尋字串。
     pub(crate) fn open_preview_search_input(&mut self) {
+        self.text_input_mode = RenameMode::Insert;
+        self.text_input_cursor = 0;
         let search = PreviewSearchState {
             pane_id: self.focused_pane,
             buffer: String::new(),
@@ -6154,6 +6295,8 @@ impl App {
 
     /// 打開目前 pane 的列表內 find-next 輸入框，並沿用目前已存在的查詢字串。
     pub(crate) fn open_list_find_input(&mut self) {
+        self.text_input_mode = RenameMode::Insert;
+        self.text_input_cursor = 0;
         let search = ListFindState {
             pane_id: self.focused_pane,
             buffer: String::new(),
@@ -8309,6 +8452,7 @@ impl App {
                         selected: *selected,
                         search: &search.buffer,
                         editing: search.editing,
+                        cursor: self.text_input_cursor,
                     })
                 } else if let Some(PendingAction::TaskPanel {
                     pane_id: action_pane_id,
@@ -8322,6 +8466,7 @@ impl App {
                             selected: *selected,
                             search: &search.buffer,
                             editing: search.editing,
+                            cursor: self.text_input_cursor,
                         })
                     } else {
                         None
@@ -8338,6 +8483,7 @@ impl App {
                             selected: *selected,
                             search: &search.buffer,
                             editing: search.editing,
+                            cursor: self.text_input_cursor,
                         })
                     } else {
                         None
@@ -8395,6 +8541,7 @@ impl App {
                     self.list_find
                         .as_ref()
                         .is_some_and(|search| search.pane_id == pane_id),
+                    self.text_input_cursor,
                 );
                 if cursor_position.is_none() {
                     cursor_position = pane_cursor;
@@ -8507,6 +8654,7 @@ impl App {
                 &self.command_buffer,
                 &command_suggestions,
                 self.command_suggestion_selected,
+                self.text_input_cursor,
             );
             if cursor_position.is_none() {
                 cursor_position = Some(command_cursor);
@@ -8516,7 +8664,13 @@ impl App {
         if let Some(filter) = &self.filter
             && filter.editing
         {
-            let filter_cursor = render_filter_input(frame, outer[0], self.theme, &filter.buffer);
+            let filter_cursor = render_filter_input(
+                frame,
+                outer[0],
+                self.theme,
+                &filter.buffer,
+                self.text_input_cursor,
+            );
             if cursor_position.is_none() {
                 cursor_position = Some(filter_cursor);
             }
@@ -8525,8 +8679,13 @@ impl App {
         if let Some(search) = &self.preview_search
             && search.editing
         {
-            let search_cursor =
-                render_preview_search_input(frame, outer[0], self.theme, &search.buffer);
+            let search_cursor = render_preview_search_input(
+                frame,
+                outer[0],
+                self.theme,
+                &search.buffer,
+                self.text_input_cursor,
+            );
             if cursor_position.is_none() {
                 cursor_position = Some(search_cursor);
             }
@@ -8542,14 +8701,20 @@ impl App {
                     self.theme,
                     search.mode.panel_title(true),
                     &search.buffer,
+                    self.text_input_cursor,
                     true,
                 );
                 if cursor_position.is_none() {
                     cursor_position = Some(search_cursor);
                 }
             } else if search.filter.editing {
-                let filter_cursor =
-                    render_filter_input(frame, *area, self.theme, &search.filter.buffer);
+                let filter_cursor = render_filter_input(
+                    frame,
+                    *area,
+                    self.theme,
+                    &search.filter.buffer,
+                    self.text_input_cursor,
+                );
                 if cursor_position.is_none() {
                     cursor_position = Some(filter_cursor);
                 }
@@ -8646,6 +8811,7 @@ impl App {
                         empty_message,
                         &search.buffer,
                         search.editing,
+                        self.text_input_cursor,
                     );
                     if search.editing && cursor_position.is_none() {
                         cursor_position = bookmark_cursor;
@@ -8669,6 +8835,7 @@ impl App {
                         *selected,
                         &search.buffer,
                         search.editing,
+                        self.text_input_cursor,
                     );
                     if search.editing && cursor_position.is_none() {
                         cursor_position = zoxide_cursor;
@@ -8698,15 +8865,34 @@ impl App {
     /// - `Some(RenameMode::Normal)` 代表應顯示方塊游標。
     /// - `None` 代表目前沒有 rename 輸入框，不需要特別切換。
     pub(crate) fn rename_cursor_mode(&self) -> Option<RenameMode> {
-        match self.pending_action {
+        match &self.pending_action {
             Some(PendingAction::Rename { mode, .. })
-            | Some(PendingAction::CreateEntry { mode, .. }) => Some(mode),
+            | Some(PendingAction::CreateEntry { mode, .. }) => Some(*mode),
+            Some(PendingAction::TrashPanel { search, .. })
+            | Some(PendingAction::HelpPanel { search, .. })
+            | Some(PendingAction::TaskPanel { search, .. })
+            | Some(PendingAction::BookmarkList { search, .. })
+            | Some(PendingAction::ZoxideList { search, .. })
+                if search.editing =>
+            {
+                Some(self.text_input_mode)
+            }
+            _ if self.command_mode
+                || self.filter.as_ref().is_some_and(|filter| filter.editing)
+                || self
+                    .preview_search
+                    .as_ref()
+                    .is_some_and(|search| search.editing)
+                || self.list_find.is_some() =>
+            {
+                Some(self.text_input_mode)
+            }
             _ if self
                 .global_search
                 .as_ref()
                 .is_some_and(|search| search.editing || search.filter.editing) =>
             {
-                Some(RenameMode::Insert)
+                Some(self.text_input_mode)
             }
             _ => None,
         }
@@ -10628,6 +10814,22 @@ fn backspace_char(buffer: &mut String, cursor: &mut usize) {
     *cursor -= 1;
 }
 
+/// 刪除字元游標目前指向的字元，供共用輸入器處理 Delete 鍵。
+///
+/// 參數：
+/// - `buffer: &mut String`，目前正在編輯的 UTF-8 字串。
+/// - `cursor: usize`，以字元數表示的游標位置。
+///
+/// 回傳：`()`, 游標在字串尾端時不修改內容。
+fn delete_char_at(buffer: &mut String, cursor: usize) {
+    if cursor >= buffer.chars().count() {
+        return;
+    }
+    let start = char_to_byte_index(buffer, cursor);
+    let end = char_to_byte_index(buffer, cursor + 1);
+    buffer.replace_range(start..end, "");
+}
+
 /// 把字元游標位置轉成 Rust 字串的位元組索引，方便做安全的字串編輯。
 ///
 /// 參數：
@@ -10652,6 +10854,16 @@ fn char_to_byte_index(text: &str, char_index: usize) -> usize {
 fn move_cursor_right(buffer: &str, cursor: usize) -> usize {
     let end = buffer.chars().count();
     (cursor + 1).min(end)
+}
+
+/// 將 Insert 模式的插入點轉成 Normal 模式可指向的字元位置。
+fn normal_cursor(buffer: &str, cursor: usize) -> usize {
+    cursor.min(buffer.chars().count().saturating_sub(1))
+}
+
+/// 在 Normal 模式向右移動一格，但不會移到最後一個字元之外。
+fn normal_move_right(buffer: &str, cursor: usize) -> usize {
+    (cursor + 1).min(buffer.chars().count().saturating_sub(1))
 }
 
 /// 回傳 normal 模式中 `$` 應該停留的位置，也就是最後一個可見字元。
@@ -14400,8 +14612,8 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 filter 輸入時會立即過濾列表，第一次 Esc 只收起輸入框。
-    fn app_filter_esc_once_keeps_filtered_results() {
+    /// 驗證 filter 第一次 Esc 只進入 Normal 模式，輸入框與過濾結果都會保留。
+    fn app_filter_first_escape_enters_normal_mode() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
         fs::write(dir.path().join("beta.txt"), "b").expect("beta");
@@ -14412,7 +14624,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .expect("type filter");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .expect("close input");
+            .expect("enter normal mode");
 
         let pane = app.panes.get(&1).expect("pane");
         let visible_names: Vec<String> = pane
@@ -14425,13 +14637,13 @@ mod tests {
             visible_names,
             vec![String::from("alpha.txt"), String::from("beta.txt")]
         );
-        assert!(app.filter.as_ref().is_some_and(|filter| !filter.editing));
-        assert_eq!(app.status, "filter locked: a");
+        assert!(app.filter.as_ref().is_some_and(|filter| filter.editing));
+        assert_eq!(app.text_input_mode, RenameMode::Normal);
     }
 
     #[test]
-    /// 驗證 filter 第二次 Esc 會完全清掉過濾狀態並恢復一般畫面。
-    fn app_filter_esc_twice_clears_filter() {
+    /// 驗證第二次 Esc 收起 filter 輸入框，第三次 Esc 才清掉已鎖定的 filter。
+    fn app_filter_escape_flow_locks_then_clears_filter() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
         fs::write(dir.path().join("beta.txt"), "b").expect("beta");
@@ -14441,6 +14653,8 @@ mod tests {
             .expect("open filter");
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
             .expect("type filter");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("enter normal mode");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("close input");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -16484,5 +16698,101 @@ mod tests {
         assert!(!search.editing);
         assert_eq!(marked_ids.len(), 2);
         assert_eq!(visual_anchor, Some(1));
+    }
+
+    #[test]
+    /// 驗證 regex rename 使用的 command UI 可以切到 Normal 模式移動游標，再回到 Insert 修正中間文字。
+    fn command_input_supports_vim_normal_and_insert_modes() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_prefilled_command("rename-regex foo baz");
+        app.handle_command_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("enter normal mode");
+        assert!(app.command_mode);
+        assert_eq!(app.text_input_mode, RenameMode::Normal);
+        assert_eq!(app.rename_cursor_mode(), Some(RenameMode::Normal));
+
+        for _ in 0..2 {
+            app.handle_command_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+                .expect("move left");
+        }
+        app.handle_command_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("enter insert mode");
+        app.handle_command_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .expect("insert correction");
+
+        assert_eq!(app.command_buffer, "rename-regex foo Xbaz");
+        assert_eq!(app.text_input_mode, RenameMode::Insert);
+    }
+
+    #[test]
+    /// 驗證一般 filter 第一次 Esc 只切換模式，Normal 模式第二次 Esc 才鎖定並離開輸入框。
+    fn filter_input_uses_two_stage_escape_and_supports_cursor_editing() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("aXbc.txt"), "demo").expect("file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_filter_input();
+        for character in ['a', 'b', 'c'] {
+            app.handle_filter_input_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ))
+            .expect("type filter");
+        }
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("normal mode");
+        assert!(app.filter.as_ref().is_some_and(|filter| filter.editing));
+
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("move left");
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("insert mode");
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .expect("insert middle");
+        assert_eq!(app.filter.as_ref().expect("filter").buffer, "aXbc");
+
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("normal mode again");
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("leave editor");
+        assert!(!app.filter.as_ref().expect("filter").editing);
+    }
+
+    #[test]
+    /// 驗證 help、trash、task、bookmark 與 zoxide 共用的面板搜尋器會攔截 Normal 模式按鍵，不會誤關面板。
+    fn panel_search_uses_shared_vim_editor_before_panel_actions() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_help_panel();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open help filter");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type filter");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("normal mode");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("move cursor instead of closing panel");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel {
+                search: PanelSearchState { editing: true, .. },
+                ..
+            })
+        ));
+        assert_eq!(app.text_input_mode, RenameMode::Normal);
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close panel search");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel {
+                search: PanelSearchState { editing: false, .. },
+                ..
+            })
+        ));
     }
 }
