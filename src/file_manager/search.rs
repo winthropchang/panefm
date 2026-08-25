@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::{
-    ffi::OsString,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,6 +10,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::ffi::OsString;
 
 use super::{fd::fd_command, rg::rg_command};
 

@@ -73,7 +73,10 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     let mut stdout = io::stdout();
     enter_tui_mode(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    let mut terminal = Terminal::new(backend)?;
+    // Windows Terminal 進入 alternate screen 時可能保留先前命令輸出的 cell。
+    terminal.clear()?;
+    Ok(terminal)
 }
 
 /// 將 terminal 從 TUI 狀態恢復成一般命令列狀態。
@@ -108,6 +111,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
     loop {
         app.poll_background_tasks();
+        if app.take_full_redraw_request() {
+            terminal.clear()?;
+        }
         terminal.draw(|frame| app.render(frame))?;
         sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
 

@@ -207,6 +207,9 @@ impl PaneState {
     /// - 失敗時代表讀目錄過程發生 I/O 錯誤。
     pub(crate) fn reload(&mut self) -> io::Result<()> {
         self.entries = read_dir_entries(&self.cwd)?;
+        if matches!(self.active_detail_kind(), SortDetailKind::Size) {
+            self.load_directory_child_counts();
+        }
         self.marked_paths
             .retain(|path| self.entries.iter().any(|entry| &entry.path == path));
         self.sort_entries();
@@ -1399,6 +1402,21 @@ impl PaneState {
         self.line_mode = Some(line_mode);
     }
 
+    /// 只在 size 欄位真正需要顯示時，才讀取各子目錄的直接項目數量。
+    ///
+    /// 參數：`self: &mut PaneState`，目前要補齊顯示資料的 pane。
+    /// 回傳：`() `；無法讀取的子目錄會保留 `None`，由 UI 顯示 `?`。
+    ///
+    /// 這項操作刻意不放在一般 `reload()` 的預設路徑，因為 Windows SMB
+    /// 每開啟一個子目錄都可能產生一次網路往返，會讓首次進入目錄明顯卡頓。
+    pub(crate) fn load_directory_child_counts(&mut self) {
+        for entry in &mut self.entries {
+            if entry.is_dir && entry.child_count.is_none() {
+                entry.child_count = count_directory_children(&entry.path).ok();
+            }
+        }
+    }
+
     /// 回傳右側欄位目前實際應顯示的資料種類。
     ///
     /// 回傳：
@@ -2450,10 +2468,8 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
             path: entry_path.clone(),
             is_dir: file_type.is_dir(),
             size: metadata.len(),
-            child_count: file_type
-                .is_dir()
-                .then(|| count_directory_children(&entry_path).ok())
-                .flatten(),
+            // 子目錄數量需要額外開啟每一個資料夾；一般列表先延遲讀取。
+            child_count: None,
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             created: metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
             readonly: metadata.permissions().readonly(),
@@ -2525,6 +2541,42 @@ mod tests {
             names,
             vec![String::from("nested/"), String::from("alpha.txt")]
         );
+    }
+
+    #[test]
+    /// 驗證一般目錄載入不會預先打開每個子目錄統計數量，避免 SMB 首次瀏覽產生額外網路 I/O。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若預設載入已填入 `child_count`，測試失敗。
+    fn pane_state_defers_directory_child_counts_until_requested() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).expect("nested dir");
+        fs::write(nested.join("one.txt"), "one").expect("first child");
+
+        let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        let directory = pane.entries.iter().find(|entry| entry.is_dir).expect("dir");
+
+        assert_eq!(directory.child_count, None);
+    }
+
+    #[test]
+    /// 驗證 size linemode 需要資料時，仍可延遲取得正確的子目錄項目數量。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若延遲載入後數量不正確，測試失敗。
+    fn pane_state_loads_directory_child_counts_on_demand() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).expect("nested dir");
+        fs::write(nested.join("one.txt"), "one").expect("first child");
+        fs::write(nested.join("two.txt"), "two").expect("second child");
+
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        pane.load_directory_child_counts();
+        let directory = pane.entries.iter().find(|entry| entry.is_dir).expect("dir");
+
+        assert_eq!(directory.child_count, Some(2));
     }
 
     #[test]

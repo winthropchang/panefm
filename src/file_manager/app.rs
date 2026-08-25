@@ -39,15 +39,12 @@ use super::{
         build_custom_launch_spec, build_launch_spec, custom_action_applies_to_target,
         default_open_action, open_picker_options,
     },
-    pane::{LineMode, PaneState, SortMode},
+    pane::{LineMode, PaneState, SortDetailKind, SortMode},
     platform::write_text_to_system_clipboard,
     search::{
         GlobalSearchEntry, GlobalSearchEvent, stream_content_search_entries, stream_search_entries,
     },
-    smb::{
-        ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location,
-        resolve_smb_location_with_mount_root,
-    },
+    smb::{ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location},
     tools::external_tool_statuses,
     trash::{TrashListEntry, TrashStore},
     ui::{
@@ -60,11 +57,14 @@ use super::{
         render_theme_picker, render_trash_confirm_dialog, render_window_picker,
         render_zoxide_picker,
     },
-    zoxide::{add_directory_to_zoxide, query_zoxide_directories},
+    zoxide::{ZoxideTracker, query_zoxide_directories},
 };
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 use super::smb::resolve_smb_location;
+
+#[cfg(any(not(target_os = "windows"), test))]
+use super::smb::resolve_smb_location_with_mount_root;
 
 /// 表示 rename 輸入框目前採用的編輯模式。
 ///
@@ -427,6 +427,10 @@ pub(crate) struct App {
     pub(crate) preview_focus: Option<usize>,
     pub(crate) task_log: Vec<TaskRecord>,
     pub(crate) next_task_id: usize,
+    /// 非阻塞記錄瀏覽目錄，避免同步啟動 zoxide 拖慢 TUI。
+    pub(crate) zoxide_tracker: ZoxideTracker,
+    /// 要求主事件迴圈在下一幀前清除實體 terminal 與 ratatui buffer。
+    pub(crate) full_redraw_requested: bool,
 }
 
 /// 記錄 F1 help 關閉後應回復到哪一種互動上下文。
@@ -465,7 +469,8 @@ impl App {
         let config_source = source.clone().unwrap_or_else(|| cwd.join("config.toml"));
         let bookmark_store = BookmarkStore::load(bookmark_file_path(&cwd, source.as_deref()))
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let _ = add_directory_to_zoxide(&cwd);
+        let zoxide_tracker = ZoxideTracker::new();
+        zoxide_tracker.track(&cwd);
         let mut pane = PaneState::new(cwd)?;
         apply_config_to_pane(&config, &mut pane);
         let mut panes = BTreeMap::new();
@@ -525,6 +530,8 @@ impl App {
             preview_focus: None,
             task_log: Vec::new(),
             next_task_id: 1,
+            zoxide_tracker,
+            full_redraw_requested: false,
         })
     }
 
@@ -4851,7 +4858,7 @@ impl App {
             return Ok(());
         };
         pane.go_to_path(target_path)?;
-        let _ = add_directory_to_zoxide(&pane.cwd);
+        self.zoxide_tracker.track(&pane.cwd);
         Ok(())
     }
 
@@ -4868,7 +4875,7 @@ impl App {
             return Ok(());
         };
         pane.reveal_path(target_path)?;
-        let _ = add_directory_to_zoxide(&pane.cwd);
+        self.zoxide_tracker.track(&pane.cwd);
         Ok(())
     }
 
@@ -4878,7 +4885,7 @@ impl App {
     /// 因為它們不會經過 `go_to_path_and_track()` 這類包裝函式。
     fn track_focused_pane_cwd_in_zoxide(&self) {
         if let Some(pane) = self.panes.get(&self.focused_pane) {
-            let _ = add_directory_to_zoxide(&pane.cwd);
+            self.zoxide_tracker.track(&pane.cwd);
         }
     }
 
@@ -5303,10 +5310,10 @@ impl App {
             }
         };
 
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", not(test)))]
         let resolved = resolve_smb_location(&location);
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(any(not(target_os = "windows"), test))]
         let resolved = resolve_smb_location_with_mount_root(&location, mount_root);
 
         match resolved {
@@ -5325,6 +5332,7 @@ impl App {
                     return Ok(());
                 };
                 pane.set_bookmark_target(BookmarkTarget::SmbLocation(location.url.clone()));
+                self.full_redraw_requested = true;
                 self.status = format!("jumped to smb: {}", location.url);
             }
             ResolvedSmbLocation::NeedsMount { local_path } => {
@@ -7576,6 +7584,9 @@ impl App {
             return Ok(());
         };
         pane.set_sort_mode(sort_mode);
+        if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
+            pane.load_directory_child_counts();
+        }
         self.status = format!("sort: {}", pane.sort_mode.label());
         Ok(())
     }
@@ -7595,8 +7606,19 @@ impl App {
             return Ok(());
         };
         pane.set_line_mode(line_mode);
+        if matches!(line_mode, LineMode::Size) {
+            pane.load_directory_child_counts();
+        }
         self.status = format!("linemode: {}", line_mode.label());
         Ok(())
+    }
+
+    /// 取出並清除下一幀的完整重畫需求。
+    ///
+    /// 參數：`self: &mut App`，目前應用程式狀態。
+    /// 回傳：`bool`；`true` 代表事件迴圈必須先呼叫 `Terminal::clear()`。
+    pub(crate) fn take_full_redraw_request(&mut self) -> bool {
+        std::mem::take(&mut self.full_redraw_requested)
     }
 
     /// 將目前選取項目放進內部剪貼簿，模式為複製。
@@ -14261,6 +14283,8 @@ mod tests {
         let pane = app.current_pane_mut().expect("pane");
         assert_eq!(pane.cwd, share_root.join("docs"));
         assert_eq!(app.status, "jumped to smb: smb://192.0.2.10/shared/docs");
+        assert!(app.take_full_redraw_request());
+        assert!(!app.take_full_redraw_request());
     }
 
     #[test]

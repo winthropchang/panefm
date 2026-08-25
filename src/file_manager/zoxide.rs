@@ -2,12 +2,69 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::mpsc::{SyncSender, TrySendError},
 };
+
+#[cfg(not(test))]
+use std::{sync::mpsc, thread};
 
 use anyhow::{Context, Result};
 
 use super::tools::{find_system_command, missing_tool_message};
+
+/// 在背景依序把瀏覽過的目錄送進 zoxide，避免目錄切換被外部程式啟動時間阻塞。
+///
+/// `SyncSender<PathBuf>` 使用有上限的佇列；若使用者移動速度超過背景處理速度，
+/// 寧可略過一次重複學習，也不能讓 TUI 主執行緒停下來等待。
+#[derive(Debug, Clone)]
+pub(crate) struct ZoxideTracker {
+    sender: Option<SyncSender<PathBuf>>,
+}
+
+impl ZoxideTracker {
+    /// 建立專用的 zoxide 背景 worker。
+    ///
+    /// 參數：無。
+    /// 回傳：`ZoxideTracker`，可透過 `track()` 非阻塞地提交目錄。
+    pub(crate) fn new() -> Self {
+        #[cfg(test)]
+        {
+            // App 測試需要立即查詢剛加入的資料；正式版本仍使用下方背景 worker。
+            return Self { sender: None };
+        }
+
+        #[cfg(not(test))]
+        let (sender, receiver) = mpsc::sync_channel::<PathBuf>(64);
+        #[cfg(not(test))]
+        thread::spawn(move || {
+            while let Ok(path) = receiver.recv() {
+                let _ = add_directory_to_zoxide(&path);
+            }
+        });
+        #[cfg(not(test))]
+        return Self {
+            sender: Some(sender),
+        };
+    }
+
+    /// 非阻塞地排入一個瀏覽過的目錄。
+    ///
+    /// 參數：
+    /// - `path: &Path`，剛完成切換的目錄。
+    ///
+    /// 回傳：`() `；佇列暫滿或 worker 已結束時會略過，不影響檔案操作。
+    pub(crate) fn track(&self, path: &Path) {
+        if let Some(sender) = &self.sender {
+            match sender.try_send(path.to_path_buf()) {
+                Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+            }
+        } else {
+            #[cfg(test)]
+            let _ = add_directory_to_zoxide(path);
+        }
+    }
+}
 
 /// 取得系統安裝的 `zoxide` 命令；本程式不再攜帶第三方 binary。
 pub(crate) fn zoxide_command() -> Result<OsString> {
@@ -70,6 +127,8 @@ fn add_directory_to_zoxide_with_data_dir(path: &Path, data_dir: &Path) -> Result
         .env("_ZO_DATA_DIR", &data_dir)
         .arg("add")
         .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("run zoxide add")?;
 
@@ -122,11 +181,13 @@ fn query_zoxide_directories_with_data_dir(data_dir: &Path) -> Result<Vec<PathBuf
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::mpsc};
+
     use tempfile::tempdir;
 
     use super::{
-        add_directory_to_zoxide_with_data_dir, query_zoxide_directories_with_data_dir,
-        zoxide_data_dir,
+        ZoxideTracker, add_directory_to_zoxide_with_data_dir,
+        query_zoxide_directories_with_data_dir, zoxide_data_dir,
     };
 
     #[test]
@@ -146,5 +207,22 @@ mod tests {
             "expected zoxide results to contain {}",
             dir.path().display()
         );
+    }
+
+    #[test]
+    /// 驗證背景佇列已滿時，提交瀏覽目錄會直接略過，而不是等待 worker 造成介面卡頓。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 `track()` 因滿佇列阻塞，測試會無法完成。
+    fn tracker_drops_updates_when_queue_is_full() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender
+            .send(PathBuf::from("already-queued"))
+            .expect("fill queue");
+        let tracker = ZoxideTracker {
+            sender: Some(sender),
+        };
+
+        tracker.track(PathBuf::from("must-not-block").as_path());
     }
 }
