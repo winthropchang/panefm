@@ -1,3 +1,8 @@
+//! zoxide 常用目錄學習、查詢與非阻塞更新佇列。
+//!
+//! 使用者每次正常進入目錄時，`App` 只嘗試把路徑送進 bounded channel；背景 worker
+//! 才執行 `zoxide add`。佇列滿時寧可丟棄單次紀錄，也不能讓目錄切換等待外部程序。
+
 use std::{
     ffi::OsString,
     fs,
@@ -209,6 +214,8 @@ mod tests {
     };
 
     #[test]
+    /// 驗證每個平台都能解析出非空的 zoxide 資料目錄。
+    /// 保護目的：避免 zoxide 資料路徑或背景佇列調整後，阻塞目錄切換或遺失既有學習資料。
     fn zoxide_data_dir_is_not_empty() {
         let data_dir = zoxide_data_dir().expect("data dir");
         assert!(!data_dir.as_os_str().is_empty());
@@ -216,6 +223,7 @@ mod tests {
 
     #[test]
     /// 驗證改名後仍會沿用既有 zoxide 資料，新資料存在時則優先使用 PaneFM 目錄。
+    /// 保護目的：避免 zoxide 資料路徑或背景佇列調整後，阻塞目錄切換或遺失既有學習資料。
     fn preferred_zoxide_data_dir_preserves_legacy_learning_data() {
         let dir = tempdir().expect("tempdir");
         let legacy = dir.path().join("terminal-file-manager").join("zoxide");
@@ -229,6 +237,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證加入測試目錄後，後續查詢可以依 frecency 回傳同一路徑。
+    /// 保護目的：避免 zoxide 資料路徑或背景佇列調整後，阻塞目錄切換或遺失既有學習資料。
     fn add_then_query_returns_tracked_directory() {
         let dir = tempdir().expect("tempdir");
         let data_dir = dir.path().join("zoxide-data");
@@ -246,6 +256,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若 `track()` 因滿佇列阻塞，測試會無法完成。
+    /// 保護目的：避免 zoxide 資料路徑或背景佇列調整後，阻塞目錄切換或遺失既有學習資料。
     fn tracker_drops_updates_when_queue_is_full() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         sender

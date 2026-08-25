@@ -1,3 +1,8 @@
+//! `fzf` 外部依賴的定位入口。
+//!
+//! fzf 會暫時接管整個 terminal，因此本模組只解析可執行檔；終端停用與恢復必須
+//! 留在 `file_manager::mod` 的生命週期層處理。
+
 use std::ffi::OsString;
 
 use anyhow::{Result, anyhow};

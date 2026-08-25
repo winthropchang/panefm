@@ -1,3 +1,8 @@
+//! 外部工具偵測與 dependency status 面板的資料來源。
+//!
+//! PaneFM 不把 fd、rg、fzf、zoxide 綁進執行檔，而是在 PATH 中尋找系統安裝版本。
+//! 新增必要工具時，必須在這裡的集中清單、缺少訊息與測試一起更新。
+
 use std::{
     ffi::{OsStr, OsString},
     path::Path,
@@ -70,6 +75,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    /// 驗證 PATH 搜尋會回傳第一個可執行的同名工具。
+    /// 保護目的：避免外部依賴清單或 PATH 偵測重構後，向使用者回報錯誤的安裝狀態。
     fn finds_first_command_in_path() {
         let first = tempdir().expect("first tempdir");
         let second = tempdir().expect("second tempdir");
@@ -84,6 +91,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證不存在的命令不會被 dependency status 誤判為已安裝。
+    /// 保護目的：避免外部依賴清單或 PATH 偵測重構後，向使用者回報錯誤的安裝狀態。
     fn missing_command_is_not_reported_as_installed() {
         let dir = tempdir().expect("tempdir");
         let path = std::env::join_paths([dir.path()]).expect("PATH");
@@ -94,6 +103,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證缺少依賴訊息包含工具名稱與 `status` 指令提示。
+    /// 保護目的：避免外部依賴清單或 PATH 偵測重構後，向使用者回報錯誤的安裝狀態。
     fn missing_message_names_installable_tools() {
         let message = missing_tool_message("rg");
         assert!(message.contains("rg"));
@@ -103,6 +114,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 status 面板集中列出 fd、rg、fzf 與 zoxide 等必要工具。
+    /// 保護目的：避免外部依賴清單或 PATH 偵測重構後，向使用者回報錯誤的安裝狀態。
     fn dependency_status_lists_all_required_tools() {
         let statuses = external_tool_statuses();
         assert_eq!(

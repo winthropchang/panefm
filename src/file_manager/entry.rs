@@ -1,3 +1,8 @@
+//! 目錄列表中單一檔案系統項目的跨平台資料模型。
+//!
+//! 掃描目錄時會把 metadata 正規化成 `FileEntry`，讓排序與 UI 不必直接依賴平台
+//! API。Windows 不存在的 Unix 權限等資訊以 `Option` 表示，而不是在 UI 端猜測。
+
 use std::{path::PathBuf, time::SystemTime};
 
 /// 表示目錄列表中的單一檔案或資料夾項目。

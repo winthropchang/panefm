@@ -1,3 +1,8 @@
+//! Copy picker 的文字格式與系統剪貼簿內容產生器。
+//!
+//! 這裡的 copy 是「複製路徑/檔名文字」，不同於 `App` 的檔案複製剪貼簿。URL、父
+//! 目錄與副檔名處理集中在此，確保 macOS 和 Windows 傳給其他軟體的文字格式一致。
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -74,12 +79,18 @@ pub(crate) fn copy_action_status_label(action: CopyAction) -> &'static str {
     }
 }
 
+/// 取得適合放入系統剪貼簿的檔名，沒有 final component 時退回完整顯示路徑。
+///
+/// 參數：`path: &Path`；回傳不含父目錄的 lossy UTF-8 `String`。
 fn file_name_text(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// 取得不含副檔名的檔名；目錄名稱中的句點不會被誤當成副檔名移除。
+///
+/// 參數：`path: &Path`；回傳檔案 stem 或目錄原名。
 fn file_stem_text(path: &Path) -> String {
     if path.is_dir() {
         return file_name_text(path);
@@ -90,6 +101,10 @@ fn file_stem_text(path: &Path) -> String {
         .unwrap_or_else(|| file_name_text(path))
 }
 
+/// 把路徑轉成其他編輯器與 shell 可直接使用的原生平台路徑文字。
+///
+/// 這裡刻意不產生 `file://` URL，也不做 `%20` 編碼，因為使用者通常會把結果貼到
+/// 終端、IDE 或檔案選擇器。參數是 `path`，回傳 `Path::display()` 的字串。
 fn path_to_clipboard_text(path: &Path) -> String {
     path.display().to_string()
 }
@@ -102,6 +117,8 @@ mod tests {
     use crate::file_manager::open::OpenTarget;
 
     #[test]
+    /// 驗證複製檔案路徑保留原生絕對路徑，不轉成 percent-encoded URL。
+    /// 保護目的：避免剪貼簿文字格式調整後，產生其他終端、IDE 或檔案工具無法直接使用的路徑。
     fn copy_file_path_preserves_plain_absolute_path() {
         let target = OpenTarget {
             path: PathBuf::from("/tmp/hello world.txt"),
@@ -114,6 +131,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證檔案的 directory copy 取父目錄，而目錄目標則保留自己。
+    /// 保護目的：避免剪貼簿文字格式調整後，產生其他終端、IDE 或檔案工具無法直接使用的路徑。
     fn copy_directory_path_uses_parent_for_files() {
         let target = OpenTarget {
             path: PathBuf::from("/tmp/docs/readme.md"),
@@ -126,6 +145,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 filename-without-extension 只移除檔案副檔名，不修改目錄名稱。
+    /// 保護目的：避免剪貼簿文字格式調整後，產生其他終端、IDE 或檔案工具無法直接使用的路徑。
     fn copy_filename_without_extension_uses_stem_for_files() {
         let target = OpenTarget {
             path: PathBuf::from("/tmp/archive.tar.gz"),
@@ -139,6 +160,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證每種 copy action 都提供可直接顯示在狀態列的清楚訊息。
+    /// 保護目的：避免剪貼簿文字格式調整後，產生其他終端、IDE 或檔案工具無法直接使用的路徑。
     fn copy_status_labels_are_human_readable() {
         assert_eq!(
             copy_action_status_label(CopyAction::FileUrl),

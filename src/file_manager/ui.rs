@@ -1,3 +1,9 @@
+//! ratatui 畫面組裝與純顯示格式化函數。
+//!
+//! 本模組只根據 `App`/`PaneState` 的快照繪圖，不執行檔案操作或改變業務狀態。
+//! panel 內 UI 應限制在傳入的 `Rect`，顏色一律取自 `Theme`，狹窄視窗則交由本層
+//! 的截斷與動態對齊 helper 處理，避免各功能自行計算造成版面不一致。
+
 use chrono::{DateTime, Local};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -1927,6 +1933,7 @@ mod tests {
     use crate::file_manager::search::GlobalSearchEntry;
     use crate::theme::Theme;
 
+    /// 建立 UI 格式測試使用的最小 FileEntry，避免測試依賴實際檔案系統 metadata。
     fn test_entry(name: &str, is_dir: bool) -> FileEntry {
         FileEntry {
             name: name.to_string(),
@@ -1943,6 +1950,7 @@ mod tests {
 
     #[test]
     /// 驗證搜尋仍在背景載入時，只要已有結果就不會再用 Loading 訊息蓋住列表。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn search_results_are_visible_while_loading() {
         let entry = GlobalSearchEntry {
             path: Path::new("result.txt").to_path_buf(),
@@ -1968,6 +1976,7 @@ mod tests {
 
     #[test]
     /// 驗證背景搜尋仍在回傳資料時，列表會立即顯示目前游標，而不是等待 Done 事件。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn search_cursor_is_visible_and_clamped_while_loading() {
         let results = vec![
             GlobalSearchEntry {
@@ -2001,6 +2010,7 @@ mod tests {
 
     #[test]
     /// 驗證 regex 預覽右側狀態會依 ready、unchanged 與錯誤類型套用主題顏色。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn regex_rename_status_uses_theme_semantic_colors() {
         let theme = Theme::default_theme();
         assert_eq!(
@@ -2023,6 +2033,7 @@ mod tests {
 
     #[test]
     /// 驗證列表會依照目錄與常見副檔名分辨檔案類別與圖示。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn entry_kind_uses_cross_platform_categories() {
         assert_eq!(
             entry_icon(&test_entry("src", true), IconStyle::Ascii),
@@ -2048,6 +2059,7 @@ mod tests {
 
     #[test]
     /// 驗證大小格式會轉成人類較容易閱讀的單位顯示。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_size_short_uses_compact_units() {
         assert_eq!(format_size_short(512), "512b");
         assert_eq!(format_size_short(2_048), "2kb");
@@ -2057,6 +2069,7 @@ mod tests {
 
     #[test]
     /// 驗證 pane 標題會把固定 pane 編號顯示在最前面，方便對照快捷鍵切換。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_pane_title_keeps_stable_pane_id_prefix() {
         let title = format_pane_title(
             3,
@@ -2076,6 +2089,7 @@ mod tests {
 
     #[test]
     /// 驗證 pane 寬度足夠時，標題會完整顯示，不會過早縮短路徑。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_pane_title_keeps_full_path_when_it_fits() {
         let title = format_pane_title(
             2,
@@ -2095,6 +2109,7 @@ mod tests {
 
     #[test]
     /// 驗證 pane 很窄時，標題仍會自動縮短，不會超出可用寬度。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_pane_title_compacts_long_path_for_narrow_panes() {
         let title = format_pane_title(
             12,
@@ -2116,6 +2131,7 @@ mod tests {
 
     #[test]
     /// 驗證路徑放不下時，會優先保留最後目錄名稱，而不是在前面留下多餘根路徑。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_pane_title_prefers_last_directory_tail() {
         let title = format_pane_title(
             4,
@@ -2135,6 +2151,7 @@ mod tests {
 
     #[test]
     /// 驗證 linemode 開啟後，pane 標題尾端會顯示目前啟用的 linemode。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_pane_title_supports_linemode_status() {
         let title = format_pane_title(5, Path::new("/tmp/demo"), "", "", "", "linemode: size", 80);
 
@@ -2143,6 +2160,7 @@ mod tests {
 
     #[test]
     /// 驗證非 Unix 平台或缺少 mode bits 時，permissions 仍有可讀的 fallback 顯示。
+    /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_permissions_detail_falls_back_to_cross_platform_text() {
         let entry = FileEntry {
             name: String::from("notes.txt"),

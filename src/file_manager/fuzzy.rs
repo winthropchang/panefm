@@ -1,3 +1,8 @@
+//! 所有 panel filter 共用的模糊匹配與穩定排序策略。
+//!
+//! 搜尋工具決定「取得哪些候選」，本模組只在既有候選中做互動式縮小範圍。欄位
+//! 彼此分開匹配，避免查詢字元跨過名稱與路徑邊界形成令人困惑的假命中。
+
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -74,6 +79,7 @@ mod tests {
 
     #[test]
     /// 驗證不連續字元也能命中，並把較貼近查詢的候選排在前面。
+    /// 保護目的：避免模糊比對演算法調整後，出現跨欄位假命中、排序跳動或 smart-case 退化。
     fn fuzzy_filter_matches_non_contiguous_characters_and_ranks_results() {
         let items = ["src/file_manager/app.rs", "archive.zip", "sample.txt"];
         let matched = fuzzy_matched_indices(&items, "sfma", |item| (*item).to_string());
@@ -83,6 +89,7 @@ mod tests {
 
     #[test]
     /// 驗證空查詢不會改變候選順序，避免剛打開 filter 時列表突然重排。
+    /// 保護目的：避免模糊比對演算法調整後，出現跨欄位假命中、排序跳動或 smart-case 退化。
     fn fuzzy_filter_keeps_original_order_for_empty_query() {
         let items = ["beta", "alpha", "gamma"];
         let matched = fuzzy_matched_indices(&items, "", |item| (*item).to_string());
@@ -92,6 +99,7 @@ mod tests {
 
     #[test]
     /// 驗證 smart-case：小寫查詢可忽略大小寫，大寫查詢則尊重大小寫。
+    /// 保護目的：避免模糊比對演算法調整後，出現跨欄位假命中、排序跳動或 smart-case 退化。
     fn fuzzy_filter_uses_smart_case_matching() {
         let items = ["README.md", "readme-copy.md"];
 
@@ -107,6 +115,7 @@ mod tests {
 
     #[test]
     /// 驗證多欄位資料不會把查詢字元跨欄位串接，避免產生肉眼無法理解的假命中。
+    /// 保護目的：避免模糊比對演算法調整後，出現跨欄位假命中、排序跳動或 smart-case 退化。
     fn fuzzy_filter_does_not_join_characters_across_fields() {
         let items = [("alp", "ha.txt"), ("alpha.txt", "/tmp")];
         let matched = fuzzy_matched_indices_by_fields(&items, "alpha", |item| {

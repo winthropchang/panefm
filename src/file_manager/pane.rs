@@ -1,3 +1,9 @@
+//! 單一 panel 的目錄列表、排序、選取、預覽與檔案操作狀態。
+//!
+//! `PaneState` 是 PaneFM 的第一級物件：每個 split 都有獨立 cwd、游標、filter、
+//! preview 與顯示模式。這一層不決定快捷鍵，也不繪製 popup；它提供可測試的資料
+//! 操作給 `App`，並在變更檔案後重新載入列表與盡可能保留游標位置。
+
 use std::{
     cmp::Ordering,
     collections::BTreeSet,
@@ -2737,6 +2743,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若排序規則錯誤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_lists_directories_before_files() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("nested")).expect("nested dir");
@@ -2756,6 +2763,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若預設載入已填入 `child_count`，測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_defers_directory_child_counts_until_requested() {
         let dir = tempdir().expect("tempdir");
         let nested = dir.path().join("nested");
@@ -2773,6 +2781,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若延遲載入後數量不正確，測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_loads_directory_child_counts_on_demand() {
         let dir = tempdir().expect("tempdir");
         let nested = dir.path().join("nested");
@@ -2792,6 +2801,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若目錄切換行為錯誤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_enters_and_leaves_directories() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("alpha")).expect("alpha dir");
@@ -2817,6 +2827,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若檔案未被刪除或狀態未更新則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_delete_selected_file_removes_it() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -2835,6 +2846,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若檔案未改名或狀態未更新則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_rename_selected_file_updates_entry() {
         let dir = tempdir().expect("tempdir");
         let old_path = dir.path().join("alpha.txt");
@@ -2858,6 +2870,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若重複名稱處理錯誤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_copy_into_same_directory_creates_duplicate_file_name() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -2882,6 +2895,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若資料夾重複名稱處理錯誤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_copy_into_same_directory_creates_duplicate_directory_name() {
         let dir = tempdir().expect("tempdir");
         let folder_path = dir.path().join("docs");
@@ -2909,6 +2923,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若正式內容錯誤或 `.panefm-transfer-*` 暫存路徑殘留則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn transactional_copy_commits_complete_file_without_temp_residue() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source.zip");
@@ -2931,6 +2946,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若失敗後仍佔用正式檔名，Finder 下一次複製可能被迫產生 `copy` 名稱。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn transactional_copy_failure_removes_partial_staged_file() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source.zip");
@@ -2958,6 +2974,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若部分檔案仍存在，Finder 後續複製就可能自動改成 `copy` 名稱。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn direct_copy_failure_removes_partial_target() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source.zip");
@@ -2984,6 +3001,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若模擬傳輸失敗後舊內容被刪除或改寫則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn transactional_overwrite_failure_preserves_existing_target() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source.zip");
@@ -3028,6 +3046,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若檔案未建立或選取狀態錯誤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_create_plain_file_adds_new_entry() {
         let dir = tempdir().expect("tempdir");
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
@@ -3047,6 +3066,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若資料夾未建立或選取狀態錯誤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_create_directory_from_trailing_slash_adds_new_entry() {
         let dir = tempdir().expect("tempdir");
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
@@ -3066,6 +3086,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若父目錄未建立或檔案未建立則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_create_nested_file_builds_parent_directories() {
         let dir = tempdir().expect("tempdir");
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
@@ -3085,6 +3106,7 @@ mod tests {
 
     #[test]
     /// 驗證預設不顯示隱藏檔，切換後才會出現在列表中。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_toggle_hidden_changes_visible_entries() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".secret"), "s").expect("hidden");
@@ -3112,6 +3134,7 @@ mod tests {
 
     #[test]
     /// 驗證排序模式會提供對應的人類可讀標籤。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn sort_mode_labels_match_expected_names() {
         assert_eq!(
             SortMode::Alphabetical { reverse: false }.label(),
@@ -3123,6 +3146,7 @@ mod tests {
 
     #[test]
     /// 驗證切換到大小排序後，較大的檔案會排在前面。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_sort_by_size_reorders_files() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("small.txt"), "a").expect("small");
@@ -3148,6 +3172,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若 preview 缺少目錄摘要或子項目清單則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_directory_preview_shows_summary_and_children() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("nested")).expect("nested dir");
@@ -3172,6 +3197,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若 preview 沒有顯示 metadata 或內容行號則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_file_preview_shows_metadata_and_numbered_lines() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -3197,6 +3223,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若圖片摘要資訊缺少格式或尺寸則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_image_preview_shows_format_and_dimensions() {
         let dir = tempdir().expect("tempdir");
         let png_bytes = vec![
@@ -3221,6 +3248,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若 preview 沒有顯示預期的類型標籤則測試失敗。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_config_preview_shows_kind_label() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("config.toml"), "theme = \"nightfox\"\n").expect("toml");
@@ -3241,6 +3269,7 @@ mod tests {
 
     #[test]
     /// 驗證可針對指定路徑建立 preview，並套用搜尋高亮，供搜尋列表下方預覽使用。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_search_preview_for_path_supports_search_highlight() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("notes.txt");
@@ -3281,6 +3310,7 @@ mod tests {
 
     #[test]
     /// 驗證一般 preview 不會再顯示舊的資訊區，搜尋也只會針對檔案內容運作。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_preview_search_ignores_metadata_lines() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("test copy.md"), "this is body text\n").expect("notes");
@@ -3308,6 +3338,7 @@ mod tests {
 
     #[test]
     /// 驗證搜尋 preview 會讓所有命中維持紅字，只有目前焦點命中帶黃色背景。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_search_preview_marks_current_match_line() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("notes.txt");
@@ -3356,6 +3387,7 @@ mod tests {
 
     #[test]
     /// 驗證搜尋 preview 即使遇到大檔案，也會顯示命中片段而不是只顯示 skipped 訊息。
+    /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
     fn pane_state_search_preview_for_large_file_shows_match_snippet() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("large.txt");

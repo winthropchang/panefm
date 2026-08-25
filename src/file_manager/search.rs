@@ -1,3 +1,9 @@
+//! `fd` 檔名搜尋與 `rg` 內容搜尋的非同步串流轉接層。
+//!
+//! 搜尋程序的 stdout 會逐行解析並分批送回 `App`，第一批結果不等待整棵目錄樹
+//! 完成。取消旗標同時負責停止讀取與終止 child process；修改此流程時要維持結果
+//! 原順序，否則背景批次到達會讓使用者正在操作的游標跳動。
+
 use serde::Deserialize;
 use std::{
     io::{BufRead, BufReader},
@@ -22,14 +28,24 @@ use super::{fd::fd_command, rg::rg_command};
 /// 讓畫面可以直接顯示結果，後續也能用完整路徑做跳轉。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalSearchEntry {
+    /// 可直接用於跳轉、預覽或開啟的絕對路徑。
     pub(crate) path: PathBuf,
+    /// 相對搜尋根目錄的顯示文字，列表只顯示這個欄位以保持簡潔。
     pub(crate) relative_path: String,
+    /// `true` 代表結果是目錄；內容搜尋的結果固定為檔案。
     pub(crate) is_dir: bool,
+    /// rg 第一個命中的 1-based 行號；檔名搜尋不提供此資訊。
     pub(crate) match_line_number: Option<usize>,
+    /// rg 第一個 submatch 的 1-based 欄位位置。
     pub(crate) match_column: Option<usize>,
+    /// 經過空白正規化的首筆命中摘要，供小型 preview 快速判斷內容。
     pub(crate) match_preview: Option<String>,
 }
 
+/// ripgrep `--json` stdout 的最外層事件格式。
+///
+/// rg 除了 `match` 還會輸出 begin、end、summary 等事件；解析後會先檢查
+/// `event_type`，只有 match 才轉成 PaneFM 的 `GlobalSearchEntry`。
 #[derive(Debug, Deserialize)]
 struct RgJsonEvent {
     #[serde(rename = "type")]
@@ -37,6 +53,10 @@ struct RgJsonEvent {
     data: RgJsonMatchData,
 }
 
+/// rg match 事件中 PaneFM 實際需要的可選欄位。
+///
+/// 欄位保持 `Option` 是因為 rg 的 JSON protocol 允許文字改用 base64 表示，且部分
+/// 事件沒有行號或 submatch；解析層會安全忽略無法顯示的資料，而不是 panic。
 #[derive(Debug, Deserialize, Default)]
 struct RgJsonMatchData {
     path: Option<RgJsonTextField>,
@@ -45,11 +65,13 @@ struct RgJsonMatchData {
     submatches: Option<Vec<RgJsonSubmatch>>,
 }
 
+/// rg JSON protocol 用來包裝 UTF-8 `text`（或未支援的 bytes/base64）的物件。
 #[derive(Debug, Deserialize)]
 struct RgJsonTextField {
     text: Option<String>,
 }
 
+/// 單一 rg submatch 的 byte 起點；目前只取第一筆換算預覽欄位。
 #[derive(Debug, Deserialize)]
 struct RgJsonSubmatch {
     start: usize,
@@ -559,6 +581,7 @@ mod tests {
 
     #[test]
     /// 驗證檔名搜尋的第一筆命中會獨立送出，不會等待批次填滿或完整掃描結束。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn stream_search_entries_emits_first_match_immediately() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("887-first.txt"), "first").expect("first");
@@ -596,6 +619,7 @@ mod tests {
 
     #[test]
     /// 驗證檔名搜尋會使用 fd 的固定字串、不分大小寫與安全路徑分隔選項。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn build_fd_search_command_uses_streaming_safe_options() {
         let dir = tempdir().expect("tempdir");
         let command = build_fd_search_command(dir.path(), true, "887").expect("fd command");
@@ -615,6 +639,7 @@ mod tests {
 
     #[test]
     /// 驗證內容搜尋只會回傳真正命中文字內容的檔案，且會略過 binary 檔。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn stream_content_search_entries_matches_file_contents() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "hello rust world\n").expect("notes");
@@ -652,6 +677,7 @@ mod tests {
 
     #[test]
     /// 驗證內容搜尋會把命中的檔案逐步分批送回，而不是全部累積到最後才一次回傳。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn stream_content_search_entries_emits_incremental_chunks() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "rust alpha\n").expect("alpha");
@@ -689,6 +715,7 @@ mod tests {
 
     #[test]
     /// 驗證 content search 使用的 rg 命令會把選項放在 `--` 前面，避免被當成查詢字串。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn build_rg_content_search_command_places_hidden_before_separator() {
         let dir = tempdir().expect("tempdir");
         let command =
@@ -716,6 +743,7 @@ mod tests {
 
     #[test]
     /// 驗證未開啟隱藏檔時，不會額外加入 Git 排除規則，避免改變既有設定語意。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn build_rg_content_search_command_does_not_add_hidden_glob_when_disabled() {
         let dir = tempdir().expect("tempdir");
         let command =
@@ -731,6 +759,7 @@ mod tests {
 
     #[test]
     /// 驗證命中行摘要會被整理成單行文字，避免把換行直接帶進結果列表。
+    /// 保護目的：避免搜尋命令或串流解析調整後，延遲首批結果、遺失資料或改變結果語意。
     fn normalize_match_preview_collapses_whitespace() {
         let preview = normalize_match_preview(" hello   rust \n  world \r\n");
         assert_eq!(preview, "hello rust world");

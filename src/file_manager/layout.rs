@@ -1,3 +1,9 @@
+//! 多 panel 分割樹與畫面矩形計算。
+//!
+//! Layout 使用樹狀結構保存 split 關係，leaf 只引用穩定的 panel id。新增、關閉或
+//! only panel 時先修改此樹，再由 `App` 同步 panel map；不要用畫面順序當作永久 id，
+//! 否則關閉中間 panel 後快捷鍵與背景 task 會指到錯誤目標。
+
 use std::collections::BTreeMap;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -181,6 +187,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若布局結果不正確則測試失敗。
+    /// 保護目的：避免分割樹重構後，panel id、方向或關閉時的父節點收合結果錯誤。
     fn split_leaf_replaces_target_with_split_node() {
         let layout = LayoutNode::Leaf { pane_id: 1 };
         let updated = layout.split_leaf(1, SplitDirection::Vertical, SplitPlacement::After, 2);
@@ -197,6 +204,7 @@ mod tests {
 
     #[test]
     /// 驗證當指定 `Before` 時，新 pane 會出現在目前 pane 的前面。
+    /// 保護目的：避免分割樹重構後，panel id、方向或關閉時的父節點收合結果錯誤。
     fn split_leaf_can_insert_new_pane_before_current_one() {
         let layout = LayoutNode::Leaf { pane_id: 1 };
         let updated = layout.split_leaf(1, SplitDirection::Horizontal, SplitPlacement::Before, 2);
@@ -216,6 +224,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若布局未正確收斂則測試失敗。
+    /// 保護目的：避免分割樹重構後，panel id、方向或關閉時的父節點收合結果錯誤。
     fn close_pane_collapses_parent_split() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,

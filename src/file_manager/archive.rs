@@ -1,3 +1,8 @@
+//! ZIP、tar.gz 與 tar 的跨平台壓縮/解壓縮實作。
+//!
+//! 壓縮固定產生 ZIP 以確保 macOS/Windows 都能開啟；解壓可辨識多種格式。所有輸出
+//! 路徑都必須經過 collision 與 path traversal 防護，不能直接信任 archive 內的名稱。
+
 use std::{
     fs::{self, File},
     io::{self, Read},
@@ -370,6 +375,8 @@ mod tests {
     use crate::file_manager::entry::FileEntry;
 
     #[test]
+    /// 驗證副檔名辨識涵蓋 zip、tar、tar.gz 與 tgz，並拒絕一般檔案。
+    /// 保護目的：避免壓縮格式或輸出命名調整後，造成跨平台無法解壓、覆蓋既有資料或路徑不安全。
     fn detect_archive_format_recognizes_supported_extensions() {
         assert_eq!(
             detect_archive_format(Path::new("demo.zip")),
@@ -391,6 +398,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證解壓目的地同名時會建立 copy 名稱，不覆蓋既有目錄。
+    /// 保護目的：避免壓縮格式或輸出命名調整後，造成跨平台無法解壓、覆蓋既有資料或路徑不安全。
     fn default_extract_output_path_avoids_name_collisions() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha"), "existing").expect("write");
@@ -408,6 +417,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證單一檔案壓縮會產生可讀取的預設 ZIP，並保存原始檔名。
+    /// 保護目的：避免壓縮格式或輸出命名調整後，造成跨平台無法解壓、覆蓋既有資料或路徑不安全。
     fn compress_entries_to_zip_creates_archive_with_default_name() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("notes.txt");

@@ -1,3 +1,8 @@
+//! macOS、Windows 與未來 Linux 的系統整合命令邊界。
+//!
+//! Reveal、系統開啟、SMB 掛載等平台差異應集中在此層，其他模組只使用 `LaunchSpec`
+//! 或抽象函數。這可讓命令建構在目前平台以單元測試驗證另一平台，而不必真的啟動。
+
 use std::{
     io::{self, Write},
     path::Path,
@@ -145,6 +150,8 @@ mod tests {
     use crate::file_manager::open::LaunchMode;
 
     #[test]
+    /// 驗證 Windows 系統開啟會透過 `cmd /C start`，並保留目標路徑為獨立參數。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn windows_system_open_uses_cmd_start() {
         let spec = system_open_spec_for_platform(
             &PathBuf::from(r"C:\work\notes.txt"),
@@ -159,6 +166,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 Windows Reveal 會使用 Explorer `/select,` 聚焦指定檔案。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn windows_reveal_uses_explorer_select() {
         let spec = reveal_in_system_spec_for_platform(
             &PathBuf::from(r"C:\work\notes.txt"),
@@ -172,6 +181,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 macOS Reveal 會產生 `open -R`，而不是只打開父目錄。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn mac_reveal_uses_open_r() {
         let spec = reveal_in_system_spec_for_platform(
             &PathBuf::from("/tmp/notes.txt"),

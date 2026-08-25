@@ -1,3 +1,12 @@
+//! PaneFM 的應用狀態機、命令分派與使用者操作流程。
+//!
+//! [`App`] 是第一層協調者：每個 panel 的瀏覽資料由 `PaneState` 保存，全域只保留
+//! layout、焦點、剪貼簿與背景 task。`handle_key` 會按照「暫時 UI -> 文字輸入 ->
+//! panel 模式 -> 一般列表」的優先順序分派事件，避免同一按鍵同時觸發兩種行為。
+//!
+//! 新功能應盡量把檔案系統或平台細節放進對應模組，這裡只保留狀態轉換；所有會
+//! 阻塞的搜尋、外部程式或網路操作都必須排入背景流程，不能卡住 TUI 主執行緒。
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
@@ -743,8 +752,17 @@ impl App {
         }
     }
 
-    /// 處理一般輸入事件的總入口。
+    /// 依照目前互動狀態，把一個鍵盤事件分派給唯一的處理流程。
+    ///
+    /// 參數：`key: KeyEvent`，已由終端事件迴圈過濾成 Press/Repeat 的按鍵。
+    /// 回傳：`Result<bool>`；`true` 代表繼續執行，`false` 只由 quit 流程回傳，錯誤
+    /// 則向上交給事件迴圈統一還原 terminal。
+    ///
+    /// 分派順序不可隨意調換：暫時面板與文字輸入必須先攔截按鍵，否則使用者在
+    /// command 輸入 `d` 時可能同時觸發刪除；一般列表快捷鍵永遠是最後一層。
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Help 被允許從任何上下文打開，因此在其他 pending action 之前處理；
+        // `help_return` 會保存原上下文，關閉說明後才能回到原 panel/輸入流程。
         if key.code == KeyCode::F(1) || key_matches_tilde(&key) {
             if matches!(self.pending_action, Some(PendingAction::HelpPanel { .. })) {
                 return self.handle_pending_action_key(key);
@@ -757,6 +775,8 @@ impl App {
         if self.pending_action.is_some() {
             return self.handle_pending_action_key(key);
         }
+        // 下列輸入狀態互斥，依 UI 層級交給各自 handler；handler 內再共用
+        // `edit_text_buffer`，以維持 Insert/Normal、Unicode 游標與 Esc 行為一致。
         if self.filter.as_ref().is_some_and(|filter| filter.editing) {
             return self.handle_filter_input_key(key);
         }
@@ -782,6 +802,8 @@ impl App {
         if self.pending_bookmark.is_some() {
             return self.handle_bookmark_key(key);
         }
+        // 不在輸入或暫時 UI 時，數字與跨 panel 快捷鍵才有意義。這段必須放在
+        // count prefix 之前，否則多 panel 下按 2 會被誤解成 `2j` 的前綴。
         if self.panes.len() > 1
             && let Some(target_pane_id) = plain_digit_target_pane_id(&key)
         {
@@ -2092,12 +2114,19 @@ impl App {
         Ok(true)
     }
 
-    /// 處理暫時互動視窗的按鍵事件。
+    /// 處理目前 pending action 所代表的暫時面板、選單或確認視窗。
+    ///
+    /// 參數：`key: KeyEvent`，要交給最上層暫時 UI 的按鍵。
+    /// 回傳：`Result<bool>`，暫時 UI 一律消耗事件並回傳 `true`；檔案操作失敗則回傳
+    /// error。函數開頭先 `take()` action，只有需要保留 UI 的分支才放回去，因此某
+    /// 分支若未重設 `pending_action`，語意就是操作完成並關閉面板。
     pub(crate) fn handle_pending_action_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(mut action) = self.pending_action.take() else {
             return Ok(true);
         };
 
+        // 所有具搜尋框的列表先共用文字編輯器。Normal 模式的 h/l 不可落入下面的
+        // panel 導航，否則使用者只想移動輸入游標時會意外關閉或執行選項。
         let panel_edit_result = match &mut action {
             PendingAction::TrashPanel {
                 selected, search, ..
@@ -8898,7 +8927,12 @@ impl App {
         }
     }
 
-    /// 在每一輪事件迴圈中檢查背景 global search 是否已完成。
+    /// 非阻塞接收背景 global search 的增量結果，並更新目前搜尋 panel 與 task。
+    ///
+    /// 參數：無；資料由 `global_search_rx` channel 取得。
+    /// 回傳：`()`, 每輪最多處理八筆訊息，避免大量結果讓主事件迴圈失去回應。
+    /// 每個訊息都核對 panel id 與 query，舊搜尋取消後晚到的 chunk 會被捨棄，不能
+    /// 混入使用者後來啟動的新搜尋。
     pub(crate) fn poll_background_tasks(&mut self) {
         let Some(receiver) = &self.global_search_rx else {
             return;
@@ -11039,6 +11073,7 @@ mod tests {
 
     #[test]
     /// 驗證狀態列只會把錯誤類訊息判斷為危險色，一般通知不會被誤標紅。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn status_is_error_distinguishes_errors_from_notifications() {
         assert!(super::status_is_error("failed to open file"));
         assert!(super::status_is_error("usage: reg <pattern> <replace>"));
@@ -11052,6 +11087,7 @@ mod tests {
 
     #[test]
     /// 驗證缺少搜尋工具時會顯示正確搜尋類型，並引導使用者打開 status 面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn missing_search_tool_status_names_mode_and_dependency_panel() {
         assert_eq!(
             missing_search_tool_status(SearchMode::Path, "fd"),
@@ -11065,6 +11101,7 @@ mod tests {
 
     #[test]
     /// 驗證檔名與內容搜尋標題會明確顯示用途及實際使用的外部工具。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn search_panel_titles_name_search_tool() {
         assert_eq!(
             SearchMode::Path.panel_title(true),
@@ -11082,6 +11119,7 @@ mod tests {
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    /// 建立測試專用預設設定，避免每個 App 案例重複準備 config 與來源路徑。
     fn default_loaded_config() -> LoadedConfig {
         LoadedConfig {
             config: AppConfig::default(),
@@ -11089,6 +11127,7 @@ mod tests {
         }
     }
 
+    /// 輪詢測試中的背景搜尋直到完成，並設定 timeout 防止失敗時無限等待。
     fn wait_for_global_search(app: &mut App) {
         for _ in 0..50 {
             app.poll_background_tasks();
@@ -11106,6 +11145,7 @@ mod tests {
 
     #[test]
     /// 驗證文字輸入 helper 會把 `Shift+6` 這類終端事件正規化成真正的符號字元。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn typed_char_from_key_normalizes_shifted_symbols() {
         assert_eq!(
             typed_char_from_key(&KeyEvent::new(KeyCode::Char('6'), KeyModifiers::SHIFT)),
@@ -11123,6 +11163,7 @@ mod tests {
 
     #[test]
     /// 驗證功能型按鍵 helper 會接受常見的 terminal 事件變體。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn key_normalization_helpers_accept_terminal_variants() {
         assert!(key_matches_plain_letter(
             &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
@@ -11178,6 +11219,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Ctrl+數字` 會正確轉成 pane 編號，供 pane 快速切換功能共用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn ctrl_digit_target_pane_id_maps_to_expected_panes() {
         assert_eq!(
             ctrl_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL)),
@@ -11199,6 +11241,7 @@ mod tests {
 
     #[test]
     /// 驗證不帶修飾鍵的數字會正確轉成 pane 編號，供多 pane 直接切換焦點使用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn plain_digit_target_pane_id_maps_to_expected_panes() {
         assert_eq!(
             plain_digit_target_pane_id(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
@@ -11220,6 +11263,7 @@ mod tests {
 
     #[test]
     /// 驗證 command 補全的切換快捷鍵支援多種常見 terminal 回報格式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn command_suggestion_navigation_accepts_terminal_variants() {
         assert_eq!(
             command_suggestion_navigation(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SHIFT)),
@@ -11248,6 +11292,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 也會把 `Shift+6` 正規化成 `^`，避免 regex 指令難以輸入。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_accepts_shifted_caret_symbol() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11262,6 +11307,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Ctrl+p` 會打開 command UI，並預先填入 `panel ` 方便直接輸入目標編號。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_p_opens_prefilled_panel_command() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11276,6 +11322,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 按下 `R` 會打開預填好的 `rename-regex ` 命令輸入框。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_r_opens_prefilled_rename_regex_command() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11290,6 +11337,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 按下第一個 `g` 會先打開 `g` 系列命令面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_g_opens_go_picker() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11306,6 +11354,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 按下 `gt` 會先經過 `g` 面板，再打開預填好的 `goto ` 命令輸入框。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_gt_opens_prefilled_goto_command() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11322,6 +11371,7 @@ mod tests {
 
     #[test]
     /// 驗證 `gd` 會直接切到使用者的 Documents 目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_gd_jumps_to_documents_directory() {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -11364,6 +11414,7 @@ mod tests {
 
     #[test]
     /// 驗證 `gk` 會直接切到使用者的 Desktop 目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_gk_jumps_to_desktop_directory() {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -11406,6 +11457,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 遇到看起來像路徑的輸入時，Enter 會直接執行，不會先套用補全建議。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_enter_executes_path_like_input_instead_of_autocomplete() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11423,6 +11475,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:goto <path>` 會讓目前 pane 跳到指定子目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_goto_command_changes_to_target_directory() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -11437,6 +11490,7 @@ mod tests {
 
     #[test]
     /// 驗證直接輸入絕對路徑也能跳到目標目錄，不必一定寫 `:goto`。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bare_path_command_changes_directory() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -11451,6 +11505,7 @@ mod tests {
 
     #[test]
     /// 驗證 Windows 磁碟機路徑會被當成絕對路徑，而不是相對於目前目錄拼接。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn windows_drive_path_is_recognized_as_absolute_like_path() {
         assert!(is_windows_drive_path("C:/"));
         assert!(is_windows_drive_path("D:\\work"));
@@ -11460,6 +11515,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 在輸入路徑時，會改成列出目前目錄下的路徑候選。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn command_suggestions_switch_to_path_completion_candidates() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -11476,6 +11532,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 在路徑補全模式下按 Tab，會直接把目前候選補進輸入框。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_tab_autocompletes_path_candidate() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -11496,6 +11553,7 @@ mod tests {
 
     #[test]
     /// 驗證多個路徑候選存在時，第一次 Tab 會先補到最長共同前綴。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_tab_completes_longest_common_path_prefix_first() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -11517,6 +11575,7 @@ mod tests {
 
     #[test]
     /// 驗證共同前綴補滿後，連按 Tab 會在同一組路徑候選間輪流切換。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_tab_cycles_path_candidates_after_common_prefix() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -11544,6 +11603,7 @@ mod tests {
 
     #[test]
     /// 驗證一般列表模式下，方向鍵會走和 `hjkl` 相同的移動與進出目錄邏輯。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_normal_mode_arrow_keys_map_to_vim_movement() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -11589,6 +11649,7 @@ mod tests {
 
     #[test]
     /// 驗證一般列表模式用 `l` / `Left` / `Right` 切換目錄後，zoxide 也會同步學習這些位置。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_normal_mode_directory_navigation_updates_zoxide() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -11619,6 +11680,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 按下 Tab 時，會直接採用目前最接近的命令提示。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_tab_autocompletes_closest_command_suggestion() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11645,6 +11707,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 會接受不同終端送出的候選切換事件格式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_cycles_autocomplete_accepts_terminal_variants() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11701,6 +11764,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 可先用提示切換快捷鍵選中候選，再按 Tab 套用該提示。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_tab_uses_currently_selected_suggestion() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11726,6 +11790,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 按下 Enter 會先補齊候選，命令完整時再執行。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_enter_autocompletes_then_executes() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -11754,6 +11819,7 @@ mod tests {
 
     #[test]
     /// 驗證 command mode 在使用者已輸入 `goto smb://...` 時，Enter 會直接執行而不覆蓋成預設模板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_enter_executes_goto_smb_with_arguments() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11783,6 +11849,7 @@ mod tests {
 
     #[test]
     /// 驗證帶參數的指令提示只會補上 `goto ` 前綴，不會把範例參數塞進輸入框。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_command_mode_autocomplete_uses_goto_prefix_instead_of_example_arguments() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11803,6 +11870,7 @@ mod tests {
 
     #[test]
     /// 驗證 `only_current_pane` 會只保留目前焦點窗格。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_only_keeps_focused_pane() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -11820,6 +11888,7 @@ mod tests {
 
     #[test]
     /// 驗證啟動設定會正確套用到第一個 pane 的隱藏檔與排序偏好。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_new_applies_startup_pane_preferences() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".hidden"), "secret").expect("hidden");
@@ -11847,6 +11916,7 @@ mod tests {
 
     #[test]
     /// 驗證新分割出來的 pane 會繼承原 pane 的顯示隱藏檔與排序方式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_split_inherits_pane_preferences() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".hidden"), "secret").expect("hidden");
@@ -11869,6 +11939,7 @@ mod tests {
 
     #[test]
     /// 驗證刪除確認流程在確認後會真正刪除選取項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_delete_confirmation_removes_selected_entry() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("delete-me.txt");
@@ -11891,6 +11962,7 @@ mod tests {
 
     #[test]
     /// 驗證刪除確認視窗再次按 `d` 會關閉視窗，而不會執行刪除或移入 trash。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_delete_confirmation_d_closes_without_deleting() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("keep-me.txt");
@@ -11908,6 +11980,7 @@ mod tests {
 
     #[test]
     /// 驗證兩個開在同一目錄的 panel，其中一個刪除檔案後，另一個也會同步刷新列表。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_delete_refreshes_other_panels_in_same_directory() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("shared.txt");
@@ -11933,6 +12006,7 @@ mod tests {
 
     #[test]
     /// 驗證移到 trash 的項目可以透過 restore 命令還原。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_restore_latest_from_trash_recovers_file() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("restore-me.txt");
@@ -11952,6 +12026,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板可以列出項目，並透過 Enter 還原目前選到的檔案。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_lists_and_restores_entry() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("panel-restore.txt");
@@ -11987,6 +12062,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板可用 `d` 永久刪除目前選到的項目，且會先進確認視窗。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_can_delete_selected_entry_permanently() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("purge-me.txt");
@@ -12017,6 +12093,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板在確認刪除時仍保留原本列表狀態，取消後會回到同一個 trash 面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_delete_confirm_cancel_returns_to_same_trash_panel() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("cancel-delete.txt");
@@ -12055,6 +12132,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板可用 `D` 永久刪除目前篩選結果的全部項目，且會先確認。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_shift_d_deletes_filtered_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
@@ -12106,6 +12184,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板可用 `V` 標記多個項目，並透過 `U` 一次還原。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_visual_mark_restore_multiple_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
@@ -12148,6 +12227,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板在已有 `V` 標記時，按 `u` 也會一次還原全部標記項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_visual_mark_lower_u_restores_multiple_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("lower-u-alpha.txt");
@@ -12190,6 +12270,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 面板在已有 `V` 標記時，按 `d` 也會一次刪除全部標記項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_visual_mark_lower_d_deletes_multiple_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("lower-d-alpha.txt");
@@ -12231,6 +12312,7 @@ mod tests {
 
     #[test]
     /// 驗證從 trash 面板按 F1 打開 help 後，按 Esc 會回到原本的 trash 列表。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_from_trash_returns_to_trash_on_escape() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("from-trash-help.txt");
@@ -12260,6 +12342,7 @@ mod tests {
 
     #[test]
     /// 驗證從 trash 打開 help 並執行 `:trash undo` 後，會回到最近的 trash 列表上下文。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_enter_from_trash_executes_undo_and_returns_to_trash() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("undo-via-help.txt");
@@ -12295,6 +12378,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:tasks` 會打開目前 pane 的任務面板，且空清單時狀態訊息正確。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tasks_command_opens_task_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -12314,6 +12398,7 @@ mod tests {
 
     #[test]
     /// 驗證一般外部開啟會建立 task，並在主事件迴圈回報成功後標記完成。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_open_task_is_created_and_can_finish() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
@@ -12343,6 +12428,7 @@ mod tests {
 
     #[test]
     /// 驗證 `z` 打開 fzf jump 時會建立 task，取消後也會正確標成 cancelled。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_fzf_jump_task_is_created_and_cancelled() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -12374,6 +12460,7 @@ mod tests {
 
     #[test]
     /// 驗證在一般列表按下 Enter 會依預設外部開啟規則排入文字編輯器啟動。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_enter_queues_default_open_for_text_file() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -12399,6 +12486,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `O` 會打開 inline `Open with` 小視窗。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_o_opens_open_picker() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -12416,6 +12504,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Shift+Enter` 也會打開 inline `Open with` 小視窗。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_enter_opens_open_picker() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -12433,6 +12522,7 @@ mod tests {
 
     #[test]
     /// 驗證 open picker 打開後，再按一次 `O` 會直接關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_o_toggles_open_picker_closed() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -12450,6 +12540,7 @@ mod tests {
 
     #[test]
     /// 驗證 open picker 打開後，再按一次 `Shift+Enter` 也會直接關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_enter_toggles_open_picker_closed() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -12467,6 +12558,7 @@ mod tests {
 
     #[test]
     /// 驗證自訂 open action 會出現在 Open with 面板中，並能排入外部啟動佇列。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_open_picker_includes_custom_actions() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -12512,6 +12604,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Tab` 會直接進入 preview mode。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tab_opens_preview_mode() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
@@ -12526,6 +12619,7 @@ mod tests {
 
     #[test]
     /// 驗證選到資料夾時，預設外部開啟會走系統開啟模式，而不是終端編輯器。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_open_directory_uses_detached_system_open() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -12540,6 +12634,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `b` 會先打開書籤功能面板，再用 `a` 自動分配代號存書籤。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_picker_saves_with_auto_key() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -12572,6 +12667,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `w` 會打開 panel 操作面板，讓第二個按鍵可視化選擇。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_w_opens_window_picker() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
@@ -12589,6 +12685,7 @@ mod tests {
 
     #[test]
     /// 驗證 `wc` 會關閉目前 panel。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_window_picker_wc_closes_current_panel() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "hello").expect("notes");
@@ -12609,6 +12706,7 @@ mod tests {
 
     #[test]
     /// 驗證仍可用 `'{key}` 直接跳回既有書籤，保留快速單鍵 workflow。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_direct_jump_still_works() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -12639,6 +12737,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `m` 後再按 `s`，會套用 linemode size，而不改變目前排序方式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_linemode_picker_applies_size_without_changing_sort_order() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "1234").expect("alpha");
@@ -12667,6 +12766,7 @@ mod tests {
 
     #[test]
     /// 驗證 linemode 面板收到非保留鍵時，不會誤存書籤，而是維持原本面板等待合法指令。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_linemode_picker_ignores_unknown_keys() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -12685,6 +12785,7 @@ mod tests {
 
     #[test]
     /// 驗證 linemode 面板打開後，再按一次 `m` 會直接關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_linemode_picker_m_toggles_closed() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -12700,6 +12801,7 @@ mod tests {
 
     #[test]
     /// 驗證 linemode 面板的 mtime 已改成 `t`，避免和 opener `m` 衝突。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_linemode_picker_t_applies_mtime() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -12716,6 +12818,7 @@ mod tests {
 
     #[test]
     /// 驗證 `bookmark.toml` 中既有的書籤可以在啟動後直接用命令跳轉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_jump_command_uses_bookmark_file() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -12736,6 +12839,7 @@ mod tests {
 
     #[test]
     /// 驗證經由 `goto smb://...` 進入 SMB 後存下書籤，會把 `smb://...` 寫進 `bookmark.toml`，而不是掛載後的本機路徑。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_set_persists_smb_location_after_goto() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
@@ -12755,6 +12859,7 @@ mod tests {
 
     #[test]
     /// 驗證 SMB 書籤在跳轉時會自動走 SMB 掛載／進入流程，成功後直接切到目標目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_jump_to_smb_bookmark_enters_target() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
@@ -12776,6 +12881,7 @@ mod tests {
 
     #[test]
     /// 驗證等待 linemode 按鍵時打開 F1，離開 help 後仍能回到原本的 linemode 面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_restores_pending_linemode_picker() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -12796,6 +12902,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:bookmark list` 會打開彈窗，並可用 Enter 跳到選中的書籤。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_list_popup_opens_and_jumps() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -12831,6 +12938,7 @@ mod tests {
 
     #[test]
     /// 驗證書籤列表會綁在開啟它的 pane 上，從第二個 pane 打開時也只影響第二個 pane。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_list_is_scoped_to_focused_pane() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -12869,6 +12977,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `b` 再按 `d` 會進入刪除列表，並可按對應書籤鍵直接刪除。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_delete_mode_removes_entry_by_matching_key() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -12907,6 +13016,7 @@ mod tests {
 
     #[test]
     /// 驗證書籤刪除列表可用游標移動後按 Enter 刪除選中的書籤。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_delete_mode_removes_selected_entry_with_enter() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -12935,6 +13045,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `b` 再按 `D` 會直接清空全部書籤。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_picker_can_delete_all_bookmarks() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -12960,6 +13071,7 @@ mod tests {
 
     #[test]
     /// 驗證書籤功能面板打開後，再按一次 `b` 會直接關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_picker_b_toggles_closed() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -12975,6 +13087,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Z` 會直接打開 zoxide 目錄列表。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_z_opens_zoxide_list() {
         let dir = tempdir().expect("tempdir");
         let docs = dir.path().join("docs");
@@ -12999,6 +13112,7 @@ mod tests {
 
     #[test]
     /// 驗證 task 面板支援 `f` 搜尋，並可只保留符合條件的任務後再查看細節。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_task_panel_supports_filtering() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13055,6 +13169,7 @@ mod tests {
 
     #[test]
     /// 驗證書籤列表支援 `f` 搜尋，並可直接打開過濾後唯一保留的書籤。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_bookmark_list_supports_filtering() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -13086,6 +13201,7 @@ mod tests {
 
     #[test]
     /// 驗證 zoxide 列表支援 `f` 搜尋，並可跳到過濾後唯一保留的目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_zoxide_list_supports_filtering() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -13114,6 +13230,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Shift+;` 也能正確打開命令模式，避免不同終端的事件格式造成 `:` 失效。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_semicolon_opens_command_mode() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13128,6 +13245,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:panel <id>` 會把焦點直接切到指定 panel。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_panel_command_focuses_target_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13145,6 +13263,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:status` 會在目前 focus panel 顯示外部工具狀態，且 Enter 可關閉查詢面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_status_command_opens_dependency_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13166,6 +13285,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Ctrl+數字` 可直接切換焦點 panel。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_digit_focuses_target_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13184,6 +13304,7 @@ mod tests {
 
     #[test]
     /// 驗證多 panel 時直接按數字鍵，也能快速把焦點切到指定 panel。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_plain_digit_focuses_target_panel_when_multiple_panels_exist() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13202,6 +13323,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Ctrl+0` 會對應到 panel 10，讓雙位數前的最後一個快捷鍵也可直接使用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_zero_focuses_tenth_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13221,6 +13343,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板中需要參數的命令，按 Enter 後會打開預填命令，而不是直接執行空參數。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_argument_command_opens_prefilled_command_mode() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13249,6 +13372,7 @@ mod tests {
 
     #[test]
     /// 驗證某些終端直接回報 `:` 而不帶 Shift modifier 時，也能正確打開命令模式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_plain_colon_opens_command_mode() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13263,6 +13387,7 @@ mod tests {
 
     #[test]
     /// 驗證 F1 說明面板可以打開，並在面板內用 `f` 進行搜尋。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_supports_filtering() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13302,6 +13427,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板搜尋輸入中的 `Tab` 不會誤套用 command hint。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_search_tab_does_not_apply_command_autocomplete() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13335,6 +13461,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `~` 時，也會像 F1 一樣打開 help 面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tilde_opens_help_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13350,6 +13477,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板已開啟時，再按一次 `~` 會直接關閉回 normal mode。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tilde_toggles_help_panel_closed() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13365,6 +13493,7 @@ mod tests {
 
     #[test]
     /// 驗證某些終端把 `~` 回報成 `Shift+\`` 時，也能正確打開 help 面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_backtick_opens_help_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13380,6 +13509,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `t` 會先打開 `t` 系列快捷鍵面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_t_opens_theme_command_picker() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13396,6 +13526,7 @@ mod tests {
 
     #[test]
     /// 驗證 `tt` 會直接進入 Trash 列表，不再多開一層選單。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tt_opens_trash_panel_directly() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13413,6 +13544,7 @@ mod tests {
 
     #[test]
     /// 驗證 `tl` 會從 `t` 系列面板打開標題為 Theme List 的主題列表。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tl_opens_theme_list() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13430,6 +13562,7 @@ mod tests {
 
     #[test]
     /// 驗證 `tn` 會從 `t` 系列面板切換下一個主題並保存設定。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_tn_cycles_theme() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13449,6 +13582,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `T` 會直接打開目前 pane 的 task 面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_t_opens_task_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13469,6 +13603,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板按下 Enter 後，會直接切到對應的互動模式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_enter_executes_selected_action() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -13488,6 +13623,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板在列表模式下按 `h` 會和 `Esc` 一樣關閉，保持與 `l` 的左右對稱操作。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_h_closes_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13502,6 +13638,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 的 `J / K` 會用固定大步長快速移動列表游標。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_j_and_k_move_by_large_step() {
         let dir = tempdir().expect("tempdir");
         for index in 0..12 {
@@ -13522,6 +13659,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview mode 的 `J / K` 會用固定大步長快速捲動內容。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_shift_j_and_k_scroll_by_large_step() {
         let dir = tempdir().expect("tempdir");
         let content = (0..20)
@@ -13548,6 +13686,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板支援 `J / K` 與 `Ctrl-d / Ctrl-u`，讓大步長與分頁移動可在暫時列表中共用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_supports_fast_and_page_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13584,6 +13723,7 @@ mod tests {
 
     #[test]
     /// 驗證 help 面板中的 `:delete` 會保留 `d` 快捷鍵，並透過 Enter 進入刪除確認。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_help_panel_delete_entry_matches_delete_behavior() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("delete-from-help.txt");
@@ -13623,6 +13763,7 @@ mod tests {
 
     #[test]
     /// 驗證輪替主題時會切換到下一個預設值。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_cycle_theme_switches_to_next_preset() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13636,6 +13777,7 @@ mod tests {
 
     #[test]
     /// 驗證打開主題選擇視窗時，游標會落在目前主題。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_open_theme_picker_tracks_current_preset() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13653,6 +13795,7 @@ mod tests {
 
     #[test]
     /// 驗證依主題名稱字串指定主題時會正確更新狀態。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_set_theme_by_name_updates_theme() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13666,6 +13809,7 @@ mod tests {
 
     #[test]
     /// 驗證在主題選擇視窗按下 Enter 後會套用目前選取的主題。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_theme_picker_confirm_applies_selected_theme() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13684,6 +13828,7 @@ mod tests {
 
     #[test]
     /// 驗證主題選擇視窗也遵守核心 `h/l` 規則：`l` 套用、`h` 關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_theme_picker_supports_h_and_l_core_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13709,6 +13854,7 @@ mod tests {
 
     #[test]
     /// 驗證主題選擇視窗支援 `j/k` 上下移動，且索引會停在有效範圍內。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_theme_picker_supports_j_and_k_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13743,6 +13889,7 @@ mod tests {
 
     #[test]
     /// 驗證主題選擇視窗支援 `Ctrl-d/u` 半頁移動，方便快速瀏覽完整主題清單。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_theme_picker_supports_ctrl_page_navigation() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13776,6 +13923,7 @@ mod tests {
 
     #[test]
     /// 驗證即時預覽後按下 Esc 會還原開啟列表前的主題，且不會修改已保存的主題。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_theme_picker_cancel_restores_original_theme() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13797,6 +13945,7 @@ mod tests {
 
     #[test]
     /// 驗證排序面板可用 `h` 關閉，避免和整體核心操作規則不一致。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_sort_picker_h_closes_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13811,6 +13960,7 @@ mod tests {
 
     #[test]
     /// 驗證排序面板打開後，再按一次 `,` 會直接關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_sort_picker_comma_toggles_closed() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -13825,6 +13975,7 @@ mod tests {
 
     #[test]
     /// 驗證打開重新命名視窗時，會帶入目前選取項目的原名稱與預設輸入值。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_start_rename_opens_dialog_with_selected_name() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -13847,6 +13998,7 @@ mod tests {
 
     #[test]
     /// 驗證在重新命名視窗按下 Enter 後會套用新的檔名。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_rename_confirm_updates_selected_entry() {
         let dir = tempdir().expect("tempdir");
         let old_path = dir.path().join("alpha.txt");
@@ -13872,6 +14024,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:rename-regex` 會打開預覽面板，並正確標示 ready / unchanged。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_rename_regex_command_opens_preview_panel() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -13902,6 +14055,7 @@ mod tests {
 
     #[test]
     /// 驗證 regex 批次改名在按下 Enter 後會一次套用所有 ready 項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_rename_regex_preview_applies_ready_entries() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
@@ -13931,6 +14085,7 @@ mod tests {
 
     #[test]
     /// 驗證從命令輸入介面送出 `reg` 後，預覽面板再次按 Enter 會實際完成改名。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_regex_rename_command_ui_enter_applies_preview() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("alpha.txt");
@@ -13960,6 +14115,7 @@ mod tests {
 
     #[test]
     /// 驗證 regex 批次改名若會撞名，會標示 conflict，且 Enter 不會直接套用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_rename_regex_preview_blocks_conflicts() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
@@ -13998,6 +14154,7 @@ mod tests {
 
     #[test]
     /// 驗證 rename 預設游標會停在副檔名前，方便優先修改主檔名。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn rename_basename_cursor_stops_before_extension() {
         assert_eq!(rename_basename_cursor("alpha.txt"), 5);
         assert_eq!(rename_basename_cursor("archive.tar.gz"), 11);
@@ -14007,6 +14164,7 @@ mod tests {
 
     #[test]
     /// 驗證 rename 可以在 insert 與 normal 模式之間切換，並保留游標位置。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn rename_mode_switches_between_insert_and_normal() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -14048,6 +14206,7 @@ mod tests {
 
     #[test]
     /// 驗證 rename 的 Vim 單字移動會依照檔名分隔符正確跳轉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn rename_word_motion_helpers_follow_filename_segments() {
         let name = "my-long_file.txt";
 
@@ -14067,6 +14226,7 @@ mod tests {
 
     #[test]
     /// 驗證 rename 的 normal 模式支援 `w`、`b`、`e`、`a`、`A` 這些 Vim 風格操作。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn rename_normal_mode_supports_vim_word_motions_and_insert_shortcuts() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("my-long_file.txt");
@@ -14138,6 +14298,7 @@ mod tests {
 
     #[test]
     /// 驗證 `y` 複製後可以用 `p` 把檔案貼到另一個目錄，且來源會保留。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_copy_and_paste_preserves_source_file() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -14175,6 +14336,7 @@ mod tests {
 
     #[test]
     /// 驗證 `x` 剪下後可以用 `p` 移動檔案，且剪貼簿會在成功後清空。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_cut_and_paste_moves_file_and_clears_clipboard() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -14213,6 +14375,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Space` 會切換目前選取項目的標記狀態。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_space_toggles_mark_on_selected_entry() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14231,6 +14394,7 @@ mod tests {
 
     #[test]
     /// 驗證 `w h/j/k/l` 會依方向在左下上右建立新的 pane。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_w_leader_splits_in_four_directions() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14273,6 +14437,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Ctrl-r` 會反轉目前所有可見項目的標記狀態。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_r_inverts_visible_marks() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14292,6 +14457,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Y` / `X` 可以清掉目前內部剪貼簿中的 copy / cut 狀態。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_y_and_shift_x_clear_clipboard_state() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14314,6 +14480,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `P` 會以覆蓋模式貼上，而不是自動產生 `copy` 檔名。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_p_pastes_with_overwrite_when_clipboard_exists() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -14347,6 +14514,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `D` 後確認，會直接永久刪除目前選取項目而不是丟進 trash。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_d_deletes_selected_entry_permanently() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("delete-me.txt");
@@ -14378,6 +14546,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:move <path>` 會把目前選取的檔案直接移到指定目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_move_command_moves_selected_entry_to_target_dir() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -14401,6 +14570,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:move-panel <id>` 會把目前選取的檔案移到指定 pane 的目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_move_panel_command_moves_selected_entry_to_target_pane_dir() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -14431,6 +14601,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:compress` 會把目前選取項目壓成 zip，並把游標帶到新壓縮檔。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_compress_command_creates_zip_and_reveals_result() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("notes.txt");
@@ -14454,6 +14625,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:extract` 會解開目前選取的 zip，並將游標帶到輸出目錄。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_extract_command_unpacks_zip_and_reveals_output() {
         let dir = tempdir().expect("tempdir");
         let folder = dir.path().join("demo");
@@ -14484,6 +14656,7 @@ mod tests {
 
     #[test]
     /// 驗證已掛載的 SMB share 可以直接經由 `goto smb://...` 切進目前 pane。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_goto_smb_location_enters_mounted_share() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
@@ -14504,6 +14677,7 @@ mod tests {
 
     #[test]
     /// 驗證尚未掛載的 SMB share 在 `goto smb://...` 時會先發出系統掛載請求。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_goto_smb_location_requests_mount_when_share_missing() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
@@ -14525,6 +14699,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:move-panel <id>` 若指定不存在的 pane，會提示目前可用的 pane 編號。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_move_panel_command_reports_available_panes_for_unknown_target() {
         let dir = tempdir().expect("tempdir");
         let source_file = dir.path().join("epsilon.txt");
@@ -14539,6 +14714,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `o` 後會打開建立新檔案的 inline 輸入框。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_start_create_entry_opens_inline_editor() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -14558,6 +14734,7 @@ mod tests {
 
     #[test]
     /// 驗證命令模式可以直接建立一般檔案與結尾 `/` 的資料夾。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_create_commands_create_entries_without_inline_prompt() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -14574,6 +14751,7 @@ mod tests {
 
     #[test]
     /// 驗證建立流程的 inline 輸入框在 Enter 後會真的建立檔案。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_create_file_confirm_creates_entry() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -14593,6 +14771,7 @@ mod tests {
 
     #[test]
     /// 驗證建立流程支援巢狀路徑，會先補齊父目錄再建立檔案。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_create_nested_file_from_inline_prompt() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -14613,6 +14792,7 @@ mod tests {
 
     #[test]
     /// 驗證 filter 第一次 Esc 只進入 Normal 模式，輸入框與過濾結果都會保留。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_filter_first_escape_enters_normal_mode() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14643,6 +14823,7 @@ mod tests {
 
     #[test]
     /// 驗證第二次 Esc 收起 filter 輸入框，第三次 Esc 才清掉已鎖定的 filter。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_filter_escape_flow_locks_then_clears_filter() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14678,6 +14859,7 @@ mod tests {
 
     #[test]
     /// 驗證連續重新開啟 filter 時，不會殘留上一輪輸入的關鍵字。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_reopening_filter_starts_with_empty_buffer() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14709,6 +14891,7 @@ mod tests {
 
     #[test]
     /// 驗證 filter 輸入框中的 `Tab` 不會被當成 command 補齊，避免誤改目前查詢字串。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_filter_input_tab_does_not_apply_command_autocomplete() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("recent.txt"), "a").expect("recent");
@@ -14737,6 +14920,7 @@ mod tests {
 
     #[test]
     /// 驗證一般檔案列表的 `f` 使用共用模糊比對，不要求查詢字元在檔名中連續出現。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_file_list_filter_matches_fuzzy_character_sequence() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("file-manager-app.rs"), "app").expect("app");
@@ -14763,6 +14947,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `.` 後會顯示隱藏檔，並可與 filter 一起使用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_toggle_hidden_reveals_hidden_entries_and_works_with_filter() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".secret"), "s").expect("hidden");
@@ -14802,6 +14987,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `,` 後可以用排序面板快捷鍵套用排序模式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_sort_picker_applies_selected_mode() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("small.txt"), "a").expect("small");
@@ -14837,6 +15023,7 @@ mod tests {
 
     #[test]
     /// 驗證 sort panel 也接受 `m + Shift` 這類終端事件，正確套用反向排序。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_sort_picker_shift_m_applies_reverse_modified() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -14856,6 +15043,7 @@ mod tests {
 
     #[test]
     /// 驗證進入 preview mode 後，`j/k` 會改成捲動 preview，Esc 會離開該模式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_mode_scrolls_and_exits_cleanly() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -14891,6 +15079,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `Tab` 會切換 preview mode，再按一次同樣的鍵會回到一般列表。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_mode_toggles_with_tab() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "preview").expect("notes");
@@ -14910,6 +15099,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview mode 支援半頁捲動與 `gg/G` 的上下端跳轉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_mode_supports_paging_and_boundary_jumps() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -14949,6 +15139,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview mode 中的 `/` 會打開搜尋輸入框，並在輸入時立即更新搜尋結果。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_search_opens_and_tracks_matches() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -14983,6 +15174,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview search 支援 `n/N` 跳轉命中結果，Esc 先清搜尋再離開 preview mode。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_search_navigation_and_escape_flow() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -15040,6 +15232,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview search 在同一行有多個命中時，`n/p` 仍會逐一輪詢每個命中位置。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_search_cycles_each_match_occurrence() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "tt line\nonly t here\n").expect("notes");
@@ -15107,6 +15300,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview search 重新打開時，不會殘留上一次輸入的查詢字串。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_search_reopen_starts_with_empty_buffer() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "alpha\nbeta\ngamma\n").expect("notes");
@@ -15144,6 +15338,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview search 輸入框中的 `Tab` 不會誤套用 command 補齊。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_search_tab_does_not_apply_command_autocomplete() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("notes.txt"), "recent\nrename\n").expect("notes");
@@ -15172,6 +15367,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Ctrl+s` / `Ctrl+v` 仍可作為分割 alias 使用。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_split_shortcuts_create_expected_panes() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
@@ -15191,6 +15387,7 @@ mod tests {
 
     #[test]
     /// 驗證 preview 狀態只屬於原本的 pane，切到其他 pane 不會被強制進入 preview mode。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_preview_mode_is_scoped_to_its_own_pane() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
@@ -15216,6 +15413,7 @@ mod tests {
 
     #[test]
     /// 驗證 global search 在輸入階段不會立即掃描，按下 Enter 後才真正執行搜尋。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_global_search_filters_nested_entries() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15254,6 +15452,7 @@ mod tests {
 
     #[test]
     /// 驗證 global search 提交查詢後，再按一次 Enter 會跳到選中的搜尋結果。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_global_search_enter_reveals_selected_file() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15285,6 +15484,7 @@ mod tests {
 
     #[test]
     /// 驗證在 global search 執行中按下 Esc，會關閉介面並要求背景搜尋停止。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_global_search_escape_cancels_background_work() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15318,6 +15518,7 @@ mod tests {
 
     #[test]
     /// 驗證在 global search 結果列表中按下 h，會安全返回一般列表。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_global_search_h_leaves_results_list() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15344,6 +15545,7 @@ mod tests {
 
     #[test]
     /// 驗證 `Shift+S` 會打開內容搜尋面板，而不是一般路徑搜尋。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_s_opens_content_search() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -15359,6 +15561,7 @@ mod tests {
 
     #[test]
     /// 驗證 `s` 與 `S` 的結果仍在串流載入時，只要列表已有內容就能立即用游標鍵與 Vim 鍵移動。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_search_lists_move_immediately_while_loading() {
         let dir = tempdir().expect("tempdir");
 
@@ -15410,6 +15613,7 @@ mod tests {
 
     #[test]
     /// 驗證 `s` 與 `S` 的結果面板都能按 `f` 開啟模糊 filter，並以不連續字元縮小結果。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_search_result_panels_support_fuzzy_filtering() {
         let dir = tempdir().expect("tempdir");
 
@@ -15459,6 +15663,7 @@ mod tests {
 
     #[test]
     /// 驗證從模糊過濾後的搜尋列表按 Enter，會開啟目前可見結果而非原始索引項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_search_filter_opens_filtered_selection() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
@@ -15513,6 +15718,7 @@ mod tests {
 
     #[test]
     /// 驗證 `s` 與 `S` 收到新批次時只會追加到下方，不會重排既有列表或移動游標。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_search_stream_appends_without_reordering_existing_rows() {
         let dir = tempdir().expect("tempdir");
         for mode in [SearchMode::Path, SearchMode::Content] {
@@ -15567,6 +15773,7 @@ mod tests {
 
     #[test]
     /// 驗證內容搜尋會依照檔案內容比對結果，並只回傳真正命中的檔案。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_content_search_matches_file_contents() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15602,6 +15809,7 @@ mod tests {
 
     #[test]
     /// 驗證內容搜尋按下 Enter 只會跳到檔案，不會強制切進 preview。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_content_search_enter_reveals_selected_file() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15638,6 +15846,7 @@ mod tests {
 
     #[test]
     /// 驗證內容搜尋按下 Right 也只會跳到檔案，與 Enter / l 行為一致。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_content_search_right_reveals_selected_file() {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("docs")).expect("docs");
@@ -15669,6 +15878,7 @@ mod tests {
 
     #[test]
     /// 驗證 task 面板中的 `x` 可以取消目前正在進行的 search task。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_task_panel_x_cancels_running_search_task() {
         let dir = tempdir().expect("tempdir");
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -15717,6 +15927,7 @@ mod tests {
 
     #[test]
     /// 驗證 task 面板中的 `X` 會取消目前 panel 內所有可取消的任務。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_task_panel_shift_x_cancels_all_running_tasks() {
         let dir = tempdir().expect("tempdir");
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -15762,6 +15973,7 @@ mod tests {
 
     #[test]
     /// 驗證建立項目後，所有開啟相同目錄的 panel 都會同步看到新項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_mutation_refreshes_sibling_panels_with_same_directory() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -15784,6 +15996,7 @@ mod tests {
 
     #[test]
     /// 驗證在搜尋尚未完成前直接開啟結果，背景 search task 會被正確標記為取消。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_opening_search_result_cancels_running_search_task() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("target.txt"), "target\n").expect("target");
@@ -15847,6 +16060,7 @@ mod tests {
 
     #[test]
     /// 驗證可以用 `V` 視覺標記多個項目，並一次放進剪貼簿。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_visual_marked_entries_copy_into_clipboard_as_batch() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -15870,6 +16084,7 @@ mod tests {
 
     #[test]
     /// 驗證 `V` 視覺標記多個項目後，刪除確認會一次刪掉整批項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_visual_marked_entries_delete_as_batch() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha.txt");
@@ -15901,6 +16116,7 @@ mod tests {
 
     #[test]
     /// 驗證 `V` 進入 visual selection 後，移動游標再按一次 `V` 會提交整段標記。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_visual_selection_commits_range_marks() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -15925,6 +16141,7 @@ mod tests {
 
     #[test]
     /// 驗證小寫 `v` 可以進入、移動並結束 visual selection。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_lowercase_v_controls_visual_selection() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -15944,6 +16161,7 @@ mod tests {
 
     #[test]
     /// 驗證某些終端把 `Shift+v` 回報成 `v + Shift` 時，也能正確進入 visual selection。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_v_opens_visual_selection() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -15965,6 +16183,7 @@ mod tests {
 
     #[test]
     /// 驗證某些終端把 `Shift+g` 回報成 `g + Shift` 時，也能正確執行 `G` 跳到列表底部。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_shift_g_jumps_to_bottom() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -15981,6 +16200,7 @@ mod tests {
 
     #[test]
     /// 驗證 visual selection 按下 `Esc` 會先提交這一段範圍並離開選取模式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_visual_selection_escape_commits_current_range() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16012,6 +16232,7 @@ mod tests {
 
     #[test]
     /// 驗證離開選取模式後再按一次 `Esc`，會清掉目前所有已提交標記。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_escape_in_normal_mode_clears_all_marks() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16035,6 +16256,7 @@ mod tests {
 
     #[test]
     /// 驗證列表模式按下 `/` 後會即時套用 find-next，並可在 Enter 後用 `n/N` 跳轉命中項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_list_find_supports_lock_and_navigation() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16087,6 +16309,7 @@ mod tests {
 
     #[test]
     /// 驗證一般貼上遇到同名檔案時，會先開啟覆蓋確認視窗，使用者確認後才覆蓋。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_paste_with_conflict_requires_confirmation_before_overwrite() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -16133,6 +16356,7 @@ mod tests {
 
     #[test]
     /// 驗證一般貼上遇到同名檔案時，若使用者取消，會保留原檔案且不執行貼上。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_paste_with_conflict_can_be_cancelled() {
         let dir = tempdir().expect("tempdir");
         let source_dir = dir.path().join("source");
@@ -16169,6 +16393,7 @@ mod tests {
 
     #[test]
     /// 驗證列表模式的 find-next 在鎖定後按下 `Esc`，會清除目前 pane 的高亮結果。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_list_find_escape_clears_active_query() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16191,6 +16416,7 @@ mod tests {
 
     #[test]
     /// 驗證重新按下 `/` 打開 list find 時，不會沿用上一輪輸入的查詢文字。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_reopening_list_find_starts_with_empty_buffer() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16222,6 +16448,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 支援像 Vim 一樣用數字前綴配合 `j` 一次移動多格。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_count_prefix_moves_list_cursor_by_multiple_rows() {
         let dir = tempdir().expect("tempdir");
         for index in 0..8 {
@@ -16240,6 +16467,7 @@ mod tests {
 
     #[test]
     /// 驗證 count prefix 可以搭配 `gg` 與 `G` 跳到指定列表位置。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_count_prefix_supports_absolute_jumps() {
         let dir = tempdir().expect("tempdir");
         for index in 0..8 {
@@ -16264,6 +16492,7 @@ mod tests {
 
     #[test]
     /// 驗證 count prefix 可以搭配 list find 的 `n` 一次跳過多個命中結果。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_count_prefix_supports_list_find_navigation() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16309,6 +16538,7 @@ mod tests {
 
     #[test]
     /// 驗證按下 `z` 後會建立 `fzf` 跳轉請求，並記住目前 pane 的根目錄設定。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_jump_key_queues_fzf_request() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16332,6 +16562,7 @@ mod tests {
 
     #[test]
     /// 驗證分割成多個 pane 後，在目前 focus 的 pane 按下 `z` 仍會建立 `fzf` 請求。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_jump_key_works_from_focused_split_pane() {
         let dir = tempdir().expect("tempdir");
         let left_dir = dir.path().join("left");
@@ -16364,6 +16595,7 @@ mod tests {
 
     #[test]
     /// 驗證 `z` 使用的 `fzf` 搜尋會固定包含 hidden 內容，不受 pane 顯示設定影響。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_jump_key_always_searches_hidden_entries() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".secret.txt"), "secret").expect("secret");
@@ -16380,6 +16612,7 @@ mod tests {
 
     #[test]
     /// 驗證套用 `fzf` 選取結果後，游標會跳到對應的檔案。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_apply_fzf_jump_selection_moves_cursor_to_match() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16405,6 +16638,7 @@ mod tests {
 
     #[test]
     /// 驗證套用巢狀 `fzf` 結果後，pane 會切到檔案所在目錄並聚焦正確項目。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_apply_fzf_jump_selection_reveals_nested_file() {
         let dir = tempdir().expect("tempdir");
         let nested_dir = dir.path().join("docs");
@@ -16425,6 +16659,7 @@ mod tests {
 
     #[test]
     /// 驗證取消 `fzf` 選擇時，不會改動目前游標位置。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_apply_fzf_jump_selection_cancel_keeps_selection() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16446,6 +16681,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 按下 `Ctrl-a` 會把目前 pane 的所有可見項目全部標記起來。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_a_marks_all_visible_entries() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16463,6 +16699,7 @@ mod tests {
 
     #[test]
     /// 驗證 `:mark-all` 命令也能把目前 pane 的所有可見項目全部標記起來。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_mark_all_command_marks_all_visible_entries() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16478,6 +16715,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 按下 `c` 會打開文字複製小視窗。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_c_key_opens_copy_picker() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16500,6 +16738,7 @@ mod tests {
 
     #[test]
     /// 驗證文字複製小視窗按下 `h` 會關閉並回到一般模式。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_copy_picker_h_closes_panel() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16515,6 +16754,7 @@ mod tests {
 
     #[test]
     /// 驗證文字複製小視窗打開後，再按一次 `c` 會直接關閉。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_copy_picker_c_toggles_closed() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16530,6 +16770,7 @@ mod tests {
 
     #[test]
     /// 驗證文字複製小視窗中，原本的檔案路徑複製已改成 `u`，避免和 opener `c` 衝突。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_copy_picker_u_copies_file_path() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("alpha.txt");
@@ -16545,6 +16786,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 按下 `Ctrl-Shift-A` 會清掉目前 pane 的所有標記。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_shift_a_clears_all_marks_in_focused_pane() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -16565,6 +16807,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 的 `Ctrl-d / Ctrl-u` 會依照目前列表 viewport 高度做半頁移動。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_d_and_ctrl_u_move_by_half_page() {
         let dir = tempdir().expect("tempdir");
         for index in 0..10 {
@@ -16590,6 +16833,7 @@ mod tests {
 
     #[test]
     /// 驗證 normal mode 的 `Ctrl-f / Ctrl-b` 會依照目前列表 viewport 高度做整頁移動。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_ctrl_f_and_ctrl_b_move_by_full_page() {
         let dir = tempdir().expect("tempdir");
         for index in 0..12 {
@@ -16615,6 +16859,7 @@ mod tests {
 
     #[test]
     /// 驗證 visual selection 中的 `Ctrl-d / Ctrl-u` 也會用半頁步長移動，並同步更新範圍。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_visual_selection_ctrl_d_and_ctrl_u_follow_half_page() {
         let dir = tempdir().expect("tempdir");
         for index in 0..10 {
@@ -16656,6 +16901,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 確認視窗會記住原本所屬的 panel，讓 UI 能畫回同一個列表內。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn trash_confirm_panel_id_returns_source_panel() {
         let action = TrashConfirmAction::DeleteFromPanel {
             pane_id: 7,
@@ -16672,6 +16918,7 @@ mod tests {
 
     #[test]
     /// 驗證 trash 確認視窗也能還原底層列表需要的搜尋與標記狀態。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn trash_confirm_overlay_state_preserves_trash_context() {
         let pending = PendingAction::ConfirmTrashAction {
             action: TrashConfirmAction::RestoreFromPanel {
@@ -16702,6 +16949,7 @@ mod tests {
 
     #[test]
     /// 驗證 regex rename 使用的 command UI 可以切到 Normal 模式移動游標，再回到 Insert 修正中間文字。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn command_input_supports_vim_normal_and_insert_modes() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -16728,6 +16976,7 @@ mod tests {
 
     #[test]
     /// 驗證一般 filter 第一次 Esc 只切換模式，Normal 模式第二次 Esc 才鎖定並離開輸入框。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn filter_input_uses_two_stage_escape_and_supports_cursor_editing() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("aXbc.txt"), "demo").expect("file");
@@ -16762,6 +17011,7 @@ mod tests {
 
     #[test]
     /// 驗證 help、trash、task、bookmark 與 zoxide 共用的面板搜尋器會攔截 Normal 模式按鍵，不會誤關面板。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn panel_search_uses_shared_vim_editor_before_panel_actions() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");

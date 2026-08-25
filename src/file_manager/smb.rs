@@ -1,3 +1,8 @@
+//! SMB URL 解析、掛載位置判斷與跨平台路徑轉換。
+//!
+//! `smb://host/share/path` 是書籤與 command 使用的穩定表示；macOS 會解析已掛載
+//! volume，Windows 則轉成 UNC path。此層只解析或產生掛載請求，不應執行檔案複製。
+
 use std::{
     io,
     path::{Path, PathBuf},
@@ -218,6 +223,10 @@ pub(crate) fn build_smb_mount_launch(location: &SmbLocation) -> LaunchSpec {
 }
 
 #[cfg(target_os = "windows")]
+/// 把已解析的 SMB share 與其子路徑組成 Windows 可直接存取的 UNC PathBuf。
+///
+/// 參數：`location: &SmbLocation`，包含 host、share 與可選 subpath。
+/// 回傳：`PathBuf`，格式類似 `\\host\share\folder`。
 fn windows_unc_path(location: &SmbLocation) -> PathBuf {
     let mut path = PathBuf::from(windows_unc_root(location));
     if !location.subpath.as_os_str().is_empty() {
@@ -227,6 +236,9 @@ fn windows_unc_path(location: &SmbLocation) -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
+/// 只產生 Windows SMB share 根目錄，不附加 share 內部子路徑。
+///
+/// 參數：`location: &SmbLocation`；回傳 `\\host\share` 格式字串。
 fn windows_unc_root(location: &SmbLocation) -> String {
     format!(r"\\{}\{}", location.host, location.share)
 }
@@ -283,6 +295,8 @@ mod tests {
     };
 
     #[test]
+    /// 驗證 SMB URL 會拆成 host、share、subpath 並解碼百分比字元。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn parse_smb_location_extracts_share_and_subpath() {
         let location =
             parse_smb_location("smb://192.0.2.10/shared/docs/report%20v1").expect("parse");
@@ -293,6 +307,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證已存在掛載根目錄時直接回傳可瀏覽路徑，不再要求系統掛載。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn resolve_smb_location_with_mount_root_reports_ready_when_share_exists() {
         let dir = tempdir().expect("tempdir");
         let share_root = dir.path().join("shared");
@@ -309,6 +325,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 share 尚未掛載時回傳 NeedsMount，讓 App 顯示明確連線流程。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn resolve_smb_location_with_mount_root_reports_needs_mount_when_missing() {
         let dir = tempdir().expect("tempdir");
         let location = parse_smb_location("smb://server/shared/docs").expect("parse");
@@ -323,6 +341,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證缺少 share 名稱的 SMB URL 會被拒絕，避免跳到不明確的 host 根目錄。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn parse_smb_location_requires_share_name() {
         let error = parse_smb_location("smb://192.0.2.10").expect_err("missing share");
 
@@ -337,6 +357,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若只依 share 名稱誤選其他伺服器的掛載點則測試失敗。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn macos_mount_parser_matches_host_and_share() {
         let output = "//otto@old-server/shared on /Volumes/shared (smbfs, nodev)\n\
                       //domain;otto@192.0.2.10/shared on /Volumes/shared-1 (smbfs, nodev)\n";
@@ -352,6 +373,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若 `\040` 沒有還原成空白則測試失敗。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn mount_field_decoder_restores_octal_escapes() {
         assert_eq!(
             decode_mount_field("/Volumes/Company\\040Share"),

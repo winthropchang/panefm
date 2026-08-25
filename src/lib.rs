@@ -1,3 +1,8 @@
+//! PaneFM 的 library 入口與可公開重用的設定、主題 API。
+//!
+//! `main.rs` 只呼叫本模組的 [`run`]；實際 TUI 實作保持在私有的 `file_manager`
+//! 模組，避免內部狀態在尚未穩定前成為對外相容性承諾。
+
 pub mod config;
 mod file_manager;
 pub mod theme;

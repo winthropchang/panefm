@@ -1,3 +1,8 @@
+//! PaneFM 私有 trash 儲存、metadata 與還原/永久刪除操作。
+//!
+//! 每筆項目由內容檔與 metadata 配對，還原時依 metadata 回到原位置。`App` 負責
+//! 多選與確認視窗，本模組只執行原子化程度可控的單筆/批次儲存操作。
+
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -421,6 +426,7 @@ mod tests {
 
     #[test]
     /// 驗證丟進 trash 的檔案可以再還原回原位置。
+    /// 保護目的：避免 trash 儲存格式或還原流程重構後，遺失原始路徑、內容或 metadata。
     fn trash_store_can_restore_latest_file() {
         let dir = tempdir().expect("tempdir");
         let trash_dir = dir.path().join(".tfm").join("trash");
@@ -442,6 +448,7 @@ mod tests {
 
     #[test]
     /// 驗證可以依指定 id 清單永久刪除 trash 項目，且之後不再能還原。
+    /// 保護目的：避免 trash 儲存格式或還原流程重構後，遺失原始路徑、內容或 metadata。
     fn trash_store_can_delete_entry_permanently() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("delete-me.txt");
@@ -469,6 +476,7 @@ mod tests {
 
     #[test]
     /// 驗證可以一次用批次刪除 API 清空整個 trash，並回傳實際清除的數量。
+    /// 保護目的：避免 trash 儲存格式或還原流程重構後，遺失原始路徑、內容或 metadata。
     fn trash_store_can_clear_all_entries() {
         let dir = tempdir().expect("tempdir");
         let first = dir.path().join("first.txt");

@@ -1,3 +1,9 @@
+//! 設定檔模型、預設值、讀取順序與持久化邏輯。
+//!
+//! PaneFM 會把穩定的使用者偏好放在 `config.toml`，把可自行擴充的外部動作放在
+//! `plugins.toml`。本模組只負責解析與驗證；檔案管理行為由 `file_manager` 套用，
+//! 因此新增設定時應同時補上預設值、反序列化相容處理與測試。
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -923,6 +929,7 @@ mod tests {
 
     #[test]
     /// 驗證 PaneFM 在 macOS、Windows 與 XDG 平台都能用相同規則建立設定路徑。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn app_config_file_uses_brand_directory_and_requested_file() {
         assert_eq!(
             app_config_file(Path::new("/settings"), "panefm", "config.toml"),
@@ -942,6 +949,7 @@ mod tests {
 
     #[test]
     /// 驗證保存主題時只更新 `[ui]` 的 `theme`，並保留其他設定與註解。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn persist_theme_updates_only_ui_theme() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
@@ -962,6 +970,7 @@ mod tests {
 
     #[test]
     /// 驗證沒有設定檔時保存主題會建立最小可讀的 `config.toml`。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn persist_theme_creates_missing_config() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
@@ -976,6 +985,7 @@ mod tests {
 
     #[test]
     /// 驗證當找不到設定檔時，系統會回退到預設設定。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_returns_defaults_when_missing() {
         let dir = tempdir().expect("tempdir");
 
@@ -987,6 +997,7 @@ mod tests {
 
     #[test]
     /// 驗證新版分區式 `config.toml` 內容可以正確解析成設定。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_reads_project_file() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -1059,6 +1070,7 @@ cancel_search_on_leave = false
 
     #[test]
     /// 驗證舊版平鋪設定格式仍可繼續使用。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_reads_legacy_flat_keys() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -1103,6 +1115,7 @@ height = 9
 
     #[test]
     /// 驗證 `plugins.toml` 中的 `actions.open_with` 會正確載入自訂外部動作設定。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_reads_custom_open_actions_from_plugins_file() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -1146,6 +1159,7 @@ windows_command = "git -C {parent} log --oneline"
 
     #[test]
     /// 驗證即使沒有 `config.toml`，只要有 `plugins.toml` 也能載入自訂動作。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_reads_plugins_without_main_config() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -1171,6 +1185,7 @@ mac_command = "open -R {path}"
 
     #[test]
     /// 驗證 navigation 設定值不可為 0，避免快捷移動完全失效。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_rejects_zero_navigation_steps() {
         let dir = tempdir().expect("tempdir");
         fs::write(
@@ -1192,6 +1207,7 @@ fast_move_step = 0
 
     #[test]
     /// 驗證字體設定不再是程式設定的一部分，避免使用者誤以為 TUI 能改外部 Terminal 字體。
+    /// 保護目的：避免設定格式演進或預設值調整時，破壞既有 config.toml 的相容性與驗證規則。
     fn load_config_ignores_removed_font_settings() {
         let dir = tempdir().expect("tempdir");
         fs::write(

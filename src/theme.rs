@@ -1,3 +1,9 @@
+//! 主題名稱、成熟色盤轉換與 PaneFM 語意顏色定義。
+//!
+//! UI 不應直接寫死 RGB 顏色，而要使用 [`Theme`] 提供的 selected、danger、search
+//! match 等語意欄位。如此切換線上成熟主題時，列表、狀態訊息與搜尋高亮才能一起
+//! 改變；新增 UI 狀態時也應先在這裡定義顏色用途。
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui_themes::ThemeName as PaletteThemeName;
 
@@ -329,6 +335,7 @@ impl From<ThemePreset> for Theme {
 ///
 /// 回傳：`PaletteThemeName`，由 `ratatui-themes` 提供的成熟色盤識別值。
 impl From<ThemePreset> for PaletteThemeName {
+    /// 將 PaneFM 穩定的設定值逐一映射到 ratatui-themes 色盤名稱。
     fn from(value: ThemePreset) -> Self {
         match value {
             ThemePreset::Dracula => Self::Dracula,
@@ -358,6 +365,7 @@ impl From<ThemePreset> for PaletteThemeName {
 ///
 /// 回傳：`ThemePreset`，本專案可儲存、切換與渲染的主題識別值。
 impl From<PaletteThemeName> for ThemePreset {
+    /// 將外部色盤名稱映射回可寫入 config.toml 的 PaneFM 主題值。
     fn from(value: PaletteThemeName) -> Self {
         match value {
             PaletteThemeName::Dracula => Self::Dracula,
@@ -400,6 +408,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若主題內容相同則測試失敗。
+    /// 保護目的：避免新增或映射主題時，造成設定名稱、色盤與 UI 語意顏色彼此不一致。
     fn built_in_themes_are_distinct() {
         assert_ne!(Theme::default_theme(), Theme::forest_theme());
         assert_ne!(Theme::default_theme(), Theme::ocean_theme());
@@ -410,6 +419,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若名稱無法正確解析則測試失敗。
+    /// 保護目的：避免新增或映射主題時，造成設定名稱、色盤與 UI 語意顏色彼此不一致。
     fn preset_name_round_trip_works() {
         for preset in ThemePreset::ALL {
             assert_eq!(ThemePreset::from_name(preset.name()), Some(preset));
@@ -418,6 +428,7 @@ mod tests {
 
     #[test]
     /// 驗證舊版設定名稱仍能對應到新的成熟主題，避免更新後既有設定失效。
+    /// 保護目的：避免新增或映射主題時，造成設定名稱、色盤與 UI 語意顏色彼此不一致。
     fn legacy_theme_names_remain_compatible() {
         assert_eq!(
             ThemePreset::from_name("default"),

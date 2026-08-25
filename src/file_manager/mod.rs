@@ -1,3 +1,9 @@
+//! 終端生命週期、主事件迴圈與外部全畫面工具的協調層。
+//!
+//! 本模組負責進入 raw mode、建立 ratatui terminal、輪詢鍵盤與背景任務，並在離開
+//! 時可靠還原終端。`App` 保存可測試的業務狀態；`ui` 只繪圖；fzf 等會接管終端的
+//! 程式則必須經由這裡暫停 TUI，避免 keyboard enhancement flags 或殘留畫面外洩。
+
 mod app;
 mod archive;
 mod bookmark;
@@ -110,6 +116,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut last_cursor_mode = None;
 
     loop {
+        // 每輪先吸收有限量背景訊息再繪圖，讓搜尋結果能逐批出現，同時避免 channel
+        // 一次灌入太多資料而延後鍵盤事件。full redraw 只用於 Windows/SMB 等可能
+        // 留下舊 cell 的情況，平常交給 ratatui diff rendering 降低閃爍。
         app.poll_background_tasks();
         if app.take_full_redraw_request() {
             terminal.clear()?;
@@ -125,6 +134,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             break;
         }
 
+        // Attached 外部程式可能需要暫時擁有 terminal；統一在 render/event 週期外
+        // 執行，避免 App handler 一半時切換 raw mode 造成狀態難以恢復。
         if let Some(queued) = app.take_pending_launch() {
             let result = run_launch_spec(terminal, queued.launch)
                 .map_err(|error| io::Error::other(error.to_string()));
@@ -132,6 +143,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             last_cursor_mode = None;
         }
 
+        // fzf 會接管 alternate screen，必須走專用生命週期完整關閉再重建 TUI。
         if let Some(request) = app.take_pending_fzf_jump() {
             match run_fzf_jump(terminal, &request) {
                 Ok(selected_line) => {
@@ -333,12 +345,18 @@ fn shell_join_os_args(args: &[std::ffi::OsString]) -> String {
 }
 
 #[cfg(not(windows))]
+/// 依 POSIX shell 單引號規則跳脫一個 OS 參數。
+///
+/// 參數：`arg` 保留原始平台字串；回傳可安全串進 `sh -c` 的單一 argument。
 fn quote_posix_shell_arg(arg: &std::ffi::OsString) -> String {
     let text = arg.to_string_lossy();
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(windows)]
+/// 依 Windows cmd.exe 規則包裝可能含空白或特殊字元的單一 OS 參數。
+///
+/// 參數：`arg` 是要傳給 helper process 的值；回傳適合串進 cmd command line 的文字。
 fn quote_windows_cmd_arg(arg: &std::ffi::OsString) -> String {
     let text = arg.to_string_lossy();
     if text.is_empty() {
@@ -580,6 +598,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無。
+    /// 保護目的：避免終端事件正規化調整後，一次實體按鍵因 Release 事件而執行兩次操作。
     #[test]
     fn should_handle_only_press_and_repeat_key_events() {
         assert!(should_handle_key_event(KeyEventKind::Press));
@@ -588,6 +607,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 fzf 候選串流會遞迴輸出相對路徑，而不是只列第一層目錄。
+    /// 保護目的：避免終端生命週期或外部工具整合調整後，破壞候選串流、Esc 取消或 helper 參數契約。
     fn stream_fzf_candidates_writes_nested_entries() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
@@ -605,6 +626,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證啟用 hidden 選項後，fzf 候選會包含點號開頭項目。
+    /// 保護目的：避免終端生命週期或外部工具整合調整後，破壞候選串流、Esc 取消或 helper 參數契約。
     fn stream_fzf_candidates_includes_hidden_entries_when_enabled() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".secret.txt"), "secret").expect("secret");
@@ -623,6 +646,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    /// 驗證 follow-links 選項能走訪符號連結目錄，同時避免無限制遞迴。
+    /// 保護目的：避免終端生命週期或外部工具整合調整後，破壞候選串流、Esc 取消或 helper 參數契約。
     fn stream_fzf_candidates_can_follow_symlinked_directories() {
         use std::os::unix::fs::symlink;
 
@@ -648,12 +673,16 @@ mod tests {
     }
 
     #[test]
+    /// 驗證啟動 fzf 時明確綁定 Esc abort，讓使用者可可靠回到 PaneFM。
+    /// 保護目的：避免終端生命週期或外部工具整合調整後，破壞候選串流、Esc 取消或 helper 參數契約。
     fn fzf_bindings_include_escape_abort() {
         assert!(fzf_bindings().contains("esc:abort"));
         assert!(fzf_bindings().contains("enter:accept"));
     }
 
     #[test]
+    /// 驗證傳給候選 helper process 的布林旗標可完整編碼再解析。
+    /// 保護目的：避免終端生命週期或外部工具整合調整後，破壞候選串流、Esc 取消或 helper 參數契約。
     fn helper_bool_flags_round_trip() {
         assert_eq!(format_helper_bool_flag(true), "1");
         assert_eq!(format_helper_bool_flag(false), "0");
@@ -662,6 +691,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證候選 helper 遇到未知布林值會拒絕執行，不默默採用錯誤預設值。
+    /// 保護目的：避免終端生命週期或外部工具整合調整後，破壞候選串流、Esc 取消或 helper 參數契約。
     fn helper_bool_flags_reject_invalid_values() {
         assert!(parse_helper_bool_flag(Some("yes".into()), "flag").is_err());
         assert!(parse_helper_bool_flag(None, "flag").is_err());

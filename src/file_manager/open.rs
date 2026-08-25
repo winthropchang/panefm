@@ -1,3 +1,9 @@
+//! 檔案/目錄的開啟選項、外部命令規格與 plugins.toml action 展開。
+//!
+//! 本模組只產生 `LaunchSpec`，不直接切換 raw mode 或等待 child process；真正啟動
+//! 由事件迴圈依 attached/detached 模式處理。自訂模板必須透過平台 quoting，不能把
+//! 含空白或 shell 字元的路徑直接串進命令。
+
 use std::{
     env, io,
     path::{Path, PathBuf},
@@ -265,6 +271,10 @@ pub(crate) fn is_text_like_path(path: &Path) -> bool {
     )
 }
 
+/// 依目前編譯平台建立「交給系統預設程式開啟」的啟動規格。
+///
+/// 參數：`path: &Path`，要開啟的檔案或目錄。
+/// 回傳：`io::Result<LaunchSpec>`，只描述命令，不會在此函數啟動 child process。
 fn system_open_spec(path: &Path) -> io::Result<LaunchSpec> {
     super::platform::system_open_spec_for_platform(path, super::platform::current_platform())
 }
@@ -319,6 +329,15 @@ fn parse_command_line(input: &str) -> Option<CommandLineSpec> {
     })
 }
 
+/// 將 plugins.toml action 中的 placeholder 展開成已依平台 quoting 的值。
+///
+/// 參數：
+/// - `template: &str`，可包含 `{path}`、`{parent}`、`{name}`、`{stem}` 的命令模板。
+/// - `target: &OpenTarget`，目前選取項目的完整路徑與類型。
+/// - `platform: PlatformKind`，決定 shell escaping 採用 Windows 或 POSIX 規則。
+///
+/// 回傳：`String`，可再交給 command-line parser 的展開結果。placeholder 在取代前
+/// 已 quote，避免空白路徑被拆成多個參數；自訂模板本身仍視為使用者信任的設定。
 fn expand_custom_action_template(
     template: &str,
     target: &OpenTarget,
@@ -352,6 +371,10 @@ fn expand_custom_action_template(
         .replace("{stem}", &stem)
 }
 
+/// 把單一 placeholder 值包成目前平台 shell 可安全視為一個參數的文字。
+///
+/// 參數：`value: &str` 是未跳脫文字，`platform` 是目標 shell 類型。
+/// 回傳：`String`，Windows 使用雙引號，macOS/Linux 使用 POSIX 單引號規則。
 fn shell_quote_for_platform(value: &str, platform: PlatformKind) -> String {
     match platform {
         PlatformKind::Windows => format!("\"{}\"", value.replace('"', "\"\"")),
@@ -361,6 +384,10 @@ fn shell_quote_for_platform(value: &str, platform: PlatformKind) -> String {
     }
 }
 
+/// 判斷 plugins.toml 的自訂動作是否應出現在目前檔案或目錄的 Open picker。
+///
+/// 參數：`action` 是已解析設定，`target` 是目前選取項目。
+/// 回傳：`bool`，符合 file/dir/both scope 時為 `true`。
 pub(crate) fn custom_action_applies_to_target(
     action: &CustomOpenActionConfig,
     target: &OpenTarget,
@@ -386,6 +413,8 @@ mod tests {
     use crate::file_manager::platform::PlatformKind;
 
     #[test]
+    /// 驗證常見文字、程式碼與設定檔會走 Editor，而二進位格式不會。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn text_like_detection_matches_common_extensions() {
         assert!(is_text_like_path(&PathBuf::from("notes.txt")));
         assert!(is_text_like_path(&PathBuf::from("Cargo.toml")));
@@ -395,6 +424,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證檔案 Open picker 不顯示只適用於目錄的系統 Open 選項。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn file_picker_omits_system_open_entry() {
         let options = open_picker_options(&OpenTarget {
             path: PathBuf::from("notes.txt"),
@@ -417,6 +448,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證文字檔優先採用 `$EDITOR`，未設定時才退回平台預設程式。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn editor_for_text_file_uses_editor_when_available_or_system_open_otherwise() {
         let spec = build_launch_spec(
             &OpenTarget {
@@ -441,6 +474,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證命令列 parser 能保留引號內空白與反斜線跳脫內容。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn parse_command_line_supports_quoted_program_and_args() {
         let command = parse_command_line("\"C:\\Program Files\\Neovim\\bin\\nvim.exe\" -u NONE")
             .expect("command");
@@ -450,6 +485,8 @@ mod tests {
     }
 
     #[test]
+    /// 驗證 plugin action 會選擇平台命令、展開 placeholder 並套用啟動模式。
+    /// 保護目的：避免跨平台命令與路徑處理調整後，只在 macOS 或 Windows 其中一端失效。
     fn custom_open_action_uses_platform_specific_command_and_placeholders() {
         let action = CustomOpenActionConfig {
             name: "Xcode".to_string(),

@@ -1,3 +1,8 @@
+//! 本機與 SMB 書籤模型，以及 `bookmark.toml` 的同步持久化。
+//!
+//! 書籤是使用者資料而不是靜態設定，因此每次新增、刪除或清空都必須立即寫檔。
+//! UI 只保存目前選取位置；實際 key 分配、路徑正規化與序列化由 `BookmarkStore` 處理。
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -242,6 +247,7 @@ mod tests {
 
     #[test]
     /// 驗證不存在的 `bookmark.toml` 會被視為空集合，而不是報錯。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn load_missing_bookmark_file_returns_empty_store() {
         let dir = tempdir().expect("tempdir");
         let store = BookmarkStore::load(dir.path().join("bookmark.toml")).expect("load store");
@@ -251,6 +257,7 @@ mod tests {
 
     #[test]
     /// 驗證設定書籤後會立刻寫回 `bookmark.toml`，之後重新載入仍能讀回相同內容。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn set_bookmark_persists_to_file() {
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("bookmark.toml");
@@ -269,6 +276,7 @@ mod tests {
 
     #[test]
     /// 驗證 SMB 書籤會以原始 `smb://...` 字串寫回檔案，重新載入後仍能辨識成 SMB 目標。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn set_smb_bookmark_persists_to_file() {
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("bookmark.toml");
@@ -294,6 +302,7 @@ mod tests {
 
     #[test]
     /// 驗證書籤檔會放在 `config.toml` 同一個目錄，若沒有設定檔則退回工作目錄旁邊。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn bookmark_file_path_prefers_config_directory() {
         let base = Path::new("/workspace/project");
         let config = Path::new("/workspace/settings/config.toml");
@@ -310,6 +319,7 @@ mod tests {
 
     #[test]
     /// 驗證自動分配書籤代號時，會挑出目前尚未使用的第一個預設按鍵。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn next_available_key_uses_first_free_preferred_key() {
         let dir = tempdir().expect("tempdir");
         let mut store = BookmarkStore::load(dir.path().join("bookmark.toml")).expect("load");
@@ -325,6 +335,7 @@ mod tests {
 
     #[test]
     /// 驗證刪除單一書籤後，記憶體與檔案都會同步更新。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn remove_bookmark_persists_to_file() {
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("bookmark.toml");
@@ -345,6 +356,7 @@ mod tests {
 
     #[test]
     /// 驗證清空全部書籤後，列表會變成空集合。
+    /// 保護目的：避免書籤格式與持久化流程調整後，造成既有 bookmark.toml 資料遺失或無法跳轉。
     fn clear_bookmarks_removes_all_entries() {
         let dir = tempdir().expect("tempdir");
         let mut store = BookmarkStore::load(dir.path().join("bookmark.toml")).expect("load");
