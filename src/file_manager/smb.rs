@@ -243,8 +243,15 @@ fn windows_unc_root(location: &SmbLocation) -> String {
     format!(r"\\{}\{}", location.host, location.share)
 }
 
-/// 將 `%20` 這類百分比編碼轉回可讀字串。
-fn percent_decode(input: &str) -> io::Result<String> {
+/// 將 `%20` 或 UTF-8 百分比編碼轉回可讀字串，供 SMB 解析與書籤顯示共用。
+///
+/// 參數：
+/// - `input: &str`，可能含有 percent encoding 的 URI 或單一路徑片段。
+///
+/// 回傳：`io::Result<String>`。
+/// - 成功時回傳解碼後的 UTF-8 文字。
+/// - 編碼不完整、含非十六進位數字或結果不是合法 UTF-8 時回傳 `InvalidInput`。
+pub(crate) fn percent_decode(input: &str) -> io::Result<String> {
     let bytes = input.as_bytes();
     let mut index = 0usize;
     let mut output = Vec::with_capacity(bytes.len());

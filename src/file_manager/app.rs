@@ -5348,7 +5348,7 @@ impl App {
                 self.bookmark_store
                     .set_smb(key, location.clone())
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                self.status = format!("bookmark [{key}] = {location}");
+                self.status = format!("bookmark [{key}] = {}", target.display_text());
             }
         }
         Ok(())
@@ -11162,15 +11162,15 @@ mod tests {
     use super::{
         App, BookmarkListMode, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
         PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord,
-        TaskState, TrashConfirmAction, VisualSelectionState, command_suggestion_navigation,
-        command_suggestions, command_suggestions_for_buffer, ctrl_digit_target_pane_id,
-        filtered_global_search_entries, help_entries, is_windows_drive_path,
-        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
-        key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
-        missing_search_tool_status, plain_digit_target_pane_id, query_zoxide_directories,
-        rename_basename_cursor, rename_next_word_start, rename_previous_word_start,
-        rename_word_end, trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action,
-        typed_char_from_key,
+        TaskState, TrashConfirmAction, VisualSelectionState, bookmark_panel_lines,
+        command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
+        ctrl_digit_target_pane_id, filtered_bookmark_entries, filtered_global_search_entries,
+        help_entries, is_windows_drive_path, key_matches_ctrl_letter,
+        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
+        key_matches_shifted_letter, looks_like_navigation_path, missing_search_tool_status,
+        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end,
+        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -11178,7 +11178,7 @@ mod tests {
             StartupSort,
         },
         file_manager::{
-            bookmark::BookmarkTarget,
+            bookmark::{BookmarkEntry, BookmarkTarget},
             layout::{LayoutNode, SplitDirection},
             open::LaunchMode,
             pane::{LineMode, SortMode},
@@ -13009,23 +13009,44 @@ mod tests {
     }
 
     #[test]
-    /// 驗證經由 `goto smb://...` 進入 SMB 後存下書籤，會把 `smb://...` 寫進 `bookmark.toml`，而不是掛載後的本機路徑。
-    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
+    /// 驗證經由 `goto smb://...` 進入中文 SMB 目錄後，書籤檔仍保存 encoded URI，狀態列則顯示可讀中文。
+    /// 保護目的：避免改善 Bookmark UI 時把解碼後文字寫回檔案，導致重新啟動後無法可靠跳轉 SMB。
     fn app_bookmark_set_persists_smb_location_after_goto() {
         let dir = tempdir().expect("tempdir");
         let mount_root = dir.path().join("mounts");
-        let share_docs = mount_root.join("shared").join("docs");
+        let share_docs = mount_root.join("shared").join("網路事業部").join("otto");
         fs::create_dir_all(&share_docs).expect("share docs");
+        let encoded = "smb://192.0.2.10/shared/%E7%B6%B2%E8%B7%AF%E4%BA%8B%E6%A5%AD%E9%83%A8/otto";
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-        app.goto_smb_location_with_mount_root("smb://192.0.2.10/shared/docs", &mount_root)
+        app.goto_smb_location_with_mount_root(encoded, &mount_root)
             .expect("goto smb");
         app.set_bookmark('s').expect("set bookmark");
 
         let bookmark_file =
             fs::read_to_string(dir.path().join("bookmark.toml")).expect("bookmark file");
-        assert!(bookmark_file.contains("smb://192.0.2.10/shared/docs"));
-        assert_eq!(app.status, "bookmark [s] = smb://192.0.2.10/shared/docs");
+        assert!(bookmark_file.contains(encoded));
+        assert_eq!(
+            app.status,
+            "bookmark [s] = smb://192.0.2.10/shared/網路事業部/otto"
+        );
+    }
+
+    #[test]
+    /// 驗證 Bookmark 彈窗與其模糊 filter 都使用解碼後的中文 SMB 路徑。
+    /// 保護目的：確保使用者看得到並能以中文搜尋書籤，同時列表背後仍保留可供跳轉的原始 target。
+    fn bookmark_list_displays_and_filters_decoded_smb_path() {
+        let encoded = "smb://192.0.2.10/shared/%E7%B6%B2%E8%B7%AF%E4%BA%8B%E6%A5%AD%E9%83%A8/otto";
+        let entries = vec![BookmarkEntry {
+            key: 's',
+            target: BookmarkTarget::SmbLocation(encoded.to_string()),
+        }];
+
+        let lines = bookmark_panel_lines(entries.clone());
+        assert_eq!(lines[0].path, "smb://192.0.2.10/shared/網路事業部/otto");
+        let filtered = filtered_bookmark_entries(entries, "網事");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].target.as_storage_value(), encoded);
     }
 
     #[test]

@@ -12,6 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use super::smb::percent_decode;
+
 /// 描述書籤實際指向的目標類型，可能是本機路徑，也可能是遠端 SMB 位址。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BookmarkTarget {
@@ -20,7 +22,14 @@ pub(crate) enum BookmarkTarget {
 }
 
 impl BookmarkTarget {
-    /// 回傳適合寫進 `bookmark.toml` 的原始字串。
+    /// 回傳適合寫進 `bookmark.toml`，或交給實際跳轉流程使用的原始字串。
+    ///
+    /// 參數：無。
+    ///
+    /// 回傳：`String`。
+    /// - 本機書籤會回傳平台原生路徑的顯示文字。
+    /// - SMB 書籤會完整保留原始 percent-encoded URI，避免中文路徑解碼後被誤當成
+    ///   尚未編碼的連線位址，或在重新儲存時改變原有資料。
     pub(crate) fn as_storage_value(&self) -> String {
         match self {
             Self::LocalPath(path) => path.display().to_string(),
@@ -28,10 +37,31 @@ impl BookmarkTarget {
         }
     }
 
-    /// 回傳目前書籤要顯示在列表上的文字。
+    /// 回傳目前書籤要顯示在列表、filter 與狀態訊息中的可讀文字。
+    ///
+    /// 參數：無。
+    ///
+    /// 回傳：`String`。
+    /// - 本機路徑維持原本顯示方式。
+    /// - SMB URI 僅在這個顯示邊界進行 percent decode，讓 `%E7%B6%B2...` 顯示成中文；
+    ///   `BookmarkTarget` 內保存的原始 URI 不會被修改，實際連線仍使用 encoded URI。
     pub(crate) fn display_text(&self) -> String {
-        self.as_storage_value()
+        match self {
+            Self::LocalPath(path) => path.display().to_string(),
+            Self::SmbLocation(location) => decode_smb_uri_for_display(location),
+        }
     }
+}
+
+/// 將 SMB URI 的百分比編碼轉成僅供 UI 顯示的 UTF-8 文字。
+///
+/// 參數：
+/// - `location: &str`，書籤中實際保存、可直接交給 SMB 連線流程的 encoded URI。
+///
+/// 回傳：`String`，可讀性較高的顯示文字。若解碼結果不是合法 UTF-8，會退回原始 URI，
+/// 避免 UI 用替代字元隱藏實際位址內容。
+fn decode_smb_uri_for_display(location: &str) -> String {
+    percent_decode(location).unwrap_or_else(|_| location.to_string())
 }
 
 /// 表示單一書籤在列表中要顯示的內容。
@@ -298,6 +328,31 @@ mod tests {
                 .expect("bookmark file")
                 .contains("smb://192.0.2.10/shared/docs")
         );
+    }
+
+    #[test]
+    /// 驗證 SMB 中文路徑在 UI 會顯示解碼後文字，但持久化值仍保持原始 percent-encoded URI。
+    /// 保護目的：避免為了改善書籤可讀性，意外破壞 `bookmark.toml` 或實際 SMB 跳轉所需的 URI。
+    fn smb_bookmark_decodes_only_its_display_text() {
+        let encoded = "smb://192.0.2.10/shared/%E7%B6%B2%E8%B7%AF%E4%BA%8B%E6%A5%AD%E9%83%A8/otto";
+        let target = BookmarkTarget::SmbLocation(encoded.to_string());
+
+        assert_eq!(
+            target.display_text(),
+            "smb://192.0.2.10/shared/網路事業部/otto"
+        );
+        assert_eq!(target.as_storage_value(), encoded);
+    }
+
+    #[test]
+    /// 驗證不合法的 UTF-8 percent encoding 不會在 UI 中被替代字元悄悄改寫。
+    /// 保護目的：遇到非 UTF-8 SMB 名稱時仍顯示可供除錯的原始 URI，並確保連線資料不受影響。
+    fn smb_bookmark_display_falls_back_for_invalid_utf8() {
+        let encoded = "smb://192.0.2.10/shared/%FF";
+        let target = BookmarkTarget::SmbLocation(encoded.to_string());
+
+        assert_eq!(target.display_text(), encoded);
+        assert_eq!(target.as_storage_value(), encoded);
     }
 
     #[test]
