@@ -49,6 +49,9 @@ use super::{
         build_custom_launch_spec, build_launch_spec, custom_action_applies_to_target,
         default_open_action, open_picker_options,
     },
+    operation_history::{
+        DEFAULT_HISTORY_LIMIT, FileOperation, FileOperationKind, OperationHistory, OperationItem,
+    },
     pane::{LineMode, PaneState, SortDetailKind, SortMode},
     platform::write_text_to_system_clipboard,
     search::{
@@ -437,6 +440,8 @@ pub(crate) struct App {
     pub(crate) pending_y: bool,
     pub(crate) pending_bookmark: Option<BookmarkPrompt>,
     pub(crate) clipboard: Option<ClipboardState>,
+    /// 全域檔案操作歷史；跨 panel 的 copy/move 仍應以同一批次復原。
+    pub(crate) operation_history: OperationHistory,
     pub(crate) filter: Option<FilterState>,
     pub(crate) preview_search: Option<PreviewSearchState>,
     pub(crate) list_find: Option<ListFindState>,
@@ -541,6 +546,7 @@ impl App {
             pending_y: false,
             pending_bookmark: None,
             clipboard: None,
+            operation_history: OperationHistory::new(DEFAULT_HISTORY_LIMIT),
             filter: None,
             preview_search: None,
             list_find: None,
@@ -1150,6 +1156,13 @@ impl App {
             _ if key_matches_shifted_letter(&key, 'P') => {
                 self.clear_pending_count();
                 self.paste_into_focused_pane_with_overwrite()?;
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_plain_letter(&key, 'u') => {
+                self.clear_pending_count();
+                self.undo_latest_file_operation()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -4852,6 +4865,7 @@ impl App {
             "cut" => self.cut_selected(),
             "paste" => self.paste_into_focused_pane()?,
             "paste!" => self.paste_into_focused_pane_with_overwrite()?,
+            "undo" => self.undo_latest_file_operation()?,
             "compress" => self.compress_selected_entries()?,
             "extract" => self.extract_selected_archives()?,
             "jump" => self.open_fzf_jump(),
@@ -7981,6 +7995,7 @@ impl App {
         };
 
         let mut pasted_count = 0usize;
+        let mut history_items = Vec::new();
         for entry in &clipboard.entries {
             if entry.source_path.parent() == Some(target_dir.as_path())
                 && clipboard.operation == ClipboardOperation::Cut
@@ -8001,16 +8016,12 @@ impl App {
 
             let paste_result = match self.panes.get_mut(&self.focused_pane) {
                 Some(pane) => match clipboard.operation {
-                    ClipboardOperation::Copy if overwrite => {
-                        pane.copy_entry_into_current_dir_overwrite(&entry.source_path)
-                    }
                     ClipboardOperation::Copy => {
-                        pane.copy_entry_into_current_dir(&entry.source_path)
+                        pane.copy_entry_with_history(&entry.source_path, overwrite)
                     }
-                    ClipboardOperation::Cut if overwrite => {
-                        pane.move_entry_into_current_dir_overwrite(&entry.source_path)
+                    ClipboardOperation::Cut => {
+                        pane.move_entry_with_history(&entry.source_path, overwrite)
                     }
-                    ClipboardOperation::Cut => pane.move_entry_into_current_dir(&entry.source_path),
                 },
                 None => {
                     self.status = String::from("panel no longer exists");
@@ -8018,12 +8029,22 @@ impl App {
                 }
             };
 
-            if let Err(error) = paste_result {
-                self.status = paste_failure_status(&entry.display_name, &planned_target, &error);
-                return Ok(());
-            }
+            let outcome = match paste_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.record_file_operation(clipboard.operation, history_items);
+                    self.status =
+                        paste_failure_status(&entry.display_name, &planned_target, &error);
+                    return Ok(());
+                }
+            };
 
             pasted_count += 1;
+            history_items.push(OperationItem {
+                source_path: entry.source_path.clone(),
+                destination_path: outcome.target_path,
+                replaced_backup: outcome.backup_path,
+            });
         }
 
         if pasted_count == 0 {
@@ -8054,7 +8075,55 @@ impl App {
         if clipboard.operation == ClipboardOperation::Cut {
             self.clipboard = None;
         }
+        self.record_file_operation(clipboard.operation, history_items);
 
+        Ok(())
+    }
+
+    /// 將已成功的貼上項目整理成一筆批次 Undo 歷史。
+    ///
+    /// 參數：
+    /// - `operation: ClipboardOperation`，原操作是 Copy 或 Cut/Move。
+    /// - `items: Vec<OperationItem>`，本批次真正成功的項目；部分失敗時可能少於剪貼簿。
+    ///
+    /// 回傳：`() `；空清單不會建立歷史。
+    fn record_file_operation(&mut self, operation: ClipboardOperation, items: Vec<OperationItem>) {
+        let kind = match operation {
+            ClipboardOperation::Copy => FileOperationKind::Copy,
+            ClipboardOperation::Cut => FileOperationKind::Move,
+        };
+        self.operation_history.push(FileOperation { kind, items });
+    }
+
+    /// 復原最近一次成功的 Copy 或 Move 批次，並同步刷新所有 panel。
+    ///
+    /// Copy 建立物會移到 PaneFM Trash；Move 會搬回原來源。可連續呼叫以依序復原最多
+    /// 20 筆記憶體內歷史，重開程式後歷史會清空。
+    ///
+    /// 參數：`self: &mut App`，目前應用程式狀態。
+    /// 回傳：`io::Result<()>`；檔案系統拒絕復原時保留失敗項目供下次重試。
+    pub(crate) fn undo_latest_file_operation(&mut self) -> io::Result<()> {
+        match self.operation_history.undo_latest(&self.trash_store) {
+            Ok(None) => self.status = String::from("nothing to undo"),
+            Ok(Some(result)) => {
+                self.reload_all_panes()?;
+                let action = match result.kind {
+                    FileOperationKind::Copy => "copy",
+                    FileOperationKind::Move => "move",
+                };
+                self.status = if result.failed == 0 {
+                    format!("undid {action}: {} items", result.restored)
+                } else {
+                    format!(
+                        "undo {action}: {} restored, {} failed; press u to retry",
+                        result.restored, result.failed
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = format!("undo failed: {error}");
+            }
+        }
         Ok(())
     }
 
@@ -8258,14 +8327,31 @@ impl App {
         }
 
         let mut moved_count = 0usize;
+        let mut history_items = Vec::new();
         for entry in &entries {
-            if let Err(error) = PaneState::move_path_to_dir(&entry.path, target_dir) {
-                self.status = format!("move failed for {}: {error}", entry.display_name());
-                return Ok(());
-            }
+            let outcome = match PaneState::move_path_to_dir_with_history(&entry.path, target_dir) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.operation_history.push(FileOperation {
+                        kind: FileOperationKind::Move,
+                        items: history_items,
+                    });
+                    self.status = format!("move failed for {}: {error}", entry.display_name());
+                    return Ok(());
+                }
+            };
             moved_count += 1;
+            history_items.push(OperationItem {
+                source_path: entry.path.clone(),
+                destination_path: outcome.target_path,
+                replaced_backup: outcome.backup_path,
+            });
         }
 
+        self.operation_history.push(FileOperation {
+            kind: FileOperationKind::Move,
+            items: history_items,
+        });
         self.reload_all_panes()?;
         self.status = if moved_count == 1 {
             format!("moved 1 item -> {}", target_dir.display())
@@ -10067,6 +10153,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "P",
             "貼上剪貼簿項目到目前目錄；若同名已存在就直接覆蓋，不會再詢問",
             HelpAction::Command("paste!"),
+        ),
+        help_entry(
+            ":undo",
+            "u",
+            "復原最近一次完整 copy 或 move 批次；可連續執行，copy 建立物會移入 trash",
+            HelpAction::Command("undo"),
         ),
         help_entry(
             ":cancel copied",
@@ -14563,6 +14655,101 @@ mod tests {
         assert!(target_dir.join("beta.txt").exists());
         assert!(app.clipboard.is_none());
         assert_eq!(app.status, "moved: 1 item");
+    }
+
+    #[test]
+    /// 驗證一般模式按下 `u` 會復原最近一次 Copy，來源保留且目的檔移入 Trash。
+    ///
+    /// 保護目的：確保操作歷史不只底層可用，實際快捷鍵也能完成使用者最常見的貼錯復原。
+    fn app_u_undoes_latest_copy_paste() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("alpha.txt");
+        let target_file = target_dir.join("alpha.txt");
+        fs::write(&source_file, "hello").expect("source file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.copy_selected();
+        app.current_pane_mut().expect("pane").cwd = target_dir;
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
+        app.paste_into_focused_pane().expect("paste");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .expect("undo shortcut");
+
+        assert!(source_file.exists());
+        assert!(!target_file.exists());
+        assert_eq!(app.status, "undid copy: 1 items");
+        assert_eq!(
+            app.trash_store.list_entries().expect("trash entries").len(),
+            1
+        );
+    }
+
+    #[test]
+    /// 驗證 `:undo` 可以把 cut/paste 的目的檔搬回原來源位置。
+    ///
+    /// 保護目的：命令與快捷鍵必須呼叫相同 Undo 核心，避免兩套入口行為不一致。
+    fn app_undo_command_reverses_cut_paste() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("beta.txt");
+        let target_file = target_dir.join("beta.txt");
+        fs::write(&source_file, "hello").expect("source file");
+
+        let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+        app.cut_selected();
+        app.current_pane_mut().expect("pane").cwd = target_dir;
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
+        app.paste_into_focused_pane().expect("paste");
+        app.execute_command("undo").expect("undo command");
+
+        assert!(source_file.exists());
+        assert!(!target_file.exists());
+        assert_eq!(app.status, "undid move: 1 items");
+    }
+
+    #[test]
+    /// 驗證覆蓋貼上後執行 Undo，會恢復目的地原內容而不是只移除新檔。
+    ///
+    /// 保護目的：覆蓋是最高風險操作，必須證明隱藏備份已接入 App 的完整流程。
+    fn app_undo_overwrite_paste_restores_previous_target() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        fs::write(source_dir.join("same.txt"), "new").expect("new source");
+        let target_file = target_dir.join("same.txt");
+        fs::write(&target_file, "old").expect("old target");
+
+        let mut app = App::new(source_dir, default_loaded_config()).expect("app");
+        app.copy_selected();
+        app.current_pane_mut().expect("pane").cwd = target_dir;
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload");
+        app.paste_into_focused_pane_with_overwrite()
+            .expect("overwrite paste");
+        app.undo_latest_file_operation().expect("undo overwrite");
+
+        assert_eq!(
+            fs::read_to_string(target_file).expect("restored target"),
+            "old"
+        );
+        assert_eq!(app.status, "undid copy: 1 items");
     }
 
     #[test]

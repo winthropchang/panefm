@@ -32,6 +32,20 @@ use super::{
 /// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
 static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// 描述一次貼上實際完成後，可供上層建立 Undo 紀錄的檔案系統結果。
+///
+/// `backup_path` 只會在覆蓋既有目標時存在；該路徑保存覆蓋前的原內容，所有權會交給
+/// `OperationHistory`。歷史被復原或淘汰前，上層不可提前刪除這個備份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PasteOutcome {
+    /// 畫面狀態列使用的貼上後名稱。
+    pub(crate) display_name: String,
+    /// 本次實際建立或移入的完整目的路徑。
+    pub(crate) target_path: PathBuf,
+    /// 覆蓋前原目標的隱藏備份；一般貼上時為 `None`。
+    pub(crate) backup_path: Option<PathBuf>,
+}
+
 /// 表示單一 pane 的完整瀏覽狀態。
 ///
 /// 每個 pane 都獨立維護自己的目錄、游標與列表狀態，
@@ -1179,11 +1193,12 @@ impl PaneState {
     /// 回傳：`io::Result<String>`。
     /// - 成功時回傳貼上後的顯示名稱。
     /// - 失敗時回傳檔案系統操作錯誤，例如目標已存在或無法讀寫。
+    #[cfg(test)]
     pub(crate) fn copy_entry_into_current_dir(&mut self, source_path: &Path) -> io::Result<String> {
-        let display_name = copy_path_into_dir(source_path, &self.cwd, false)?;
+        let outcome = copy_path_into_dir(source_path, &self.cwd, false, false)?;
         self.reload()?;
 
-        let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
+        let pasted_path = outcome.target_path.clone();
         if let Some(index) = self.visible_indices.iter().position(|visible_index| {
             self.entries
                 .get(*visible_index)
@@ -1194,7 +1209,22 @@ impl PaneState {
             self.list_state.select(Some(index));
         }
 
-        Ok(display_name)
+        Ok(outcome.display_name)
+    }
+
+    /// 複製項目並保留建立 Undo 所需的完整結果。
+    ///
+    /// 參數：`source_path: &Path`，要複製的來源檔案或資料夾。
+    /// 回傳：`io::Result<PasteOutcome>`；成功時包含實際目標與可能的覆蓋備份。
+    pub(crate) fn copy_entry_with_history(
+        &mut self,
+        source_path: &Path,
+        overwrite: bool,
+    ) -> io::Result<PasteOutcome> {
+        let outcome = copy_path_into_dir(source_path, &self.cwd, overwrite, true)?;
+        self.reload()?;
+        self.select_path(&outcome.target_path);
+        Ok(outcome)
     }
 
     /// 計算貼上操作實際會使用的完整目標路徑，但不建立或修改任何檔案。
@@ -1222,78 +1252,30 @@ impl PaneState {
         target_path_for_paste(source_path, &self.cwd, file_name, overwrite)
     }
 
-    /// 將外部來源的檔案或資料夾移動到目前 pane 的目錄中。
+    /// 移動項目並保留建立 Undo 所需的完整結果。
     ///
-    /// 參數：
-    /// - `self: &mut PaneState`，要接收新項目的目標 pane。
-    /// - `source_path: &Path`，原始檔案或資料夾路徑。
-    ///
-    /// 回傳：`io::Result<String>`。
-    /// - 成功時回傳貼上後的顯示名稱。
-    /// - 失敗時回傳檔案系統操作錯誤，例如目標已存在或來源不可用。
-    pub(crate) fn move_entry_into_current_dir(&mut self, source_path: &Path) -> io::Result<String> {
-        let display_name = move_path_into_dir(source_path, &self.cwd, false)?;
-        self.reload()?;
-
-        let moved_path = self.cwd.join(trimmed_display_name(&display_name));
-        if let Some(index) = self.visible_indices.iter().position(|visible_index| {
-            self.entries
-                .get(*visible_index)
-                .map(|candidate| candidate.path == moved_path)
-                .unwrap_or(false)
-        }) {
-            self.selected = index;
-            self.list_state.select(Some(index));
-        }
-
-        Ok(display_name)
-    }
-
-    /// 將來源檔案或資料夾移動到指定目錄，不要求目標目錄必須是目前 pane 的 cwd。
-    ///
-    /// 參數：
-    /// - `source_path: &Path`，要被移動的來源路徑。
-    /// - `target_dir: &Path`，要接收項目的目標目錄。
-    ///
-    /// 回傳：`io::Result<String>`。
-    /// - 成功時回傳移動後可用於顯示的名稱。
-    /// - 失敗時回傳檔案系統移動過程中的錯誤。
-    pub(crate) fn move_path_to_dir(source_path: &Path, target_dir: &Path) -> io::Result<String> {
-        move_path_into_dir(source_path, target_dir, false)
-    }
-
-    /// 將外部來源的檔案或資料夾覆蓋貼到目前 pane 的目錄中。
-    ///
-    /// 規則：
-    /// - 若目標不存在，就和一般貼上一樣直接建立。
-    /// - 若目標已存在，會先刪除目標，再把來源複製進來。
-    /// - 若來源本來就在同一個目錄中，則退回一般複製，避免覆蓋自己。
-    pub(crate) fn copy_entry_into_current_dir_overwrite(
+    /// 參數：`source_path: &Path`，要移動的來源檔案或資料夾；`overwrite: bool`，是否覆蓋。
+    /// 回傳：`io::Result<PasteOutcome>`；成功時包含目的路徑與覆蓋前備份。
+    pub(crate) fn move_entry_with_history(
         &mut self,
         source_path: &Path,
-    ) -> io::Result<String> {
-        let display_name = copy_path_into_dir(source_path, &self.cwd, true)?;
+        overwrite: bool,
+    ) -> io::Result<PasteOutcome> {
+        let outcome = move_path_into_dir(source_path, &self.cwd, overwrite, true)?;
         self.reload()?;
-        let pasted_path = self.cwd.join(trimmed_display_name(&display_name));
-        self.select_path(&pasted_path);
-        Ok(display_name)
+        self.select_path(&outcome.target_path);
+        Ok(outcome)
     }
 
-    /// 將外部來源的檔案或資料夾覆蓋移動到目前 pane 的目錄中。
+    /// 將來源移到指定目錄並回傳 Undo 所需結果，不要求目標是目前 panel。
     ///
-    /// 規則：
-    /// - 若目標不存在，就和一般移動一樣直接搬移。
-    /// - 若目標已存在，會先刪除目標，再把來源搬移進來。
-    /// - 若來源本來就在同一個目錄中，則不做任何事。
-    pub(crate) fn move_entry_into_current_dir_overwrite(
-        &mut self,
+    /// 參數：`source_path: &Path`，來源路徑；`target_dir: &Path`，目的目錄。
+    /// 回傳：`io::Result<PasteOutcome>`，成功時可直接寫入操作歷史。
+    pub(crate) fn move_path_to_dir_with_history(
         source_path: &Path,
-    ) -> io::Result<String> {
-        let display_name = move_path_into_dir(source_path, &self.cwd, true)?;
-        self.reload()?;
-        let moved_path = self.cwd.join(trimmed_display_name(&display_name));
-        self.select_path(&moved_path);
-        Ok(display_name)
+        target_dir: &Path,
+    ) -> io::Result<PasteOutcome> {
+        move_path_into_dir(source_path, target_dir, false, true)
     }
 
     /// 依照輸入路徑建立新項目。
@@ -2237,13 +2219,14 @@ fn copy_path_into_dir(
     source_path: &Path,
     target_dir: &Path,
     overwrite: bool,
-) -> io::Result<String> {
+    retain_backup: bool,
+) -> io::Result<PasteOutcome> {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
     let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
-    if overwrite {
-        copy_path_transactional(source_path, &target_path, true)?;
+    let backup_path = if overwrite {
+        copy_path_transactional_with_backup(source_path, &target_path, true, retain_backup)?
     } else {
         copy_path_direct_with_cleanup(source_path, &target_path, |source, target| {
             if source.is_dir() {
@@ -2252,13 +2235,19 @@ fn copy_path_into_dir(
                 copy_file_and_verify(source, target)
             }
         })?;
-    }
+        None
+    };
 
-    if source_path.is_dir() {
-        Ok(format!("{}/", target_path_file_name(&target_path)))
+    let display_name = if source_path.is_dir() {
+        format!("{}/", target_path_file_name(&target_path))
     } else {
-        Ok(target_path_file_name(&target_path))
-    }
+        target_path_file_name(&target_path)
+    };
+    Ok(PasteOutcome {
+        display_name,
+        target_path,
+        backup_path,
+    })
 }
 
 /// 直接複製到正式目標，失敗時清除本次建立的部分內容。
@@ -2319,22 +2308,79 @@ fn move_path_into_dir(
     source_path: &Path,
     target_dir: &Path,
     overwrite: bool,
-) -> io::Result<String> {
+    retain_backup: bool,
+) -> io::Result<PasteOutcome> {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
     let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
 
-    if overwrite && target_path.exists() {
-        remove_existing_target(&target_path)?;
+    let backup_path = (overwrite && target_path.exists())
+        .then(|| unique_transfer_path(&target_path, "undo-backup"));
+    if let Some(backup_path) = &backup_path {
+        fs::rename(&target_path, backup_path)?;
     }
-    fs::rename(source_path, &target_path)?;
+    if let Err(error) = fs::rename(source_path, &target_path) {
+        if let Some(backup_path) = &backup_path {
+            let _ = fs::rename(backup_path, &target_path);
+        }
+        return Err(error);
+    }
 
-    if target_path.is_dir() {
-        Ok(format!("{}/", target_path_file_name(&target_path)))
+    let display_name = if target_path.is_dir() {
+        format!("{}/", target_path_file_name(&target_path))
     } else {
-        Ok(target_path_file_name(&target_path))
+        target_path_file_name(&target_path)
+    };
+    let backup_path = if retain_backup {
+        backup_path
+    } else {
+        if let Some(backup_path) = &backup_path {
+            remove_transfer_path(backup_path)?;
+        }
+        None
+    };
+    Ok(PasteOutcome {
+        display_name,
+        target_path,
+        backup_path,
+    })
+}
+
+/// 執行交易式複製，並依需求把覆蓋前備份交給 Undo 歷史保存。
+///
+/// 參數：
+/// - `source_path: &Path`，來源路徑。
+/// - `target_path: &Path`，正式目標路徑。
+/// - `overwrite: bool`，是否允許覆蓋。
+/// - `retain_backup: bool`，成功後是否保留舊目標備份。
+///
+/// 回傳：`io::Result<Option<PathBuf>>`；有覆蓋且要求保留時回傳備份路徑。
+fn copy_path_transactional_with_backup(
+    source_path: &Path,
+    target_path: &Path,
+    overwrite: bool,
+    retain_backup: bool,
+) -> io::Result<Option<PathBuf>> {
+    let staged_path = unique_transfer_path(target_path, "part");
+    let copy_result = if source_path.is_dir() {
+        copy_dir_recursive(source_path, &staged_path)
+    } else {
+        copy_file_and_verify(source_path, &staged_path)
+    };
+    if let Err(error) = copy_result {
+        let _ = remove_transfer_path(&staged_path);
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "copy {} to {} failed: {error}",
+                source_path.display(),
+                target_path.display()
+            ),
+        ));
     }
+
+    commit_staged_copy(&staged_path, target_path, overwrite, retain_backup)
 }
 
 /// 依照是否允許覆蓋，決定貼上時真正要使用的目標路徑。
@@ -2373,6 +2419,7 @@ fn target_path_for_paste(
 ///
 /// 回傳：`io::Result<()>`；成功時正式路徑已完整可用，失敗時不會留下
 /// 只有部分內容的正式檔名，並會盡力清除內部暫存路徑。
+#[cfg(test)]
 fn copy_path_transactional(
     source_path: &Path,
     target_path: &Path,
@@ -2397,6 +2444,7 @@ fn copy_path_transactional(
 ///   `FnOnce(&Path, &Path) -> io::Result<()>`。
 ///
 /// 回傳：`io::Result<()>`，成功時已提交正式名稱；失敗時保留原目標並清理暫存資料。
+#[cfg(test)]
 fn copy_path_transactional_with<F>(
     source_path: &Path,
     target_path: &Path,
@@ -2419,7 +2467,7 @@ where
         ));
     }
 
-    if let Err(error) = commit_staged_copy(&staged_path, target_path, overwrite) {
+    if let Err(error) = commit_staged_copy(&staged_path, target_path, overwrite, false) {
         let _ = remove_transfer_path(&staged_path);
         return Err(error);
     }
@@ -2476,7 +2524,12 @@ fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()
 /// - `overwrite: bool`，是否允許替換既有目標。
 ///
 /// 回傳：`io::Result<()>`；提交失敗時會盡力把舊目標從備份改回原名。
-fn commit_staged_copy(staged_path: &Path, target_path: &Path, overwrite: bool) -> io::Result<()> {
+fn commit_staged_copy(
+    staged_path: &Path,
+    target_path: &Path,
+    overwrite: bool,
+    retain_backup: bool,
+) -> io::Result<Option<PathBuf>> {
     if target_path.exists() && !overwrite {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -2501,10 +2554,20 @@ fn commit_staged_copy(staged_path: &Path, target_path: &Path, overwrite: bool) -
         ));
     }
 
-    if let Some(backup_path) = backup_path {
-        remove_transfer_path(&backup_path)?;
+    if let Some(backup_path) = &backup_path
+        && !retain_backup
+    {
+        remove_transfer_path(backup_path)?;
     }
-    Ok(())
+    Ok(backup_path.filter(|_| retain_backup))
+}
+
+/// 清除 Undo 歷史不再需要的覆蓋備份。
+///
+/// 參數：`path: &Path`，由貼上結果交回的隱藏備份路徑。
+/// 回傳：`io::Result<()>`；路徑不存在時視為已清理完成。
+pub(crate) fn remove_undo_backup(path: &Path) -> io::Result<()> {
+    remove_transfer_path(path)
 }
 
 /// 在正式目標旁產生不衝突的隱藏暫存路徑。
@@ -2737,16 +2800,6 @@ fn parse_create_input(input: &str) -> io::Result<CreateRequest> {
         display_name,
         is_directory,
     })
-}
-
-/// 將畫面顯示用的名稱轉回實際檔案名稱，移除資料夾顯示用的尾端 `/`。
-///
-/// 參數：
-/// - `display_name: &str`，畫面上顯示的檔名。
-///
-/// 回傳：`&str`，可用來組合實際路徑的名稱。
-fn trimmed_display_name(display_name: &str) -> &str {
-    display_name.trim_end_matches('/')
 }
 
 /// 讀取指定目錄，並整理成可顯示的檔案項目清單。

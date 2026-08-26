@@ -14,6 +14,7 @@ mod fuzzy;
 mod fzf;
 mod layout;
 mod open;
+mod operation_history;
 mod pane;
 mod platform;
 mod rg;
