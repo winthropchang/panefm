@@ -8,9 +8,9 @@ use std::{
     cmp::Ordering,
     collections::BTreeSet,
     collections::hash_map::DefaultHasher,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     time::SystemTime,
@@ -2226,11 +2226,19 @@ where
         ));
     }
     if let Err(error) = copy_to_target(source_path, target_path) {
-        let _ = remove_transfer_path(target_path);
+        let cleanup_result = remove_transfer_path(target_path);
+        let cleanup_detail = cleanup_result
+            .err()
+            .map_or_else(String::new, |cleanup_error| {
+                format!(
+                    "; WARNING: partial target could not be removed: {} ({cleanup_error})",
+                    target_path.display()
+                )
+            });
         return Err(io::Error::new(
             error.kind(),
             format!(
-                "copy {} to {} failed: {error}",
+                "copy {} to {} failed: {error}{cleanup_detail}",
                 source_path.display(),
                 target_path.display()
             ),
@@ -2358,22 +2366,41 @@ where
     Ok(())
 }
 
-/// 複製單一檔案並比對來源與暫存檔大小，避免把不完整的 SMB 傳輸提交成正式檔案。
+/// 複製單一檔案，強制送出緩衝資料，並在關閉後重新確認目標大小。
+///
+/// 不能只依賴 `fs::copy` 的成功回傳：SMB 或網路磁碟可能先建立目標名稱，資料卻仍在
+/// 用戶端或伺服器緩衝區中。這裡明確執行 `flush` 與 `sync_all`，關閉寫入 handle 後再
+/// 重新開啟目標讀取 metadata，只有來源大小、實際寫入量與目標大小一致才算成功。
 ///
 /// 參數：
 /// - `source_path: &Path`，來源檔案。
-/// - `staged_path: &Path`，與正式目標位於相同目錄的暫存檔。
+/// - `staged_path: &Path`，要寫入的目標檔；可能是正式名稱或交易式暫存名稱。
 ///
-/// 回傳：`io::Result<()>`；成功代表複製 API 回報位元組數與兩端檔案大小一致。
+/// 回傳：`io::Result<()>`；成功代表資料已同步、寫入 handle 已關閉，且兩端大小一致。
 fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()> {
-    let expected_size = fs::metadata(source_path)?.len();
-    let copied_size = fs::copy(source_path, staged_path)?;
-    let staged_size = fs::metadata(staged_path)?.len();
-    if copied_size != expected_size || staged_size != expected_size {
+    let mut source_file = File::open(source_path)?;
+    let expected_size = source_file.metadata()?.len();
+    let mut target_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged_path)?;
+
+    let copied_size = io::copy(&mut source_file, &mut target_file)?;
+    target_file.flush()?;
+    target_file.sync_all()?;
+    drop(target_file);
+
+    let source_size_after_copy = source_file.metadata()?.len();
+    drop(source_file);
+    let stored_size = File::open(staged_path)?.metadata()?.len();
+    if copied_size != expected_size
+        || source_size_after_copy != expected_size
+        || stored_size != expected_size
+    {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             format!(
-                "incomplete copy: expected {expected_size} bytes, copied {copied_size}, stored {staged_size}"
+                "incomplete copy: expected {expected_size} bytes, source now {source_size_after_copy}, copied {copied_size}, stored {stored_size}"
             ),
         ));
     }
@@ -2467,13 +2494,13 @@ fn remove_existing_target(target_path: &Path) -> io::Result<()> {
     }
 }
 
-/// 遞迴複製整個資料夾，保留所有子目錄與檔案。
+/// 遞迴複製整個資料夾，並逐檔執行同步與完整性驗證。
 ///
 /// 參數：
 /// - `source_dir: &Path`，來源資料夾。
 /// - `target_dir: &Path`，目標資料夾。
 ///
-/// 回傳：`io::Result<()>`。
+/// 回傳：`io::Result<()>`；任一檔案未完整寫入就立即失敗，外層會清除整個 partial 目錄。
 fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
     fs::create_dir(target_dir)?;
 
@@ -2485,7 +2512,7 @@ fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
         if item.file_type()?.is_dir() {
             copy_dir_recursive(&item_path, &next_target)?;
         } else {
-            fs::copy(&item_path, &next_target)?;
+            copy_file_and_verify(&item_path, &next_target)?;
         }
     }
 
@@ -2733,7 +2760,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{PaneState, SortMode, copy_path_direct_with_cleanup, copy_path_transactional_with};
+    use super::{
+        PaneState, SortMode, copy_file_and_verify, copy_path_direct_with_cleanup,
+        copy_path_transactional_with,
+    };
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
     use crate::theme::Theme;
@@ -2991,6 +3021,56 @@ mod tests {
 
         assert_eq!(
             result.expect_err("copy must fail").kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    /// 驗證可靠複製會完整寫入資料，且回傳前已關閉目標檔案 handle。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若內容不一致或 Windows 因 handle 尚未關閉而無法改名，測試就會失敗。
+    /// 保護目的：避免未來改回單純 `fs::copy`，導致 SMB 尚未 flush/close 就被 UI 視為成功。
+    fn verified_file_copy_is_complete_and_closed_before_returning() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target = dir.path().join("target.zip");
+        let renamed = dir.path().join("renamed.zip");
+        fs::write(&source, b"complete zip bytes").expect("source");
+
+        copy_file_and_verify(&source, &target).expect("verified copy");
+        fs::rename(&target, &renamed).expect("target handle must be closed");
+
+        assert_eq!(
+            fs::read(&renamed).expect("renamed target content"),
+            b"complete zip bytes"
+        );
+    }
+
+    #[test]
+    /// 模擬資料夾傳輸建立數個 partial 子項目後失敗，驗證整棵未完成目錄會被清除。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若目標資料夾或其中任何 partial 檔案仍存在，測試就會失敗。
+    /// 保護目的：避免單檔清理正常、但 SMB 資料夾貼上失敗時仍留下殘缺目錄佔用名稱。
+    fn direct_directory_copy_failure_removes_partial_tree() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+
+        let result = copy_path_direct_with_cleanup(&source, &target, |_, target| {
+            fs::create_dir_all(target.join("nested"))?;
+            fs::write(target.join("nested").join("partial.zip"), b"partial")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated SMB disconnect",
+            ))
+        });
+
+        assert_eq!(
+            result.expect_err("directory copy must fail").kind(),
             std::io::ErrorKind::ConnectionReset
         );
         assert!(!target.exists());
