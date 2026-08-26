@@ -984,6 +984,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "unicode-width",
  "zip",
 ]
 

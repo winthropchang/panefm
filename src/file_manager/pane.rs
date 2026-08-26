@@ -1161,6 +1161,31 @@ impl PaneState {
         Ok(display_name)
     }
 
+    /// 計算貼上操作實際會使用的完整目標路徑，但不建立或修改任何檔案。
+    ///
+    /// 這個方法讓上層在貼上失敗時能顯示真正的 destination，而不是只顯示目標目錄。
+    /// 一般貼上若遇到同名項目，結果會包含 `copy` / `copy 2` 等實際名稱；覆蓋貼上則
+    /// 回傳原始檔名。計算規則與真正執行 copy/move 的底層共用，避免錯誤訊息誤導使用者。
+    ///
+    /// 參數：
+    /// - `self: &PaneState`，提供目前 pane 的目標目錄。
+    /// - `source_path: &Path`，準備貼上的來源檔案或資料夾。
+    /// - `overwrite: bool`，是否使用無條件覆蓋規則。
+    ///
+    /// 回傳：`io::Result<PathBuf>`。
+    /// - 成功時回傳本次操作預計使用的完整目標路徑。
+    /// - 失敗時代表來源路徑沒有可用檔名，無法建立目標路徑。
+    pub(crate) fn planned_paste_target(
+        &self,
+        source_path: &Path,
+        overwrite: bool,
+    ) -> io::Result<PathBuf> {
+        let file_name = source_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
+        })?;
+        target_path_for_paste(source_path, &self.cwd, file_name, overwrite)
+    }
+
     /// 將外部來源的檔案或資料夾移動到目前 pane 的目錄中。
     ///
     /// 參數：
@@ -2918,6 +2943,24 @@ mod tests {
         assert_eq!(second_copy, "alpha copy 2.txt");
         assert!(dir.path().join("alpha copy.txt").exists());
         assert!(dir.path().join("alpha copy 2.txt").exists());
+    }
+
+    #[test]
+    /// 驗證貼上前取得的預計目標路徑與同名複製規則完全一致。
+    /// 保護目的：避免錯誤訊息顯示原始檔名，但實際失敗位置是 `copy` 名稱而誤導 SMB 除錯。
+    fn pane_state_planned_paste_target_uses_actual_duplicate_name() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, "hello").expect("file");
+        fs::write(dir.path().join("alpha copy.txt"), "existing").expect("existing copy");
+        let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+
+        let planned = pane
+            .planned_paste_target(&file_path, false)
+            .expect("planned target");
+
+        assert_eq!(planned, dir.path().join("alpha copy 2.txt"));
+        assert!(!planned.exists());
     }
 
     #[test]

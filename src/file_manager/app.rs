@@ -30,6 +30,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use regex::Regex;
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     config::{AppConfig, LoadedConfig, StartupSort, persist_theme},
@@ -7962,6 +7963,17 @@ impl App {
                 continue;
             }
 
+            // 在真正執行前先保存目標名稱；失敗後檔案可能已被清理，不能再靠目錄內容
+            // 推測目的地。這也確保同名複製時能顯示實際的 `copy` 名稱。
+            let planned_target = self
+                .panes
+                .get(&self.focused_pane)
+                .and_then(|pane| {
+                    pane.planned_paste_target(&entry.source_path, overwrite)
+                        .ok()
+                })
+                .unwrap_or_else(|| target_dir.join(&entry.display_name));
+
             let paste_result = match self.panes.get_mut(&self.focused_pane) {
                 Some(pane) => match clipboard.operation {
                     ClipboardOperation::Copy if overwrite => {
@@ -7982,7 +7994,7 @@ impl App {
             };
 
             if let Err(error) = paste_result {
-                self.status = format!("paste failed for {}: {error}", entry.display_name);
+                self.status = paste_failure_status(&entry.display_name, &planned_target, &error);
                 return Ok(());
             }
 
@@ -8290,13 +8302,37 @@ impl App {
     }
 
     /// 根據目前應用程式狀態繪製整個畫面。
+    ///
+    /// 繪製前會先依 terminal cell 寬度切割狀態文字，再動態計算 status area 高度。
+    /// 這讓一般通知仍只占一行，而貼上失敗的完整 destination 與 OS error 可以依實際
+    /// 長度展開成多行，不會因終端視窗較窄而遺失錯誤尾端。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，提供目前 panel、輸入模式、狀態文字及 theme 等畫面狀態。
+    /// - `frame: &mut ratatui::Frame<'_>`，ratatui 本次更新可使用的繪圖 frame。
+    ///
+    /// 回傳：`()`；畫面內容會直接寫入傳入的 `frame`。
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let raw_status_text = if self.command_mode {
+            format!(":{}", self.command_buffer)
+        } else {
+            self.status.clone()
+        };
+        let status_text = wrap_status_text(&raw_status_text, frame.area().width);
+        let status_style = if self.command_mode {
+            Style::default()
+        } else if status_is_error(&raw_status_text) {
+            self.theme.danger_style()
+        } else {
+            Style::default()
+        };
+        let status_height = status_area_height(&status_text, frame.area().height.saturating_sub(3));
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(2),
-                Constraint::Length(1),
+                Constraint::Length(status_height),
             ])
             .split(frame.area());
 
@@ -8658,18 +8694,6 @@ impl App {
         .block(Block::default().borders(Borders::TOP));
         frame.render_widget(help, outer[1]);
 
-        let status_text = if self.command_mode {
-            format!(":{}", self.command_buffer)
-        } else {
-            self.status.clone()
-        };
-        let status_style = if self.command_mode {
-            Style::default()
-        } else if status_is_error(&status_text) {
-            self.theme.danger_style()
-        } else {
-            Style::default()
-        };
         frame.render_widget(Paragraph::new(status_text).style(status_style), outer[2]);
 
         if self.command_mode
@@ -9642,6 +9666,71 @@ fn zoxide_list_status(query: &str, count: usize, selected: usize, editing: bool)
     }
 }
 
+/// 建立貼上失敗時供 status area 顯示的完整診斷訊息。
+///
+/// 第一行只描述失敗的來源項目，讓使用者能快速辨識是哪一筆操作；第二行保留完整
+/// destination 與作業系統錯誤。UI 會依終端寬度自動換行，因此 UNC/SMB 長路徑即使
+/// 需要三行以上也不會遺失尾端最重要的 OS error。
+///
+/// 參數：
+/// - `source_name: &str`，貼上來源的顯示名稱。
+/// - `destination: &Path`，本次操作實際預計使用的完整目標路徑。
+/// - `error: &io::Error`，底層檔案系統或作業系統回傳的原始錯誤。
+///
+/// 回傳：`String`，含明確換行及完整診斷資訊的狀態文字。
+fn paste_failure_status(source_name: &str, destination: &Path, error: &io::Error) -> String {
+    format!(
+        "paste failed for {source_name}\ndestination: {} | OS error: {error}",
+        destination.display()
+    )
+}
+
+/// 依終端 cell 寬度把 status 文字預先切成實際要繪製的多行內容。
+///
+/// 不直接使用 Rust 字串長度，因為中文等寬字元通常占兩個 terminal cell。預先換行後
+/// 再交給 `Paragraph`，可確保高度計算與真正畫面使用完全相同的內容，也避免 ratatui
+/// 私有的 rendered-line API。長路徑會按 cell 邊界切開，不會因為沒有空白而被截斷。
+///
+/// 參數：
+/// - `status: &str`，準備顯示的完整狀態文字，可包含換行。
+/// - `width: u16`，status area 可使用的終端欄寬。
+///
+/// 回傳：`String`，已插入必要換行、可直接交給 `Paragraph` 的文字。
+fn wrap_status_text(status: &str, width: u16) -> String {
+    let max_width = usize::from(width.max(1));
+    let mut wrapped = Vec::new();
+
+    for logical_line in status.split('\n') {
+        let mut current = String::new();
+        let mut current_width = 0usize;
+
+        for character in logical_line.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if current_width > 0 && current_width.saturating_add(character_width) > max_width {
+                wrapped.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(character);
+            current_width = current_width.saturating_add(character_width);
+        }
+        wrapped.push(current);
+    }
+
+    wrapped.join("\n")
+}
+
+/// 計算已換行 status 內容應占用的畫面高度。
+///
+/// 參數：
+/// - `wrapped_status: &str`，經 `wrap_status_text` 處理後的狀態文字。
+/// - `max_height: u16`，扣除主列表最低高度與快捷鍵區後可使用的最大高度。
+///
+/// 回傳：`u16`，至少一行且不超過可用畫面的 status area 高度。
+fn status_area_height(wrapped_status: &str, max_height: u16) -> u16 {
+    let required = wrapped_status.split('\n').count().max(1) as u16;
+    required.min(max_height.max(1))
+}
+
 /// 判斷狀態列文字是否代表錯誤或目前操作無法執行。
 ///
 /// 參數：
@@ -9663,6 +9752,7 @@ fn status_is_error(status: &str) -> bool {
         "cannot",
         "nothing selected",
         "panel no longer exists",
+        "paste failed",
         "rename-regex: resolve conflicts",
         "rename-regex: nothing to apply",
     ]
@@ -11083,6 +11173,58 @@ mod tests {
         assert!(!super::status_is_error("opened directory"));
         assert!(!super::status_is_error("rename-regex: renamed 2 items"));
         assert!(!super::status_is_error("trash cancelled: note.txt"));
+    }
+
+    #[test]
+    /// 驗證貼上錯誤會把摘要與完整診斷拆行，並保留 destination 及原始 OS error。
+    /// 保護目的：避免 SMB/UNC 長路徑再次把最重要的錯誤尾端截掉，導致公司環境無法除錯。
+    fn paste_failure_status_preserves_destination_and_os_error() {
+        let destination =
+            std::path::Path::new(r"\\server\shared\department\release\large-archive.zip");
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access is denied. (os error 5)",
+        );
+
+        let status = super::paste_failure_status("large-archive.zip", destination, &error);
+        let mut lines = status.lines();
+
+        assert_eq!(lines.next(), Some("paste failed for large-archive.zip"));
+        let detail = lines.next().expect("diagnostic detail line");
+        assert!(detail.contains(destination.to_string_lossy().as_ref()));
+        assert!(detail.contains("OS error: Access is denied. (os error 5)"));
+        assert_eq!(lines.next(), None);
+        assert!(super::status_is_error(&status));
+    }
+
+    #[test]
+    /// 驗證長錯誤會依終端寬度增加 status area，高度不足時則遵守畫面上限。
+    /// 保護目的：避免 layout 重構後又把 status 固定成一行，或讓錯誤區吃掉整個檔案列表。
+    fn status_area_height_wraps_long_errors_and_preserves_short_notifications() {
+        let long_error = concat!(
+            "paste failed for archive.zip\n",
+            "destination: \\\\server\\shared\\department\\release\\archive.zip | ",
+            "OS error: The network name cannot be found. (os error 67)"
+        );
+
+        let short_status = super::wrap_status_text("opened directory", 80);
+        let wrapped_error = super::wrap_status_text(long_error, 40);
+        let narrow_error = super::wrap_status_text(long_error, 20);
+
+        assert_eq!(super::status_area_height(&short_status, 20), 1);
+        assert!(super::status_area_height(&wrapped_error, 20) >= 3);
+        assert_eq!(super::status_area_height(&narrow_error, 2), 2);
+        assert!(wrapped_error.contains("OS error"));
+    }
+
+    #[test]
+    /// 驗證 status 換行使用 terminal cell 寬度，而不是 UTF-8 byte 或 Unicode 字元數。
+    /// 保護目的：公司 SMB 路徑可能包含中文，必須避免配置高度不足而截掉錯誤內容。
+    fn status_wrapping_accounts_for_wide_cjk_characters() {
+        let wrapped = super::wrap_status_text("錯誤位置", 4);
+
+        assert_eq!(wrapped, "錯誤\n位置");
+        assert_eq!(super::status_area_height(&wrapped, 10), 2);
     }
 
     #[test]
