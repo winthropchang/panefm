@@ -62,6 +62,11 @@ pub(crate) struct PaneState {
     pub(crate) line_mode: Option<LineMode>,
     /// 隨機排序時使用的種子，讓每次重新套用時都能洗牌。
     pub(crate) random_seed: u64,
+    /// 目前這個 panel 是否以放大的 preview 取代檔案列表。
+    ///
+    /// 這個開關必須跟著 `PaneState` 保存，不能放在 `App` 的全域欄位；否則在第二個
+    /// panel 打開 preview 時，第一個 panel 的 preview 會被同一個全域值覆蓋。
+    pub(crate) preview_active: bool,
     /// 目前 preview 在內容中的捲動偏移量。
     pub(crate) preview_scroll: usize,
     /// 目前 preview 區實際可顯示的列數，供捲動邏輯計算上下界。
@@ -196,6 +201,7 @@ impl PaneState {
             sort_mode: SortMode::Natural { reverse: false },
             line_mode: None,
             random_seed,
+            preview_active: false,
             preview_scroll: 0,
             preview_viewport_height: 4,
             preview_search_query: None,
@@ -205,6 +211,36 @@ impl PaneState {
         };
         pane.reload()?;
         Ok(pane)
+    }
+
+    /// 判斷目前 panel 是否正在顯示放大的 preview。
+    ///
+    /// 參數：無。
+    ///
+    /// 回傳：`bool`；`true` 代表 preview 已取代這個 panel 的檔案列表，`false`
+    /// 代表顯示一般列表。每個 `PaneState` 都有自己的值，因此切換 panel 不會互相影響。
+    pub(crate) fn is_preview_active(&self) -> bool {
+        self.preview_active
+    }
+
+    /// 明確設定目前 panel 的 preview 顯示狀態。
+    ///
+    /// 參數：
+    /// - `active: bool`，`true` 表示打開 preview，`false` 表示回到一般列表。
+    ///
+    /// 回傳：`()`；只更新目前 `PaneState`，不會修改其他 panel。
+    pub(crate) fn set_preview_active(&mut self, active: bool) {
+        self.preview_active = active;
+    }
+
+    /// 切換目前 panel 的 preview 顯示狀態，並回傳切換後的結果。
+    ///
+    /// 參數：無。
+    ///
+    /// 回傳：`bool`；`true` 代表切換後已打開 preview，`false` 代表切換後已關閉。
+    pub(crate) fn toggle_preview_active(&mut self) -> bool {
+        self.preview_active = !self.preview_active;
+        self.preview_active
     }
 
     /// 重新掃描目前目錄，並同步更新列表與游標位置。

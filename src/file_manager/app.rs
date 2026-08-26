@@ -449,7 +449,6 @@ pub(crate) struct App {
     pub(crate) help_return: Option<HelpReturnState>,
     pub(crate) pending_launch: Option<QueuedLaunch>,
     pub(crate) pending_fzf_jump: Option<FzfJumpRequest>,
-    pub(crate) preview_focus: Option<usize>,
     pub(crate) task_log: Vec<TaskRecord>,
     pub(crate) next_task_id: usize,
     /// 非阻塞記錄瀏覽目錄，避免同步啟動 zoxide 拖慢 TUI。
@@ -554,7 +553,6 @@ impl App {
             help_return: None,
             pending_launch: None,
             pending_fzf_jump: None,
-            preview_focus: None,
             task_log: Vec::new(),
             next_task_id: 1,
             zoxide_tracker,
@@ -835,7 +833,11 @@ impl App {
             self.split_current(SplitDirection::Vertical)?;
             return Ok(true);
         }
-        if self.preview_focus == Some(self.focused_pane) {
+        if self
+            .panes
+            .get(&self.focused_pane)
+            .is_some_and(PaneState::is_preview_active)
+        {
             return self.handle_preview_key(key);
         }
         if self.capture_pending_count_digit(&key) {
@@ -1275,7 +1277,7 @@ impl App {
                 self.pending_g = false;
                 return Ok(true);
             }
-            self.preview_focus = None;
+            self.current_pane_mut()?.set_preview_active(false);
             self.reset_pending_motion_state();
             self.status = String::from("normal mode");
             return Ok(true);
@@ -1320,7 +1322,7 @@ impl App {
                     self.pending_g = false;
                     return Ok(true);
                 }
-                self.preview_focus = None;
+                self.current_pane_mut()?.set_preview_active(false);
                 self.reset_pending_motion_state();
                 self.status = String::from("normal mode");
             }
@@ -1664,13 +1666,19 @@ impl App {
             return Ok(true);
         }
 
-        if self.preview_focus == Some(search.pane_id) && matches!(search.mode, SearchMode::Content)
+        if self
+            .panes
+            .get(&search.pane_id)
+            .is_some_and(PaneState::is_preview_active)
+            && matches!(search.mode, SearchMode::Content)
         {
             match key.code {
                 KeyCode::Tab => {
                     self.clear_pending_count();
                     self.pending_g = false;
-                    self.preview_focus = None;
+                    if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                        pane.set_preview_active(false);
+                    }
                     self.status = global_search_status(
                         search.mode,
                         &search.buffer,
@@ -1685,7 +1693,9 @@ impl App {
                 KeyCode::Esc => {
                     self.clear_pending_count();
                     self.pending_g = false;
-                    self.preview_focus = None;
+                    if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                        pane.set_preview_active(false);
+                    }
                     self.status = global_search_status(
                         search.mode,
                         &search.buffer,
@@ -1702,7 +1712,9 @@ impl App {
                 _ if key_matches_plain_letter(&key, 'h') => {
                     self.clear_pending_count();
                     self.pending_g = false;
-                    self.preview_focus = None;
+                    if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                        pane.set_preview_active(false);
+                    }
                     self.status = global_search_status(
                         search.mode,
                         &search.buffer,
@@ -1961,7 +1973,9 @@ impl App {
             _ if key_matches_plain_letter(&key, 'f') => {
                 self.clear_pending_count();
                 self.pending_g = false;
-                self.preview_focus = None;
+                if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                    pane.set_preview_active(false);
+                }
                 search.filter.editing = true;
                 self.text_input_mode = RenameMode::Insert;
                 self.text_input_cursor = search.filter.buffer.chars().count();
@@ -1983,7 +1997,9 @@ impl App {
             KeyCode::Tab if matches!(search.mode, SearchMode::Content) => {
                 self.clear_pending_count();
                 self.pending_g = false;
-                self.preview_focus = Some(search.pane_id);
+                if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                    pane.set_preview_active(true);
+                }
                 self.status = self.search_preview_status_for(&search);
                 self.global_search = Some(search);
             }
@@ -5082,9 +5098,6 @@ impl App {
             if let Some(layout) = self.layout.clone().close_pane(old_focus) {
                 self.layout = layout;
                 self.panes.remove(&old_focus);
-                if self.preview_focus == Some(old_focus) {
-                    self.preview_focus = None;
-                }
                 if self
                     .global_search
                     .as_ref()
@@ -5103,9 +5116,6 @@ impl App {
         let focused = self.focused_pane;
         self.panes.retain(|id, _| *id == focused);
         self.layout = LayoutNode::Leaf { pane_id: focused };
-        if self.preview_focus != Some(focused) {
-            self.preview_focus = None;
-        }
         if self
             .global_search
             .as_ref()
@@ -5847,8 +5857,11 @@ impl App {
         if let Some(prompt) = self.pending_bookmark.take() {
             return Some(HelpReturnState::PendingBookmark(prompt));
         }
-        if let Some(pane_id) = self.preview_focus {
-            return Some(HelpReturnState::PreviewFocus(pane_id));
+        if let Some(pane) = self.panes.get_mut(&self.focused_pane)
+            && pane.is_preview_active()
+        {
+            pane.set_preview_active(false);
+            return Some(HelpReturnState::PreviewFocus(self.focused_pane));
         }
         None
     }
@@ -5915,8 +5928,12 @@ impl App {
                 };
             }
             HelpReturnState::PreviewFocus(pane_id) => {
-                self.preview_focus = Some(pane_id);
-                self.status = String::from("preview mode");
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.set_preview_active(true);
+                    self.status = String::from("preview mode");
+                } else {
+                    self.status = String::from("panel no longer exists");
+                }
             }
         }
 
@@ -6293,19 +6310,26 @@ impl App {
         Ok(())
     }
 
-    /// 進入 preview mode，讓目前焦點 pane 的預覽區放大並接手捲動按鍵。
+    /// 切換目前焦點 panel 自己的 preview mode。
+    ///
+    /// 參數：
+    /// - `self: &mut App`，包含 panel 集合與目前焦點的應用程式狀態。
+    ///
+    /// 回傳：`()`；只切換 `focused_pane` 對應的 `PaneState::preview_active`，其他
+    /// panel 已開啟的 preview 會保持原狀。若焦點 panel 已不存在，會在狀態列顯示錯誤。
     pub(crate) fn open_preview_focus(&mut self) {
-        if self.preview_focus == Some(self.focused_pane) {
-            self.preview_focus = None;
-            self.pending_g = false;
-            self.pending_y = false;
-            self.status = String::from("normal mode");
+        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
+            self.status = String::from("panel no longer exists");
             return;
-        }
-        self.preview_focus = Some(self.focused_pane);
+        };
+        let preview_active = pane.toggle_preview_active();
         self.pending_g = false;
         self.pending_y = false;
-        self.status = String::from("preview mode");
+        self.status = if preview_active {
+            String::from("preview mode")
+        } else {
+            String::from("normal mode")
+        };
     }
 
     /// 打開 preview search 輸入框，並清空上一次的搜尋字串。
@@ -7547,9 +7571,8 @@ impl App {
             return true;
         }
 
-        if let Some(pane) = self
-            .preview_focus
-            .and_then(|pane_id| self.panes.get_mut(&pane_id))
+        if let Some(pane) = self.panes.get_mut(&self.focused_pane)
+            && pane.is_preview_active()
             && pane.has_preview_search()
         {
             pane.clear_preview_search();
@@ -7618,12 +7641,12 @@ impl App {
 
     /// 在 preview mode 中跳到下一個或上一個搜尋結果，並回傳狀態訊息。
     fn jump_preview_match(&mut self, forward: bool, count: usize) -> io::Result<String> {
-        let Some(pane) = self
-            .preview_focus
-            .and_then(|pane_id| self.panes.get_mut(&pane_id))
-        else {
+        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
             return Ok(String::from("panel no longer exists"));
         };
+        if !pane.is_preview_active() {
+            return Ok(String::from("preview mode is not active"));
+        }
 
         let Some(query) = pane.preview_search_query().map(str::to_string) else {
             return Ok(String::from("preview search is empty"));
@@ -7673,7 +7696,9 @@ impl App {
         }
         self.cancel_global_search_worker();
         self.global_search = None;
-        self.preview_focus = None;
+        if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+            pane.set_preview_active(false);
+        }
         self.status = format!("search opened: {}", entry.relative_path);
         Ok(())
     }
@@ -8583,13 +8608,14 @@ impl App {
                 } else {
                     None
                 };
+                let preview_active = pane.is_preview_active();
                 let pane_cursor = render_pane(
                     frame,
                     rect,
                     pane_id,
                     pane,
                     pane_id == self.focused_pane,
-                    self.preview_focus == Some(pane_id),
+                    preview_active,
                     self.visual_selection.as_ref().and_then(|selection| {
                         (selection.pane_id == pane_id)
                             .then_some((selection.anchor, selection.current))
@@ -12755,7 +12781,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("open preview with tab");
 
-        assert_eq!(app.preview_focus, Some(1));
+        assert!(app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(app.status, "preview mode");
     }
 
@@ -15202,7 +15228,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("open preview");
-        assert_eq!(app.preview_focus, Some(1));
+        assert!(app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(app.status, "preview mode");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
@@ -15215,7 +15241,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("leave preview");
-        assert_eq!(app.preview_focus, None);
+        assert!(!app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(app.status, "normal mode");
     }
 
@@ -15230,12 +15256,12 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("open preview");
-        assert_eq!(app.preview_focus, Some(1));
+        assert!(app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(app.status, "preview mode");
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .expect("toggle preview off");
-        assert_eq!(app.preview_focus, None);
+        assert!(!app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(app.status, "normal mode");
     }
 
@@ -15362,13 +15388,13 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("clear search");
-        assert_eq!(app.preview_focus, Some(1));
+        assert!(app.panes.get(&1).expect("pane").is_preview_active());
         assert!(!app.panes.get(&1).expect("pane").has_preview_search());
         assert_eq!(app.status, "preview search cleared");
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("leave preview");
-        assert_eq!(app.preview_focus, None);
+        assert!(!app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(app.status, "normal mode");
     }
 
@@ -15528,8 +15554,9 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 preview 狀態只屬於原本的 pane，切到其他 pane 不會被強制進入 preview mode。
-    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
+    /// 驗證三個 panel 可以各自打開 preview，且關閉其中一個不會影響另外兩個。
+    /// 保護目的：防止 preview 開關退回 `App` 全域單一狀態，造成後開啟的 panel 關掉
+    /// 其他 panel 已顯示的 preview。
     fn app_preview_mode_is_scoped_to_its_own_pane() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
@@ -15540,17 +15567,27 @@ mod tests {
         assert_eq!(app.focused_pane, 2);
 
         app.open_preview_focus();
-        assert_eq!(app.preview_focus, Some(2));
+        assert!(app.panes.get(&2).expect("panel 2").is_preview_active());
 
         app.focus_pane_by_id(1);
-        assert_eq!(app.focused_pane, 1);
-        assert_eq!(app.preview_focus, Some(2));
+        app.open_preview_focus();
+        assert!(app.panes.get(&1).expect("panel 1").is_preview_active());
+        assert!(app.panes.get(&2).expect("panel 2").is_preview_active());
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-            .expect("move in normal mode");
+        app.split_current(SplitDirection::Horizontal)
+            .expect("split third panel");
+        app.open_preview_focus();
+        assert_eq!(app.focused_pane, 3);
+        assert!(app.panes.get(&1).expect("panel 1").is_preview_active());
+        assert!(app.panes.get(&2).expect("panel 2").is_preview_active());
+        assert!(app.panes.get(&3).expect("panel 3").is_preview_active());
 
-        assert_eq!(app.panes.get(&1).expect("pane").selected, 1);
-        assert_eq!(app.panes.get(&2).expect("pane").preview_scroll, 0);
+        app.focus_pane_by_id(2);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("close only panel 2 preview");
+        assert!(app.panes.get(&1).expect("panel 1").is_preview_active());
+        assert!(!app.panes.get(&2).expect("panel 2").is_preview_active());
+        assert!(app.panes.get(&3).expect("panel 3").is_preview_active());
     }
 
     #[test]
@@ -15976,7 +16013,7 @@ mod tests {
             .expect("open search result");
 
         assert!(app.global_search.is_none());
-        assert_eq!(app.preview_focus, None);
+        assert!(!app.panes.get(&1).expect("pane").is_preview_active());
         let pane = app.panes.get(&1).expect("pane");
         assert_eq!(
             pane.selected_entry().map(|entry| entry.display_name()),
@@ -16008,7 +16045,7 @@ mod tests {
             .expect("open by right");
 
         assert!(app.global_search.is_none());
-        assert_eq!(app.preview_focus, None);
+        assert!(!app.panes.get(&1).expect("pane").is_preview_active());
         let pane = app.panes.get(&1).expect("pane");
         assert_eq!(
             pane.selected_entry().map(|entry| entry.display_name()),
@@ -16188,7 +16225,7 @@ mod tests {
         assert!(app.global_search.is_none());
         assert!(app.global_search_rx.is_none());
         assert!(app.active_global_search_task_id.is_none());
-        assert_eq!(app.preview_focus, None);
+        assert!(!app.panes.get(&1).expect("pane").is_preview_active());
         assert_eq!(
             app.panes
                 .get(&1)
