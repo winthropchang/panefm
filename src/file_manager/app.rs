@@ -8742,10 +8742,11 @@ impl App {
 
         if let Some(filter) = &self.filter
             && filter.editing
+            && let Some(area) = pane_rects.get(&filter.pane_id)
         {
             let filter_cursor = render_filter_input(
                 frame,
-                outer[0],
+                *area,
                 self.theme,
                 &filter.buffer,
                 self.text_input_cursor,
@@ -8757,10 +8758,11 @@ impl App {
 
         if let Some(search) = &self.preview_search
             && search.editing
+            && let Some(area) = pane_rects.get(&search.pane_id)
         {
             let search_cursor = render_preview_search_input(
                 frame,
-                outer[0],
+                *area,
                 self.theme,
                 &search.buffer,
                 self.text_input_cursor,
@@ -11185,6 +11187,7 @@ mod tests {
         theme::{Theme, ThemePreset},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
     use std::{fs, thread, time::Duration};
 
     #[test]
@@ -14987,6 +14990,53 @@ mod tests {
         );
         assert!(app.filter.as_ref().is_some_and(|filter| filter.editing));
         assert_eq!(app.text_input_mode, RenameMode::Normal);
+    }
+
+    #[test]
+    /// 驗證一般 Filter 與 Preview Search 都會畫在其狀態所屬的左側 Panel 內。
+    /// 保護目的：避免繪圖重構時重新使用全畫面 `frame.area()`，導致多 Panel 的輸入框
+    /// 跑到整個 terminal 右上角，或覆蓋其他 Panel。
+    fn app_filter_inputs_render_inside_their_target_panel() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "alpha").expect("alpha");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        app.focus_pane_by_id(1);
+        assert_eq!(app.focused_pane, 1);
+
+        app.open_filter_input();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render panel filter");
+        let filter_x = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .position(|cell| cell.symbol() == "F")
+            .map(|index| index % 80)
+            .expect("Filter title");
+        assert!(filter_x < 40, "Filter must stay in panel 1");
+
+        app.filter = None;
+        app.open_preview_focus();
+        app.open_preview_search_input();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render preview search");
+        let preview_search_x = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| {
+                (cell.symbol() == "P" && index / 80 < 4).then_some(index % 80)
+            })
+            .expect("Preview Search title");
+        assert!(preview_search_x < 40, "Preview Search must stay in panel 1");
     }
 
     #[test]

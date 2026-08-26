@@ -933,13 +933,7 @@ fn render_top_right_input(
     buffer: &str,
     cursor: usize,
 ) -> (u16, u16) {
-    let width = area.width.min(32).max(18);
-    let input_area = Rect {
-        x: area.x + area.width.saturating_sub(width + 1),
-        y: area.y + 1,
-        width,
-        height: 3,
-    };
+    let input_area = top_right_input_rect(area);
 
     frame.render_widget(Clear, input_area);
     let input_block = Block::default()
@@ -963,6 +957,32 @@ fn render_top_right_input(
         ),
         input_inner.y,
     )
+}
+
+/// 計算 Panel 右上角短文字輸入框的實際範圍，並保證結果不會超出 Panel。
+///
+/// 一般寬度會保留 Panel 右側一欄空間並使用最多 32 欄；當多重分割讓 Panel
+/// 小於預期寬度時，輸入框會跟著縮小，而不是覆蓋相鄰 Panel。高度也採相同規則，
+/// 因此極小的 Panel 仍不會畫到自身邊界以外。
+///
+/// 參數：
+/// - `area: Rect`，擁有這個輸入 UI 的 Panel 完整畫面範圍。
+///
+/// 回傳：`Rect`，限制在 `area` 內、靠右上方的輸入框範圍。
+fn top_right_input_rect(area: Rect) -> Rect {
+    let right_margin = u16::from(area.width > 1);
+    let top_margin = u16::from(area.height > 1);
+    let width = area.width.saturating_sub(right_margin).min(32);
+    let height = area.height.saturating_sub(top_margin).min(3);
+
+    Rect {
+        x: area
+            .x
+            .saturating_add(area.width.saturating_sub(width + right_margin)),
+        y: area.y.saturating_add(top_margin),
+        width,
+        height,
+    }
 }
 
 /// 在畫面右上方繪製 filter 輸入框，並回傳游標應該停留的位置。
@@ -1924,8 +1944,9 @@ mod tests {
     use super::{
         FileCategory, IconStyle, SearchListState, entry_icon, file_category, format_pane_title,
         format_permissions_detail, format_size_short, regex_rename_status_style,
-        search_empty_message, search_list_selected_index,
+        search_empty_message, search_list_selected_index, top_right_input_rect,
     };
+    use ratatui::layout::Rect;
     use std::path::Path;
     use std::time::SystemTime;
 
@@ -1946,6 +1967,33 @@ mod tests {
             readonly: false,
             unix_mode: None,
         }
+    }
+
+    #[test]
+    /// 驗證右上角輸入框會使用傳入 Panel 的座標，而不是退回整個 terminal 的右上角。
+    /// 保護目的：避免多 Panel 重構後，Find／Filter UI 再次脫離 active Panel。
+    fn top_right_input_rect_is_relative_to_owning_panel() {
+        let panel = Rect::new(40, 2, 38, 18);
+
+        let popup = top_right_input_rect(panel);
+
+        assert_eq!(popup, Rect::new(45, 3, 32, 3));
+        assert!(popup.x >= panel.x);
+        assert!(popup.right() <= panel.right());
+        assert!(popup.bottom() <= panel.bottom());
+    }
+
+    #[test]
+    /// 驗證 Panel 小於一般輸入框寬度時，輸入框會縮小並完整留在 Panel 內。
+    /// 保護目的：避免四分割或更小版面中，Filter 邊框與文字覆蓋相鄰 Panel。
+    fn top_right_input_rect_shrinks_inside_narrow_panel() {
+        let panel = Rect::new(12, 4, 10, 2);
+
+        let popup = top_right_input_rect(panel);
+
+        assert_eq!(popup, Rect::new(12, 5, 9, 1));
+        assert!(popup.right() <= panel.right());
+        assert!(popup.bottom() <= panel.bottom());
     }
 
     #[test]
