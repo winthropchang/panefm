@@ -10,7 +10,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     time::SystemTime,
@@ -2477,9 +2477,10 @@ where
 
 /// 複製單一檔案，強制送出緩衝資料，並在關閉後重新確認目標大小。
 ///
-/// 不能只依賴 `fs::copy` 的成功回傳：SMB 或網路磁碟可能先建立目標名稱，資料卻仍在
-/// 用戶端或伺服器緩衝區中。這裡明確執行 `flush` 與 `sync_all`，關閉寫入 handle 後再
-/// 重新開啟目標讀取 metadata，只有來源大小、實際寫入量與目標大小一致才算成功。
+/// `fs::copy` 會使用 Rust 標準函式庫針對目前平台提供的檔案複製實作，比自行用
+/// `io::copy` 串流更能遵守 Windows UNC/SMB 與 macOS 掛載磁碟的原生語意。複製 API
+/// 回傳後仍會重新開啟目標並執行 `sync_all`，最後只有來源大小、API 回報寫入量與
+/// 目標大小完全一致才算成功。
 ///
 /// 參數：
 /// - `source_path: &Path`，來源檔案。
@@ -2487,20 +2488,45 @@ where
 ///
 /// 回傳：`io::Result<()>`；成功代表資料已同步、寫入 handle 已關閉，且兩端大小一致。
 fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()> {
-    let mut source_file = File::open(source_path)?;
-    let expected_size = source_file.metadata()?.len();
-    let mut target_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staged_path)?;
+    copy_file_and_verify_with(source_path, staged_path, |source, target| {
+        fs::copy(source, target)
+    })
+}
 
-    let copied_size = io::copy(&mut source_file, &mut target_file)?;
-    target_file.flush()?;
+/// 執行可注入平台複製器的單檔驗證核心，供 SMB 不完整寫入情境做回歸測試。
+///
+/// 參數：
+/// - `source_path: &Path`，來源檔案。
+/// - `staged_path: &Path`，本次新建立的目標檔案。
+/// - `platform_copy: F`，平台複製函數，型別為
+///   `FnOnce(&Path, &Path) -> io::Result<u64>`，回傳宣稱已複製的 byte 數。
+///
+/// 回傳：`io::Result<()>`；只有平台複製、同步及關閉後大小驗證全部成功才回傳 `Ok`。
+fn copy_file_and_verify_with<F>(
+    source_path: &Path,
+    staged_path: &Path,
+    platform_copy: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<u64>,
+{
+    if staged_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("copy target already exists: {}", staged_path.display()),
+        ));
+    }
+
+    let expected_size = File::open(source_path)?.metadata()?.len();
+    let copied_size = platform_copy(source_path, staged_path)?;
+
+    // 平台 copy 已關閉它自己的寫入 handle；重新開啟後同步，避免只把資料留在
+    // Windows redirector 或 SMB client cache，卻先讓 UI 誤以為傳輸完成。
+    let target_file = OpenOptions::new().write(true).open(staged_path)?;
     target_file.sync_all()?;
     drop(target_file);
 
-    let source_size_after_copy = source_file.metadata()?.len();
-    drop(source_file);
+    let source_size_after_copy = File::open(source_path)?.metadata()?.len();
     let stored_size = File::open(staged_path)?.metadata()?.len();
     if copied_size != expected_size
         || source_size_after_copy != expected_size
@@ -2875,8 +2901,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PaneState, SortMode, copy_file_and_verify, copy_path_direct_with_cleanup,
-        copy_path_transactional_with,
+        PaneState, SortMode, copy_file_and_verify, copy_file_and_verify_with,
+        copy_path_direct_with_cleanup, copy_path_transactional_with,
     };
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
@@ -3163,7 +3189,7 @@ mod tests {
     ///
     /// 參數：無。
     /// 回傳：無；若內容不一致或 Windows 因 handle 尚未關閉而無法改名，測試就會失敗。
-    /// 保護目的：避免未來改回單純 `fs::copy`，導致 SMB 尚未 flush/close 就被 UI 視為成功。
+    /// 保護目的：避免未來移除平台 copy 後的同步與大小驗證，導致 SMB 尚未完成就被 UI 視為成功。
     fn verified_file_copy_is_complete_and_closed_before_returning() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source.zip");
@@ -3178,6 +3204,34 @@ mod tests {
             fs::read(&renamed).expect("renamed target content"),
             b"complete zip bytes"
         );
+    }
+
+    #[test]
+    /// 模擬 SMB 複製 API 宣稱已寫入完整 byte 數，實際目的檔卻仍是 0-byte。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若驗證流程錯把 0-byte 目的檔當成成功，或失敗後仍留下正式檔名，
+    /// 測試就會失敗。
+    /// 保護目的：重現公司 Windows 傳到 SMB 後，PaneFM 看得到檔名但 macOS 端讀到
+    /// 0 KB 的問題，確保 UI 不會回報成功且 partial target 一定會被清除。
+    fn smb_zero_byte_copy_is_rejected_and_partial_target_is_removed() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target = dir.path().join("target.zip");
+        let source_bytes = b"zip content that must reach the SMB server";
+        fs::write(&source, source_bytes).expect("source");
+
+        let result = copy_path_direct_with_cleanup(&source, &target, |source, target| {
+            copy_file_and_verify_with(source, target, |_, target| {
+                fs::write(target, [])?;
+                Ok(source_bytes.len() as u64)
+            })
+        });
+
+        let error = result.expect_err("0-byte SMB target must fail verification");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("stored 0"));
+        assert!(!target.exists(), "failed target must not occupy its name");
     }
 
     #[test]
