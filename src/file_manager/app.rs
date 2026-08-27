@@ -662,7 +662,8 @@ impl App {
     /// - `key: &KeyEvent`，正規化後要處理的鍵盤事件。
     ///
     /// 回傳：`TextEditResult`，指出內容已改變、按鍵已被模式處理，或應交回 UI
-    /// 處理 Enter、Tab 與 Normal 模式下第二次 Esc 等業務行為。
+    /// 處理 Enter、Tab、空輸入框的第一次 Esc，以及 Normal 模式下第二次 Esc 等
+    /// 業務行為。空輸入框沒有可供 Vim 游標修正的文字，因此 Esc 會直接交回 UI 關閉。
     fn edit_text_buffer(&mut self, buffer: &mut String, key: &KeyEvent) -> TextEditResult {
         self.text_input_cursor = self.text_input_cursor.min(buffer.chars().count());
         match self.text_input_mode {
@@ -700,6 +701,9 @@ impl App {
                     TextEditResult::Consumed
                 }
                 KeyCode::Esc => {
+                    if buffer.trim().is_empty() {
+                        return TextEditResult::PassThrough;
+                    }
                     self.text_input_mode = RenameMode::Normal;
                     self.text_input_cursor = normal_cursor(buffer, self.text_input_cursor);
                     TextEditResult::Consumed
@@ -1564,6 +1568,11 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Esc if search.buffer.trim().is_empty() => {
+                self.apply_preview_search_buffer(&search);
+                self.preview_search = None;
+                self.status = String::from("preview mode");
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 search.editing = false;
                 self.status = if search.buffer.is_empty() {
@@ -2127,6 +2136,12 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Esc if filter.buffer.trim().is_empty() => {
+                if let Some(pane) = self.panes.get_mut(&filter.pane_id) {
+                    pane.clear_filter();
+                }
+                self.status = String::from("normal mode");
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 filter.editing = false;
                 self.status = if filter.buffer.is_empty() {
@@ -4072,15 +4087,19 @@ impl App {
                         self.confirm_rename(pane_id, &original_name, &buffer)?;
                     }
                     KeyCode::Esc => {
-                        mode = RenameMode::Normal;
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = String::from("rename: normal");
+                        if buffer.trim().is_empty() {
+                            self.status = format!("rename cancelled: {original_name}");
+                        } else {
+                            mode = RenameMode::Normal;
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = String::from("rename: normal");
+                        }
                     }
                     _ => {
                         self.pending_action = Some(PendingAction::Rename {
@@ -4286,14 +4305,18 @@ impl App {
                         self.confirm_create_entry(pane_id, &buffer)?;
                     }
                     KeyCode::Esc => {
-                        mode = RenameMode::Normal;
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = create_status_label("normal");
+                        if buffer.trim().is_empty() {
+                            self.status = String::from("create cancelled");
+                        } else {
+                            mode = RenameMode::Normal;
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = create_status_label("normal");
+                        }
                     }
                     _ => {
                         self.pending_action = Some(PendingAction::CreateEntry {
@@ -17559,6 +17582,138 @@ mod tests {
                 search: PanelSearchState { editing: false, .. },
                 ..
             })
+        ));
+    }
+
+    #[test]
+    /// 驗證空白 command UI 在 Insert 模式按第一次 Esc 就會直接關閉。
+    /// 保護目的：空輸入沒有文字需要進入 Vim Normal 模式修正，不應要求使用者連按兩次。
+    fn empty_command_input_closes_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_prefilled_command("");
+        app.handle_command_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close empty command input");
+
+        assert!(!app.command_mode);
+        assert!(app.command_buffer.is_empty());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證剛開啟且尚未輸入內容的 filter，第一次 Esc 會完整清除 filter 狀態。
+    /// 保護目的：避免輸入框雖消失，內部卻殘留一個不可見的空 filter，造成後續 Esc 流程混亂。
+    fn empty_filter_input_closes_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "demo").expect("file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_filter_input();
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close empty filter input");
+
+        assert!(app.filter.is_none());
+        assert!(!app.panes.get(&1).expect("pane").has_active_filter());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證空白 Preview Search 在第一次 Esc 就會關閉，並清除 pane 上的搜尋條件。
+    /// 保護目的：所有共用文字輸入 UI 都必須遵守相同的空輸入快速離開規則。
+    fn empty_preview_search_closes_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "alpha").expect("file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_preview_focus();
+        app.open_preview_search_input();
+        app.handle_preview_search_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close empty preview search");
+
+        assert!(app.preview_search.is_none());
+        assert_eq!(app.status, "preview mode");
+    }
+
+    #[test]
+    /// 驗證建立檔案的 inline 輸入框尚未輸入名稱時，第一次 Esc 就會取消建立。
+    /// 保護目的：rename/create 使用獨立編輯流程，也必須與共用輸入器保持一致。
+    fn empty_create_input_closes_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.start_create_entry();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel empty create input");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "create cancelled");
+    }
+
+    #[test]
+    /// 驗證空白 rename 輸入框在 Insert 模式按第一次 Esc 就會取消改名。
+    /// 保護目的：rename 使用獨立編輯流程，清空原檔名後也不可殘留在無意義的 Normal 模式。
+    fn empty_rename_input_closes_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "demo").expect("file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.pending_action = Some(PendingAction::Rename {
+            pane_id: 1,
+            original_name: String::from("alpha.txt"),
+            buffer: String::new(),
+            cursor: 0,
+            mode: RenameMode::Insert,
+        });
+
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel empty rename input");
+
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "rename cancelled: alpha.txt");
+    }
+
+    #[test]
+    /// 驗證空白 list find 與 global search 都能用第一次 Esc 直接回到一般列表。
+    /// 保護目的：兩種搜尋使用不同外層狀態機，但都必須遵守共用輸入器的快速離開規則。
+    fn empty_list_and_global_search_close_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "demo").expect("file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_list_find_input();
+        app.handle_list_find_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close empty list find");
+        assert!(app.list_find.is_none());
+
+        app.open_global_search().expect("open global search");
+        app.handle_global_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close empty global search");
+        assert!(app.global_search.is_none());
+        assert_eq!(app.status, "normal mode");
+    }
+
+    #[test]
+    /// 驗證列表面板內剛開啟的空白搜尋框，第一次 Esc 就會收起輸入框。
+    /// 保護目的：Help、Trash、Task、Bookmark、Zoxide 共用此流程，修正一次即可保持一致。
+    fn empty_panel_search_closes_on_first_escape() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.open_help_panel();
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open panel search");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close empty panel search");
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel {
+                search: PanelSearchState {
+                    editing: false,
+                    ref buffer,
+                },
+                ..
+            }) if buffer.is_empty()
         ));
     }
 }
