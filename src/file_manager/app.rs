@@ -46,8 +46,8 @@ use super::{
     layout::{LayoutNode, SplitDirection, SplitPlacement},
     open::{
         LaunchSpec, OpenAction, OpenPickerAction, OpenPickerOption, OpenTarget,
-        build_custom_launch_spec, build_launch_spec, custom_action_applies_to_target,
-        default_open_action, open_picker_options,
+        build_custom_launch_spec, build_launch_spec, build_terminal_launch_spec,
+        custom_action_applies_to_target, default_open_action, open_picker_options,
     },
     operation_history::{
         DEFAULT_HISTORY_LIMIT, FileOperation, FileOperationKind, OperationHistory, OperationItem,
@@ -2510,6 +2510,16 @@ impl App {
                         self.status = String::from("panel focus changed");
                     }
                 }
+                _ if key_matches_plain_letter(&key, 't') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    if self.focused_pane == pane_id {
+                        self.open_terminal_in_active_panel()?;
+                    } else {
+                        self.status = String::from("panel focus changed");
+                    }
+                }
                 KeyCode::Esc => {
                     self.status = String::from("normal mode");
                 }
@@ -2518,7 +2528,7 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::WindowPicker { pane_id });
-                    self.status = String::from("panel: choose h/j/k/l/c/o from the panel");
+                    self.status = String::from("panel: choose h/j/k/l/c/o/t from the panel");
                 }
             },
             PendingAction::LineModePicker { pane_id } => match key.code {
@@ -4866,6 +4876,7 @@ impl App {
             "paste" => self.paste_into_focused_pane()?,
             "paste!" => self.paste_into_focused_pane_with_overwrite()?,
             "undo" => self.undo_latest_file_operation()?,
+            "terminal" => self.open_terminal_in_active_panel()?,
             "compress" => self.compress_selected_entries()?,
             "extract" => self.extract_selected_archives()?,
             "jump" => self.open_fzf_jump(),
@@ -5192,7 +5203,7 @@ impl App {
         self.pending_action = Some(PendingAction::WindowPicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("panel: choose h/j/k/l/c/o from the panel");
+        self.status = String::from("panel: choose h/j/k/l/c/o/t from the panel");
     }
 
     /// 打開底部 linemode 面板，等待使用者輸入右側欄位顯示模式。
@@ -5720,6 +5731,33 @@ impl App {
             OpenAction::Open => format!("opening {}", target.display_name),
             OpenAction::Reveal => format!("revealing {}", target.display_name),
         };
+        Ok(())
+    }
+
+    /// 以目前 active panel 的目錄開啟新終端，並排入統一外部程序佇列。
+    ///
+    /// 多 panel 時只讀取 `focused_pane` 的 cwd。若 plugins.toml 有 `[terminal]`，會使用
+    /// 公司環境指定的 TrustView 等入口；否則 Windows 直接建立繼承權杖的新 console，
+    /// macOS 則優先延續目前終端 App，無法辨識時才交給 Terminal.app。
+    ///
+    /// 參數：`self: &mut App`，目前應用程式狀態。
+    /// 回傳：`io::Result<()>`；active panel 不存在或命令無法建立時回傳錯誤。
+    fn open_terminal_in_active_panel(&mut self) -> io::Result<()> {
+        let cwd = self
+            .panes
+            .get(&self.focused_pane)
+            .map(|pane| pane.cwd.clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "panel no longer exists"))?;
+        let launch = build_terminal_launch_spec(&cwd, self.config.actions.terminal.as_ref())?;
+        let detail = format!("{} {}", launch.program, launch.args.join(" "));
+        let task_id = self.push_task(
+            self.focused_pane,
+            "terminal",
+            format!("open terminal: {}", cwd.display()),
+            detail,
+        );
+        self.pending_launch = Some(QueuedLaunch { task_id, launch });
+        self.status = format!("opening terminal: {}", cwd.display());
         Ok(())
     }
 
@@ -10311,6 +10349,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("only"),
         ),
         help_entry(
+            ":terminal",
+            "wt",
+            "在 active panel 目前目錄開啟新終端；Windows 會繼承 PaneFM 的安全權杖與環境",
+            HelpAction::Command("terminal"),
+        ),
+        help_entry(
             ":theme list",
             "tl",
             "打開主題列表；游標會停在目前使用中的主題",
@@ -12398,7 +12442,7 @@ mod tests {
     /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_trash_panel_shift_d_deletes_filtered_entries() {
         let dir = tempdir().expect("tempdir");
-        let alpha = dir.path().join("alpha.txt");
+        let alpha = dir.path().join("zzzzzz-alpha.txt");
         let beta = dir.path().join("beta.txt");
         fs::write(&alpha, "alpha").expect("alpha");
         fs::write(&beta, "beta").expect("beta");
@@ -12414,16 +12458,10 @@ mod tests {
         app.open_trash_panel().expect("open trash panel");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
             .expect("start trash search");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
-            .expect("type filter");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
-            .expect("type filter");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
-            .expect("type filter");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
-            .expect("type filter");
-        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
-            .expect("type filter");
+        for _ in 0..6 {
+            app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+                .expect("type unique filter");
+        }
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("lock trash filter");
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
@@ -12442,7 +12480,7 @@ mod tests {
         let remaining = app.trash_store.list_entries().expect("list remaining");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].display_name, "beta.txt");
-        assert_eq!(app.status, "deleted permanently alpha.txt");
+        assert_eq!(app.status, "deleted permanently zzzzzz-alpha.txt");
     }
 
     #[test]
@@ -12943,7 +12981,48 @@ mod tests {
             app.pending_action,
             Some(PendingAction::WindowPicker { pane_id: 1 })
         );
-        assert_eq!(app.status, "panel: choose h/j/k/l/c/o from the panel");
+        assert_eq!(app.status, "panel: choose h/j/k/l/c/o/t from the panel");
+    }
+
+    #[test]
+    /// 驗證 `wt` 只使用目前 active panel 的 cwd 建立新終端請求。
+    ///
+    /// 保護目的：多 panel 時不可誤用第一個 panel 或 PaneFM 啟動目錄，否則終端會開錯位置。
+    fn app_wt_opens_terminal_in_active_panel_directory() {
+        let dir = tempdir().expect("tempdir");
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        fs::create_dir(&first_dir).expect("first dir");
+        fs::create_dir(&second_dir).expect("second dir");
+        let mut app = App::new(first_dir, default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical)
+            .expect("second panel");
+        app.current_pane_mut().expect("active panel").cwd = second_dir.clone();
+        app.current_pane_mut()
+            .expect("active panel")
+            .reload()
+            .expect("reload second");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("window picker");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("terminal action");
+
+        let queued = app.take_pending_launch().expect("terminal launch");
+        let path_is_active = queued
+            .launch
+            .args
+            .iter()
+            .any(|arg| arg == &second_dir.display().to_string())
+            || matches!(
+                queued.launch.mode,
+                LaunchMode::NewTerminal { ref current_dir } if current_dir == &second_dir
+            );
+        assert!(path_is_active);
+        assert_eq!(
+            app.status,
+            format!("opening terminal: {}", second_dir.display())
+        );
     }
 
     #[test]

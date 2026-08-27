@@ -99,12 +99,14 @@ panefm
 | `v` | 進入或離開範圍選取模式 |
 | `y` / `x` | 複製 / 剪下 |
 | `p` / `P` | 貼上並詢問覆蓋 / 直接覆蓋 |
+| `u` | 復原最近一次 copy 或 move 批次，可連續復原最多 20 筆 |
 | `d` / `D` | 移到 Trash / 永久刪除 |
 | `s` / `S` | 用 `fd` 搜尋檔名 / 用 `rg` 搜尋內容 |
 | `z` / `Z` | 用 `fzf` 搜尋目前目錄樹 / 用 `zoxide` 跳轉常用目錄 |
 | `f` | 模糊過濾目前列表 |
 | `Tab` | 開啟或關閉 Preview |
 | `w` | 開啟 Panel 操作選單 |
+| `wt` | 在 active Panel 目前目錄開啟新終端 |
 | `1..9` / `0` | 直接切換到指定 Panel |
 | `:` | 開啟命令輸入介面 |
 | `~` / `F1` | 顯示完整 Help，可搜尋並直接執行命令 |
@@ -132,6 +134,11 @@ panefm
 1. 按 `w` 開啟 Panel 選單。
 2. 使用 `h/j/k/l` 在左、下、上、右建立新 Panel。
 3. 直接按 `1..9` 或 `0` 切換 Panel。
+
+若公司要求終端必須經由 TrustView 等保護軟體啟動，可在 `plugins.toml` 的
+`[terminal]` 設定平台專用命令；`{path}` 會替換成 active Panel 目錄。未設定時，
+Windows 會直接建立繼承 PaneFM 安全權杖的新 console；macOS 會優先延續目前的 iTerm2、
+Terminal、WezTerm、Ghostty 或 Warp，無法辨識時才使用 Terminal.app。
 
 ## 設定
 

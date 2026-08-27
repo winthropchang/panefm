@@ -1303,6 +1303,10 @@ pub(crate) fn render_window_picker(frame: &mut ratatui::Frame<'_>, area: Rect, t
                 label: "keep only current panel",
             },
             ShortcutPanelItem {
+                shortcut: "t",
+                label: "terminal in current directory",
+            },
+            ShortcutPanelItem {
                 shortcut: "Esc",
                 label: "cancel",
             },

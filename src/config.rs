@@ -159,6 +159,16 @@ pub struct BehaviorConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionsConfig {
     pub open_with: Vec<CustomOpenActionConfig>,
+    /// 可選的新終端啟動器；公司保護環境可在 plugins.toml 指定 TrustView 等入口。
+    pub terminal: Option<TerminalLauncherConfig>,
+}
+
+/// 表示 `plugins.toml` 中可覆寫的平台終端啟動命令。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalLauncherConfig {
+    pub command: Option<String>,
+    pub mac_command: Option<String>,
+    pub windows_command: Option<String>,
 }
 
 /// 表示單一自訂外部動作。
@@ -257,6 +267,7 @@ impl Default for AppConfig {
             },
             actions: ActionsConfig {
                 open_with: Vec::new(),
+                terminal: None,
             },
         }
     }
@@ -417,6 +428,15 @@ struct BehaviorConfigFile {
 #[derive(Debug, Default, Deserialize)]
 struct PluginsConfigFile {
     actions: Option<ActionsConfigFile>,
+    terminal: Option<TerminalLauncherFile>,
+}
+
+/// 表示 plugins.toml `[terminal]` 區塊尚未驗證的原始欄位。
+#[derive(Debug, Default, Deserialize)]
+struct TerminalLauncherFile {
+    command: Option<String>,
+    mac_command: Option<String>,
+    windows_command: Option<String>,
 }
 
 /// 表示 `actions` 區塊的原始設定格式。
@@ -498,6 +518,9 @@ pub fn load_config(base_dir: &Path) -> Result<LoadedConfig> {
             .with_context(|| format!("failed to parse plugins file {}", path.display()))?;
         if let Some(actions) = plugins.actions {
             apply_actions_config(&mut config, actions)?;
+        }
+        if let Some(terminal) = plugins.terminal {
+            apply_terminal_launcher_config(&mut config, terminal)?;
         }
     }
 
@@ -858,6 +881,34 @@ fn apply_actions_config(config: &mut AppConfig, actions: ActionsConfigFile) -> R
     Ok(())
 }
 
+/// 驗證並套用 `[terminal]` 自訂啟動器。
+///
+/// 參數：`config: &mut AppConfig`，最終設定；`terminal: TerminalLauncherFile`，原始欄位。
+/// 回傳：`Result<()>`；完全沒有命令時回傳設定錯誤，避免 `wt` 靜默失效。
+fn apply_terminal_launcher_config(
+    config: &mut AppConfig,
+    terminal: TerminalLauncherFile,
+) -> Result<()> {
+    let normalize = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let launcher = TerminalLauncherConfig {
+        command: normalize(terminal.command),
+        mac_command: normalize(terminal.mac_command),
+        windows_command: normalize(terminal.windows_command),
+    };
+    if launcher.command.is_none()
+        && launcher.mac_command.is_none()
+        && launcher.windows_command.is_none()
+    {
+        bail!("terminal must define at least one of command / mac_command / windows_command");
+    }
+    config.actions.terminal = Some(launcher);
+    Ok(())
+}
+
 /// 套用並驗證 `navigation` 區塊設定。
 fn apply_navigation_config(config: &mut AppConfig, navigation: NavigationConfigFile) -> Result<()> {
     if let Some(value) = navigation.fast_move_step {
@@ -1154,6 +1205,34 @@ windows_command = "git -C {parent} log --oneline"
         assert_eq!(
             loaded.config.actions.open_with[1].command.as_deref(),
             Some("git -C {parent} log --oneline")
+        );
+    }
+
+    #[test]
+    /// 驗證 plugins.toml 的 terminal 啟動器可分別保存 macOS 與 Windows 公司入口。
+    ///
+    /// 保護目的：TrustView 等保護環境不能被固定的系統終端命令繞過，且路徑模板必須保留。
+    fn load_config_reads_custom_terminal_launcher() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("plugins.toml"),
+            r#"
+[terminal]
+mac_command = "open -a 'Protected Terminal' {path}"
+windows_command = "ProtectedTerminal.exe {path}"
+"#,
+        )
+        .expect("plugins file");
+
+        let loaded = load_config(dir.path()).expect("config");
+        let terminal = loaded.config.actions.terminal.expect("terminal launcher");
+        assert_eq!(
+            terminal.mac_command.as_deref(),
+            Some("open -a 'Protected Terminal' {path}")
+        );
+        assert_eq!(
+            terminal.windows_command.as_deref(),
+            Some("ProtectedTerminal.exe {path}")
         );
     }
 

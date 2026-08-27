@@ -12,6 +12,16 @@
 # 2. `[[actions.open_with]]` 代表一個可出現在 `Open with` 面板中的選項。
 # 3. 你可以寫很多個 `[[actions.open_with]]`，每一個都是獨立功能。
 
+# 可選：覆寫 `wt` / `:terminal` 使用的新終端啟動器。
+# 預設不需要設定；Windows 會直接建立繼承 PaneFM 權杖的新 console，macOS 會依
+# `TERM_PROGRAM` / `LC_TERMINAL` 延續 iTerm2、Terminal、WezTerm、Ghostty 或 Warp，
+# 無法辨識才回退到 Terminal.app。公司若要求終端必須經由 TrustView 等保護軟體啟動，
+# 可取消下列註解並改成公司提供的正式命令。`{path}` 會替換成 active panel 的完整目錄。
+#
+# [terminal]
+# mac_command = "open -a 'Company Terminal Launcher' {path}"
+# windows_command = "CompanyTerminalLauncher.exe {path}"
+
 [actions]
 
 # 範例 1：

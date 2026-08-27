@@ -41,6 +41,93 @@ pub(crate) fn current_platform() -> PlatformKind {
     }
 }
 
+/// 依指定平台建立「在目錄中開新終端」的命令規格。
+///
+/// Windows 不呼叫可能轉送到既有程序的 `wt.exe`，而是要求事件迴圈直接以新 console
+/// 啟動 `cmd.exe`；子程序因此繼承 PaneFM 的環境與安全權杖。macOS 優先延續目前終端
+/// App，無法辨識才交給 Terminal.app。LinuxLike 僅保留未來擴充用預設。
+///
+/// 參數：`path: &Path`，active panel cwd；`platform: PlatformKind`，目標平台。
+/// 回傳：`io::Result<LaunchSpec>`，成功時可交給統一外部程序執行層。
+pub(crate) fn new_terminal_spec_for_platform(
+    path: &Path,
+    platform: PlatformKind,
+) -> io::Result<LaunchSpec> {
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let lc_terminal = std::env::var("LC_TERMINAL").ok();
+    new_terminal_spec_for_platform_with_env(
+        path,
+        platform,
+        term_program.as_deref(),
+        lc_terminal.as_deref(),
+    )
+}
+
+/// 依平台與終端識別環境建立新終端規格，並讓測試不必修改程序的全域環境變數。
+///
+/// macOS 終端通常透過 `TERM_PROGRAM` 或 `LC_TERMINAL` 告知子程序自己的名稱。PaneFM
+/// 只把已知值轉成可交給 `open -a` 的 App 名稱；未知值回退到系統 Terminal.app，避免
+/// 把任意環境內容當成應用程式名稱執行。Windows 不使用這兩個欄位。
+///
+/// 參數：`path: &Path`，active panel cwd；`platform: PlatformKind`，目標平台；
+/// `term_program: Option<&str>` 與 `lc_terminal: Option<&str>`，目前終端提供的識別值。
+/// 回傳：`io::Result<LaunchSpec>`，成功時包含可交給統一程序層執行的規格。
+fn new_terminal_spec_for_platform_with_env(
+    path: &Path,
+    platform: PlatformKind,
+    term_program: Option<&str>,
+    lc_terminal: Option<&str>,
+) -> io::Result<LaunchSpec> {
+    let launch = match platform {
+        PlatformKind::Windows => LaunchSpec {
+            program: "cmd.exe".to_string(),
+            args: Vec::new(),
+            mode: LaunchMode::NewTerminal {
+                current_dir: path.to_path_buf(),
+            },
+        },
+        PlatformKind::MacOs => {
+            let application = mac_terminal_application(term_program, lc_terminal);
+            LaunchSpec {
+                program: "open".to_string(),
+                args: vec![
+                    "-a".to_string(),
+                    application.to_string(),
+                    path.display().to_string(),
+                ],
+                mode: LaunchMode::Detached,
+            }
+        }
+        PlatformKind::LinuxLike => LaunchSpec {
+            program: "x-terminal-emulator".to_string(),
+            args: Vec::new(),
+            mode: LaunchMode::NewTerminal {
+                current_dir: path.to_path_buf(),
+            },
+        },
+    };
+    Ok(launch)
+}
+
+/// 將 macOS 終端環境變數轉成 Launch Services 可辨識的應用程式名稱。
+///
+/// 參數：`term_program: Option<&str>`、`lc_terminal: Option<&str>`，由目前 PaneFM 程序
+/// 繼承的終端識別值。回傳：`&'static str`，已知終端的 App 名稱；無法辨識時回傳
+/// `Terminal` 作為安全且普遍存在的預設值。
+fn mac_terminal_application(term_program: Option<&str>, lc_terminal: Option<&str>) -> &'static str {
+    for value in [term_program, lc_terminal].into_iter().flatten() {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "iterm.app" | "iterm2" => return "iTerm",
+            "apple_terminal" | "terminal.app" => return "Terminal",
+            "wezterm" | "wezterm.app" => return "WezTerm",
+            "ghostty" | "ghostty.app" => return "Ghostty",
+            "warp" | "warpterminal" | "warp.app" => return "Warp",
+            _ => {}
+        }
+    }
+    "Terminal"
+}
+
 /// 依指定平台建立「用系統預設程式打開目標」的命令。
 pub(crate) fn system_open_spec_for_platform(
     path: &Path,
@@ -146,7 +233,10 @@ pub(crate) fn write_text_to_system_clipboard(text: &str) -> io::Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{PlatformKind, reveal_in_system_spec_for_platform, system_open_spec_for_platform};
+    use super::{
+        PlatformKind, new_terminal_spec_for_platform, new_terminal_spec_for_platform_with_env,
+        reveal_in_system_spec_for_platform, system_open_spec_for_platform,
+    };
     use crate::file_manager::open::LaunchMode;
 
     #[test]
@@ -192,5 +282,65 @@ mod tests {
 
         assert_eq!(spec.program, "open");
         assert_eq!(spec.args, vec!["-R", "/tmp/notes.txt"]);
+    }
+
+    #[test]
+    /// 驗證 Windows 新終端直接使用新 console 並把 active panel cwd 保存於執行規格。
+    /// 保護目的：避免未來改用 `wt.exe` broker，讓 TrustView 等父程序權杖意外遺失。
+    fn windows_terminal_inherits_context_and_active_directory() {
+        let path = PathBuf::from(r"C:\project\foo");
+        let spec = new_terminal_spec_for_platform(&path, PlatformKind::Windows).expect("spec");
+
+        assert_eq!(spec.program, "cmd.exe");
+        assert_eq!(spec.mode, LaunchMode::NewTerminal { current_dir: path });
+    }
+
+    #[test]
+    /// 驗證無法辨識目前終端時，macOS 會安全回退到 Terminal.app。
+    /// 保護目的：多 panel 時不可誤用其他 panel 的 cwd，未知環境也不可造成啟動失敗。
+    fn mac_terminal_opens_active_directory() {
+        let spec = new_terminal_spec_for_platform_with_env(
+            &PathBuf::from("/Users/otto/project/foo"),
+            PlatformKind::MacOs,
+            None,
+            None,
+        )
+        .expect("spec");
+
+        assert_eq!(spec.program, "open");
+        assert_eq!(spec.args, vec!["-a", "Terminal", "/Users/otto/project/foo"]);
+        assert_eq!(spec.mode, LaunchMode::Detached);
+    }
+
+    #[test]
+    /// 驗證從 iTerm2 啟動 PaneFM 時，`wt` 會延續使用 iTerm，而非固定開 Terminal.app。
+    /// 保護目的：避免未來平台重構再次把 macOS 終端寫死為系統內建 Terminal。
+    fn mac_terminal_spec_preserves_iterm_from_term_program() {
+        let spec = new_terminal_spec_for_platform_with_env(
+            &PathBuf::from("/Users/otto/project/foo"),
+            PlatformKind::MacOs,
+            Some("iTerm.app"),
+            Some("iTerm2"),
+        )
+        .expect("spec");
+
+        assert_eq!(spec.program, "open");
+        assert_eq!(spec.args, vec!["-a", "iTerm", "/Users/otto/project/foo"]);
+        assert_eq!(spec.mode, LaunchMode::Detached);
+    }
+
+    #[test]
+    /// 驗證主要識別值未知時仍可採用 `LC_TERMINAL` 的已知值。
+    /// 保護目的：支援不同終端版本只設定其中一種識別環境變數的情況。
+    fn mac_terminal_spec_uses_known_lc_terminal_as_fallback() {
+        let spec = new_terminal_spec_for_platform_with_env(
+            &PathBuf::from("/Users/otto/project/foo"),
+            PlatformKind::MacOs,
+            Some("unknown-wrapper"),
+            Some("iTerm2"),
+        )
+        .expect("spec");
+
+        assert_eq!(spec.args, vec!["-a", "iTerm", "/Users/otto/project/foo"]);
     }
 }

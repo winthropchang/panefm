@@ -9,7 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::config::{ActionLaunchMode, ActionTargetScope, CustomOpenActionConfig};
+use crate::config::{
+    ActionLaunchMode, ActionTargetScope, CustomOpenActionConfig, TerminalLauncherConfig,
+};
 
 use super::platform::PlatformKind;
 
@@ -60,10 +62,44 @@ pub(crate) struct LaunchSpec {
 }
 
 /// 描述外部命令應該如何執行。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LaunchMode {
     TerminalBlocking,
     Detached,
+    /// Windows 直接建立新 console 子程序，避免 `wt.exe` broker 丟失目前保護權杖。
+    NewTerminal {
+        current_dir: PathBuf,
+    },
+}
+
+/// 建立「在指定目錄開新終端」的跨平台命令。
+///
+/// 有 `[terminal]` 設定時使用自訂命令，並以 `{path}` 展開 active panel 目錄；否則
+/// 使用平台預設。自訂入口可用來明確呼叫 TrustView 等公司保護軟體。
+///
+/// 參數：`path: &Path`，active panel cwd；`launcher: Option<&TerminalLauncherConfig>`，覆寫設定。
+/// 回傳：`io::Result<LaunchSpec>`，只建立規格，不會在此啟動程序。
+pub(crate) fn build_terminal_launch_spec(
+    path: &Path,
+    launcher: Option<&TerminalLauncherConfig>,
+) -> io::Result<LaunchSpec> {
+    if let Some(launcher) = launcher {
+        let action = CustomOpenActionConfig {
+            name: String::from("terminal"),
+            scope: ActionTargetScope::Directory,
+            mode: ActionLaunchMode::Detached,
+            command: launcher.command.clone(),
+            mac_command: launcher.mac_command.clone(),
+            windows_command: launcher.windows_command.clone(),
+        };
+        let target = OpenTarget {
+            path: path.to_path_buf(),
+            display_name: path.display().to_string(),
+            is_dir: true,
+        };
+        return build_custom_launch_spec(&target, &action);
+    }
+    super::platform::new_terminal_spec_for_platform(path, super::platform::current_platform())
 }
 
 /// 根據目標項目決定 `Open with` 面板應顯示的選項。

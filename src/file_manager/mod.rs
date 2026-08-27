@@ -535,8 +535,42 @@ fn run_launch_spec(
                 ));
             }
         }
+        LaunchMode::NewTerminal { current_dir } => {
+            spawn_new_terminal_process(&launch.program, &launch.args, &current_dir)?;
+        }
     }
 
+    Ok(())
+}
+
+/// 直接建立具有獨立 console 的 shell 子程序，並把 cwd 設成 active panel 目錄。
+///
+/// Windows 的 `CREATE_NEW_CONSOLE` 不經過 Windows Terminal broker，因此 child 會繼承
+/// PaneFM 當下的安全權杖與環境。其他平台保留一般 detached fallback，方便未來擴充。
+///
+/// 參數：`program: &str`，shell；`args: &[String]`，參數；`current_dir: &Path`，cwd。
+/// 回傳：`Result<()>`；程序無法建立時回傳完整 OS 錯誤。
+fn spawn_new_terminal_process(
+    program: &str,
+    args: &[String],
+    current_dir: &std::path::Path,
+) -> Result<()> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(current_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        command.creation_flags(CREATE_NEW_CONSOLE);
+    }
+
+    command.spawn()?;
     Ok(())
 }
 
