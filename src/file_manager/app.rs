@@ -8787,84 +8787,8 @@ impl App {
             }
         }
 
-        let help = Paragraph::new(Line::from(vec![
-            Span::styled("hjkl", self.theme.accent_style()),
-            Span::raw(" move  "),
-            Span::styled("J/K", self.theme.accent_style()),
-            Span::raw(" fast  "),
-            Span::styled("Ctrl-d/u", self.theme.accent_style()),
-            Span::raw(" half  "),
-            Span::styled("Ctrl-b/f", self.theme.accent_style()),
-            Span::raw(" page  "),
-            Span::styled("gg/G", self.theme.accent_style()),
-            Span::raw(" jump  "),
-            Span::styled("1..9/0", self.theme.accent_style()),
-            Span::raw(" panel  "),
-            Span::styled("m", self.theme.accent_style()),
-            Span::raw(" linemode  "),
-            Span::styled("b", self.theme.accent_style()),
-            Span::raw(" bookmark  "),
-            Span::styled("t", self.theme.accent_style()),
-            Span::raw(" theme/trash  "),
-            Span::styled("T", self.theme.accent_style()),
-            Span::raw(" tasks  "),
-            Span::styled("~ / F1", self.theme.accent_style()),
-            Span::raw(" help  "),
-            Span::styled("'", self.theme.accent_style()),
-            Span::raw(" jump  "),
-            Span::styled("v", self.theme.accent_style()),
-            Span::raw(" visual mark  "),
-            Span::styled("y", self.theme.accent_style()),
-            Span::raw(" file copy  "),
-            Span::styled("c", self.theme.accent_style()),
-            Span::raw(" text copy  "),
-            Span::styled("x", self.theme.accent_style()),
-            Span::raw(" cut  "),
-            Span::styled("z", self.theme.accent_style()),
-            Span::raw(" jump  "),
-            Span::styled("Z", self.theme.accent_style()),
-            Span::raw(" zoxide  "),
-            Span::styled("p", self.theme.accent_style()),
-            Span::raw(" paste  "),
-            Span::styled("w", self.theme.accent_style()),
-            Span::raw(" panel  "),
-            Span::styled("Ctrl-p", self.theme.accent_style()),
-            Span::raw(" panel cmd  "),
-            Span::styled("d", self.theme.accent_style()),
-            Span::raw(" trash  "),
-            Span::styled("r", self.theme.accent_style()),
-            Span::raw(" rename  "),
-            Span::styled("P", self.theme.accent_style()),
-            Span::raw(" preview  "),
-            Span::styled("/ n p", self.theme.accent_style()),
-            Span::raw(" search  "),
-            Span::styled("a", self.theme.accent_style()),
-            Span::raw(" create  "),
-            Span::styled("s", self.theme.accent_style()),
-            Span::raw(" global search  "),
-            Span::styled("S", self.theme.accent_style()),
-            Span::raw(" content search  "),
-            Span::styled("f", self.theme.accent_style()),
-            Span::raw(" filter  "),
-            Span::styled(".", self.theme.accent_style()),
-            Span::raw(" hidden  "),
-            Span::styled(",", self.theme.accent_style()),
-            Span::raw(" sort  "),
-            Span::styled(":rename", self.theme.accent_style()),
-            Span::raw(" dialog  "),
-            Span::styled(":create", self.theme.accent_style()),
-            Span::raw("  "),
-            Span::styled(":trash undo", self.theme.accent_style()),
-            Span::raw("  "),
-            Span::styled(":preview-search", self.theme.accent_style()),
-            Span::raw("  "),
-            Span::styled(":preview", self.theme.accent_style()),
-            Span::raw("  "),
-            Span::styled(":split :vsplit :close :only", self.theme.accent_style()),
-            Span::raw("  "),
-            Span::styled(":theme", self.theme.accent_style()),
-        ]))
-        .block(Block::default().borders(Borders::TOP));
+        let help = Paragraph::new(status_shortcut_line(outer[1].width, self.theme))
+            .block(Block::default().borders(Borders::TOP));
         frame.render_widget(help, outer[1]);
 
         frame.render_widget(Paragraph::new(status_text).style(status_style), outer[2]);
@@ -9858,6 +9782,121 @@ fn paste_failure_status(source_name: &str, destination: &Path, error: &io::Error
         "paste failed for {source_name}\ndestination: {} | OS error: {error}",
         destination.display()
     )
+}
+
+/// 描述底部快捷鍵列中的一組高頻操作提示。
+///
+/// 欄位：
+/// - `key: &'static str`，實際要按下的快捷鍵。
+/// - `label: &'static str`，簡短的英文功能名稱。
+///
+/// 清單本身的順序就是顯示優先度；畫面不足時只會捨棄尾端低優先項目，避免把
+/// `~/F1 help` 等重要入口裁掉，或顯示只剩一半的快捷鍵說明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusShortcutHint {
+    key: &'static str,
+    label: &'static str,
+}
+
+/// 回傳底部 status bar 允許顯示的高頻快捷鍵，並依實際使用優先度排序。
+///
+/// 參數：無。
+/// 回傳：`&'static [StatusShortcutHint]`，第一筆固定為 Help；低頻功能應留在 F1
+/// 完整說明，不要加入這份清單讓 status bar 重新變得難以閱讀。
+fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
+    &[
+        StatusShortcutHint {
+            key: "~/F1",
+            label: "help",
+        },
+        StatusShortcutHint {
+            key: "hjkl",
+            label: "move",
+        },
+        StatusShortcutHint {
+            key: "Enter",
+            label: "open",
+        },
+        StatusShortcutHint {
+            key: "b",
+            label: "bookmark",
+        },
+        StatusShortcutHint {
+            key: "Tab",
+            label: "preview",
+        },
+        StatusShortcutHint {
+            key: "y",
+            label: "copy",
+        },
+        StatusShortcutHint {
+            key: "x",
+            label: "cut",
+        },
+        StatusShortcutHint {
+            key: "p/P",
+            label: "paste/overwrite",
+        },
+        StatusShortcutHint {
+            key: "v",
+            label: "select",
+        },
+        StatusShortcutHint {
+            key: "s/S",
+            label: "search",
+        },
+        StatusShortcutHint {
+            key: "f",
+            label: "filter",
+        },
+        StatusShortcutHint {
+            key: "r",
+            label: "rename",
+        },
+        StatusShortcutHint {
+            key: "a",
+            label: "create",
+        },
+        StatusShortcutHint {
+            key: "u",
+            label: "undo",
+        },
+        StatusShortcutHint {
+            key: "w",
+            label: "panel",
+        },
+    ]
+}
+
+/// 依 terminal 寬度建立底部快捷鍵列，只放入能完整顯示的提示。
+///
+/// 參數：
+/// - `width: u16`，目前快捷鍵列可使用的 terminal cell 寬度。
+/// - `theme: Theme`，用來替按鍵套用目前主題的 accent 顏色。
+///
+/// 回傳：`Line<'static>`，可直接交給 ratatui `Paragraph` 繪製的單行內容。
+fn status_shortcut_line(width: u16, theme: Theme) -> Line<'static> {
+    let available_width = usize::from(width);
+    let mut used_width = 0usize;
+    let mut spans = Vec::new();
+
+    for (index, hint) in status_shortcut_hints().iter().enumerate() {
+        let separator = if index == 0 { "" } else { "  " };
+        let item_width = separator.len() + hint.key.len() + 1 + hint.label.len();
+        if index > 0 && used_width.saturating_add(item_width) > available_width {
+            break;
+        }
+
+        if !separator.is_empty() {
+            spans.push(Span::raw(separator));
+        }
+        spans.push(Span::styled(hint.key, theme.accent_style()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(hint.label));
+        used_width = used_width.saturating_add(item_width);
+    }
+
+    Line::from(spans)
 }
 
 /// 依終端 cell 寬度把 status 文字預先切成實際要繪製的多行內容。
@@ -11361,6 +11400,44 @@ mod tests {
         assert!(!super::status_is_error("opened directory"));
         assert!(!super::status_is_error("rename-regex: renamed 2 items"));
         assert!(!super::status_is_error("trash cancelled: note.txt"));
+    }
+
+    #[test]
+    /// 驗證底部快捷鍵列永遠先顯示 Help，再依照移動、開啟與書籤等使用頻率排列。
+    /// 保護目的：避免新增命令時又依 command 定義順序插入提示，讓使用者在不知道按鍵時
+    /// 看不到最重要的 `~/F1 help` 入口。
+    fn status_shortcut_hints_keep_help_first_and_follow_usage_priority() {
+        let hints = super::status_shortcut_hints();
+
+        assert_eq!((hints[0].key, hints[0].label), ("~/F1", "help"));
+        assert_eq!((hints[1].key, hints[1].label), ("hjkl", "move"));
+        assert_eq!((hints[2].key, hints[2].label), ("Enter", "open"));
+        assert_eq!((hints[3].key, hints[3].label), ("b", "bookmark"));
+    }
+
+    #[test]
+    /// 驗證窄 terminal 只保留能完整放下的高優先快捷鍵，不會把下一筆裁成半截。
+    /// 保護目的：多 panel 或小視窗會縮短 status bar；此測試避免重新出現只看得到半個
+    /// 快捷鍵名稱，並確認寬畫面使用的是目前正確的 Tab preview 與 P 覆蓋貼上提示。
+    fn status_shortcut_line_drops_low_priority_items_instead_of_clipping() {
+        let theme = Theme::default_theme();
+        let narrow = super::status_shortcut_line(31, theme);
+        let narrow_text = narrow
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let wide = super::status_shortcut_line(u16::MAX, theme);
+        let wide_text = wide
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(narrow_text, "~/F1 help  hjkl move");
+        assert!(wide_text.contains("Tab preview"));
+        assert!(wide_text.contains("p/P paste/overwrite"));
+        assert!(!wide_text.contains("P preview"));
     }
 
     #[test]
