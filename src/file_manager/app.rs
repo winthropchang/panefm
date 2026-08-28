@@ -232,6 +232,22 @@ pub(crate) struct QueuedLaunch {
     pub(crate) launch: LaunchSpec,
 }
 
+/// 描述一次 UNC 網路路徑背景跳轉的完成訊息。
+///
+/// worker 會在主執行緒之外複製並載入 [`PaneState`]；主迴圈收到結果後，只有在
+/// task 尚未被取消且目標 panel 仍存在時才套用，避免失聯 SMB 主機凍結整個 TUI。
+#[derive(Debug)]
+struct NetworkGotoEvent {
+    /// 對應 task manager 中的任務編號。
+    task_id: usize,
+    /// 啟動跳轉時的 active panel 編號。
+    pane_id: usize,
+    /// 使用者輸入的 UNC 目標，供狀態列與錯誤訊息顯示。
+    target: PathBuf,
+    /// 背景載入完成的 panel 狀態，或作業系統回傳的 I/O 錯誤。
+    result: io::Result<PaneState>,
+}
+
 /// 記錄目前是否處於範圍標記模式，以及起點和目前游標位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisualSelectionState {
@@ -449,6 +465,10 @@ pub(crate) struct App {
     pub(crate) global_search_rx: Option<Receiver<GlobalSearchEvent>>,
     pub(crate) global_search_cancelled: Option<Arc<AtomicBool>>,
     pub(crate) active_global_search_task_id: Option<usize>,
+    /// 目前 UNC `goto` 背景工作的接收端；`None` 代表沒有等待中的網路跳轉。
+    network_goto_rx: Option<Receiver<NetworkGotoEvent>>,
+    /// 目前 UNC `goto` 對應的 task id，供 Esc 與 task panel 取消後捨棄晚到結果。
+    active_network_goto_task_id: Option<usize>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
@@ -554,6 +574,8 @@ impl App {
             global_search_rx: None,
             global_search_cancelled: None,
             active_global_search_task_id: None,
+            network_goto_rx: None,
+            active_network_goto_task_id: None,
             visual_selection: None,
             pending_action: None,
             help_return: None,
@@ -810,6 +832,12 @@ impl App {
         }
         if self.pending_bookmark.is_some() {
             return self.handle_bookmark_key(key);
+        }
+        // UNC 目錄可能被 Windows 網路層長時間阻塞。背景跳轉期間允許 Esc 立即
+        // 捨棄接收端並回到一般操作，不必等待作業系統的檔案系統呼叫結束。
+        if key.code == KeyCode::Esc && self.active_network_goto_task_id.is_some() {
+            self.cancel_network_goto("cancelled by user");
+            return Ok(true);
         }
         // 不在輸入或暫時 UI 時，數字與跨 panel 快捷鍵才有意義。這段必須放在
         // count prefix 之前，否則多 panel 下按 2 會被誤解成 `2j` 的前綴。
@@ -6914,6 +6942,12 @@ impl App {
             return;
         }
 
+        if self.active_network_goto_task_id == Some(task_id) {
+            self.cancel_network_goto("cancelled from task panel");
+            self.status = format!("cancelled task {task_id}");
+            return;
+        }
+
         if self
             .pending_fzf_jump
             .as_ref()
@@ -8291,6 +8325,10 @@ impl App {
             return Ok(());
         };
 
+        if is_unc_path(target.trim()) {
+            return self.start_network_goto(target_path);
+        }
+
         match self.go_to_path_and_track(self.focused_pane, &target_path) {
             Ok(()) => {
                 self.status = format!("jumped to path: {}", target_path.display());
@@ -8300,6 +8338,79 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// 在背景執行 UNC 目錄跳轉，避免 Windows 等待失聯 SMB 主機時凍結 TUI。
+    ///
+    /// 參數：
+    /// - `target_path: PathBuf`，`//server/share` 或 `\\server\share` 形式的目標。
+    ///
+    /// 回傳：`io::Result<()>`；成功代表工作已排入背景，不代表網路目錄已載入完成。
+    fn start_network_goto(&mut self, target_path: PathBuf) -> io::Result<()> {
+        self.start_network_goto_with(target_path, |mut pane, target| {
+            pane.go_to_path(&target)?;
+            Ok(pane)
+        })
+    }
+
+    /// 以可注入 loader 啟動 UNC 背景跳轉，讓測試能證明主執行緒不會等待網路 I/O。
+    ///
+    /// 參數：
+    /// - `target_path: PathBuf`，要交給背景工作載入的 UNC 路徑。
+    /// - `loader: F`，取得目前 panel 副本與目標路徑，回傳載入後的 panel 狀態。
+    ///
+    /// 回傳：`io::Result<()>`；panel 不存在時回傳正常狀態並顯示錯誤，其餘情況會
+    /// 立即回傳，loader 則留在背景執行。
+    fn start_network_goto_with<F>(&mut self, target_path: PathBuf, loader: F) -> io::Result<()>
+    where
+        F: FnOnce(PaneState, PathBuf) -> io::Result<PaneState> + Send + 'static,
+    {
+        if self.active_network_goto_task_id.is_some() {
+            self.cancel_network_goto("replaced by new goto");
+        }
+
+        let pane_id = self.focused_pane;
+        let Some(pane) = self.panes.get(&pane_id).cloned() else {
+            self.status = String::from("panel no longer exists");
+            return Ok(());
+        };
+        let task_id = self.push_task(
+            pane_id,
+            "goto",
+            format!("goto {}", target_path.display()),
+            String::from("loading UNC path in background"),
+        );
+        let (sender, receiver) = mpsc::channel();
+        let worker_target = target_path.clone();
+        thread::spawn(move || {
+            let result = loader(pane, worker_target.clone());
+            let _ = sender.send(NetworkGotoEvent {
+                task_id,
+                pane_id,
+                target: worker_target,
+                result,
+            });
+        });
+
+        self.network_goto_rx = Some(receiver);
+        self.active_network_goto_task_id = Some(task_id);
+        self.status = format!(
+            "connecting to {} in background; Esc cancels",
+            target_path.display()
+        );
+        Ok(())
+    }
+
+    /// 取消目前 UNC 背景跳轉並捨棄晚到的結果。
+    ///
+    /// 參數：`reason: &str`，寫入 task log 的取消原因。
+    /// 回傳：`()`；作業系統中已開始的阻塞呼叫可能稍後才結束，但不再影響 UI。
+    fn cancel_network_goto(&mut self, reason: &str) {
+        self.network_goto_rx = None;
+        if let Some(task_id) = self.active_network_goto_task_id.take() {
+            self.finish_task(task_id, TaskState::Cancelled, reason.to_string());
+        }
+        self.status = String::from("network goto cancelled");
     }
 
     /// 讓 `g` 系列快捷鍵可以快速跳到常用的系統目錄。
@@ -9057,6 +9168,8 @@ impl App {
     /// 每個訊息都核對 panel id 與 query，舊搜尋取消後晚到的 chunk 會被捨棄，不能
     /// 混入使用者後來啟動的新搜尋。
     pub(crate) fn poll_background_tasks(&mut self) {
+        self.poll_network_goto();
+
         let Some(receiver) = &self.global_search_rx else {
             return;
         };
@@ -9157,6 +9270,67 @@ impl App {
 
         if finished {
             self.cancel_global_search_worker();
+        }
+    }
+
+    /// 非阻塞接收 UNC `goto` 的背景載入結果，完成後才替換指定 panel。
+    ///
+    /// 參數：無；資料來自 `network_goto_rx`。
+    /// 回傳：`()`；尚未完成時立即返回，取消後晚到的結果也不會被套用。
+    fn poll_network_goto(&mut self) {
+        let Some(receiver) = self.network_goto_rx.take() else {
+            return;
+        };
+
+        let event = match receiver.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::TryRecvError::Empty) => {
+                self.network_goto_rx = Some(receiver);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if let Some(task_id) = self.active_network_goto_task_id.take() {
+                    self.finish_task(
+                        task_id,
+                        TaskState::Failed,
+                        String::from("network goto worker disconnected"),
+                    );
+                }
+                self.status = String::from("network goto failed: worker disconnected");
+                return;
+            }
+        };
+
+        if self.active_network_goto_task_id != Some(event.task_id) {
+            return;
+        }
+        self.active_network_goto_task_id = None;
+
+        match event.result {
+            Ok(pane) if self.panes.contains_key(&event.pane_id) => {
+                let cwd = pane.cwd.clone();
+                self.panes.insert(event.pane_id, pane);
+                self.zoxide_tracker.track(&cwd);
+                self.finish_task(
+                    event.task_id,
+                    TaskState::Done,
+                    format!("opened {}", event.target.display()),
+                );
+                self.full_redraw_requested = true;
+                self.status = format!("jumped to path: {}", event.target.display());
+            }
+            Ok(_) => {
+                self.finish_task(
+                    event.task_id,
+                    TaskState::Cancelled,
+                    String::from("panel no longer exists"),
+                );
+                self.status = String::from("network goto cancelled: panel no longer exists");
+            }
+            Err(error) => {
+                self.finish_task(event.task_id, TaskState::Failed, error.to_string());
+                self.status = format!("path jump failed: {} ({error})", event.target.display());
+            }
         }
     }
 }
@@ -10653,6 +10827,8 @@ struct CommandPathCompletionContext {
     search_dir: PathBuf,
     partial_name: String,
     preferred_separator: char,
+    /// `true` 代表路徑會觸發 UNC/SMB 網路存取，不可在 command render 時同步掃描。
+    network_path: bool,
 }
 
 /// 若目前 command buffer 正在輸入路徑，整理出路徑補全所需的上下文。
@@ -10692,6 +10868,7 @@ fn command_path_completion_context(
         search_dir,
         partial_name,
         preferred_separator,
+        network_path: is_unc_path(raw_path) || raw_path.trim_start().starts_with("smb://"),
     })
 }
 
@@ -10699,6 +10876,11 @@ fn command_path_completion_context(
 fn path_completion_suggestions(
     context: &CommandPathCompletionContext,
 ) -> Vec<CommandSuggestionLine> {
+    // command suggestions 會在每次按鍵與每次 render 時計算；若這裡讀取 UNC，失聯
+    // 主機會把 TUI 主執行緒鎖住數十秒。網路路徑只在 Enter 後交給背景 goto。
+    if context.network_path {
+        return Vec::new();
+    }
     let Ok(entries) = fs::read_dir(&context.search_dir) else {
         return Vec::new();
     };
@@ -11935,6 +12117,65 @@ mod tests {
         assert_eq!(suggestions[0].display_command, "docs/");
         assert!(suggestions[0].shortcut.is_empty());
         assert!(suggestions[0].description.is_empty());
+    }
+
+    #[test]
+    /// 驗證 UNC 路徑輸入期間不會建立需要讀取網路目錄的即時補全候選。
+    ///
+    /// 保護目的：command suggestion 會在按鍵與 render 階段反覆計算；若對
+    /// `//server/share` 呼叫 `read_dir`，Windows 遇到失聯主機時會凍結整個 TUI。
+    /// 網路路徑必須等 Enter 後交給背景 goto，不能在使用者仍輸入時碰檔案系統。
+    fn command_suggestions_do_not_scan_unc_paths() {
+        let dir = tempdir().expect("tempdir");
+
+        let unc_suggestions =
+            command_suggestions_for_buffer(Some(dir.path()), "goto //192.0.2.10/share");
+        let smb_suggestions =
+            command_suggestions_for_buffer(Some(dir.path()), "goto smb://192.0.2.10/share");
+
+        assert!(unc_suggestions.is_empty());
+        assert!(smb_suggestions.is_empty());
+    }
+
+    #[test]
+    /// 驗證 UNC goto 的 loader 即使尚未完成，啟動函式仍會立即把控制權交回 TUI。
+    ///
+    /// 保護目的：公司網路主機不存在或 SMB 回應緩慢時，Windows 檔案系統呼叫可能
+    /// 等待很久；此測試用 channel 人為暫停 worker，確認主執行緒仍可用 Esc 取消，
+    /// 且取消後晚到的結果不會覆蓋原本 panel。
+    fn app_unc_goto_runs_in_background_and_escape_discards_late_result() {
+        let dir = tempdir().expect("tempdir");
+        let original_cwd = dir.path().to_path_buf();
+        let mut app = App::new(original_cwd.clone(), default_loaded_config()).expect("app");
+        let target = std::path::PathBuf::from("//192.0.2.10/share");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        app.start_network_goto_with(target, move |mut pane, target| {
+            started_tx.send(()).expect("report worker started");
+            release_rx.recv().expect("release worker");
+            pane.cwd = target;
+            Ok(pane)
+        })
+        .expect("start background goto");
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background loader should start without blocking caller");
+        assert!(app.active_network_goto_task_id.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel network goto");
+        release_tx.send(()).expect("finish stale worker");
+        thread::sleep(Duration::from_millis(10));
+        app.poll_background_tasks();
+
+        assert!(app.active_network_goto_task_id.is_none());
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, original_cwd);
+        assert!(matches!(
+            app.task_log.last().map(|task| task.state),
+            Some(TaskState::Cancelled)
+        ));
     }
 
     #[test]

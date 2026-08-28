@@ -50,7 +50,7 @@ pub(crate) struct PasteOutcome {
 ///
 /// 每個 pane 都獨立維護自己的目錄、游標與列表狀態，
 /// 這樣分割視窗後每個區塊才可以各自操作。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PaneState {
     /// 目前 pane 正在瀏覽的目錄。
     pub(crate) cwd: PathBuf,
