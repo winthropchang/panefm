@@ -30,8 +30,12 @@ use ratatui::{
 use crate::theme::Theme;
 
 use super::{
-    bookmark::BookmarkTarget, entry::FileEntry, fuzzy::fuzzy_matched_indices,
-    search::GlobalSearchEntry, trash::TrashStore,
+    bookmark::BookmarkTarget,
+    cow::{clone_file_cow, is_cow_unsupported_error},
+    entry::FileEntry,
+    fuzzy::fuzzy_matched_indices,
+    search::GlobalSearchEntry,
+    trash::TrashStore,
 };
 
 /// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
@@ -3088,22 +3092,32 @@ where
 /// `/Volumes` 或一般本機路徑切換成另一套手寫串流，而是統一交給 `std::fs::copy`。
 /// 這可讓 Rust 標準函式庫與作業系統處理 SMB redirector、clone 與平台細節。
 ///
+/// 使用平台原生 copy 複製單一檔案，並驗證來源與目標大小一致。
+///
+/// 這條路徑在同 APFS/Btrfs 磁區優先採用 Copy-on-Write (CoW) 秒級克隆；在跨磁區、
+/// 跨網路芳鄰（SMB）或不支援檔案系統時，無縫降級交由 `std::fs::copy` 處理。
+///
 /// 參數：
 /// - `source_path: &Path`，來源檔案。
 /// - `staged_path: &Path`，要寫入的目標檔；可能是正式名稱或交易式暫存名稱。
 ///
 /// 回傳：`io::Result<()>`；成功代表原生 copy 已返回，且兩端大小一致。
 fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()> {
-    copy_file_and_verify_with(source_path, staged_path, |source, target| {
-        fs::copy(source, target)
-    })
+    match clone_file_cow(source_path, staged_path) {
+        Ok(()) => Ok(()),
+        Err(error) if is_cow_unsupported_error(&error) => {
+            copy_file_and_verify_with(source_path, staged_path, |source, target| {
+                fs::copy(source, target)
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// 使用平台原生 copy 複製檔案，並在 copy 執行期間輪詢目的檔大小更新背景進度。
 ///
-/// 原生 copy 在 blocking worker 中執行，另一個非同步工作定期讀取目的檔
-/// metadata；輪詢週期為 200ms，讓大型
-/// 檔案在 task 面板中有較即時的百分比，但輪詢本身不接管或改寫資料傳輸。
+/// 優先嘗試 CoW 秒級克隆；跨磁區或跨 SMB 傳輸時在 blocking worker 中執行，
+/// 另一個非同步工作定期讀取目的檔 metadata 輪詢進度。
 ///
 /// 參數：`source_path`、`target_path` 為來源與目標；`progress` 在單檔完整完成後收到
 /// 寫入增量。回傳：`io::Result<()>`；原生 copy 或大小驗證失敗時回傳原始 I/O 錯誤。
@@ -3116,6 +3130,18 @@ where
     F: FnMut(u64) + ?Sized,
 {
     let expected_size = fs::metadata(source_path)?.len();
+
+    // 優先嘗試 CoW 秒級克隆（同 APFS 磁區 0ms 完成免建立 thread）
+    match clone_file_cow(source_path, target_path) {
+        Ok(()) => {
+            progress(expected_size);
+            return Ok(());
+        }
+        Err(error) if is_cow_unsupported_error(&error) => {
+            // 跨磁區、跨網路芳鄰（SMB）或不支援檔案系統時，平滑進入進度輪詢或串流
+        }
+        Err(error) => return Err(error),
+    }
 
     // 小檔案直接在既有 file worker 執行，避免每一筆檔案再建立一條監看 thread。
     // 對含數萬個小檔案的 build 目錄，這個分支是主要效能路徑。
@@ -3185,20 +3211,17 @@ where
     C: FnOnce(&Path, &Path) -> io::Result<u64>,
 {
     let expected_size = fs::metadata(source_path)?.len();
-    copy_file_with_native_fallback_known_size(
+    copy_file_with_native_fallback_known_size_using(
         source_path,
         target_path,
         expected_size,
         progress,
+        |_, _| Err(io::Error::new(io::ErrorKind::Unsupported, "test simulated fallback")),
         native_copy,
     )
 }
 
 /// 使用呼叫端已取得的來源大小執行原生 copy 與串流 fallback。
-///
-/// 大量小檔案是目錄 copy 的主要成本；若外層為判斷進度策略已讀過 metadata，這裡不可
-/// 再重複開啟來源檔。參數中的 `expected_size: u64` 是外層同一次操作取得的來源大小；
-/// 其餘參數是來源、目標、進度 callback 與平台 copy。回傳成功前仍會驗證目的檔大小。
 fn copy_file_with_native_fallback_known_size<F, C>(
     source_path: &Path,
     target_path: &Path,
@@ -3210,11 +3233,47 @@ where
     F: FnMut(u64) + ?Sized,
     C: FnOnce(&Path, &Path) -> io::Result<u64>,
 {
+    copy_file_with_native_fallback_known_size_using(
+        source_path,
+        target_path,
+        expected_size,
+        progress,
+        clone_file_cow,
+        native_copy,
+    )
+}
+
+/// 接收 CoW 與平台原生 copy 實作的底層單檔複製器。
+fn copy_file_with_native_fallback_known_size_using<F, CoW, C>(
+    source_path: &Path,
+    target_path: &Path,
+    expected_size: u64,
+    progress: &mut F,
+    cow_copy: CoW,
+    native_copy: C,
+) -> io::Result<()>
+where
+    F: FnMut(u64) + ?Sized,
+    CoW: FnOnce(&Path, &Path) -> io::Result<()>,
+    C: FnOnce(&Path, &Path) -> io::Result<u64>,
+{
     if target_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("copy target already exists: {}", target_path.display()),
         ));
+    }
+
+    // 優先嘗試 CoW 秒級克隆
+    match cow_copy(source_path, target_path) {
+        Ok(()) => {
+            progress(expected_size);
+            return Ok(());
+        }
+        Err(error) if is_cow_unsupported_error(&error) => {
+            // 跨磁區/跨 SMB/不支援時平滑走 native copy
+        }
+        Err(error) => return Err(error),
     }
 
     match native_copy(source_path, target_path) {
@@ -4296,10 +4355,10 @@ mod tests {
 
     use super::{
         DirectoryLoadProgress, PaneState, SortMode, TransferProgress,
-        copy_dir_parallel_with_progress, copy_file_and_verify, copy_file_and_verify_with,
-        copy_file_native_with_progress, copy_file_native_with_progress_using,
-        copy_file_with_native_fallback, copy_path_direct_with_cleanup,
-        copy_path_transactional_with, natural_cmp, read_dir_entries,
+        copy_dir_parallel_with_progress, copy_dir_recursive, copy_dir_recursive_with_progress,
+        copy_file_and_verify, copy_file_and_verify_with, copy_file_native_with_progress,
+        copy_file_native_with_progress_using, copy_file_with_native_fallback,
+        copy_path_direct_with_cleanup, copy_path_transactional_with, natural_cmp, read_dir_entries,
         read_dir_entries_with_cancellation, stream_dir_entries_with_cancellation,
     };
     use crate::file_manager::entry::FileEntry;
@@ -5622,5 +5681,52 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(got_complete, "必須完成最終 Complete 步驟");
+    }
+
+    #[test]
+    /// 驗證 pane 的單檔與目錄複製支援 CoW 快速克隆，並在跨檔案系統／不支援情境下平滑降級。
+    fn cow_and_fallback_copy_file_and_directory_in_pane() {
+        let dir = tempdir().expect("tempdir");
+        let src_file = dir.path().join("source.dat");
+        let dst_file = dir.path().join("target.dat");
+        let payload = vec![0x42u8; 1024 * 64];
+        fs::write(&src_file, &payload).expect("write src");
+
+        // 1. 單檔複製
+        copy_file_and_verify(&src_file, &dst_file).expect("copy file");
+        assert!(dst_file.exists());
+        assert_eq!(fs::read(&dst_file).expect("read dst"), payload);
+
+        // 2. 資料夾遞迴複製
+        let src_dir = dir.path().join("source_dir");
+        let dst_dir = dir.path().join("target_dir");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("nested.txt"), b"nested content").expect("write nested");
+
+        copy_dir_recursive(&src_dir, &dst_dir).expect("copy dir");
+        assert!(dst_dir.is_dir());
+        assert_eq!(
+            fs::read_to_string(dst_dir.join("nested.txt")).expect("read nested"),
+            "nested content"
+        );
+
+        // 3. 帶進度回報的資料夾複製
+        let dst_dir2 = dir.path().join("target_dir2");
+        let mut discovered = 0u64;
+        let mut copied = 0u64;
+        copy_dir_recursive_with_progress(&src_dir, &dst_dir2, &mut |progress| match progress {
+            TransferProgress::BytesDiscovered(b) => discovered = discovered.saturating_add(b),
+            TransferProgress::BytesCopied(b) => copied = copied.saturating_add(b),
+            _ => {}
+        })
+        .expect("copy dir with progress");
+
+        assert!(dst_dir2.is_dir());
+        assert_eq!(
+            fs::read_to_string(dst_dir2.join("nested.txt")).expect("read nested2"),
+            "nested content"
+        );
+        assert!(discovered > 0);
+        assert!(copied > 0);
     }
 }

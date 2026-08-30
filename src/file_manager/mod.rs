@@ -8,6 +8,7 @@ mod app;
 mod archive;
 mod bookmark;
 mod copy;
+mod cow;
 mod entry;
 mod fd;
 mod filesystem_watcher;
