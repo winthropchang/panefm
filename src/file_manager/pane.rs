@@ -6,11 +6,11 @@
 
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
     collections::hash_map::DefaultHasher,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
     hash::{Hash, Hasher},
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -37,11 +37,25 @@ use super::{
 /// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
 static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// 經過跨平台 I/O 壓力與小檔案吞吐量取捨的檔案複製 worker 數量。
+/// 目錄傳輸使用的固定檔案 worker 數量。
 ///
-/// 目錄走訪只負責建立資料夾與排入單檔工作，實際 copy 由固定數量 worker 並行處理。
-/// 固定上限可提升大量小檔案的速度，同時避免對 SMB 或較慢磁碟產生無限制 I/O 壓力。
+/// 檔案複製主要受儲存裝置與網路 share 限制，worker 太多反而會讓 macOS APFS、
+/// Windows redirector 或 SMB server 產生額外 seek、鎖定與 metadata 競爭。固定三條 worker
+/// 可讓一條處理較慢檔案時，另外兩條繼續消化小檔案，同時避免對網路磁碟過度併發。
 const COPY_FILE_WORKERS: usize = 3;
+
+/// 單檔達到這個大小後，才值得建立額外 thread 輪詢目的檔大小。
+///
+/// 小檔案若每一筆都建立 thread，像 Rust `target` 這類含數萬個小檔案的目錄會把
+/// 大部分時間花在線程建立與排程，而不是實際 I/O。小於門檻的檔案直接使用原生 copy，
+/// 完成後一次回報大小；大檔案才每 200ms 更新進度。
+const PROGRESSIVE_NATIVE_COPY_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// SMB 或其他檔案系統不支援平台原生 copy 時，分塊傳輸使用的 buffer 大小。
+///
+/// 1 MiB 可降低網路 share 上大量小 read/write system call 的成本，同時不會讓每一條
+/// file worker 占用過多記憶體。
+const STREAM_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// 描述一次貼上實際完成後，可供上層建立 Undo 紀錄的檔案系統結果。
 ///
@@ -55,6 +69,18 @@ pub(crate) struct PasteOutcome {
     pub(crate) target_path: PathBuf,
     /// 覆蓋前原目標的隱藏備份；一般貼上時為 `None`。
     pub(crate) backup_path: Option<PathBuf>,
+}
+
+/// 描述背景傳輸排程器送給 task manager 的進度事件。
+///
+/// 走訪器發現檔案時先回報 [`TransferProgress::BytesDiscovered`]，file worker 完成實際
+/// 寫入時再回報 [`TransferProgress::BytesCopied`]。這讓目錄只需走訪一次，不必為了
+/// 百分比另外掃描整棵樹；[`TransferProgress::TargetVisible`] 則通知 UI 第一層目標已建立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferProgress {
+    TargetVisible,
+    BytesDiscovered(u64),
+    BytesCopied(u64),
 }
 
 /// 表示單一 pane 的完整瀏覽狀態。
@@ -280,9 +306,23 @@ impl PaneState {
         // 外部程式可能在游標前方新增或刪除項目。先記住實際路徑，重新排序後再找回
         // 同一項，避免 watcher 更新列表時游標只依舊索引而跳到另一個檔案。
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        let cached_directory_sizes = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir)
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    (entry.directory_size, entry.directory_size_complete),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         self.entries = read_dir_entries(&self.cwd)?;
-        if matches!(self.active_detail_kind(), SortDetailKind::Size) {
-            self.load_directory_child_counts();
+        for entry in &mut self.entries {
+            if let Some((size, complete)) = cached_directory_sizes.get(&entry.path) {
+                entry.directory_size = *size;
+                entry.directory_size_complete = *complete;
+            }
         }
         self.marked_paths
             .retain(|path| self.entries.iter().any(|entry| &entry.path == path));
@@ -580,6 +620,7 @@ impl PaneState {
     /// 回傳：`io::Result<()>`。
     /// - 成功時代表已完成目錄切換或目前選項不是資料夾。
     /// - 失敗時代表進入目錄或重新載入內容時發生錯誤。
+    #[cfg(test)]
     pub(crate) fn enter_selected(&mut self) -> io::Result<()> {
         if let Some(entry) = self.selected_entry().cloned()
             && entry.is_dir
@@ -598,6 +639,86 @@ impl PaneState {
         Ok(())
     }
 
+    /// 立即切換到目前選取的子目錄，但不在呼叫端同步讀取新目錄內容。
+    ///
+    /// 參數：無。
+    /// 回傳：`Option<PathBuf>`；成功切換時回傳新 cwd，選到檔案時回傳 `None`。
+    /// `App` 會先繪製空列表或快取，再由背景 worker 呼叫 `read_dir_entries`，避免大型
+    /// 目錄的數萬筆 metadata 與排序凍結 TUI。
+    pub(crate) fn begin_enter_selected(&mut self) -> Option<PathBuf> {
+        let entry = self.selected_entry()?.clone();
+        if !entry.is_dir {
+            return None;
+        }
+        self.cwd = entry.path;
+        self.bookmark_target = match &self.bookmark_target {
+            BookmarkTarget::SmbLocation(current_url) => {
+                BookmarkTarget::SmbLocation(append_smb_url_segment(current_url, &entry.name))
+            }
+            BookmarkTarget::LocalPath(_) => BookmarkTarget::LocalPath(self.cwd.clone()),
+        };
+        self.selected = 0;
+        self.filter_query = None;
+        self.replace_entries(Vec::new(), None);
+        Some(self.cwd.clone())
+    }
+
+    /// 立即切換到父目錄，但把目錄讀取交給背景 worker。
+    ///
+    /// 參數：無。
+    /// 回傳：`Option<(PathBuf, PathBuf)>`；依序為父目錄 cwd 與載入完成後應重新選取的
+    /// 原目錄。已位於檔案系統根目錄時回傳 `None`。
+    pub(crate) fn begin_go_parent(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let previous_cwd = self.cwd.clone();
+        let parent = self.cwd.parent()?.to_path_buf();
+        self.cwd = parent;
+        self.bookmark_target = match &self.bookmark_target {
+            BookmarkTarget::SmbLocation(current_url) => smb_parent_url(current_url)
+                .map(BookmarkTarget::SmbLocation)
+                .unwrap_or_else(|| BookmarkTarget::LocalPath(self.cwd.clone())),
+            BookmarkTarget::LocalPath(_) => BookmarkTarget::LocalPath(self.cwd.clone()),
+        };
+        self.filter_query = None;
+        self.replace_entries(Vec::new(), None);
+        Some((self.cwd.clone(), previous_cwd))
+    }
+
+    /// 套用背景讀取或目錄快取提供的完整清單，並依目前 pane 設定重新排序與選取。
+    ///
+    /// 參數：`entries` 是新 cwd 的項目；`selected_path` 是回到父目錄時要找回的子目錄。
+    /// 回傳：`()`；此函數只修改目前 panel，不會觸碰其他 panel 或全域 UI。
+    pub(crate) fn replace_entries(
+        &mut self,
+        entries: Vec<FileEntry>,
+        selected_path: Option<&Path>,
+    ) {
+        self.entries = entries;
+        self.sort_entries();
+        self.refresh_visible_entries();
+        if let Some(path) = selected_path {
+            self.select_path(path);
+        }
+    }
+
+    /// 套用已在背景完成排序的清單，跳過主 UI 執行緒的排序運算。
+    pub(crate) fn replace_entries_presorted(
+        &mut self,
+        entries: Vec<FileEntry>,
+        selected_path: Option<&Path>,
+    ) {
+        self.entries = entries;
+        self.refresh_visible_entries();
+        if let Some(path) = selected_path {
+            self.select_path(path);
+        }
+    }
+
+    /// 增量追加載入中的目錄項目，並在保留目前可見游標索引的前提下即時更新畫面。
+    pub(crate) fn extend_entries(&mut self, new_entries: Vec<FileEntry>) {
+        self.entries.extend(new_entries);
+        self.refresh_visible_entries();
+    }
+
     /// 回到目前目錄的上一層。
     ///
     /// 參數：
@@ -606,6 +727,7 @@ impl PaneState {
     /// 回傳：`io::Result<()>`。
     /// - 成功時代表已回到父目錄或目前已無父目錄。
     /// - 失敗時代表重新載入父目錄內容時發生錯誤。
+    #[cfg(test)]
     pub(crate) fn go_parent(&mut self) -> io::Result<()> {
         let current_dir = self.cwd.clone();
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
@@ -1288,7 +1410,7 @@ impl PaneState {
     /// 在背景工作中複製路徑，並於每次寫入資料後回報新增完成的 byte 數。
     ///
     /// 參數：`source_path: &Path` 為來源；`target_dir: &Path` 為目的目錄；
-    /// `overwrite: bool` 表示是否覆蓋；`progress: &mut F` 接收本次新增完成量。
+    /// `overwrite: bool` 表示是否覆蓋；`progress: &mut F` 接收目標可見、發現大小與完成量。
     /// 回傳：`io::Result<PasteOutcome>`；不重新載入 panel，適合 worker thread 使用。
     pub(crate) fn copy_path_to_dir_with_history_progress<F>(
         source_path: &Path,
@@ -1297,7 +1419,7 @@ impl PaneState {
         progress: &mut F,
     ) -> io::Result<PasteOutcome>
     where
-        F: FnMut(u64),
+        F: FnMut(TransferProgress),
     {
         copy_path_into_dir_with_progress(source_path, target_dir, overwrite, true, progress)
     }
@@ -1305,7 +1427,7 @@ impl PaneState {
     /// 在背景工作中移動路徑；跨磁碟或 SMB 無法 rename 時改採 copy 後刪除來源。
     ///
     /// 參數：`source_path: &Path` 為來源；`target_dir: &Path` 為目的目錄；
-    /// `overwrite: bool` 表示是否覆蓋；`progress: &mut F` 接收新增完成的 byte 數。
+    /// `overwrite: bool` 表示是否覆蓋；`progress: &mut F` 接收傳輸排程與 byte 進度。
     /// 回傳：`io::Result<PasteOutcome>`；同磁碟 rename 會立即完成，跨裝置則可持續回報。
     pub(crate) fn move_path_to_dir_with_history_progress<F>(
         source_path: &Path,
@@ -1314,7 +1436,7 @@ impl PaneState {
         progress: &mut F,
     ) -> io::Result<PasteOutcome>
     where
-        F: FnMut(u64),
+        F: FnMut(TransferProgress),
     {
         Self::move_path_to_dir_with_history_progress_using_rename(
             source_path,
@@ -1339,7 +1461,7 @@ impl PaneState {
         rename_source: R,
     ) -> io::Result<PasteOutcome>
     where
-        F: FnMut(u64),
+        F: FnMut(TransferProgress),
         R: FnOnce(&Path, &Path) -> io::Result<()>,
     {
         // 一般檔案可用單次 metadata 提供完成量；目錄不可在 rename 前遞迴掃描，否則
@@ -1357,7 +1479,8 @@ impl PaneState {
         ) {
             Ok(outcome) => {
                 if let Some(source_file_size) = source_file_size {
-                    progress(source_file_size);
+                    progress(TransferProgress::BytesDiscovered(source_file_size));
+                    progress(TransferProgress::BytesCopied(source_file_size));
                 }
                 Ok(outcome)
             }
@@ -1578,19 +1701,48 @@ impl PaneState {
         self.line_mode = Some(line_mode);
     }
 
-    /// 只在 size 欄位真正需要顯示時，才讀取各子目錄的直接項目數量。
+    /// 將未曾計算容量的直接子目錄初始化為預估中的 ~0B。
     ///
     /// 參數：`self: &mut PaneState`，目前要補齊顯示資料的 pane。
-    /// 回傳：`() `；無法讀取的子目錄會保留 `None`，由 UI 顯示 `?`。
-    ///
-    /// 這項操作刻意不放在一般 `reload()` 的預設路徑，因為 Windows SMB
-    /// 每開啟一個子目錄都可能產生一次網路往返，會讓首次進入目錄明顯卡頓。
-    pub(crate) fn load_directory_child_counts(&mut self) {
+    /// 回傳：`() `；已有容量資料的子目錄會完整保留既有數值，不重設為 0。
+    pub(crate) fn init_directory_sizes_if_missing(&mut self) {
         for entry in &mut self.entries {
-            if entry.is_dir && entry.child_count.is_none() {
-                entry.child_count = count_directory_children(&entry.path).ok();
+            if entry.is_dir && entry.directory_size.is_none() {
+                entry.directory_size = Some(0);
+                entry.directory_size_complete = false;
             }
         }
+    }
+
+    /// 清除目錄大小快取，準備接收新的背景遞迴掃描結果。
+    ///
+    /// 參數：`self: &mut PaneState`，目前要補齊顯示資料的 pane。
+    /// 回傳：`() `；只改記憶體狀態，不執行任何同步檔案系統 I/O。
+    pub(crate) fn clear_directory_sizes(&mut self) {
+        for entry in &mut self.entries {
+            if entry.is_dir {
+                entry.directory_size = Some(0);
+                entry.directory_size_complete = false;
+            }
+        }
+    }
+
+    /// 套用背景 worker 對單一直接子目錄計算出的遞迴大小。
+    ///
+    /// 參數：`path` 是目前 pane 直接子項目的完整路徑；`size` 是已統計 byte；
+    /// `complete` 表示該子樹是否已全部走訪完成。
+    /// 回傳：`bool`；找到對應項目並更新時為 `true`，路徑已離開列表時為 `false`。
+    pub(crate) fn update_directory_size(&mut self, path: &Path, size: u64, complete: bool) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_dir && entry.path == path)
+        else {
+            return false;
+        };
+        entry.directory_size = Some(size);
+        entry.directory_size_complete = complete;
+        true
     }
 
     /// 回傳右側欄位目前實際應顯示的資料種類。
@@ -1657,19 +1809,79 @@ impl PaneState {
 
     /// 依照目前排序模式重排完整項目列表。
     fn sort_entries(&mut self) {
-        let sort_mode = self.sort_mode;
-        let random_seed = self.random_seed;
-        self.entries.sort_by(|left, right| {
-            if matches!(sort_mode, SortMode::Random) {
-                match (left.is_dir, right.is_dir) {
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    _ => random_key(left, random_seed).cmp(&random_key(right, random_seed)),
-                }
-            } else {
-                compare_entries(left, right, sort_mode)
+        sort_file_entries(&mut self.entries, self.sort_mode, self.random_seed);
+    }
+}
+
+/// 依照指定的排序模式與種子對項目清單進行就地排序（可在背景執行緒執行）。
+pub(crate) fn sort_file_entries(entries: &mut [FileEntry], sort_mode: SortMode, random_seed: u64) {
+    if entries.len() <= 1 {
+        return;
+    }
+
+    let comparator = |left: &FileEntry, right: &FileEntry| {
+        if matches!(sort_mode, SortMode::Random) {
+            match (left.is_dir, right.is_dir) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => random_key(left, random_seed).cmp(&random_key(right, random_seed)),
             }
-        });
+        } else {
+            compare_entries(left, right, sort_mode)
+        }
+    };
+
+    let worker_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+
+    if entries.len() < 1000 || worker_count <= 1 {
+        entries.sort_unstable_by(comparator);
+        return;
+    }
+
+    let chunk_size = entries.len().div_ceil(worker_count);
+    thread::scope(|scope| {
+        for chunk in entries.chunks_mut(chunk_size) {
+            scope.spawn(move || {
+                chunk.sort_unstable_by(comparator);
+            });
+        }
+    });
+
+    // 多路合併（Pairwise Merge）
+    let mut step = chunk_size;
+    let mut scratch = Vec::with_capacity(entries.len());
+    while step < entries.len() {
+        scratch.clear();
+        let mut i = 0;
+        while i < entries.len() {
+            let mid = (i + step).min(entries.len());
+            let end = (i + 2 * step).min(entries.len());
+            if mid < end {
+                let left_slice = &entries[i..mid];
+                let right_slice = &entries[mid..end];
+                let mut l = 0;
+                let mut r = 0;
+                while l < left_slice.len() && r < right_slice.len() {
+                    if comparator(&left_slice[l], &right_slice[r]) != Ordering::Greater {
+                        scratch.push(left_slice[l].clone());
+                        l += 1;
+                    } else {
+                        scratch.push(right_slice[r].clone());
+                        r += 1;
+                    }
+                }
+                scratch.extend_from_slice(&left_slice[l..]);
+                scratch.extend_from_slice(&right_slice[r..]);
+            } else {
+                scratch.extend_from_slice(&entries[i..mid]);
+            }
+            i = end;
+        }
+        entries.clone_from_slice(&scratch);
+        step *= 2;
     }
 }
 
@@ -1723,7 +1935,7 @@ fn compare_entries(left: &FileEntry, right: &FileEntry, sort_mode: SortMode) -> 
         _ => {
             let primary = match sort_mode {
                 SortMode::Alphabetical { reverse } => compare_with_reverse(
-                    left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+                    compare_ascii_case_insensitive(&left.name, &right.name),
                     reverse,
                 ),
                 SortMode::Natural { reverse } => {
@@ -1741,19 +1953,35 @@ fn compare_entries(left: &FileEntry, right: &FileEntry, sort_mode: SortMode) -> 
                 SortMode::Extension { reverse } => compare_with_reverse(
                     file_extension(left)
                         .cmp(&file_extension(right))
-                        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
+                        .then_with(|| compare_ascii_case_insensitive(&left.name, &right.name)),
                     reverse,
                 ),
                 SortMode::Random => Ordering::Equal,
             };
 
             if primary == Ordering::Equal {
-                left.name.to_lowercase().cmp(&right.name.to_lowercase())
+                left.name.cmp(&right.name)
             } else {
                 primary
             }
         }
     }
+}
+
+/// 零記憶體配置的 ASCII 不分大小寫字串比較。
+fn compare_ascii_case_insensitive(left: &str, right: &str) -> Ordering {
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let mut i = 0;
+    while i < left_bytes.len() && i < right_bytes.len() {
+        let bl = left_bytes[i].to_ascii_lowercase();
+        let br = right_bytes[i].to_ascii_lowercase();
+        if bl != br {
+            return bl.cmp(&br);
+        }
+        i += 1;
+    }
+    left_bytes.len().cmp(&right_bytes.len())
 }
 
 /// 依照 reverse 旗標決定是否翻轉比較結果。
@@ -1780,50 +2008,93 @@ fn file_extension(entry: &FileEntry) -> String {
 
 /// 用比較接近自然排序的方式比較兩個名稱，讓數字片段能按數值排序。
 fn natural_cmp(left: &str, right: &str) -> Ordering {
-    let left_parts = split_natural_parts(left);
-    let right_parts = split_natural_parts(right);
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let (mut left_index, mut right_index) = (0usize, 0usize);
 
-    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
-        let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
-            (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
-            _ => left_part.to_lowercase().cmp(&right_part.to_lowercase()),
-        };
+    while left_index < left_bytes.len() && right_index < right_bytes.len() {
+        if left_bytes[left_index].is_ascii_digit() && right_bytes[right_index].is_ascii_digit() {
+            let left_end = ascii_digit_run_end(left_bytes, left_index);
+            let right_end = ascii_digit_run_end(right_bytes, right_index);
+            let ordering = compare_ascii_number_runs(
+                &left_bytes[left_index..left_end],
+                &right_bytes[right_index..right_end],
+            );
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+            left_index = left_end;
+            right_index = right_end;
+            continue;
+        }
 
+        // Fast path for ASCII characters (avoids Unicode lookup overhead)
+        if left_bytes[left_index].is_ascii() && right_bytes[right_index].is_ascii() {
+            let c_left = left_bytes[left_index].to_ascii_lowercase();
+            let c_right = right_bytes[right_index].to_ascii_lowercase();
+            if c_left != c_right {
+                return c_left.cmp(&c_right);
+            }
+            left_index += 1;
+            right_index += 1;
+            continue;
+        }
+
+        let left_character = left[left_index..]
+            .chars()
+            .next()
+            .expect("index is inside UTF-8 string");
+        let right_character = right[right_index..]
+            .chars()
+            .next()
+            .expect("index is inside UTF-8 string");
+        let ordering = left_character
+            .to_lowercase()
+            .cmp(right_character.to_lowercase());
         if ordering != Ordering::Equal {
             return ordering;
         }
+        left_index += left_character.len_utf8();
+        right_index += right_character.len_utf8();
     }
 
-    left_parts.len().cmp(&right_parts.len())
+    (left_bytes.len() - left_index).cmp(&(right_bytes.len() - right_index))
 }
 
-/// 將名稱拆成數字與文字片段，供自然排序比較使用。
-fn split_natural_parts(value: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_digits = None;
-
-    for character in value.chars() {
-        let is_digit = character.is_ascii_digit();
-        match in_digits {
-            Some(flag) if flag == is_digit => current.push(character),
-            Some(_) => {
-                parts.push(std::mem::take(&mut current));
-                current.push(character);
-                in_digits = Some(is_digit);
-            }
-            None => {
-                current.push(character);
-                in_digits = Some(is_digit);
-            }
-        }
+/// 找出 ASCII 數字片段的尾端索引，過程不建立暫存字串。
+///
+/// 參數：`bytes: &[u8]` 是完整 UTF-8 檔名；`start: usize` 必須指向 ASCII 數字。
+/// 回傳：`usize`，代表第一個非數字 byte 的索引，或 `bytes.len()`。
+fn ascii_digit_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
     }
+    end
+}
 
-    if !current.is_empty() {
-        parts.push(current);
-    }
+/// 比較兩段任意長度的 ASCII 數字，不轉成整數，也不配置 heap 記憶體。
+///
+/// 參數：`left/right: &[u8]` 都只包含 `0..=9`。
+/// 回傳：`Ordering`；先比較去掉前置零後的位數，再比較內容，數值相等時較短原始片段
+/// 排在前面。這可處理超過 `u64` 的檔名數字，並避免大型目錄排序時大量建立字串。
+fn compare_ascii_number_runs(left: &[u8], right: &[u8]) -> Ordering {
+    let left_trimmed = left
+        .iter()
+        .position(|byte| *byte != b'0')
+        .map(|index| &left[index..])
+        .unwrap_or(&[]);
+    let right_trimmed = right
+        .iter()
+        .position(|byte| *byte != b'0')
+        .map(|index| &right[index..])
+        .unwrap_or(&[]);
 
-    parts
+    left_trimmed
+        .len()
+        .cmp(&right_trimmed.len())
+        .then_with(|| left_trimmed.cmp(right_trimmed))
+        .then_with(|| left.len().cmp(&right.len()))
 }
 
 /// 根據路徑內容產生一個基本種子，供隨機排序使用。
@@ -1843,12 +2114,26 @@ fn random_key(entry: &FileEntry, seed: u64) -> u64 {
 
 /// 計算指定資料夾內的子項目數量。
 ///
+/// 計算指定資料夾的項目數量，並設有上限以防大型目錄阻塞 TUI 主執行緒。
+///
 /// 參數：
 /// - `path: &Path`，要計算內容數量的資料夾路徑。
 ///
-/// 回傳：`usize`，讀取成功時為項目數量，失敗時回傳 `0`。
-fn count_items(path: &Path) -> usize {
-    fs::read_dir(path).map(|iter| iter.count()).unwrap_or(0)
+/// 回傳：`String`，讀取成功時為項目數量（超過 64 時顯示 `64+`），失敗時回傳 `0`。
+fn count_items(path: &Path) -> String {
+    let Ok(read_dir) = fs::read_dir(path) else {
+        return String::from("0");
+    };
+    let mut count = 0;
+    for entry in read_dir {
+        if entry.is_ok() {
+            count += 1;
+            if count > 64 {
+                return String::from("64+");
+            }
+        }
+    }
+    count.to_string()
 }
 
 /// 為資料夾產生較完整的預覽內容，包含路徑、項目數與部分子項目名稱。
@@ -1869,18 +2154,22 @@ fn preview_directory(entry: &FileEntry, max_lines: usize) -> Vec<Line<'static>> 
         return lines;
     }
 
-    let remaining = max_lines.saturating_sub(lines.len());
+    let remaining = max_lines.saturating_sub(lines.len()).min(50);
     if remaining == 0 {
         return lines;
     }
 
     match fs::read_dir(&entry.path) {
         Ok(read_dir) => {
-            let child_names: Vec<String> = read_dir
-                .filter_map(|child| child.ok())
-                .map(|child| child.file_name().to_string_lossy().to_string())
-                .take(remaining)
-                .collect();
+            let mut child_names = Vec::new();
+            for child in read_dir {
+                if let Ok(child) = child {
+                    child_names.push(child.file_name().to_string_lossy().to_string());
+                    if child_names.len() >= remaining {
+                        break;
+                    }
+                }
+            }
 
             if child_names.is_empty() {
                 lines.push(Line::from("empty directory"));
@@ -2375,7 +2664,7 @@ fn copy_path_into_dir(
 
 /// 將單一路徑複製到目標資料夾，並持續回報實際讀寫完成量。
 ///
-/// 參數與 [`copy_path_into_dir`] 相同；`progress` 的參數是本次新增完成的 byte 數。
+/// 參數與 [`copy_path_into_dir`] 相同；`progress` 接收走訪與實際寫入進度事件。
 /// 回傳：`io::Result<PasteOutcome>`；失敗時沿用 partial target 清理與 Undo 備份規則。
 fn copy_path_into_dir_with_progress<F>(
     source_path: &Path,
@@ -2385,7 +2674,7 @@ fn copy_path_into_dir_with_progress<F>(
     progress: &mut F,
 ) -> io::Result<PasteOutcome>
 where
-    F: FnMut(u64),
+    F: FnMut(TransferProgress),
 {
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
@@ -2427,7 +2716,7 @@ where
 
 /// 依來源型別選擇可回報進度的單檔或遞迴資料夾複製。
 ///
-/// 參數：`source_path`、`target_path` 為來源與目標；`progress` 接收新增完成量。
+/// 參數：`source_path`、`target_path` 為來源與目標；`progress` 接收傳輸進度事件。
 /// 回傳：`io::Result<()>`；任一子項目失敗會交由外層清理整批目標。
 fn copy_path_with_progress<F>(
     source_path: &Path,
@@ -2435,12 +2724,16 @@ fn copy_path_with_progress<F>(
     progress: &mut F,
 ) -> io::Result<()>
 where
-    F: FnMut(u64),
+    F: FnMut(TransferProgress),
 {
     if source_path.is_dir() {
         copy_dir_recursive_with_progress(source_path, target_path, progress)
     } else {
-        copy_file_native_with_progress(source_path, target_path, progress)
+        let size = fs::metadata(source_path)?.len();
+        progress(TransferProgress::BytesDiscovered(size));
+        copy_file_native_with_progress(source_path, target_path, &mut |increment| {
+            progress(TransferProgress::BytesCopied(increment));
+        })
     }
 }
 
@@ -2729,9 +3022,229 @@ fn copy_file_native_with_progress<F>(
 where
     F: FnMut(u64) + ?Sized,
 {
-    copy_file_native_with_progress_using(source_path, target_path, progress, |source, target| {
-        fs::copy(source, target)
+    let expected_size = fs::metadata(source_path)?.len();
+
+    // 小檔案直接在既有 file worker 執行，避免每一筆檔案再建立一條監看 thread。
+    // 對含數萬個小檔案的 build 目錄，這個分支是主要效能路徑。
+    if expected_size < PROGRESSIVE_NATIVE_COPY_THRESHOLD_BYTES {
+        return copy_file_with_native_fallback_known_size(
+            source_path,
+            target_path,
+            expected_size,
+            progress,
+            |source, target| fs::copy(source, target),
+        );
+    }
+
+    let mut native_reported = 0u64;
+    let native_result = copy_file_native_with_progress_using(
+        source_path,
+        target_path,
+        &mut |increment| {
+            native_reported = native_reported.saturating_add(increment);
+            progress(increment);
+        },
+        |source, target| fs::copy(source, target),
+    );
+    match native_result {
+        Ok(()) => Ok(()),
+        Err(error) if native_copy_supports_stream_fallback(&error) => {
+            // macOS 的 copyfile 與 Windows redirector 在部分 SMB server 會留下 0-byte
+            // 目標再回傳 not supported。串流重試前一定先移除，才能使用 create_new
+            // 保證不會覆寫其他程序剛建立的檔案。
+            remove_partial_file_for_fallback(target_path, &error)?;
+            let mut fallback_reported = 0u64;
+            copy_file_streaming_with_progress(source_path, target_path, &mut |increment| {
+                fallback_reported = fallback_reported.saturating_add(increment);
+                // 原生路徑已經把 partial 大小回報給 task，fallback 從零重寫時不能再
+                // 重複累加同一段範圍；超過原生已回報量後才繼續增加百分比。
+                let previous = fallback_reported.saturating_sub(increment);
+                let newly_visible = fallback_reported.saturating_sub(native_reported)
+                    - previous.saturating_sub(native_reported);
+                if newly_visible > 0 {
+                    progress(newly_visible);
+                }
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 先嘗試平台原生 copy，不支援時安全切換到跨平台分塊串流。
+///
+/// 參數：
+/// - `source_path: &Path`，來源檔案。
+/// - `target_path: &Path`，尚不存在的目的檔案。
+/// - `progress: &mut F`，接收已完整寫入的 byte 增量。
+/// - `native_copy: C`，可注入的平台原生 copy；正式環境使用 `std::fs::copy`。
+///
+/// 回傳：`io::Result<()>`；成功前一定驗證目的大小，原生 API 的一般權限或磁碟錯誤
+/// 不會被 fallback 隱藏，只有明確的「不支援」錯誤才會改走串流。
+#[cfg(test)]
+fn copy_file_with_native_fallback<F, C>(
+    source_path: &Path,
+    target_path: &Path,
+    progress: &mut F,
+    native_copy: C,
+) -> io::Result<()>
+where
+    F: FnMut(u64) + ?Sized,
+    C: FnOnce(&Path, &Path) -> io::Result<u64>,
+{
+    let expected_size = fs::metadata(source_path)?.len();
+    copy_file_with_native_fallback_known_size(
+        source_path,
+        target_path,
+        expected_size,
+        progress,
+        native_copy,
+    )
+}
+
+/// 使用呼叫端已取得的來源大小執行原生 copy 與串流 fallback。
+///
+/// 大量小檔案是目錄 copy 的主要成本；若外層為判斷進度策略已讀過 metadata，這裡不可
+/// 再重複開啟來源檔。參數中的 `expected_size: u64` 是外層同一次操作取得的來源大小；
+/// 其餘參數是來源、目標、進度 callback 與平台 copy。回傳成功前仍會驗證目的檔大小。
+fn copy_file_with_native_fallback_known_size<F, C>(
+    source_path: &Path,
+    target_path: &Path,
+    expected_size: u64,
+    progress: &mut F,
+    native_copy: C,
+) -> io::Result<()>
+where
+    F: FnMut(u64) + ?Sized,
+    C: FnOnce(&Path, &Path) -> io::Result<u64>,
+{
+    if target_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("copy target already exists: {}", target_path.display()),
+        ));
+    }
+
+    match native_copy(source_path, target_path) {
+        Ok(copied_size) if copied_size == expected_size => {
+            progress(expected_size);
+            Ok(())
+        }
+        Ok(copied_size) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("incomplete native copy: expected {expected_size} bytes, copied {copied_size}"),
+        )),
+        Err(error) if native_copy_supports_stream_fallback(&error) => {
+            remove_partial_file_for_fallback(target_path, &error)?;
+            copy_file_streaming_with_progress(source_path, target_path, progress)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 判斷平台原生 copy 的錯誤是否適合改用一般 read/write 串流重試。
+///
+/// Rust 在 macOS 可能直接傳回 `ENOTSUP`（45），Windows SMB redirector 常見
+/// `ERROR_INVALID_FUNCTION`（1）或 `ERROR_NOT_SUPPORTED`（50）。這些錯誤只表示伺服器
+/// 不支援原生 copy 加速，不代表一般檔案寫入也失敗。
+///
+/// 參數：`error: &io::Error`，原生 copy 回傳的錯誤。
+/// 回傳：`bool`，只有可安全降級的 unsupported 類型回傳 `true`。
+fn native_copy_supports_stream_fallback(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+
+    match error.raw_os_error() {
+        #[cfg(unix)]
+        Some(45) | Some(95) => true,
+        #[cfg(windows)]
+        Some(1) | Some(50) => true,
+        _ => false,
+    }
+}
+
+/// 清除原生 copy 失敗後可能留下的 0-byte 或 partial 目的檔。
+///
+/// 參數：`target_path: &Path` 是要重試的目標；`native_error: &io::Error` 是原始錯誤。
+/// 回傳：`io::Result<()>`；清理失敗時同時保留原生與清理錯誤，不能在未知 partial
+/// 上繼續寫入。
+fn remove_partial_file_for_fallback(
+    target_path: &Path,
+    native_error: &io::Error,
+) -> io::Result<()> {
+    if !target_path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(target_path).map_err(|cleanup_error| {
+        io::Error::new(
+            cleanup_error.kind(),
+            format!(
+                "native copy is unsupported ({native_error}); removing partial target {} failed: {cleanup_error}",
+                target_path.display()
+            ),
+        )
     })
+}
+
+/// 使用固定大小 buffer 跨平台串流複製單一檔案並即時回報進度。
+///
+/// 這是 SMB 不支援平台原生 copy 時的可靠 fallback，不是本機預設路徑。目的檔使用
+/// `create_new`，因此不會意外覆寫其他程序在 fallback 前建立的同名項目；寫完會 flush、
+/// 關閉 handle，再重新讀 metadata 驗證完整大小。
+///
+/// 參數：`source_path: &Path`、`target_path: &Path` 為來源與目的；`progress: &mut F`
+/// 接收每一塊成功寫入的 byte 數。
+/// 回傳：`io::Result<()>`；任何 read/write/flush/驗證錯誤都交由外層交易清理 partial。
+fn copy_file_streaming_with_progress<F>(
+    source_path: &Path,
+    target_path: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64) + ?Sized,
+{
+    let mut source = BufReader::with_capacity(STREAM_COPY_BUFFER_BYTES, File::open(source_path)?);
+    let expected_size = source.get_ref().metadata()?.len();
+    let target_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target_path)?;
+    let mut target = BufWriter::with_capacity(STREAM_COPY_BUFFER_BYTES, target_file);
+    let mut buffer = vec![0u8; STREAM_COPY_BUFFER_BYTES];
+    let mut copied = 0u64;
+
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read])?;
+        copied = copied.saturating_add(read as u64);
+        progress(read as u64);
+    }
+    target.flush()?;
+    drop(target);
+
+    let source_size_after_copy = fs::metadata(source_path)?.len();
+    let stored_size = fs::metadata(target_path)?.len();
+    if copied != expected_size
+        || source_size_after_copy != expected_size
+        || stored_size != expected_size
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "incomplete streaming copy: expected {expected_size} bytes, source now {source_size_after_copy}, copied {copied}, stored {stored_size}"
+            ),
+        ));
+    }
+
+    // 權限複製是 best effort：部分 SMB server 可寫內容但拒絕 chmod。資料完整性已經
+    // 驗證成功，不應因伺服器不支援 Unix 權限而把有效檔案判定為失敗。
+    if let Ok(metadata) = fs::metadata(source_path) {
+        let _ = fs::set_permissions(target_path, metadata.permissions());
+    }
+    Ok(())
 }
 
 /// 執行可注入原生 copy 的 progressive copy 核心，供 metadata 輪詢行為做回歸測試。
@@ -2819,6 +3332,24 @@ fn copy_file_and_verify_with<F>(
 where
     F: FnOnce(&Path, &Path) -> io::Result<u64>,
 {
+    let expected_size = File::open(source_path)?.metadata()?.len();
+    copy_file_and_verify_with_known_size(source_path, staged_path, expected_size, platform_copy)
+}
+
+/// 使用已知來源大小驗證平台 copy，避免大量小檔案重複開啟來源。
+///
+/// 參數：`expected_size: u64` 必須由本次 copy 開始前的來源 metadata 取得；其他參數與
+/// [`copy_file_and_verify_with`] 相同。回傳：`io::Result<()>`；平台回報量及落盤目標大小
+/// 都正確才成功。目的檔會以 metadata 重新確認，因此 SMB 的 0-byte 假成功仍會被拒絕。
+fn copy_file_and_verify_with_known_size<F>(
+    source_path: &Path,
+    staged_path: &Path,
+    expected_size: u64,
+    platform_copy: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<u64>,
+{
     if staged_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -2826,19 +3357,13 @@ where
         ));
     }
 
-    let expected_size = File::open(source_path)?.metadata()?.len();
     let copied_size = platform_copy(source_path, staged_path)?;
-
-    let source_size_after_copy = File::open(source_path)?.metadata()?.len();
-    let stored_size = File::open(staged_path)?.metadata()?.len();
-    if copied_size != expected_size
-        || source_size_after_copy != expected_size
-        || stored_size != expected_size
-    {
+    let stored_size = fs::metadata(staged_path)?.len();
+    if copied_size != expected_size || stored_size != expected_size {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             format!(
-                "incomplete copy: expected {expected_size} bytes, source now {source_size_after_copy}, copied {copied_size}, stored {stored_size}"
+                "incomplete copy: expected {expected_size} bytes, copied {copied_size}, stored {stored_size}"
             ),
         ));
     }
@@ -2982,14 +3507,24 @@ fn copy_dir_recursive_with_progress<F>(
     progress: &mut F,
 ) -> io::Result<()>
 where
-    F: FnMut(u64),
+    F: FnMut(TransferProgress),
 {
     copy_dir_parallel_with_progress(
         source_dir,
         target_dir,
         progress,
-        |source_path, target_path, file_progress| {
-            copy_file_native_with_progress(source_path, target_path, file_progress)
+        |source_path, target_path, expected_size, file_progress| {
+            if expected_size < PROGRESSIVE_NATIVE_COPY_THRESHOLD_BYTES {
+                copy_file_with_native_fallback_known_size(
+                    source_path,
+                    target_path,
+                    expected_size,
+                    file_progress,
+                    |source, target| fs::copy(source, target),
+                )
+            } else {
+                copy_file_native_with_progress(source_path, target_path, file_progress)
+            }
         },
     )
 }
@@ -2999,11 +3534,13 @@ where
 struct CopyFileJob {
     source_path: PathBuf,
     target_path: PathBuf,
+    expected_size: u64,
 }
 
 /// 表示 file worker 完成一個工作後回傳給協調執行緒的結果。
 #[derive(Debug)]
 enum CopyFileResult {
+    Discovered(u64),
     Progress(u64),
     Copied,
     Failed(io::Error),
@@ -3018,8 +3555,8 @@ enum CopyFileResult {
 /// 參數：
 /// - `source_dir: &Path`，來源目錄。
 /// - `target_dir: &Path`，要建立的目標目錄。
-/// - `progress: &mut F`，接收各 worker 回報的新增完成 byte 數。
-/// - `copy_file: C`，平台原生單檔複製函數；第三個參數負責回報該檔案進度。
+/// - `progress: &mut F`，接收走訪器與 worker 回報的傳輸事件。
+/// - `copy_file: C`，平台原生單檔複製函數；第三項是已知來源大小，第四項回報完成量。
 ///
 /// 回傳：`io::Result<()>`；走訪、建立目錄或任一 worker 失敗時回傳第一個錯誤。
 fn copy_dir_parallel_with_progress<F, C>(
@@ -3029,13 +3566,13 @@ fn copy_dir_parallel_with_progress<F, C>(
     copy_file: C,
 ) -> io::Result<()>
 where
-    F: FnMut(u64),
-    C: Fn(&Path, &Path, &mut dyn FnMut(u64)) -> io::Result<()> + Sync,
+    F: FnMut(TransferProgress),
+    C: Fn(&Path, &Path, u64, &mut dyn FnMut(u64)) -> io::Result<()> + Sync,
 {
     // 第一層目標一建立就通知 App 刷新目的 panel。這個 0 不是完成 byte 數，而是
     // 「目標已可見」訊號；真正百分比仍只由後續成功複製的 byte 累計。
     fs::create_dir(target_dir)?;
-    progress(0);
+    progress(TransferProgress::TargetVisible);
 
     let (job_sender, job_receiver) = mpsc::sync_channel::<CopyFileJob>(COPY_FILE_WORKERS * 8);
     let job_receiver = Arc::new(Mutex::new(job_receiver));
@@ -3064,7 +3601,12 @@ where
                     let mut file_progress = |increment| {
                         let _ = results.send(CopyFileResult::Progress(increment));
                     };
-                    match copy_file(&job.source_path, &job.target_path, &mut file_progress) {
+                    match copy_file(
+                        &job.source_path,
+                        &job.target_path,
+                        job.expected_size,
+                        &mut file_progress,
+                    ) {
                         Ok(()) => {
                             if results.send(CopyFileResult::Copied).is_err() {
                                 break;
@@ -3079,6 +3621,9 @@ where
                 }
             });
         }
+        // producer 不可保留一份永遠存活的 receiver；所有 worker 因錯誤退出後，
+        // bounded sender 必須收到 disconnected，才能結束而不是永久等待空位。
+        drop(job_receiver);
         // 走訪器必須和結果接收端同時執行。若在目前執行緒先完整走訪再讀 result，
         // 大型目錄會等掃描結束後才把 worker 進度交給 App，畫面因此長時間停在
         // RUNNING。獨立 producer 一邊建立目錄、一邊送出檔案工作，下面的 consumer
@@ -3090,6 +3635,7 @@ where
                 source_dir,
                 target_dir,
                 &job_sender,
+                &producer_results,
                 producer_cancelled.as_ref(),
             ) {
                 producer_cancelled.store(true, AtomicOrdering::Relaxed);
@@ -3100,7 +3646,12 @@ where
 
         for result in result_receiver {
             match result {
-                CopyFileResult::Progress(increment) => progress(increment),
+                CopyFileResult::Discovered(size) => {
+                    progress(TransferProgress::BytesDiscovered(size));
+                }
+                CopyFileResult::Progress(increment) => {
+                    progress(TransferProgress::BytesCopied(increment));
+                }
                 CopyFileResult::Copied => {}
                 CopyFileResult::Failed(error) if traversal_error.is_none() => {
                     traversal_error = Some(error);
@@ -3120,36 +3671,45 @@ where
     }
 }
 
-/// 遞迴建立目標目錄，並把每個一般檔案送入有界 worker 佇列。
+/// 以廣度優先方式建立目標目錄，並把每個一般檔案送入有界 worker 佇列。
 ///
 /// 參數：`source_dir` 與 `target_dir` 為目前走訪層級；`jobs` 是工作 sender；
-/// `cancelled` 在任一 worker 失敗後停止繼續發現新工作。
+/// `results` 回報新發現的 byte；`cancelled` 在任一 worker 失敗後停止繼續發現新工作。
 /// 回傳：`io::Result<()>`；讀取來源或建立目標失敗時保留原始作業系統錯誤。
 fn enqueue_copy_tree(
     source_dir: &Path,
     target_dir: &Path,
     jobs: &mpsc::SyncSender<CopyFileJob>,
+    results: &mpsc::Sender<CopyFileResult>,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    for item in fs::read_dir(source_dir)? {
-        if cancelled.load(AtomicOrdering::Relaxed) {
-            break;
-        }
-        let item = item?;
-        let source_path = item.path();
-        let target_path = target_dir.join(item.file_name());
-        if item.file_type()?.is_dir() {
-            fs::create_dir(&target_path)?;
-            enqueue_copy_tree(&source_path, &target_path, jobs, cancelled)?;
-        } else {
-            send_copy_job(
-                jobs,
-                cancelled,
-                CopyFileJob {
-                    source_path,
-                    target_path,
-                },
-            )?;
+    let mut directories = VecDeque::from([(source_dir.to_path_buf(), target_dir.to_path_buf())]);
+    while let Some((current_source, current_target)) = directories.pop_front() {
+        for item in fs::read_dir(&current_source)? {
+            if cancelled.load(AtomicOrdering::Relaxed) {
+                return Ok(());
+            }
+            let item = item?;
+            let source_path = item.path();
+            let target_path = current_target.join(item.file_name());
+            if item.file_type()?.is_dir() {
+                fs::create_dir(&target_path)?;
+                directories.push_back((source_path, target_path));
+            } else {
+                let expected_size = item.metadata()?.len();
+                results
+                    .send(CopyFileResult::Discovered(expected_size))
+                    .map_err(|_| io::Error::other("copy result channel disconnected"))?;
+                send_copy_job(
+                    jobs,
+                    cancelled,
+                    CopyFileJob {
+                        source_path,
+                        target_path,
+                        expected_size,
+                    },
+                )?;
+            }
         }
     }
     Ok(())
@@ -3157,31 +3717,23 @@ fn enqueue_copy_tree(
 
 /// 將工作放入有界佇列，並在其他 worker 失敗後立即停止等待。
 ///
-/// 直接呼叫阻塞式 `SyncSender::send` 時，如果佇列已滿且所有 worker 因錯誤停止，走訪器
-/// 可能永遠卡住。這裡使用 `try_send` 定期檢查取消旗標，確保 SMB 斷線或權限錯誤不會
-/// 讓整個背景 task 無法結束。
+/// 阻塞式 `send` 會自然施加 backpressure，避免忙等耗盡 CPU；外層不保留額外 receiver，
+/// 因此所有 worker 因錯誤停止時 channel 會斷線，走訪器可立即結束而不會永久卡住。
 ///
 /// 參數：`jobs` 為有界佇列；`cancelled` 是共享取消狀態；`job` 是待排入的檔案工作。
 /// 回傳：`io::Result<()>`；佇列斷線時回傳錯誤，已取消時不再排入並正常返回。
 fn send_copy_job(
     jobs: &mpsc::SyncSender<CopyFileJob>,
     cancelled: &AtomicBool,
-    mut job: CopyFileJob,
+    job: CopyFileJob,
 ) -> io::Result<()> {
-    loop {
-        if cancelled.load(AtomicOrdering::Relaxed) {
-            return Ok(());
-        }
-        match jobs.try_send(job) {
-            Ok(()) => return Ok(()),
-            Err(mpsc::TrySendError::Full(returned_job)) => {
-                job = returned_job;
-                thread::yield_now();
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                return Err(io::Error::other("copy worker queue disconnected"));
-            }
-        }
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Ok(());
+    }
+    match jobs.send(job) {
+        Ok(()) => Ok(()),
+        Err(_) if cancelled.load(AtomicOrdering::Relaxed) => Ok(()),
+        Err(_) => Err(io::Error::other("copy worker queue disconnected")),
     }
 }
 
@@ -3363,6 +3915,145 @@ fn parse_create_input(input: &str) -> io::Result<CreateRequest> {
     })
 }
 
+/// 大型目錄載入回傳的事件類型。
+#[derive(Debug)]
+pub(crate) enum DirectoryLoadProgress {
+    /// 快速發現的增量檔案清單。
+    #[allow(dead_code)]
+    Batch {
+        entries: Vec<FileEntry>,
+        is_first_chunk: bool,
+    },
+    /// 完整掃描結束，傳入最終全量已補齊 metadata 且在背景排序好的清單。
+    Complete(Vec<FileEntry>),
+}
+
+
+
+/// 快速讀取目錄：在背景多執行緒讀取 metadata 並完成自然排序，直接送出 100% 正確排序的完整清單，徹底避免畫面列表跳動。
+pub(crate) fn stream_dir_entries_with_cancellation<F>(
+    path: &Path,
+    sort_mode: SortMode,
+    random_seed: u64,
+    cancelled: &AtomicBool,
+    mut on_progress: F,
+) -> io::Result<()>
+where
+    F: FnMut(DirectoryLoadProgress) -> bool,
+{
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+
+    let read_dir = fs::read_dir(path)?;
+    let mut items = Vec::new();
+    let mut first_batch = Vec::new();
+    let mut sent_first_chunk = false;
+
+    for dir_entry_result in read_dir {
+        if cancelled.load(AtomicOrdering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "directory load cancelled",
+            ));
+        }
+
+        let item = dir_entry_result?;
+        let file_type = item.file_type().ok();
+        let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+        let name = item.file_name().to_string_lossy().into_owned();
+        let entry_path = item.path();
+
+        if !sent_first_chunk {
+            first_batch.push(FileEntry {
+                name,
+                path: entry_path,
+                is_dir,
+                size: 0,
+                directory_size: None,
+                directory_size_complete: false,
+                modified: SystemTime::UNIX_EPOCH,
+                created: SystemTime::UNIX_EPOCH,
+                readonly: false,
+                unix_mode: None,
+            });
+            if first_batch.len() >= 128 {
+                sort_file_entries(&mut first_batch, sort_mode, random_seed);
+                let chunk = std::mem::take(&mut first_batch);
+                if !on_progress(DirectoryLoadProgress::Batch {
+                    entries: chunk,
+                    is_first_chunk: true,
+                }) {
+                    return Ok(());
+                }
+                sent_first_chunk = true;
+            }
+        }
+
+        items.push(item);
+    }
+
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+
+    let needs_metadata = matches!(
+        sort_mode,
+        SortMode::Size { .. } | SortMode::Modified { .. } | SortMode::Created { .. }
+    );
+
+    let mut final_entries = if needs_metadata {
+        read_metadata_for_dir_entries(items, cancelled)?
+    } else {
+        let mut entries = Vec::with_capacity(items.len());
+        for item in items {
+            let file_type = item.file_type().ok();
+            let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+            let name = item.file_name().to_string_lossy().into_owned();
+            let entry_path = item.path();
+            entries.push(FileEntry {
+                name,
+                path: entry_path,
+                is_dir,
+                size: 0,
+                directory_size: None,
+                directory_size_complete: false,
+                modified: SystemTime::UNIX_EPOCH,
+                created: SystemTime::UNIX_EPOCH,
+                readonly: false,
+                unix_mode: None,
+            });
+        }
+        entries
+    };
+
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+
+    // 在背景執行緒進行自然排序，避免在主 UI 執行緒排序數萬筆檔案造成卡頓
+    sort_file_entries(&mut final_entries, sort_mode, random_seed);
+
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+
+    let _ = on_progress(DirectoryLoadProgress::Complete(final_entries));
+    Ok(())
+}
+
 /// 讀取指定目錄，並整理成可顯示的檔案項目清單。
 ///
 /// 參數：
@@ -3371,41 +4062,132 @@ fn parse_create_input(input: &str) -> io::Result<CreateRequest> {
 /// 回傳：`io::Result<Vec<FileEntry>>`。
 /// - 成功時回傳已排序的檔案與資料夾清單。
 /// - 失敗時回傳讀取目錄或 metadata 時的 I/O 錯誤。
-fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
-    let mut entries = Vec::new();
-
-    for item in fs::read_dir(path)? {
-        let item = item?;
-        let file_type = item.file_type()?;
-        let metadata = item.metadata()?;
-        let entry_path = item.path();
-        entries.push(FileEntry {
-            name: item.file_name().to_string_lossy().into_owned(),
-            path: entry_path.clone(),
-            is_dir: file_type.is_dir(),
-            size: metadata.len(),
-            // 子目錄數量需要額外開啟每一個資料夾；一般列表先延遲讀取。
-            child_count: None,
-            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            created: metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
-            readonly: metadata.permissions().readonly(),
-            unix_mode: read_unix_mode(&metadata),
-        });
-    }
-
-    Ok(entries)
+pub(crate) fn read_dir_entries(path: &Path) -> io::Result<Vec<FileEntry>> {
+    read_dir_entries_with_cancellation(path, &AtomicBool::new(false))
 }
 
-/// 讀取單一目錄的直接子項目數量，供 linemode size 在資料夾時顯示。
+/// 讀取指定目錄並支援即時取消，整理成可顯示的檔案項目清單。
 ///
 /// 參數：
-/// - `path: &Path`，要統計的目錄路徑。
+/// - `path: &Path`，要掃描的目錄路徑。
+/// - `cancelled: &AtomicBool`，外部通知提早中斷的取消旗標。
 ///
-/// 回傳：`io::Result<usize>`。
-/// - 成功時回傳目前目錄直接包含的子項目數量。
-/// - 失敗時回傳讀取子目錄時發生的 I/O 錯誤。
-fn count_directory_children(path: &Path) -> io::Result<usize> {
-    Ok(fs::read_dir(path)?.filter_map(Result::ok).count())
+/// 回傳：`io::Result<Vec<FileEntry>>`。
+/// - 成功時回傳檔案與資料夾清單。
+/// - 若中途被取消，回傳 `ErrorKind::Interrupted` 的 I/O 錯誤。
+/// - 失敗時回傳讀取目錄或 metadata 時的 I/O 錯誤。
+pub(crate) fn read_dir_entries_with_cancellation(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> io::Result<Vec<FileEntry>> {
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+    let items = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+    read_metadata_for_dir_entries(items, cancelled)
+}
+
+/// 讀取指定項目清單的完整 metadata，並支援中途取消。
+fn read_metadata_for_dir_entries(
+    items: Vec<fs::DirEntry>,
+    cancelled: &AtomicBool,
+) -> io::Result<Vec<FileEntry>> {
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8)
+        .min(items.len().max(1));
+
+    // 小目錄直接處理可避免建立 thread 的成本；大型目錄則把 metadata 系統呼叫分散到
+    // 有上限的 worker。這段仍需等清單完成才能排序，但不再讓數萬筆 metadata 串行阻塞。
+    if items.len() < 512 || worker_count == 1 {
+        let mut entries = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            if index % 64 == 0 && cancelled.load(AtomicOrdering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "directory load cancelled",
+                ));
+            }
+            entries.push(file_entry_from_dir_entry(item)?);
+        }
+        return Ok(entries);
+    }
+
+    let chunk_size = items.len().div_ceil(worker_count);
+    let mut chunks = items.into_iter();
+    let results = thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let chunk = chunks.by_ref().take(chunk_size).collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            workers.push(scope.spawn(move || {
+                let mut chunk_entries = Vec::with_capacity(chunk.len());
+                for (index, item) in chunk.into_iter().enumerate() {
+                    if index % 64 == 0 && cancelled.load(AtomicOrdering::Relaxed) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "directory load cancelled",
+                        ));
+                    }
+                    chunk_entries.push(file_entry_from_dir_entry(item)?);
+                }
+                Ok(chunk_entries)
+            }));
+        }
+
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().map_err(|_| {
+                    io::Error::other("directory metadata worker terminated unexpectedly")
+                })?
+            })
+            .collect::<io::Result<Vec<_>>>()
+    })?;
+
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory load cancelled",
+        ));
+    }
+
+    Ok(results.into_iter().flatten().collect())
+}
+
+/// 將單一 `DirEntry` 轉成 PaneFM 列表資料。
+///
+/// 參數：`item: fs::DirEntry`，由目前目錄讀出的項目。
+/// 回傳：`io::Result<FileEntry>`；metadata 無法讀取時保留原始作業系統錯誤。
+fn file_entry_from_dir_entry(item: fs::DirEntry) -> io::Result<FileEntry> {
+    let file_type = item.file_type()?;
+    let metadata = item.metadata()?;
+    let entry_path = item.path();
+    Ok(FileEntry {
+        name: item.file_name().to_string_lossy().into_owned(),
+        path: entry_path,
+        is_dir: file_type.is_dir(),
+        size: metadata.len(),
+        // 遞迴目錄容量由 App 的背景 worker 計算；一般列表載入不可同步掃描。
+        directory_size: None,
+        directory_size_complete: false,
+        modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        created: metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
+        readonly: metadata.permissions().readonly(),
+        unix_mode: read_unix_mode(&metadata),
+    })
 }
 
 /// 讀取目前平台可提供的 Unix 權限位元，供 linemode permissions 顯示。
@@ -3432,11 +4214,11 @@ fn read_unix_mode(_: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::{self, OpenOptions},
-        io::Write,
+        fs::{self, File, OpenOptions},
+        io::{self, Write},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -3445,10 +4227,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PaneState, SortMode, copy_dir_parallel_with_progress, copy_file_and_verify,
-        copy_file_and_verify_with, copy_file_native_with_progress,
-        copy_file_native_with_progress_using, copy_path_direct_with_cleanup,
-        copy_path_transactional_with,
+        DirectoryLoadProgress, PaneState, SortMode, TransferProgress,
+        copy_dir_parallel_with_progress, copy_file_and_verify, copy_file_and_verify_with,
+        copy_file_native_with_progress, copy_file_native_with_progress_using,
+        copy_file_with_native_fallback, copy_path_direct_with_cleanup,
+        copy_path_transactional_with, natural_cmp, read_dir_entries,
+        read_dir_entries_with_cancellation,
+        stream_dir_entries_with_cancellation,
     };
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
@@ -3475,12 +4260,51 @@ mod tests {
     }
 
     #[test]
-    /// 驗證一般目錄載入不會預先打開每個子目錄統計數量，避免 SMB 首次瀏覽產生額外網路 I/O。
+    /// 驗證自然排序不需要把數字轉成 `u64`，超長數字與前置零仍有穩定順序。
+    ///
+    /// 保護目的：大型 build 目錄含有數萬個帶 hash 或數字的檔名；自然排序改為零配置
+    /// 比較器後，必須同時保留 `file2 < file10` 的語意，且不可因數字溢位退回文字排序。
+    fn natural_compare_handles_large_numbers_without_allocating_numeric_strings() {
+        assert!(natural_cmp("file2", "file10").is_lt());
+        assert!(natural_cmp("file0002", "file2").is_gt());
+        assert!(
+            natural_cmp(
+                "build999999999999999999999999",
+                "build1000000000000000000000000"
+            )
+            .is_lt()
+        );
+        assert!(natural_cmp("中文2", "中文10").is_lt());
+    }
+
+    #[test]
+    /// 驗證超過平行化門檻的大型目錄仍完整讀取每一筆 metadata。
+    ///
+    /// 保護目的：大型目錄改成多 worker 後，chunk 邊界不能遺漏或重複項目；檔案大小也
+    /// 必須保持準確，否則 size linemode、排序與後續傳輸估算都會得到錯誤資料。
+    fn large_directory_metadata_loading_keeps_every_entry_and_size() {
+        let directory = tempdir().expect("tempdir");
+        for index in 0..520usize {
+            fs::write(
+                directory.path().join(format!("entry-{index}.bin")),
+                [index as u8],
+            )
+            .expect("write fixture");
+        }
+
+        let entries = read_dir_entries(directory.path()).expect("read large directory");
+
+        assert_eq!(entries.len(), 520);
+        assert!(entries.iter().all(|entry| entry.size == 1));
+    }
+
+    #[test]
+    /// 驗證一般目錄載入不會同步遞迴統計大小，避免本機大型目錄或 SMB 首次瀏覽卡住。
     ///
     /// 參數：無。
-    /// 回傳：無；若預設載入已填入 `child_count`，測試失敗。
+    /// 回傳：無；若預設載入已填入目錄容量，測試失敗。
     /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
-    fn pane_state_defers_directory_child_counts_until_requested() {
+    fn pane_state_defers_directory_sizes_until_requested() {
         let dir = tempdir().expect("tempdir");
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).expect("nested dir");
@@ -3489,16 +4313,17 @@ mod tests {
         let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
         let directory = pane.entries.iter().find(|entry| entry.is_dir).expect("dir");
 
-        assert_eq!(directory.child_count, None);
+        assert_eq!(directory.directory_size, None);
+        assert!(!directory.directory_size_complete);
     }
 
     #[test]
-    /// 驗證 size linemode 需要資料時，仍可延遲取得正確的子目錄項目數量。
+    /// 驗證背景掃描的部分大小與完成狀態可以分階段更新同一個目錄。
     ///
     /// 參數：無。
-    /// 回傳：無；若延遲載入後數量不正確，測試失敗。
+    /// 回傳：無；若部分值、最終值或完成旗標不正確，測試失敗。
     /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
-    fn pane_state_loads_directory_child_counts_on_demand() {
+    fn pane_state_applies_incremental_directory_size_snapshot() {
         let dir = tempdir().expect("tempdir");
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).expect("nested dir");
@@ -3506,10 +4331,40 @@ mod tests {
         fs::write(nested.join("two.txt"), "two").expect("second child");
 
         let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
-        pane.load_directory_child_counts();
+        assert!(pane.update_directory_size(&nested, 3, false));
         let directory = pane.entries.iter().find(|entry| entry.is_dir).expect("dir");
 
-        assert_eq!(directory.child_count, Some(2));
+        assert_eq!(directory.directory_size, Some(3));
+        assert!(!directory.directory_size_complete);
+
+        assert!(pane.update_directory_size(&nested, 6, true));
+        let directory = pane.entries.iter().find(|entry| entry.is_dir).expect("dir");
+        assert_eq!(directory.directory_size, Some(6));
+        assert!(directory.directory_size_complete);
+    }
+
+    #[test]
+    /// 驗證 watcher 或背景貼上觸發列表 reload 時，不會把正在顯示的目錄大小清空。
+    ///
+    /// 保護目的：`ms` 掃描可能持續數秒；若每次外部檔案事件都重設快取，畫面會反覆
+    /// 跳回 `…` 或 `~0B`，大型目錄甚至永遠無法顯示完成值。
+    fn pane_reload_preserves_directory_size_cache_for_existing_paths() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).expect("nested dir");
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        assert!(pane.update_directory_size(&nested, 42_000, true));
+
+        fs::write(dir.path().join("new.txt"), "new").expect("external file");
+        pane.reload().expect("reload");
+
+        let directory = pane
+            .entries
+            .iter()
+            .find(|entry| entry.path == nested)
+            .expect("dir");
+        assert_eq!(directory.directory_size, Some(42_000));
+        assert!(directory.directory_size_complete);
     }
 
     #[test]
@@ -3755,6 +4610,69 @@ mod tests {
     }
 
     #[test]
+    /// 驗證平台原生 copy 回傳「不支援」且留下 0-byte 目標時，會清理該目標並改走
+    /// 分塊串流，最後仍得到完整內容與正確進度。
+    ///
+    /// 保護目的：部分 macOS／Windows SMB server 不支援原生 copy 加速；PaneFM 過去
+    /// 會直接顯示失敗或留下 0 KB ZIP。這個測試確保 fallback 是跨平台傳檔的必要
+    /// 正確性路徑，而不是只在特定公司環境手動驗證。
+    fn unsupported_native_copy_falls_back_to_verified_streaming_copy() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.zip");
+        let target = dir.path().join("target.zip");
+        let payload = vec![0x5a; 2 * 1024 * 1024 + 37];
+        fs::write(&source, &payload).expect("source");
+        let mut reported = 0u64;
+
+        copy_file_with_native_fallback(
+            &source,
+            &target,
+            &mut |increment| reported = reported.saturating_add(increment),
+            |_, target| {
+                File::create(target).expect("simulated partial target");
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "native copy unsupported by share",
+                ))
+            },
+        )
+        .expect("stream fallback");
+
+        assert_eq!(reported, payload.len() as u64);
+        assert_eq!(fs::read(&target).expect("target bytes"), payload);
+    }
+
+    #[test]
+    /// 驗證原生 copy 的一般權限錯誤不會被錯誤地改成串流重試。
+    ///
+    /// 保護目的：fallback 只能處理「API 不支援」；若權限、磁碟空間或連線本身失敗，
+    /// 必須保留原始 OS error，避免第二次寫入掩蓋真正原因或造成額外 partial 檔案。
+    fn native_copy_permission_error_does_not_trigger_stream_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.bin");
+        let target = dir.path().join("target.bin");
+        fs::write(&source, b"protected").expect("source");
+        let mut reported = 0u64;
+
+        let error = copy_file_with_native_fallback(
+            &source,
+            &target,
+            &mut |increment| reported = reported.saturating_add(increment),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "permission denied by share",
+                ))
+            },
+        )
+        .expect_err("permission error must remain visible");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(reported, 0);
+        assert!(!target.exists());
+    }
+
+    #[test]
     /// 驗證原生 copy 尚未完成時，metadata 輪詢就能先回報部分進度。
     ///
     /// 參數：無。
@@ -3885,7 +4803,11 @@ mod tests {
             &source,
             &target_dir,
             false,
-            &mut |increment| completed = completed.saturating_add(increment),
+            &mut |event| {
+                if let TransferProgress::BytesCopied(increment) = event {
+                    completed = completed.saturating_add(increment);
+                }
+            },
             |_, _| Err(std::io::Error::from_raw_os_error(45)),
         )
         .expect("copy fallback");
@@ -3925,14 +4847,14 @@ mod tests {
         copy_dir_parallel_with_progress(
             &source,
             &target,
-            &mut |increment| {
-                if increment == 0 {
-                    target_became_visible = target.is_dir();
-                } else {
+            &mut |event| match event {
+                TransferProgress::TargetVisible => target_became_visible = target.is_dir(),
+                TransferProgress::BytesCopied(increment) => {
                     completed = completed.saturating_add(increment);
                 }
+                TransferProgress::BytesDiscovered(_) => {}
             },
-            move |from, to, progress| {
+            move |from, to, _, progress| {
                 let running = active_for_copy.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum_for_copy.fetch_max(running, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(15));
@@ -3958,6 +4880,37 @@ mod tests {
     }
 
     #[test]
+    /// 驗證複製一般專案目錄時會完整包含巢狀 `.tfm`，不會擅自略過使用者資料。
+    ///
+    /// 保護目的：即使 `.tfm` 可能很大，傳輸引擎仍必須靠高效率排程解決，不可用檔名
+    /// 規則刪減複製內容，否則副本和來源不一致且可能遺失使用者需要的資料。
+    fn directory_copy_preserves_nested_internal_state() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("project");
+        let target = dir.path().join("project-copy");
+        fs::create_dir_all(source.join(".tfm/trash/items")).expect("internal state");
+        fs::write(source.join("source.rs"), b"project source").expect("project file");
+        fs::write(source.join(".tfm/trash/items/large.bin"), b"internal trash")
+            .expect("trash file");
+
+        copy_dir_parallel_with_progress(&source, &target, &mut |_| {}, |from, to, _, progress| {
+            let copied = fs::copy(from, to)?;
+            progress(copied);
+            Ok(())
+        })
+        .expect("copy project");
+
+        assert_eq!(
+            fs::read(target.join("source.rs")).expect("copied source"),
+            b"project source"
+        );
+        assert_eq!(
+            fs::read(target.join(".tfm/trash/items/large.bin")).expect("nested state copy"),
+            b"internal trash"
+        );
+    }
+
+    #[test]
     /// 驗證 producer 尚在排入大型目錄內容時，已完成檔案的進度就會立刻送到呼叫端。
     ///
     /// 參數：無。
@@ -3980,12 +4933,14 @@ mod tests {
         copy_dir_parallel_with_progress(
             &source,
             &target,
-            &mut |increment| {
-                if increment > 0 && finished_when_first_progress_arrived.is_none() {
+            &mut |event| {
+                if matches!(event, TransferProgress::BytesCopied(increment) if increment > 0)
+                    && finished_when_first_progress_arrived.is_none()
+                {
                     finished_when_first_progress_arrived = Some(finished.load(Ordering::SeqCst));
                 }
             },
-            move |from, to, progress| {
+            move |from, to, _, progress| {
                 thread::sleep(Duration::from_millis(5));
                 let copied = fs::copy(from, to)?;
                 finished_for_copy.fetch_add(1, Ordering::SeqCst);
@@ -4018,12 +4973,13 @@ mod tests {
             fs::write(source.join(format!("file-{index}.txt")), b"data").expect("source file");
         }
 
-        let result = copy_dir_parallel_with_progress(&source, &target, &mut |_| {}, |_, _, _| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "simulated SMB disconnect",
-            ))
-        });
+        let result =
+            copy_dir_parallel_with_progress(&source, &target, &mut |_| {}, |_, _, _, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated SMB disconnect",
+                ))
+            });
 
         assert_eq!(
             result.expect_err("copy must fail").kind(),
@@ -4539,5 +5495,58 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("preview skipped for files larger than 128 KiB"))
         );
+    }
+
+    #[test]
+    /// 驗證當 cancelled 旗標被設定時，read_dir_entries_with_cancellation 會立即中斷並回傳 Interrupted。
+    /// 保護目的：確保使用者在大型目錄快速切換時，舊的 worker 會提早退出，不會持續佔用磁碟 I/O。
+    fn read_dir_entries_with_cancellation_aborts_promptly() {
+        let dir = tempdir().expect("tempdir");
+        for i in 0..10 {
+            fs::write(dir.path().join(format!("file_{i}.txt")), b"data").expect("write");
+        }
+
+        let cancelled = AtomicBool::new(true);
+        let result = read_dir_entries_with_cancellation(dir.path(), &cancelled);
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("must error").kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    /// 驗證 stream_dir_entries_with_cancellation 會直接回傳正確排序的完整清單。
+    /// 保護目的：確保大型目錄進入時，畫面呈現即為最終自然排序，完全不會有列表跳動或錯位。
+    fn stream_dir_entries_with_cancellation_loads_and_completes_sorted() {
+        let dir = tempdir().expect("tempdir");
+        for i in 0..300 {
+            fs::write(dir.path().join(format!("file_{i:03}.txt")), b"sample").expect("write");
+        }
+
+        let cancelled = AtomicBool::new(false);
+        let mut got_complete = false;
+
+        let result = stream_dir_entries_with_cancellation(
+            dir.path(),
+            SortMode::Natural { reverse: false },
+            0,
+            &cancelled,
+            |progress| {
+                match progress {
+                    DirectoryLoadProgress::Batch { .. } => {}
+                    DirectoryLoadProgress::Complete(entries) => {
+                        assert_eq!(entries.len(), 300);
+                        assert_eq!(entries[0].name, "file_000.txt");
+                        assert_eq!(entries[299].name, "file_299.txt");
+                        got_complete = true;
+                    }
+                }
+                true
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(got_complete, "必須完成最終 Complete 步驟");
     }
 }

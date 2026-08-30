@@ -14,7 +14,10 @@ pub(crate) struct FileEntry {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
     pub(crate) size: u64,
-    pub(crate) child_count: Option<usize>,
+    /// 目錄目前已遞迴統計到的內容大小；一般檔案不使用這個欄位。
+    pub(crate) directory_size: Option<u64>,
+    /// `true` 表示 `directory_size` 已包含整棵目錄樹，而不是背景掃描中的暫存值。
+    pub(crate) directory_size_complete: bool,
     pub(crate) modified: SystemTime,
     pub(crate) created: SystemTime,
     pub(crate) readonly: bool,

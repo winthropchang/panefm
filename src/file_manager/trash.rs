@@ -4,10 +4,13 @@
 //! 多選與確認視窗，本模組只執行原子化程度可控的單筆/批次儲存操作。
 
 use std::{
-    env, fs, io,
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(test))]
+use std::env;
 
 use serde::{Deserialize, Serialize};
 
@@ -288,8 +291,90 @@ impl TrashStore {
 
 /// 解析 internal trash 的根目錄。
 fn resolve_trash_root(base_dir: &Path) -> PathBuf {
-    if let Some(custom) = env::var_os("TFM_TRASH_DIR") {
-        return PathBuf::from(custom);
+    // 測試必須把所有資料限制在 tempdir，否則平行測試會讀寫開發者真正的 Trash。
+    #[cfg(test)]
+    return base_dir.join(".tfm").join("trash");
+
+    #[cfg(not(test))]
+    {
+        let custom = env::var_os("TFM_TRASH_DIR");
+        let platform_root = resolve_trash_root_from_environment(
+            base_dir,
+            custom.clone(),
+            env::var_os("PANEFM_STATE_DIR"),
+            env::var_os("LOCALAPPDATA"),
+            env::var_os("APPDATA"),
+            env::var_os("HOME"),
+            cfg!(target_os = "macos"),
+        );
+        prefer_existing_legacy_trash(base_dir, platform_root, custom.is_some())
+    }
+}
+
+/// 在既有安裝仍有舊 Trash 時保留其可見性，不搬移也不刪除使用者資料。
+///
+/// 參數：`base_dir: &Path` 是啟動目錄；`platform_root: PathBuf` 是新式全域位置；
+/// `has_custom_root: bool` 表示使用者是否明確指定 `TFM_TRASH_DIR`。回傳：實際使用路徑。
+/// 明確設定永遠優先；否則只有舊 Trash 確實存在時才沿用它。這個相容路徑只負責避免
+/// 舊資料突然消失；檔案傳輸仍會忠實複製 `.tfm`，使用者可清空舊 Trash 後改用新位置。
+fn prefer_existing_legacy_trash(
+    base_dir: &Path,
+    platform_root: PathBuf,
+    has_custom_root: bool,
+) -> PathBuf {
+    let legacy_root = base_dir.join(".tfm").join("trash");
+    if !has_custom_root && legacy_root.exists() {
+        legacy_root
+    } else {
+        platform_root
+    }
+}
+
+/// 依跨平台環境變數決定 PaneFM Trash 的使用者資料位置。
+///
+/// Trash 不可預設放在目前工作目錄，否則使用者複製整個專案時會把 PaneFM 自己的
+/// 刪除歷史一起複製；Trash 越大，後續每一次專案 copy 又會呈倍數放大。優先順序為：
+/// 明確覆寫、PaneFM state、Windows local/app data、macOS Application Support，最後才是
+/// 可攜式 fallback。
+///
+/// 參數：
+/// - `base_dir: &Path`，所有平台資訊都缺失時的最後 fallback。
+/// - 其餘 `Option<OsString>`，分別是已讀取的環境變數，方便單元測試不修改全域環境。
+/// - `is_macos: bool`，指定 HOME 應採 macOS 或一般可攜式目錄規則。
+///
+/// 回傳：`PathBuf`，PaneFM 專用 Trash 根目錄；函數只計算路徑，不建立或搬移檔案。
+#[allow(clippy::too_many_arguments)]
+fn resolve_trash_root_from_environment(
+    base_dir: &Path,
+    custom: Option<std::ffi::OsString>,
+    state_dir: Option<std::ffi::OsString>,
+    local_app_data: Option<std::ffi::OsString>,
+    app_data: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    is_macos: bool,
+) -> PathBuf {
+    if let Some(path) = custom {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = state_dir {
+        return PathBuf::from(path).join("trash");
+    }
+    if let Some(path) = local_app_data.or(app_data) {
+        return PathBuf::from(path).join("panefm").join("trash");
+    }
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
+        return if is_macos {
+            home.join("Library")
+                .join("Application Support")
+                .join("panefm")
+                .join("trash")
+        } else {
+            home.join(".local")
+                .join("share")
+                .join("panefm")
+                .join("trash")
+        };
     }
 
     base_dir.join(".tfm").join("trash")
@@ -418,11 +503,88 @@ fn display_name_for_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{ffi::OsString, fs, path::Path};
 
     use tempfile::tempdir;
 
-    use super::TrashStore;
+    use super::{TrashStore, prefer_existing_legacy_trash, resolve_trash_root_from_environment};
+
+    #[test]
+    /// 驗證正式環境在 macOS 與 Windows 都會把 Trash 放在使用者資料區，而不是專案內。
+    /// 保護目的：專案內 `.tfm/trash` 曾累積到數十 GB，導致複製專案時把 Trash 再複製
+    /// 一次並耗時數分鐘；此測試避免路徑重構後再次引入相同的遞迴放大問題。
+    fn production_trash_paths_are_outside_the_working_directory() {
+        let cwd = Path::new("/workspace/project");
+        let mac = resolve_trash_root_from_environment(
+            cwd,
+            None,
+            None,
+            None,
+            None,
+            Some(OsString::from("/Users/example")),
+            true,
+        );
+        let windows = resolve_trash_root_from_environment(
+            cwd,
+            None,
+            None,
+            Some(OsString::from(r"C:\Users\example\AppData\Local")),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            mac,
+            Path::new("/Users/example/Library/Application Support/panefm/trash")
+        );
+        assert_eq!(
+            windows,
+            Path::new(r"C:\Users\example\AppData\Local")
+                .join("panefm")
+                .join("trash")
+        );
+        assert!(!mac.starts_with(cwd));
+        assert!(!windows.starts_with(cwd));
+    }
+
+    #[test]
+    /// 驗證明確設定的 Trash 位置永遠高於各平台預設值。
+    /// 保護目的：公司環境可能要求把敏感刪除資料放到受控磁碟，不能因跨平台路徑調整
+    /// 而忽略管理者或使用者既有的 `TFM_TRASH_DIR` 設定。
+    fn custom_trash_path_overrides_platform_defaults() {
+        let resolved = resolve_trash_root_from_environment(
+            Path::new("/workspace/project"),
+            Some(OsString::from("/secure/panefm-trash")),
+            Some(OsString::from("/state/panefm")),
+            None,
+            None,
+            Some(OsString::from("/Users/example")),
+            true,
+        );
+
+        assert_eq!(resolved, Path::new("/secure/panefm-trash"));
+    }
+
+    #[test]
+    /// 驗證升級後仍可讀取既有工作目錄中的 Trash，但明確自訂路徑不會被舊目錄攔截。
+    /// 保護目的：修正 Trash 資料位置時不可讓使用者原本可還原的項目突然從面板消失；
+    /// 同時公司環境的受控儲存設定仍必須擁有最高優先權。
+    fn existing_legacy_trash_remains_visible_until_user_clears_it() {
+        let dir = tempdir().expect("tempdir");
+        let legacy = dir.path().join(".tfm/trash");
+        let platform = dir.path().join("platform/trash");
+        fs::create_dir_all(&legacy).expect("legacy trash");
+
+        assert_eq!(
+            prefer_existing_legacy_trash(dir.path(), platform.clone(), false),
+            legacy
+        );
+        assert_eq!(
+            prefer_existing_legacy_trash(dir.path(), platform.clone(), true),
+            platform
+        );
+    }
 
     #[test]
     /// 驗證丟進 trash 的檔案可以再還原回原位置。

@@ -187,6 +187,7 @@ pub(crate) fn render_pane(
     list_find_buffer: Option<&str>,
     list_find_editing: bool,
     text_input_cursor: usize,
+    active_job_badges: &std::collections::HashMap<std::path::PathBuf, String>,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
@@ -378,29 +379,38 @@ pub(crate) fn render_pane(
         if visible_entries.is_empty() {
             vec![ListItem::new(Line::from("empty directory"))]
         } else {
+            let offset = pane.list_state.offset();
+            let view_start = offset.saturating_sub(10);
+            let view_end = (offset + list_viewport_height + 10).min(visible_entries.len());
             visible_entries
                 .into_iter()
                 .enumerate()
-                .map(|entry| {
-                    ListItem::new(render_entry_line(
-                        entry.1,
-                        pane.is_marked(entry.1),
-                        mark_column_active,
-                        visual_range
-                            .map(|(start, end)| {
-                                let range_start = start.min(end);
-                                let range_end = start.max(end);
-                                entry.0 >= range_start && entry.0 <= range_end
-                            })
-                            .unwrap_or(false),
-                        detail_kind,
-                        content_width,
-                        theme,
-                        config.ui.icons.enabled,
-                        config.ui.icons.style,
-                        pane.list_find_query(),
-                        find_match_position.filter(|_| entry.0 == pane.selected),
-                    ))
+                .map(|(index, entry)| {
+                    if index < view_start || index >= view_end {
+                        ListItem::new("")
+                    } else {
+                        let active_job_badge = active_job_badges.get(&entry.path).map(|s| s.as_str());
+                        ListItem::new(render_entry_line(
+                            entry,
+                            pane.is_marked(entry),
+                            mark_column_active,
+                            visual_range
+                                .map(|(start, end)| {
+                                    let range_start = start.min(end);
+                                    let range_end = start.max(end);
+                                    index >= range_start && index <= range_end
+                                })
+                                .unwrap_or(false),
+                            detail_kind,
+                            content_width,
+                            theme,
+                            config.ui.icons.enabled,
+                            config.ui.icons.style,
+                            pane.list_find_query(),
+                            find_match_position.filter(|_| index == pane.selected),
+                            active_job_badge,
+                        ))
+                    }
                 })
                 .collect()
         }
@@ -1592,11 +1602,11 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 /// 回傳：`Vec<Line<'static>>`，可直接交給單一 [`ListItem`] 顯示的多行文字。
 fn task_panel_display_lines(task: &TaskPanelLine, max_width: usize) -> Vec<Line<'static>> {
     let summary = format!(
-        "{:<11} start {}  end {}  {:>4}  {}",
+        "{:<11} start {}  end {}  {}  {}",
         truncate_text(&task.state, 11),
         truncate_text(&task.started_at, 8),
         truncate_text(&task.finished_at, 8),
-        truncate_text(&task.progress, 4),
+        task.progress,
         task.title
     );
     let mut lines = wrap_text_for_width(&summary, max_width, "");
@@ -1655,6 +1665,7 @@ fn render_entry_line(
     icon_style: IconStyle,
     list_find_query: Option<&str>,
     list_find_position: Option<(usize, usize)>,
+    active_job_badge: Option<&str>,
 ) -> Line<'static> {
     let marker = if mark_column_active {
         if marked || visual_selected {
@@ -1678,7 +1689,11 @@ fn render_entry_line(
         .as_ref()
         .map(|value| value.chars().count() + 1)
         .unwrap_or(0);
-    let name_len = marker.chars().count() + name.chars().count() + badge_len;
+    let job_badge_len = active_job_badge
+        .as_ref()
+        .map(|value| value.chars().count() + 1)
+        .unwrap_or(0);
+    let name_len = marker.chars().count() + name.chars().count() + badge_len + job_badge_len;
 
     if detail.is_empty() || width < 8 {
         let mut spans = Vec::new();
@@ -1694,6 +1709,15 @@ fn render_entry_line(
             theme,
             entry_style(entry, theme),
         ));
+        if let Some(job_badge) = active_job_badge {
+            spans.push(Span::raw(" ".to_string()));
+            spans.push(Span::styled(
+                job_badge.to_string(),
+                ratatui::style::Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(badge) = badge {
             spans.push(Span::raw(" ".to_string()));
             spans.push(Span::styled(
@@ -1724,6 +1748,15 @@ fn render_entry_line(
         theme,
         entry_style(entry, theme),
     ));
+    if let Some(job_badge) = active_job_badge {
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            job_badge.to_string(),
+            ratatui::style::Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(badge) = badge {
         spans.push(Span::raw(" ".to_string()));
         spans.push(Span::styled(
@@ -1915,9 +1948,16 @@ fn format_sort_detail(entry: &super::entry::FileEntry, detail_kind: SortDetailKi
         SortDetailKind::Size => {
             if entry.is_dir {
                 entry
-                    .child_count
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| String::from("?"))
+                    .directory_size
+                    .map(|size| {
+                        let size = format_size_short(size);
+                        if entry.directory_size_complete {
+                            size
+                        } else {
+                            format!("~{size}")
+                        }
+                    })
+                    .unwrap_or_else(|| String::from("…"))
             } else {
                 format_size_short(entry.size)
             }
@@ -1974,28 +2014,44 @@ fn format_system_time(value: std::time::SystemTime) -> String {
     datetime.format("%m/%d %H:%M").to_string()
 }
 
-/// 把位元組大小轉成較容易閱讀的短格式。
+/// 把 byte 大小轉成 PaneFM 在 macOS 與 Windows 共用的 1024 進位短格式。
+///
+/// 參數：`size: u64` 是檔案內容的 logical bytes。
+/// 回傳：`String`，使用 `B/K/M/G/T`；每一級都是前一級的 1024 倍，且這不是
+/// 檔案系統的磁碟配置空間。
 fn format_size_short(size: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
+    const K: f64 = 1_024.0;
+    const M: f64 = K * 1_024.0;
+    const G: f64 = M * 1_024.0;
+    const T: f64 = G * 1_024.0;
 
     let size = size as f64;
-    if size >= GB {
-        format_compact_size(size / GB, "G")
-    } else if size >= MB {
-        format_compact_size(size / MB, "mb")
-    } else if size >= KB {
-        format_compact_size(size / KB, "kb")
+    if size >= T {
+        format_compact_size(size / T, "T")
+    } else if size >= G {
+        format_compact_size(size / G, "G")
+    } else if size >= M {
+        format_compact_size(size / M, "M")
+    } else if size >= K {
+        format_compact_size(size / K, "K")
     } else {
-        format!("{}b", size as u64)
+        format!("{}B", size as u64)
     }
 }
 
-/// 將大小數值格式化成最多一位小數的緊湊字串。
+/// 將大小數值格式化成最多兩位小數的緊湊字串。
+///
+/// 參數：`value: f64` 是已換算的單位數值；`suffix: &str` 是單位。
+/// 回傳：`String`；小於 10 時保留兩位，使 Finder 顯示的 `6.27 GB` 不會被過度捨入。
 fn format_compact_size(value: f64, suffix: &str) -> String {
-    if value >= 10.0 || value.fract() == 0.0 {
+    if value.fract() == 0.0 {
         format!("{:.0}{suffix}", value)
+    } else if value < 10.0 {
+        let number = format!("{value:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned();
+        format!("{number}{suffix}")
     } else {
         format!("{value:.1}{suffix}")
     }
@@ -2005,9 +2061,9 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 mod tests {
     use super::{
         FileCategory, IconStyle, SearchListState, TaskPanelLine, entry_icon, file_category,
-        format_pane_title, format_permissions_detail, format_size_short, regex_rename_status_style,
-        search_empty_message, search_list_selected_index, task_panel_display_lines,
-        top_right_input_rect,
+        format_pane_title, format_permissions_detail, format_size_short, format_sort_detail,
+        regex_rename_status_style, render_entry_line, search_empty_message,
+        search_list_selected_index, task_panel_display_lines, top_right_input_rect,
     };
     use ratatui::layout::Rect;
     use std::path::Path;
@@ -2015,6 +2071,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use crate::file_manager::entry::FileEntry;
+    use crate::file_manager::pane::SortDetailKind;
     use crate::file_manager::search::GlobalSearchEntry;
     use crate::theme::Theme;
 
@@ -2025,12 +2082,42 @@ mod tests {
             path: Path::new(name).to_path_buf(),
             is_dir,
             size: 0,
-            child_count: None,
+            directory_size: None,
+            directory_size_complete: false,
             modified: SystemTime::UNIX_EPOCH,
             created: SystemTime::UNIX_EPOCH,
             readonly: false,
             unix_mode: None,
         }
+    }
+
+    #[test]
+    /// 驗證當項目處於背景傳輸或處理中時，列表列會直接顯示工作標籤與百分比。
+    fn render_entry_line_displays_active_job_badge() {
+        let entry = test_entry("terminal-file-manager", true);
+        let line = render_entry_line(
+            &entry,
+            false,
+            false,
+            false,
+            SortDetailKind::None,
+            60,
+            Theme::from(crate::theme::ThemePreset::Dracula),
+            true,
+            IconStyle::NerdFont,
+            None,
+            None,
+            Some("[copying 99%]"),
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            text.contains("[copying 99%]"),
+            "列表列必須包含工作進度標籤: {text}"
+        );
     }
 
     #[test]
@@ -2072,7 +2159,7 @@ mod tests {
             state: String::from("RUNNING"),
             started_at: String::from("14:30:47"),
             finished_at: String::from("--:--:--"),
-            progress: String::from("32%"),
+            progress: String::from("24.4G / 77.2G"),
             title: String::from("copy 1 item(s)"),
             detail: String::from(
                 "destination: /Users/otto/Documents/AB_Demo/very-long-target-directory",
@@ -2212,10 +2299,24 @@ mod tests {
     /// 驗證大小格式會轉成人類較容易閱讀的單位顯示。
     /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
     fn format_size_short_uses_compact_units() {
-        assert_eq!(format_size_short(512), "512b");
-        assert_eq!(format_size_short(2_048), "2kb");
-        assert_eq!(format_size_short(1_572_864), "1.5mb");
-        assert_eq!(format_size_short(3_221_225_472), "3G");
+        assert_eq!(format_size_short(512), "512B");
+        assert_eq!(format_size_short(2_048), "2K");
+        assert_eq!(format_size_short(1_572_864), "1.5M");
+        assert_eq!(format_size_short(6_270_192_614), "5.84G");
+    }
+
+    #[test]
+    /// 驗證 size linemode 會區分背景計算中的部分容量與已完成的真實容量。
+    ///
+    /// 保護目的：使用者必須知道數字是否還會增加；掃描中以 `~` 標示，完成後同一列
+    /// 應只留下最終大小，不能退回舊版的直接子項目數量。
+    fn size_detail_marks_partial_directory_size_until_scan_completes() {
+        let mut entry = test_entry("target", true);
+        entry.directory_size = Some(1_572_864);
+
+        assert_eq!(format_sort_detail(&entry, SortDetailKind::Size), "~1.5M");
+        entry.directory_size_complete = true;
+        assert_eq!(format_sort_detail(&entry, SortDetailKind::Size), "1.5M");
     }
 
     #[test]
@@ -2318,7 +2419,8 @@ mod tests {
             path: Path::new("/tmp/notes.txt").to_path_buf(),
             is_dir: false,
             size: 12,
-            child_count: None,
+            directory_size: None,
+            directory_size_complete: false,
             modified: SystemTime::UNIX_EPOCH,
             created: SystemTime::UNIX_EPOCH,
             readonly: true,

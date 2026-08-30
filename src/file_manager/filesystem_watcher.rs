@@ -109,15 +109,27 @@ impl FilesystemWatcher {
             if native_result.is_ok() {
                 self.native_dirs.insert(directory.clone());
             }
-            let poll_result = self.poll.watch(directory, RecursiveMode::NonRecursive);
-            if poll_result.is_ok() {
+            // 本機大型目錄若同時註冊 PollWatcher，`watch` 可能同步建立數萬筆快照，讓
+            // 使用者剛切換目錄就卡住。網路位置仍主動保留輪詢；本機只有原生監看失敗
+            // 時才 fallback，兼顧 Finder／Explorer 即時更新與 SMB 可靠性。
+            let needs_poll = native_result.is_err() || is_likely_network_path(directory);
+            let poll_result =
+                needs_poll.then(|| self.poll.watch(directory, RecursiveMode::NonRecursive));
+            if poll_result.as_ref().is_some_and(Result::is_ok) {
                 self.poll_dirs.insert(directory.clone());
             }
-            if let (Err(native_error), Err(poll_error)) = (native_result, poll_result) {
-                errors.push(format!(
-                    "{}: native watcher: {native_error}; polling watcher: {poll_error}",
-                    directory.display()
-                ));
+            if let Err(native_error) = native_result {
+                match poll_result {
+                    Some(Err(poll_error)) => errors.push(format!(
+                        "{}: native watcher: {native_error}; polling watcher: {poll_error}",
+                        directory.display()
+                    )),
+                    None => errors.push(format!(
+                        "{}: native watcher: {native_error}; polling watcher was not started",
+                        directory.display()
+                    )),
+                    Some(Ok(())) => {}
+                }
             }
         }
 
@@ -151,6 +163,28 @@ impl FilesystemWatcher {
     }
 }
 
+/// 判斷路徑是否很可能位於網路 share，這類位置需要輪詢補足不可靠的原生事件。
+///
+/// 參數：`path: &PathBuf`，目前 panel 的實際本機或掛載路徑。
+/// 回傳：`bool`；Windows UNC 與 macOS `/Volumes` 掛載位置回傳 `true`。其他平台暫時
+/// 回傳 `false`，未來支援 Linux 時可只在此擴充 mount 判斷，不必修改 watcher 主流程。
+fn is_likely_network_path(path: &PathBuf) -> bool {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        return text.starts_with(r"\\") || text.starts_with("//");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return path.starts_with("/Volumes");
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// 判斷 notify 事件是否會改變檔案列表可見內容或 metadata。
 ///
 /// 參數：`kind: &EventKind`，notify 回傳的跨平台事件種類。
@@ -169,7 +203,7 @@ mod tests {
     use notify::{EventKind, event::AccessKind};
     use tempfile::tempdir;
 
-    use super::{FilesystemWatcher, event_kind_requires_reload};
+    use super::{FilesystemWatcher, event_kind_requires_reload, is_likely_network_path};
 
     #[test]
     /// 驗證單純讀取檔案不會被當成列表變更，但新增、修改與刪除都會要求刷新。
@@ -194,22 +228,32 @@ mod tests {
     /// 保護目的：這正是 Finder／Explorer 修改完成後 PaneFM 自動更新所依賴的完整事件鏈。
     fn external_file_creation_reports_watched_directory() {
         let directory = tempdir().expect("tempdir");
+        let watched_path = directory.path().canonicalize().expect("canonical tempdir");
         let mut watcher = FilesystemWatcher::new(Duration::from_millis(50)).expect("watcher");
-        assert!(
-            watcher
-                .sync_directories([directory.path().to_path_buf()])
-                .is_empty()
-        );
-        std::fs::write(directory.path().join("created-outside.txt"), "content")
+        assert!(watcher.sync_directories([watched_path.clone()]).is_empty());
+        // macOS FSEvents 在剛註冊 watcher 的極短窗口內可能尚未開始送事件；先讓 backend
+        // 完成啟動，測試才能驗證真正的外部建立，而不是依賴 PollWatcher 補救競態。
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(watched_path.join("created-outside.txt"), "content")
             .expect("create external file");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if watcher.changed_directories().contains(directory.path()) {
+            if watcher.changed_directories().contains(&watched_path) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("watcher did not report external file creation");
+    }
+
+    #[test]
+    /// 驗證本機大型目錄不會被誤判為網路位置，避免註冊輪詢 watcher 時同步掃描全部項目。
+    ///
+    /// 保護目的：目錄非阻塞載入完成後，若 watcher 又在主執行緒建立數萬筆 snapshot，
+    /// 使用者仍會感覺 TUI 卡住；本測試固定一般本機路徑只能使用原生 watcher。
+    fn local_directory_does_not_require_polling_fallback() {
+        let directory = tempdir().expect("tempdir");
+        assert!(!is_likely_network_path(&directory.path().to_path_buf()));
     }
 }

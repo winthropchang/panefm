@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use crate::file_manager::app::TaskState;
 
-    /// 驗證 task 歷史可完整保存並重新載入所有狀態、時間與百分比。
+    /// 驗證 task 歷史可完整保存並重新載入所有狀態、時間與 byte 進度。
     ///
     /// 保護目的：task 歷史是長時間 SMB copy 的診斷依據；若序列化漏掉任一欄位，
     /// 使用者重開 PaneFM 後就無法判斷工作何時開始、何時結束或停在哪個進度。
@@ -143,6 +143,8 @@ mod tests {
             detail: String::from("destination: share"),
             state: TaskState::Done,
             progress_percent: Some(100),
+            completed_bytes: Some(1_024),
+            total_bytes: Some(1_024),
             started_at_unix_ms: 1_700_000_000_000,
             finished_at_unix_ms: Some(1_700_000_001_000),
         }];
@@ -151,6 +153,26 @@ mod tests {
         let loaded = load_task_history(&path).expect("load history");
 
         assert_eq!(loaded, tasks);
+    }
+
+    /// 驗證舊版只有百分比的 task 歷史仍可載入。
+    ///
+    /// 保護目的：新增 byte 欄位不能讓使用者既有 `task-history.json` 變成啟動錯誤；
+    /// 舊紀錄可顯示無 byte 資料，新工作則會保存完整 byte。
+    #[test]
+    fn legacy_task_history_without_byte_fields_remains_readable() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("task-history.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"tasks":[{"id":1,"pane_id":1,"kind":"paste","title":"copy","detail":"destination","state":"running","progress_percent":42,"started_at_unix_ms":1,"finished_at_unix_ms":null}]}"#,
+        )
+        .expect("legacy history");
+
+        let tasks = load_task_history(&path).expect("load legacy history");
+        assert_eq!(tasks[0].progress_percent, Some(42));
+        assert_eq!(tasks[0].completed_bytes, None);
+        assert_eq!(tasks[0].total_bytes, None);
     }
 
     /// 驗證沒有歷史檔時會回傳空清單，而不是阻止 PaneFM 第一次啟動。

@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread,
@@ -23,6 +23,7 @@ use std::{
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ignore::{WalkBuilder, WalkState};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::Style,
@@ -57,7 +58,10 @@ use super::{
     operation_history::{
         DEFAULT_HISTORY_LIMIT, FileOperation, FileOperationKind, OperationHistory, OperationItem,
     },
-    pane::{LineMode, PaneState, SortDetailKind, SortMode, path_content_size},
+    pane::{
+        DirectoryLoadProgress, LineMode, PaneState, SortDetailKind, SortMode, TransferProgress,
+        path_content_size,
+    },
     platform::write_text_to_system_clipboard,
     search::{
         GlobalSearchEntry, GlobalSearchEvent, stream_content_search_entries, stream_search_entries,
@@ -230,7 +234,17 @@ pub(crate) struct TaskRecord {
     pub(crate) detail: String,
     pub(crate) state: TaskState,
     /// 背景檔案工作目前完成百分比；不支援進度的外部工作使用 `None`。
+    ///
+    /// 這個欄位只為向下相容舊版 `task-history.json` 保留；新介面改顯示原始 byte，
+    /// 避免百分比掩蓋大型傳輸實際有沒有繼續前進。
+    #[serde(default)]
     pub(crate) progress_percent: Option<u8>,
+    /// 背景工作目前已完成的 byte；舊歷史沒有這個欄位時為 `None`。
+    #[serde(default)]
+    pub(crate) completed_bytes: Option<u64>,
+    /// 背景工作目前已知或估算的總 byte；走訪目錄期間可持續增加。
+    #[serde(default)]
+    pub(crate) total_bytes: Option<u64>,
     pub(crate) started_at_unix_ms: u64,
     pub(crate) finished_at_unix_ms: Option<u64>,
 }
@@ -266,7 +280,7 @@ struct NetworkGotoEvent {
 enum FileJobEvent {
     /// 背景貼上已建立第一層目標，主執行緒可立即刷新目的 panel，不必等待整批完成。
     DestinationVisible { target_dir: PathBuf },
-    /// worker 定期回報累計完成量，主執行緒再換算成百分比更新 task 面板。
+    /// worker 定期回報累計 byte，主執行緒直接更新 task 面板與持久化歷史。
     Progress {
         task_id: usize,
         completed_bytes: u64,
@@ -290,7 +304,62 @@ enum FileJobEvent {
         pane_id: usize,
         result: io::Result<(Vec<ExtractedArchive>, usize)>,
     },
+    Delete {
+        task_id: usize,
+        target_name: String,
+        result: io::Result<Vec<String>>,
+    },
 }
+
+/// 目錄大小 worker 傳回主執行緒的增量事件。
+#[derive(Debug)]
+enum DirectorySizeEvent {
+    /// 單一直接子目錄目前已統計的 byte，以及該子樹是否已完成。
+    Update {
+        path: PathBuf,
+        bytes: u64,
+        complete: bool,
+    },
+    /// 目前 panel 啟動的整批直接子目錄都已完成或已取消。
+    Done,
+}
+
+/// 保存單一 panel 的目錄大小背景工作。
+///
+/// `cwd` 用來拒絕切換目錄後晚到的舊結果；`cancelled` 讓新掃描取代舊掃描時，舊
+/// worker 能在下一個檔案邊界停止，不會持續佔用磁碟或 SMB 連線。
+#[derive(Debug)]
+struct DirectorySizeJob {
+    cwd: PathBuf,
+    receiver: Receiver<DirectorySizeEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// 保存單一 panel 的目錄清單背景載入工作。
+///
+/// `cwd` 用來比對當前目錄；`cancelled` 讓新導航發生時，舊 worker 能立即在分塊邊界停止，
+/// 避免背景磁碟 I/O 阻塞主事件迴圈。
+#[derive(Debug)]
+struct DirectoryLoadJob {
+    cwd: PathBuf,
+    receiver: Receiver<DirectoryLoadEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// 大型目錄背景讀取完成或分批串流送回主迴圈的資料。
+#[derive(Debug)]
+struct DirectoryLoadEvent {
+    pane_id: usize,
+    cwd: PathBuf,
+    selected_path: Option<PathBuf>,
+    result: io::Result<DirectoryLoadProgress>,
+}
+
+/// `ms` 背景掃描回報部分容量的最小間隔。
+///
+/// 200ms 可讓大型目錄的數字明顯持續前進，同時不會為每個檔案都傳送事件而
+/// 壓垮 TUI 主執行緒。
+const DIRECTORY_SIZE_UPDATE_INTERVAL_MS: u64 = 200;
 
 /// 背景 paste 完成的批次結果，包含成功項目及第一個失敗原因。
 #[derive(Debug)]
@@ -531,6 +600,14 @@ pub(crate) struct App {
     active_network_goto_task_id: Option<usize>,
     /// 所有大型 paste/compress/extract 工作接收端，以 task id 區分並允許並行完成。
     file_job_receivers: BTreeMap<usize, Receiver<FileJobEvent>>,
+    /// 記錄目前正在由背景工作處理（寫入、壓縮、解壓、刪除）的路徑集合，用來防止使用者在傳輸中途進入未完成的目錄。
+    active_file_job_busy_paths: BTreeMap<usize, Vec<PathBuf>>,
+    /// 每個 panel 各自擁有的 linemode size 背景掃描，不會互相覆蓋或阻塞 TUI。
+    directory_size_jobs: BTreeMap<usize, DirectorySizeJob>,
+    /// 每個 panel 最新一次非阻塞目錄讀取；新導航會取代舊 worker 並即時取消舊掃描。
+    directory_load_jobs: BTreeMap<usize, DirectoryLoadJob>,
+    /// 已成功讀取的目錄清單快取；重複進出大型目錄時先立即顯示，再由背景結果校正。
+    directory_entry_cache: BTreeMap<PathBuf, Vec<super::entry::FileEntry>>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
@@ -709,6 +786,10 @@ impl App {
             network_goto_rx: None,
             active_network_goto_task_id: None,
             file_job_receivers: BTreeMap::new(),
+            active_file_job_busy_paths: BTreeMap::new(),
+            directory_size_jobs: BTreeMap::new(),
+            directory_load_jobs: BTreeMap::new(),
+            directory_entry_cache: BTreeMap::new(),
             visual_selection: None,
             pending_action: None,
             help_return: None,
@@ -1144,7 +1225,22 @@ impl App {
             }
             _ if key_matches_plain_letter(&key, 'h') => {
                 self.clear_pending_count();
-                self.current_pane_mut()?.go_parent()?;
+                let pane_id = self.focused_pane;
+                let is_loading = self.directory_load_jobs.contains_key(&pane_id);
+                let previous_cwd = self.current_pane_mut()?.cwd.clone();
+                let previous_entries = self.current_pane_mut()?.entries.as_slice();
+                if !is_loading && !previous_entries.is_empty() {
+                    let cached_chunk = if previous_entries.len() > 2000 {
+                        previous_entries[..2000].to_vec()
+                    } else {
+                        previous_entries.to_vec()
+                    };
+                    self.directory_entry_cache
+                        .insert(previous_cwd, cached_chunk);
+                }
+                if let Some((cwd, selected_path)) = self.current_pane_mut()?.begin_go_parent() {
+                    self.start_directory_load(pane_id, cwd, Some(selected_path));
+                }
                 self.track_focused_pane_cwd_in_zoxide();
                 self.status = String::from("moved to parent directory");
                 self.pending_g = false;
@@ -1153,7 +1249,36 @@ impl App {
             }
             _ if key_matches_plain_letter(&key, 'l') => {
                 self.clear_pending_count();
-                self.current_pane_mut()?.enter_selected()?;
+                let pane_id = self.focused_pane;
+                if let Some(entry) = self.panes.get(&pane_id).and_then(|p| p.selected_entry()) {
+                    if entry.is_dir {
+                        if let Some((task_id, title, progress)) = self.active_file_job_for_path(&entry.path) {
+                            let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
+                            self.status = format!(
+                                "cannot enter '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
+                                entry.display_name()
+                            );
+                            self.pending_g = false;
+                            self.pending_y = false;
+                            return Ok(true);
+                        }
+                    }
+                }
+                let is_loading = self.directory_load_jobs.contains_key(&pane_id);
+                let previous_cwd = self.current_pane_mut()?.cwd.clone();
+                let previous_entries = self.current_pane_mut()?.entries.as_slice();
+                if !is_loading && !previous_entries.is_empty() {
+                    let cached_chunk = if previous_entries.len() > 2000 {
+                        previous_entries[..2000].to_vec()
+                    } else {
+                        previous_entries.to_vec()
+                    };
+                    self.directory_entry_cache
+                        .insert(previous_cwd, cached_chunk);
+                }
+                if let Some(cwd) = self.current_pane_mut()?.begin_enter_selected() {
+                    self.start_directory_load(pane_id, cwd, None);
+                }
                 self.track_focused_pane_cwd_in_zoxide();
                 self.status = String::from("opened directory");
                 self.pending_g = false;
@@ -5249,12 +5374,28 @@ impl App {
     ///
     /// 回傳：`io::Result<()>`。
     fn go_to_path_and_track(&mut self, pane_id: usize, target_path: &Path) -> io::Result<()> {
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
+        let Some(previous_cwd) = self.panes.get(&pane_id).map(|pane| pane.cwd.clone()) else {
             self.status = String::from("panel no longer exists");
             return Ok(());
         };
-        pane.go_to_path(target_path)?;
-        self.zoxide_tracker.track(&pane.cwd);
+        if let Some((task_id, title, progress)) = self.active_file_job_for_path(target_path) {
+            let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
+            self.status = format!(
+                "cannot enter '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
+                target_path.display()
+            );
+            return Ok(());
+        }
+        self.cancel_directory_load(pane_id);
+        let current_cwd = {
+            let pane = self.panes.get_mut(&pane_id).expect("panel checked above");
+            pane.go_to_path(target_path)?;
+            self.directory_entry_cache
+                .insert(pane.cwd.clone(), pane.entries.clone());
+            pane.cwd.clone()
+        };
+        self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
+        self.zoxide_tracker.track(&current_cwd);
         Ok(())
     }
 
@@ -5266,12 +5407,20 @@ impl App {
     ///
     /// 回傳：`io::Result<()>`。
     fn reveal_path_and_track(&mut self, pane_id: usize, target_path: &Path) -> io::Result<()> {
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
+        let Some(previous_cwd) = self.panes.get(&pane_id).map(|pane| pane.cwd.clone()) else {
             self.status = String::from("panel no longer exists");
             return Ok(());
         };
-        pane.reveal_path(target_path)?;
-        self.zoxide_tracker.track(&pane.cwd);
+        self.cancel_directory_load(pane_id);
+        let current_cwd = {
+            let pane = self.panes.get_mut(&pane_id).expect("panel checked above");
+            pane.reveal_path(target_path)?;
+            self.directory_entry_cache
+                .insert(pane.cwd.clone(), pane.entries.clone());
+            pane.cwd.clone()
+        };
+        self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
+        self.zoxide_tracker.track(&current_cwd);
         Ok(())
     }
 
@@ -5314,6 +5463,8 @@ impl App {
             };
             if let Some(layout) = self.layout.clone().close_pane(old_focus) {
                 self.layout = layout;
+                self.cancel_directory_load(old_focus);
+                self.cancel_directory_size_scan(old_focus);
                 self.panes.remove(&old_focus);
                 if self
                     .global_search
@@ -5905,8 +6056,92 @@ impl App {
         Ok(())
     }
 
+    /// 檢查指定路徑是否目前正由背景檔案工作（複製、貼上、移動、刪除、壓縮、解壓）寫入或修改中。
+    /// 若正在處理，回傳該工作的資訊（工作編號、標題、完成百分比）。
+    pub(crate) fn active_file_job_for_path(
+        &self,
+        path: &Path,
+    ) -> Option<(usize, String, Option<u8>)> {
+        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        for (task_id, busy_paths) in &self.active_file_job_busy_paths {
+            if busy_paths.iter().any(|busy| {
+                let canon_busy = busy.canonicalize().unwrap_or_else(|_| busy.to_path_buf());
+                canon_path == canon_busy
+                    || canon_path.starts_with(&canon_busy)
+                    || path == busy
+                    || path.starts_with(busy)
+            }) {
+                let task = self.task_log.iter().find(|t| t.id == *task_id);
+                let title = task
+                    .map(|t| t.title.clone())
+                    .unwrap_or_else(|| String::from("task in progress"));
+                let progress = task.and_then(|t| match (t.completed_bytes, t.total_bytes) {
+                    (Some(c), Some(tot)) if tot > 0 => {
+                        Some(((c as f64 / tot as f64) * 100.0).min(100.0) as u8)
+                    }
+                    _ => t.progress_percent,
+                });
+                return Some((*task_id, title, progress));
+            }
+        }
+        None
+    }
+
+    /// 回傳指定路徑目前正處於背景工作中的狀態標籤（例如 `[copying 99%]` 或 `[deleting...]`），若無進行中工作則回傳 `None`。
+    pub(crate) fn active_job_badge_for_path(&self, path: &Path) -> Option<String> {
+        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        for (task_id, busy_paths) in &self.active_file_job_busy_paths {
+            if busy_paths.iter().any(|busy| {
+                let canon_busy = busy.canonicalize().unwrap_or_else(|_| busy.to_path_buf());
+                canon_path == canon_busy
+                    || canon_path.starts_with(&canon_busy)
+                    || path == busy
+                    || path.starts_with(busy)
+            }) {
+                let task = self.task_log.iter().find(|t| t.id == *task_id)?;
+                let action = match task.kind.as_str() {
+                    "paste" => {
+                        if task.title.starts_with("move") {
+                            "moving"
+                        } else {
+                            "copying"
+                        }
+                    }
+                    "extract" => "extracting",
+                    "compress" => "compressing",
+                    "delete" => "deleting",
+                    _ => "busy",
+                };
+                let progress = match (task.completed_bytes, task.total_bytes) {
+                    (Some(c), Some(tot)) if tot > c && tot > 0 => {
+                        Some(((c as f64 / tot as f64) * 100.0).min(100.0) as u8)
+                    }
+                    _ => task.progress_percent,
+                };
+                return match progress {
+                    Some(pct) => Some(format!("[{action} {pct}%]")),
+                    None => match task.completed_bytes {
+                        Some(c) if c > 0 => Some(format!("[{action} {}]", format_task_bytes(c))),
+                        _ => Some(format!("[{action}...]")),
+                    },
+                };
+            }
+        }
+        None
+    }
+
     /// 將外部開啟動作排入待執行佇列。
     fn queue_open_action(&mut self, target: OpenTarget, action: OpenAction) -> io::Result<()> {
+        if target.is_dir {
+            if let Some((task_id, title, progress)) = self.active_file_job_for_path(&target.path) {
+                let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
+                self.status = format!(
+                    "cannot open '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
+                    target.display_name
+                );
+                return Ok(());
+            }
+        }
         let launch = build_launch_spec(&target, action)?;
         let title = match action {
             OpenAction::Editor => format!("open {} with editor", target.display_name),
@@ -7081,6 +7316,8 @@ impl App {
             detail,
             state: TaskState::Running,
             progress_percent: None,
+            completed_bytes: None,
+            total_bytes: None,
             started_at_unix_ms: unix_time_ms_now(),
             finished_at_unix_ms: None,
         });
@@ -7101,6 +7338,12 @@ impl App {
             if state == TaskState::Done && task.progress_percent.is_some() {
                 task.progress_percent = Some(100);
             }
+            if state == TaskState::Done
+                && let Some(total_bytes) = task.total_bytes
+            {
+                task.completed_bytes = Some(total_bytes.max(task.completed_bytes.unwrap_or(0)));
+                task.total_bytes = task.completed_bytes;
+            }
             task.finished_at_unix_ms = Some(unix_time_ms_now());
             changed = true;
         }
@@ -7109,26 +7352,31 @@ impl App {
         }
     }
 
-    /// 更新背景檔案工作的完成比例，百分比只允許向前增加。
+    /// 更新背景檔案工作的原始 byte 進度，並允許走訪期間依新發現的總量校正。
     ///
     /// 參數：`task_id: usize` 為 task 編號；`completed_bytes: u64` 為已完成量；
     /// `total_bytes: u64` 為預估總量。
     /// 回傳：`() `；找不到 task 或總量為零時不修改狀態。
     fn update_task_progress(&mut self, task_id: usize, completed_bytes: u64, total_bytes: u64) {
-        if total_bytes == 0 {
-            return;
-        }
-        let percent = completed_bytes
-            .saturating_mul(100)
-            .checked_div(total_bytes)
-            .unwrap_or(0)
-            .min(99) as u8;
         let mut changed = false;
         if let Some(task) = self.task_log.iter_mut().find(|task| task.id == task_id) {
-            let previous = task.progress_percent.unwrap_or(0);
-            let next = previous.max(percent);
-            if task.progress_percent != Some(next) {
-                task.progress_percent = Some(next);
+            let total_bytes = total_bytes.max(completed_bytes);
+            if task.completed_bytes != Some(completed_bytes)
+                || task.total_bytes != Some(total_bytes)
+            {
+                task.completed_bytes = Some(completed_bytes);
+                task.total_bytes = Some(total_bytes);
+                task.progress_percent = if total_bytes == 0 {
+                    Some(0)
+                } else {
+                    Some(
+                        completed_bytes
+                            .saturating_mul(100)
+                            .checked_div(total_bytes)
+                            .unwrap_or(0)
+                            .min(99) as u8,
+                    )
+                };
                 changed = true;
             }
         }
@@ -7151,7 +7399,7 @@ impl App {
     /// 執行正常關閉前的 task 收尾與持久化。
     ///
     /// 尚在背景 thread 執行的工作不能跨 process 真正暫停；PaneFM 會把它們標記為
-    /// `Interrupted`，保留當下百分比與診斷資料，但不在下次啟動時自動覆寫目的地。
+    /// `Interrupted`，保留當下 byte 進度與診斷資料，但不在下次啟動時自動覆寫目的地。
     /// 即使程式被強制關閉、來不及執行本函數，啟動載入也會把磁碟上的 `Running`
     /// 紀錄轉成 `Interrupted`。
     ///
@@ -7363,6 +7611,8 @@ impl App {
             format!("compress {entry_count} item(s)"),
             format!("output: {}", target_dir.display()),
         );
+        let busy_paths = entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
+        self.active_file_job_busy_paths.insert(task_id, busy_paths);
         let (sender, receiver) = std::sync::mpsc::channel();
         thread::spawn(move || {
             // 計算大型目錄的內容總量也會遞迴碰觸檔案系統，必須跟壓縮本體一起留在
@@ -7378,16 +7628,20 @@ impl App {
             });
             let progress_sender = sender.clone();
             let mut completed_bytes = 0u64;
-            let mut last_percent = 0u8;
+            let mut last_progress = None;
+            let mut last_progress_update = Instant::now();
             let mut progress = |increment: u64| {
                 completed_bytes = completed_bytes.saturating_add(increment);
-                send_progress_if_changed(
-                    &progress_sender,
-                    task_id,
-                    completed_bytes,
-                    total_bytes,
-                    &mut last_percent,
-                );
+                if last_progress_update.elapsed() >= Duration::from_millis(500) {
+                    send_progress_if_changed(
+                        &progress_sender,
+                        task_id,
+                        completed_bytes,
+                        total_bytes,
+                        &mut last_progress,
+                    );
+                    last_progress_update = Instant::now();
+                }
             };
             let result =
                 compress_entries_to_zip_with_progress(&target_dir, &entries, &mut progress);
@@ -7422,8 +7676,10 @@ impl App {
             format!("extract {entry_count} item(s)"),
             format!("output: {}", target_dir.display()),
         );
+        let busy_paths = vec![target_dir.clone()];
+        self.active_file_job_busy_paths.insert(task_id, busy_paths);
         let (sender, receiver) = mpsc::channel();
-        // 解壓後資料通常比壓縮檔大，因此這是估算分母；完成事件一定會校正成 100%。
+        // 解壓後資料通常比壓縮檔大，因此這是估算分母；完成事件會校正成最終 byte。
         let total_bytes = entries
             .iter()
             .map(|entry| entry.size)
@@ -7432,16 +7688,20 @@ impl App {
         thread::spawn(move || {
             let progress_sender = sender.clone();
             let mut completed_bytes = 0u64;
-            let mut last_percent = 0u8;
+            let mut last_progress = None;
+            let mut last_progress_update = Instant::now();
             let mut progress = |increment: u64| {
                 completed_bytes = completed_bytes.saturating_add(increment);
-                send_progress_if_changed(
-                    &progress_sender,
-                    task_id,
-                    completed_bytes,
-                    total_bytes,
-                    &mut last_percent,
-                );
+                if last_progress_update.elapsed() >= Duration::from_millis(500) {
+                    send_progress_if_changed(
+                        &progress_sender,
+                        task_id,
+                        completed_bytes,
+                        total_bytes,
+                        &mut last_progress,
+                    );
+                    last_progress_update = Instant::now();
+                }
             };
             let result = extract_entries_with_progress(&target_dir, &entries, &mut progress);
             let _ = sender.send(FileJobEvent::Extract {
@@ -7494,7 +7754,120 @@ impl App {
         };
     }
 
-    /// 真正執行將目前待確認項目移到 trash 的檔案系統操作。
+    /// 把永久刪除工作排入背景 task 執行，避免刪除大型目錄（數萬筆檔案）時凍結主 UI 執行緒。
+    fn start_background_delete(
+        &mut self,
+        pane_id: usize,
+        entries: Vec<super::entry::FileEntry>,
+        target_name: String,
+    ) -> io::Result<()> {
+        let entry_count = entries.len();
+        let task_id = self.push_task(
+            pane_id,
+            "delete",
+            format!("delete {entry_count} item(s)"),
+            format!("target: {target_name}"),
+        );
+        let mut busy_paths = Vec::new();
+        let mut delete_targets = Vec::new();
+        let deleted_names = entries.iter().map(|e| e.display_name()).collect::<Vec<_>>();
+        let pid = std::process::id();
+        let now_ms = unix_time_ms_now();
+
+        for (idx, entry) in entries.iter().enumerate() {
+            busy_paths.push(entry.path.clone());
+            if entry.is_dir {
+                if let Some(parent) = entry.path.parent() {
+                    let staging_path = parent.join(format!(
+                        ".panefm-del-{pid}-{task_id}-{idx}-{now_ms}"
+                    ));
+                    if fs::rename(&entry.path, &staging_path).is_ok() {
+                        busy_paths.push(staging_path.clone());
+                        delete_targets.push((staging_path, entry.path.clone(), true));
+                        continue;
+                    }
+                }
+            }
+            delete_targets.push((entry.path.clone(), entry.path.clone(), entry.is_dir));
+        }
+        self.active_file_job_busy_paths.insert(task_id, busy_paths);
+
+        // 資料夾移入暫存刪除路徑後，立即重載面板讓使用者看到目錄已瞬間移除
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.marked_paths.clear();
+            let _ = pane.reload();
+        }
+
+        let total_bytes = entries
+            .iter()
+            .map(|e| e.directory_size.unwrap_or(e.size))
+            .fold(0u64, u64::saturating_add);
+        self.update_task_progress(task_id, 0, total_bytes.max(1));
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let mut completed_bytes = 0u64;
+            let mut last_progress = None;
+            let mut last_progress_update = Instant::now();
+            let mut progress = |increment: u64| {
+                completed_bytes = completed_bytes.saturating_add(increment);
+                if last_progress_update.elapsed() >= Duration::from_millis(200) {
+                    send_progress_if_changed(
+                        &progress_sender,
+                        task_id,
+                        completed_bytes,
+                        total_bytes.max(completed_bytes),
+                        &mut last_progress,
+                    );
+                    last_progress_update = Instant::now();
+                }
+            };
+
+            let mut failed_error = None;
+            for (path, original_path, is_dir) in delete_targets {
+                let res = if is_dir {
+                    remove_dir_all_parallel_with_progress(&path, &mut progress)
+                } else {
+                    match remove_file_or_symlink_with_retry(&path) {
+                        Ok(size) => {
+                            progress(size);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                if let Err(error) = res {
+                    // 若失敗且曾改名為暫存檔，且原路徑目前不存在，嘗試改名還原讓使用者在目錄看見
+                    if path != original_path && path.exists() && !original_path.exists() {
+                        let _ = fs::rename(&path, &original_path);
+                    }
+                    failed_error = Some(error);
+                    break;
+                }
+            }
+            send_progress_if_changed(
+                &progress_sender,
+                task_id,
+                completed_bytes,
+                total_bytes.max(completed_bytes),
+                &mut last_progress,
+            );
+            let result = match failed_error {
+                Some(error) => Err(error),
+                None => Ok(deleted_names),
+            };
+            let _ = sender.send(FileJobEvent::Delete {
+                task_id,
+                target_name,
+                result,
+            });
+        });
+        self.file_job_receivers.insert(task_id, receiver);
+        self.status = format!("deleting {entry_count} item(s) in background [task #{task_id}]");
+        Ok(())
+    }
+
+    /// 真正執行將目前待確認項目移到 trash 或永久刪除的檔案系統操作。
     pub(crate) fn confirm_delete(
         &mut self,
         pane_id: usize,
@@ -7506,29 +7879,19 @@ impl App {
             return Ok(());
         };
 
-        let mut should_reload_panels = false;
         if permanent {
-            let delete_result = {
+            let entries = {
                 let pane = self
                     .panes
                     .get_mut(&pane_id)
                     .expect("checked pane existence before delete");
-                pane.delete_selected_or_marked()
+                pane.selected_or_marked_entries()
             };
-            match delete_result {
-                Ok(deleted_names) if deleted_names.is_empty() => {
-                    self.status = String::from("nothing selected to delete");
-                }
-                Ok(deleted_names) if deleted_names.len() == 1 => {
-                    should_reload_panels = true;
-                    self.status = format!("deleted permanently {}", deleted_names[0]);
-                }
-                Ok(deleted_names) => {
-                    should_reload_panels = true;
-                    self.status = format!("deleted permanently {} items", deleted_names.len());
-                }
-                Err(error) => self.status = format!("failed to delete {target_name}: {error}"),
+            if entries.is_empty() {
+                self.status = String::from("nothing selected to delete");
+                return Ok(());
             }
+            self.start_background_delete(pane_id, entries, target_name.to_string())?;
         } else {
             let trash_store = self.trash_store.clone();
             let trash_result = {
@@ -7543,19 +7906,15 @@ impl App {
                     self.status = String::from("nothing selected to trash");
                 }
                 Ok(trashed_names) if trashed_names.len() == 1 => {
-                    should_reload_panels = true;
+                    self.reload_all_panes()?;
                     self.status = format!("trashed {}", trashed_names[0]);
                 }
                 Ok(trashed_names) => {
-                    should_reload_panels = true;
+                    self.reload_all_panes()?;
                     self.status = format!("trashed {} items", trashed_names.len());
                 }
                 Err(error) => self.status = format!("failed to trash {target_name}: {error}"),
             }
-        }
-
-        if should_reload_panels {
-            self.reload_all_panes()?;
         }
 
         Ok(())
@@ -8249,10 +8608,13 @@ impl App {
             return Ok(());
         };
         pane.set_sort_mode(sort_mode);
-        if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
-            pane.load_directory_child_counts();
-        }
+        let needs_directory_sizes = matches!(pane.active_detail_kind(), SortDetailKind::Size);
         self.status = format!("sort: {}", pane.sort_mode.label());
+        if needs_directory_sizes {
+            self.start_directory_size_scan(pane_id);
+        } else {
+            self.cancel_directory_size_scan(pane_id);
+        }
         Ok(())
     }
 
@@ -8271,11 +8633,103 @@ impl App {
             return Ok(());
         };
         pane.set_line_mode(line_mode);
-        if matches!(line_mode, LineMode::Size) {
-            pane.load_directory_child_counts();
-        }
+        let needs_directory_sizes = matches!(pane.active_detail_kind(), SortDetailKind::Size);
         self.status = format!("linemode: {}", line_mode.label());
+        if needs_directory_sizes {
+            self.start_directory_size_scan(pane_id);
+        } else {
+            self.cancel_directory_size_scan(pane_id);
+        }
         Ok(())
+    }
+
+    /// 為指定 panel 啟動非同步遞迴目錄大小掃描。
+    ///
+    /// 參數：`pane_id: usize`，要顯示 `ms` 大小的 panel 編號。
+    /// 回傳：`() `；panel 不存在或已在計算相同目錄時不重複重啟，避免複製或頻繁變更時數字反覆歸零跳動。
+    fn start_directory_size_scan(&mut self, pane_id: usize) {
+        let (cwd, directories) = {
+            let Some(pane) = self.panes.get_mut(&pane_id) else {
+                return;
+            };
+            if self
+                .directory_size_jobs
+                .get(&pane_id)
+                .is_some_and(|job| job.cwd == pane.cwd)
+            {
+                return;
+            }
+            pane.init_directory_sizes_if_missing();
+            let cwd = pane.cwd.clone();
+            let directories = pane
+                .entries
+                .iter()
+                .filter(|entry| entry.is_dir)
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            (cwd, directories)
+        };
+        self.cancel_directory_size_scan(pane_id);
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        thread::spawn(move || {
+            scan_directory_sizes(directories, &worker_cancelled, &sender);
+            let _ = sender.send(DirectorySizeEvent::Done);
+        });
+        self.directory_size_jobs.insert(
+            pane_id,
+            DirectorySizeJob {
+                cwd,
+                receiver,
+                cancelled,
+            },
+        );
+    }
+
+    /// 在 panel 成功切換目錄後，同步目前目錄容量工作的生命週期。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，剛完成目錄切換的 panel 編號。
+    /// - `previous_cwd: &Path`，切換前的工作目錄，用來避免選到一般檔案時無謂重啟。
+    ///
+    /// 回傳：`() `。只有工作目錄真的改變才處理；`linemode size` 或 size 排序啟用時，
+    /// 會取消舊目錄工作並立即替新列表填入 `~0B`、啟動新掃描。其他顯示模式則只取消
+    /// 可能殘留的舊工作，避免背景執行緒繼續走訪已離開的目錄。
+    fn restart_directory_size_scan_after_navigation(
+        &mut self,
+        pane_id: usize,
+        previous_cwd: &Path,
+    ) {
+        let is_size_detail = {
+            let Some(pane) = self.panes.get_mut(&pane_id) else {
+                self.cancel_directory_size_scan(pane_id);
+                return;
+            };
+            if pane.cwd == previous_cwd {
+                return;
+            }
+            if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
+                pane.clear_directory_sizes();
+                true
+            } else {
+                false
+            }
+        };
+        self.cancel_directory_size_scan(pane_id);
+        if is_size_detail {
+            self.start_directory_size_scan(pane_id);
+        }
+    }
+
+    /// 取消指定 panel 尚未完成的大小掃描並丟棄其接收端。
+    ///
+    /// 參數：`pane_id: usize`，要停止掃描的 panel 編號。
+    /// 回傳：`() `；沒有工作時安全地不做任何事。
+    fn cancel_directory_size_scan(&mut self, pane_id: usize) {
+        if let Some(job) = self.directory_size_jobs.remove(&pane_id) {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
     }
 
     /// 取出並清除下一幀的完整重畫需求。
@@ -8550,59 +9004,63 @@ impl App {
             format!("{operation_label} {entry_count} item(s)"),
             format!("destination: {}", target_dir.display()),
         );
-        // 背景 paste 一排入就顯示 0%，避免總大小掃描尚未完成時 task 面板只有
-        // RUNNING 而沒有任何進度資訊。後續實際 byte 事件只會讓比例向前增加。
+        let mut busy = Vec::new();
+        for entry in &clipboard.entries {
+            let item_name = entry
+                .source_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.display_name.trim_end_matches('/').to_string());
+            busy.push(target_dir.join(&item_name));
+            if clipboard.operation == ClipboardOperation::Cut {
+                busy.push(entry.source_path.clone());
+            }
+        }
+        self.active_file_job_busy_paths.insert(task_id, busy);
+        // 背景 paste 一排入就顯示初始 byte，避免總大小尚未發現時 task 面板只有
+        // RUNNING 而沒有任何進度資訊。後續事件會逐步修正已完成量與總量。
         self.update_task_progress(task_id, 0, 1);
         let (sender, receiver) = mpsc::channel();
         let worker_clipboard = clipboard.clone();
         let worker_target_dir = target_dir.clone();
         thread::spawn(move || {
-            // 容量掃描與真正複製必須同時開始。過去先完整掃描再複製，含大量小檔案的
-            // build 目錄會被走訪兩次且兩段時間相加，造成目標數秒後才出現在列表。
-            let size_clipboard = worker_clipboard.clone();
-            let (size_sender, size_receiver) = mpsc::sync_channel(1);
-            let size_worker = thread::spawn(move || {
-                let total_bytes = size_clipboard
-                    .entries
-                    .iter()
-                    .filter_map(|entry| path_content_size(&entry.source_path).ok())
-                    .fold(0u64, u64::saturating_add);
-                let _ = size_sender.send(total_bytes);
-            });
             let progress_sender = sender.clone();
             let progress_target_dir = worker_target_dir.clone();
             let mut completed_bytes = 0u64;
-            let mut total_bytes = None;
-            let mut last_percent = 0u8;
-            let mut last_destination_refresh = Instant::now();
-            let mut progress = |increment: u64| {
-                if increment == 0 {
+            let mut total_bytes = 0u64;
+            let mut last_progress = None;
+            let mut last_progress_update = Instant::now()
+                .checked_sub(Duration::from_millis(500))
+                .unwrap_or_else(Instant::now);
+            let mut progress = |event: TransferProgress| {
+                if event == TransferProgress::TargetVisible {
                     let _ = progress_sender.send(FileJobEvent::DestinationVisible {
                         target_dir: progress_target_dir.clone(),
                     });
-                    last_destination_refresh = Instant::now();
                     return;
                 }
-                completed_bytes = completed_bytes.saturating_add(increment);
-                // 正在複製的目錄可能已被使用者打開；固定節流後要求主執行緒刷新目的
-                // 樹，讓已落盤的檔案逐步出現在列表，而不是整批完成後一次跳出。
-                if last_destination_refresh.elapsed() >= Duration::from_millis(250) {
-                    let _ = progress_sender.send(FileJobEvent::DestinationVisible {
-                        target_dir: progress_target_dir.clone(),
-                    });
-                    last_destination_refresh = Instant::now();
+
+                match event {
+                    TransferProgress::BytesDiscovered(increment) => {
+                        total_bytes = total_bytes.saturating_add(increment);
+                    }
+                    TransferProgress::BytesCopied(increment) => {
+                        completed_bytes = completed_bytes.saturating_add(increment);
+                    }
+                    TransferProgress::TargetVisible => unreachable!(),
                 }
-                if total_bytes.is_none() {
-                    total_bytes = size_receiver.try_recv().ok();
-                }
-                if let Some(total_bytes) = total_bytes {
+                // 動態總量可能在相鄰檔案間持續增加；若每次都送到 App，task
+                // history 會持續寫檔並反過來拖慢數十萬個小檔案的 copy。固定節流為
+                // 每 500ms 最多一次，完成事件前仍會再送最後的精確值。
+                if last_progress_update.elapsed() >= Duration::from_millis(500) {
                     send_progress_if_changed(
                         &progress_sender,
                         task_id,
                         completed_bytes,
                         total_bytes,
-                        &mut last_percent,
+                        &mut last_progress,
                     );
+                    last_progress_update = Instant::now();
                 }
             };
             let result = perform_paste_job(
@@ -8613,19 +9071,10 @@ impl App {
             );
             drop(progress);
 
-            // Copy 很快時，容量掃描可能稍晚完成；完成事件前等待它並送出最後一次穩定
-            // 分母，確保 task 百分比不因動態增加的總量而倒退。
-            let total_bytes = total_bytes.unwrap_or_else(|| {
-                size_worker
-                    .join()
-                    .ok()
-                    .and_then(|_| size_receiver.try_recv().ok())
-                    .unwrap_or(completed_bytes)
-            });
             let _ = sender.send(FileJobEvent::Progress {
                 task_id,
                 completed_bytes,
-                total_bytes,
+                total_bytes: total_bytes.max(completed_bytes),
             });
             let _ = sender.send(FileJobEvent::Paste {
                 task_id,
@@ -9039,6 +9488,19 @@ impl App {
         for pane in self.panes.values_mut() {
             pane.reload()?;
         }
+        for pane in self.panes.values() {
+            self.directory_entry_cache
+                .insert(pane.cwd.clone(), pane.entries.clone());
+        }
+        let size_panes = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| matches!(pane.active_detail_kind(), SortDetailKind::Size))
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<Vec<_>>();
+        for pane_id in size_panes {
+            self.start_directory_size_scan(pane_id);
+        }
         Ok(())
     }
 
@@ -9054,6 +9516,19 @@ impl App {
         {
             pane.reload()?;
         }
+        for pane in self
+            .panes
+            .values()
+            .filter(|pane| pane.cwd == directory || pane.cwd.starts_with(directory))
+        {
+            self.directory_entry_cache
+                .insert(pane.cwd.clone(), pane.entries.clone());
+        }
+        // 清理不在目前開啟 panel 中的陳舊子目錄快取
+        self.directory_entry_cache.retain(|cached_path, _| {
+            !cached_path.starts_with(directory)
+                || self.panes.values().any(|pane| &pane.cwd == cached_path)
+        });
         Ok(())
     }
 
@@ -9189,6 +9664,19 @@ impl App {
                 .map(|search| {
                     filtered_global_search_entries(&search.results, &search.filter.buffer)
                 });
+            let active_job_badges = self
+                .panes
+                .get(&pane_id)
+                .map(|pane| {
+                    pane.entries
+                        .iter()
+                        .filter_map(|entry| {
+                            self.active_job_badge_for_path(&entry.path)
+                                .map(|badge| (entry.path.clone(), badge))
+                        })
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .unwrap_or_default();
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 let rename_buffer = match &self.pending_action {
                     Some(PendingAction::Rename {
@@ -9373,6 +9861,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|search| search.pane_id == pane_id),
                     self.text_input_cursor,
+                    &active_job_badges,
                 );
                 if cursor_position.is_none() {
                     cursor_position = pane_cursor;
@@ -9653,6 +10142,8 @@ impl App {
         self.poll_filesystem_watcher();
         self.poll_network_goto();
         self.poll_file_jobs();
+        self.poll_directory_load_jobs();
+        self.poll_directory_size_jobs();
 
         let Some(receiver) = &self.global_search_rx else {
             return;
@@ -9757,6 +10248,196 @@ impl App {
         }
     }
 
+    /// 啟動單一 panel 的非阻塞目錄讀取，並先套用已有快取。
+    ///
+    /// 參數：`pane_id` 是導航來源 panel；`cwd` 是新目錄；`selected_path` 是回到父目錄
+    /// 時應重新選取的子目錄。回傳：`() `；I/O 結果由 `poll_directory_load_jobs` 套用。
+    fn start_directory_load(
+        &mut self,
+        pane_id: usize,
+        cwd: PathBuf,
+        selected_path: Option<PathBuf>,
+    ) {
+        self.cancel_directory_size_scan(pane_id);
+        self.cancel_directory_load(pane_id);
+        let (sort_mode, random_seed) = self
+            .panes
+            .get(&pane_id)
+            .map(|pane| (pane.sort_mode, pane.random_seed))
+            .unwrap_or((SortMode::Natural { reverse: false }, 0));
+        if let Some(cached) = self.directory_entry_cache.get(&cwd).cloned()
+            && let Some(pane) = self.panes.get_mut(&pane_id)
+        {
+            pane.replace_entries_presorted(cached, selected_path.as_deref());
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let worker_cwd = cwd.clone();
+        let worker_selection = selected_path.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        thread::spawn(move || {
+            let thread_pane_id = pane_id;
+            let thread_cwd = worker_cwd.clone();
+            let thread_selection = worker_selection.clone();
+            let thread_sender = sender.clone();
+            let stream_result = super::pane::stream_dir_entries_with_cancellation(
+                &worker_cwd,
+                sort_mode,
+                random_seed,
+                &worker_cancelled,
+                move |progress| {
+                    thread_sender
+                        .send(DirectoryLoadEvent {
+                            pane_id: thread_pane_id,
+                            cwd: thread_cwd.clone(),
+                            selected_path: thread_selection.clone(),
+                            result: Ok(progress),
+                        })
+                        .is_ok()
+                },
+            );
+            if let Err(error) = stream_result {
+                let _ = sender.send(DirectoryLoadEvent {
+                    pane_id,
+                    cwd: worker_cwd,
+                    selected_path: worker_selection,
+                    result: Err(error),
+                });
+            }
+        });
+        self.directory_load_jobs.insert(
+            pane_id,
+            DirectoryLoadJob {
+                cwd: cwd.clone(),
+                receiver,
+                cancelled,
+            },
+        );
+        self.status = format!("loading directory: {}", cwd.display());
+    }
+
+    /// 取消指定 panel 尚未完成的目錄載入工作。
+    ///
+    /// 參數：`pane_id: usize`，要停止載入的 panel 編號。
+    /// 回傳：`() `；沒有工作時安全地不做任何事。
+    fn cancel_directory_load(&mut self, pane_id: usize) {
+        if let Some(job) = self.directory_load_jobs.remove(&pane_id) {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 非阻塞接收大型目錄清單；分批套用快速發現項目，並在完成時更新快取與 size linemode。
+    ///
+    /// 參數：無。回傳：`() `；第一批（< 1ms）讓 UI 立即畫出列表與響應游標，後續增量批次平滑呈現。
+    fn poll_directory_load_jobs(&mut self) {
+        let pane_ids = self.directory_load_jobs.keys().copied().collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            let mut job_done = false;
+            let Some((job_cwd, events)) = self
+                .directory_load_jobs
+                .get(&pane_id)
+                .map(|job| (job.cwd.clone(), job.receiver.try_iter().collect::<Vec<_>>()))
+            else {
+                continue;
+            };
+            for event in events {
+                if event.cwd != job_cwd {
+                    continue;
+                }
+                match event.result {
+                    Ok(DirectoryLoadProgress::Batch {
+                        entries,
+                        is_first_chunk,
+                    }) => {
+                        if let Some(pane) = self.panes.get_mut(&event.pane_id)
+                            && pane.cwd == event.cwd
+                        {
+                            if is_first_chunk {
+                                pane.replace_entries_presorted(entries, event.selected_path.as_deref());
+                            } else {
+                                pane.extend_entries(entries);
+                            }
+                            self.status = format!(
+                                "loading directory: {} ({} items)",
+                                event.cwd.display(),
+                                pane.entries.len()
+                            );
+                        }
+                    }
+                    Ok(DirectoryLoadProgress::Complete(entries)) => {
+                        job_done = true;
+                        self.directory_entry_cache
+                            .insert(event.cwd.clone(), entries.clone());
+                        if let Some(pane) = self.panes.get_mut(&event.pane_id)
+                            && pane.cwd == event.cwd
+                        {
+                            pane.replace_entries_presorted(entries, event.selected_path.as_deref());
+                            if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
+                                self.start_directory_size_scan(event.pane_id);
+                            }
+                            self.status = format!("opened directory: {}", event.cwd.display());
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        job_done = true;
+                    }
+                    Err(error) => {
+                        job_done = true;
+                        if self
+                            .panes
+                            .get(&event.pane_id)
+                            .is_some_and(|pane| pane.cwd == event.cwd)
+                        {
+                            self.status = format!("open directory failed: {error}");
+                        }
+                    }
+                }
+            }
+            if job_done {
+                self.directory_load_jobs.remove(&pane_id);
+            }
+        }
+    }
+
+    /// 非阻塞套用各 panel 的目錄大小快照。
+    ///
+    /// 參數：無，資料來自 `directory_size_jobs`。
+    /// 回傳：`() `；每個 job 每幀最多處理 64 筆，避免大量小目錄拖慢鍵盤事件。
+    fn poll_directory_size_jobs(&mut self) {
+        let pane_ids = self.directory_size_jobs.keys().copied().collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            let mut finished = false;
+            let mut updates = Vec::new();
+            let Some(job) = self.directory_size_jobs.get(&pane_id) else {
+                continue;
+            };
+            let job_cwd = job.cwd.clone();
+            for event in job.receiver.try_iter().take(64) {
+                match event {
+                    DirectorySizeEvent::Update {
+                        path,
+                        bytes,
+                        complete,
+                    } => updates.push((path, bytes, complete)),
+                    DirectorySizeEvent::Done => finished = true,
+                }
+            }
+            let cwd_matches = self
+                .panes
+                .get(&pane_id)
+                .is_some_and(|pane| pane.cwd == job_cwd);
+            if cwd_matches && let Some(pane) = self.panes.get_mut(&pane_id) {
+                for (path, bytes, complete) in updates {
+                    pane.update_directory_size(&path, bytes, complete);
+                }
+            }
+            if finished || !cwd_matches {
+                self.cancel_directory_size_scan(pane_id);
+            }
+        }
+    }
+
     /// 接收檔案系統 watcher 事件，去重後刷新所有顯示受影響目錄的 panel。
     ///
     /// 參數：無；監看目錄來自目前 `panes`，事件來自 [`FilesystemWatcher`] channel。
@@ -9780,9 +10461,14 @@ impl App {
         }
         if !changed.is_empty() {
             self.pending_watched_directories.extend(changed);
+            let debounce = if self.file_job_receivers.is_empty() {
+                self.config.watcher.debounce
+            } else {
+                Duration::from_millis(400)
+            };
             // 第一個事件設定 deadline，後續同批事件只合併路徑而不無限延後刷新。
             self.filesystem_refresh_deadline
-                .get_or_insert_with(|| Instant::now() + self.config.watcher.debounce);
+                .get_or_insert_with(|| Instant::now() + debounce);
         }
 
         if !self
@@ -9804,12 +10490,36 @@ impl App {
     /// 參數：`directories: &BTreeSet<PathBuf>`，已經過 debounce 的異動目錄集合。
     /// 回傳：`io::Result<()>`；任一受影響 panel 無法重新讀取時回傳原始 I/O 錯誤。
     fn reload_watched_directories(&mut self, directories: &BTreeSet<PathBuf>) -> io::Result<()> {
-        for pane in self
+        let affected_panes = self
             .panes
-            .values_mut()
-            .filter(|pane| directories.contains(&pane.cwd))
-        {
+            .iter()
+            .filter(|(_, pane)| directories.contains(&pane.cwd))
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<Vec<_>>();
+        for pane_id in &affected_panes {
+            let pane = self.panes.get_mut(pane_id).expect("pane id came from map");
             pane.reload()?;
+        }
+        for pane_id in &affected_panes {
+            if let Some(pane) = self.panes.get(pane_id) {
+                self.directory_entry_cache
+                    .insert(pane.cwd.clone(), pane.entries.clone());
+            }
+        }
+        for pane_id in &affected_panes {
+            if self.file_job_receivers.is_empty()
+                && self
+                    .panes
+                    .get(pane_id)
+                    .is_some_and(|pane| matches!(pane.active_detail_kind(), SortDetailKind::Size))
+            {
+                self.start_directory_size_scan(*pane_id);
+            }
+        }
+        for dir in directories {
+            if !self.panes.values().any(|pane| &pane.cwd == dir) {
+                self.directory_entry_cache.remove(dir);
+            }
         }
         if !directories.is_empty() {
             self.full_redraw_requested = true;
@@ -9889,15 +10599,11 @@ impl App {
                 continue;
             };
             let mut completed = false;
+            let mut refresh_target = None;
             loop {
                 match receiver.try_recv() {
                     Ok(FileJobEvent::DestinationVisible { target_dir }) => {
-                        if let Err(error) = self.reload_panes_in_tree(&target_dir) {
-                            self.status = format!(
-                                "background paste started; destination refresh failed: {error}"
-                            );
-                        }
-                        self.full_redraw_requested = true;
+                        refresh_target = Some(target_dir);
                     }
                     Ok(FileJobEvent::Progress {
                         task_id,
@@ -9931,26 +10637,37 @@ impl App {
                     }
                 }
             }
+            if let Some(target_dir) = refresh_target {
+                if let Err(error) = self.reload_panes_in_tree(&target_dir) {
+                    self.status = format!(
+                        "background paste started; destination refresh failed: {error}"
+                    );
+                }
+                self.full_redraw_requested = true;
+            }
             if !completed {
                 self.file_job_receivers.insert(task_id, receiver);
-            } else if self
-                .task_log
-                .iter()
-                .any(|task| task.id == task_id && task.state == TaskState::Running)
-            {
-                self.finish_task(
-                    task_id,
-                    TaskState::Failed,
-                    String::from("file worker disconnected"),
-                );
-                self.status = format!("file task {task_id} failed: worker disconnected");
+            } else {
+                self.active_file_job_busy_paths.remove(&task_id);
+                if self
+                    .task_log
+                    .iter()
+                    .any(|task| task.id == task_id && task.state == TaskState::Running)
+                {
+                    self.finish_task(
+                        task_id,
+                        TaskState::Failed,
+                        String::from("file worker disconnected"),
+                    );
+                    self.status = format!("file task {task_id} failed: worker disconnected");
+                }
             }
         }
     }
 
     /// 套用單一背景檔案工作的完成結果。
     ///
-    /// 參數：`event: FileJobEvent`，worker 回傳的 paste、compress 或 extract 結果。
+    /// 參數：`event: FileJobEvent`，worker 回傳的 paste、compress、extract 或 delete 結果。
     /// 回傳：`()`；I/O 錯誤會完整寫入 task 與狀態列，不會中止主事件迴圈。
     fn apply_file_job_event(&mut self, event: FileJobEvent) {
         match event {
@@ -9966,6 +10683,7 @@ impl App {
                 overwrite,
                 result,
             } => {
+                self.active_file_job_busy_paths.remove(&task_id);
                 let operation = clipboard.operation;
                 self.record_file_operation(operation, result.history_items);
                 if let Some(failure) = result.failure {
@@ -9997,62 +10715,95 @@ impl App {
                 entry_count,
                 first_name,
                 result,
-            } => match result {
-                Ok(archive_path) => {
-                    if let Err(error) = self.reload_all_panes() {
-                        self.status = format!("compress completed; refresh failed: {error}");
+            } => {
+                self.active_file_job_busy_paths.remove(&task_id);
+                match result {
+                    Ok(archive_path) => {
+                        if let Err(error) = self.reload_all_panes() {
+                            self.status = format!("compress completed; refresh failed: {error}");
+                            self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                            return;
+                        }
+                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                            pane.select_path(&archive_path);
+                        }
+                        let archive_name = archive_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("archive.zip");
+                        self.status = if entry_count == 1 {
+                            format!("compressed {first_name} -> {archive_name}")
+                        } else {
+                            format!("compressed {entry_count} items -> {archive_name}")
+                        };
+                        self.finish_task(task_id, TaskState::Done, self.status.clone());
+                        self.full_redraw_requested = true;
+                    }
+                    Err(error) => {
+                        self.status = format!("compress failed: {error}");
                         self.finish_task(task_id, TaskState::Failed, self.status.clone());
-                        return;
                     }
-                    if let Some(pane) = self.panes.get_mut(&pane_id) {
-                        pane.select_path(&archive_path);
-                    }
-                    let archive_name = archive_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("archive.zip");
-                    self.status = if entry_count == 1 {
-                        format!("compressed {first_name} -> {archive_name}")
-                    } else {
-                        format!("compressed {entry_count} items -> {archive_name}")
-                    };
-                    self.finish_task(task_id, TaskState::Done, self.status.clone());
-                    self.full_redraw_requested = true;
                 }
-                Err(error) => {
-                    self.status = format!("compress failed: {error}");
-                    self.finish_task(task_id, TaskState::Failed, self.status.clone());
-                }
-            },
+            }
             FileJobEvent::Extract {
                 task_id,
                 pane_id,
                 result,
-            } => match result {
-                Ok((extracted, skipped)) if !extracted.is_empty() => {
-                    if let Err(error) = self.reload_all_panes() {
-                        self.status = format!("extract completed; refresh failed: {error}");
+            } => {
+                self.active_file_job_busy_paths.remove(&task_id);
+                match result {
+                    Ok((extracted, skipped)) if !extracted.is_empty() => {
+                        if let Err(error) = self.reload_all_panes() {
+                            self.status = format!("extract completed; refresh failed: {error}");
+                            self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                            return;
+                        }
+                        if let Some(first) = extracted.first()
+                            && let Some(pane) = self.panes.get_mut(&pane_id)
+                        {
+                            pane.select_path(&first.output_path);
+                        }
+                        self.status = extraction_status_label(&extracted, skipped);
+                        self.finish_task(task_id, TaskState::Done, self.status.clone());
+                        self.full_redraw_requested = true;
+                    }
+                    Ok((_, skipped)) => {
+                        self.status = format!("no supported archives selected (skipped {skipped})");
                         self.finish_task(task_id, TaskState::Failed, self.status.clone());
-                        return;
                     }
-                    if let Some(first) = extracted.first()
-                        && let Some(pane) = self.panes.get_mut(&pane_id)
-                    {
-                        pane.select_path(&first.output_path);
+                    Err(error) => {
+                        self.status = format!("extract failed: {error}");
+                        self.finish_task(task_id, TaskState::Failed, self.status.clone());
                     }
-                    self.status = extraction_status_label(&extracted, skipped);
-                    self.finish_task(task_id, TaskState::Done, self.status.clone());
-                    self.full_redraw_requested = true;
                 }
-                Ok((_, skipped)) => {
-                    self.status = format!("no supported archives selected (skipped {skipped})");
-                    self.finish_task(task_id, TaskState::Failed, self.status.clone());
+            }
+            FileJobEvent::Delete {
+                task_id,
+                target_name,
+                result,
+            } => {
+                self.active_file_job_busy_paths.remove(&task_id);
+                match result {
+                    Ok(deleted_names) => {
+                        let status = if deleted_names.len() == 1 {
+                            format!("deleted permanently {}", deleted_names[0])
+                        } else {
+                            format!("deleted permanently {} items", deleted_names.len())
+                        };
+                        self.finish_task(task_id, TaskState::Done, status.clone());
+                        self.status = status;
+                    }
+                    Err(error) => {
+                        let status = format!("failed to delete {target_name}: {error}");
+                        self.finish_task(task_id, TaskState::Failed, status.clone());
+                        self.status = status;
+                    }
                 }
-                Err(error) => {
-                    self.status = format!("extract failed: {error}");
-                    self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                if let Err(error) = self.reload_all_panes() {
+                    self.status = format!("{}; refresh failed: {error}", self.status);
                 }
-            },
+                self.full_redraw_requested = true;
+            }
         }
     }
 }
@@ -10722,7 +11473,7 @@ fn perform_paste_job<F>(
     progress: &mut F,
 ) -> PasteJobResult
 where
-    F: FnMut(u64),
+    F: FnMut(TransferProgress),
 {
     let mut history_items = Vec::new();
     let mut pasted_count = 0usize;
@@ -10781,35 +11532,300 @@ where
     }
 }
 
-/// 百分比實際增加時才送出進度事件，避免大型檔案產生數萬筆 channel 訊息。
+/// 平行計算目前 panel 每個直接子目錄的真實內容大小。
+///
+/// 參數：
+/// - `directories: Vec<PathBuf>`，目前 panel 的直接子目錄；每個路徑各自成為一列。
+/// - `cancelled: &AtomicBool`，切換 linemode、目錄或重啟掃描時由主執行緒設為 `true`。
+/// - `sender: &mpsc::Sender<DirectorySizeEvent>`，把部分值與最終值送回 TUI。
+///
+/// 回傳：`() `。工作數受 CPU 平行度限制；目錄少時會把額度用於同一棵大型
+/// 子樹，目錄多時則會同時計算多列。無法讀取的項目會略過，且不追蹤 symlink，
+/// 避免循環目錄與意外走訪其他 share。各列最多約每 200ms 回報一次，完成時一定回報
+/// 精確終值。
+fn scan_directory_sizes(
+    directories: Vec<PathBuf>,
+    cancelled: &AtomicBool,
+    sender: &mpsc::Sender<DirectorySizeEvent>,
+) {
+    if directories.is_empty() {
+        return;
+    }
+
+    let available_workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+        .clamp(1, 12);
+    let root_workers = available_workers.min(directories.len());
+    let threads_per_root = (available_workers / root_workers).max(1);
+    let next_root = AtomicUsize::new(0);
+
+    thread::scope(|scope| {
+        for _ in 0..root_workers {
+            let directories = &directories;
+            let next_root = &next_root;
+            scope.spawn(move || {
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let index = next_root.fetch_add(1, Ordering::Relaxed);
+                    let Some(root) = directories.get(index) else {
+                        return;
+                    };
+                    scan_one_directory_size(root, cancelled, sender, threads_per_root);
+                }
+            });
+        }
+    });
+}
+
+/// 使用受限制的平行 walker 計算單一直接子目錄。
+///
+/// 參數：`root` 是列表中的直接子目錄；`cancelled` 是取消旗標；`sender` 將部分與
+/// 最終 byte 傳回 TUI；`worker_threads` 是這棵子樹可使用的最大執行緒數。
+///
+/// 回傳：`() `。每個一般檔案只累加 `metadata.len()`；目錄本身與 symbolic link 不計入，
+/// 因此結果代表內容的 logical bytes，不是檔案系統的磁碟配置空間。
+fn scan_one_directory_size(
+    root: &Path,
+    cancelled: &AtomicBool,
+    sender: &mpsc::Sender<DirectorySizeEvent>,
+    worker_threads: usize,
+) {
+    let total_bytes = AtomicU64::new(0);
+    let last_update_ms = AtomicU64::new(0);
+    let started_at = Instant::now();
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .ignore(false)
+        .follow_links(false)
+        .threads(worker_threads.max(1));
+
+    walker.build_parallel().run(|| {
+        Box::new(|result| {
+            if cancelled.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+            let Ok(entry) = result else {
+                return WalkState::Continue;
+            };
+            let Some(file_type) = entry.file_type() else {
+                return WalkState::Continue;
+            };
+            if !file_type.is_file() {
+                return WalkState::Continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                return WalkState::Continue;
+            };
+            let bytes = total_bytes
+                .fetch_add(metadata.len(), Ordering::Relaxed)
+                .saturating_add(metadata.len());
+            let elapsed_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let previous_update = last_update_ms.load(Ordering::Relaxed);
+            if should_report_directory_size(elapsed_ms, previous_update)
+                && last_update_ms
+                    .compare_exchange(
+                        previous_update,
+                        elapsed_ms,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                let _ = sender.send(DirectorySizeEvent::Update {
+                    path: root.to_path_buf(),
+                    bytes,
+                    complete: false,
+                });
+            }
+            WalkState::Continue
+        })
+    });
+
+    if !cancelled.load(Ordering::Relaxed) {
+        let _ = sender.send(DirectorySizeEvent::Update {
+            path: root.to_path_buf(),
+            bytes: total_bytes.load(Ordering::Relaxed),
+            complete: true,
+        });
+    }
+}
+
+/// 判斷目錄容量部分結果是否已到下一次回報時間。
+///
+/// 參數：`elapsed_ms: u64` 是掃描啟動後的毫秒數；`previous_update_ms: u64` 是上次回報時間。
+/// 回傳：`bool`；間隔達 200ms 時為 `true`，否則為 `false`。
+fn should_report_directory_size(elapsed_ms: u64, previous_update_ms: u64) -> bool {
+    elapsed_ms.saturating_sub(previous_update_ms) >= DIRECTORY_SIZE_UPDATE_INTERVAL_MS
+}
+
+/// byte 進度發生變化時送出事件；呼叫端負責以時間節流，避免大量 channel 訊息。
 ///
 /// 參數：`sender` 為 worker event channel；`task_id` 為工作編號；`completed_bytes` 與
-/// `total_bytes` 為累計量；`last_percent` 保存上次已送出的比例。
+/// `total_bytes` 為累計量；`last_progress` 保存上次送出的 byte 組合。
 /// 回傳：`() `；channel 已關閉時安靜停止回報，不影響檔案工作的錯誤處理。
 fn send_progress_if_changed(
     sender: &mpsc::Sender<FileJobEvent>,
     task_id: usize,
     completed_bytes: u64,
     total_bytes: u64,
-    last_percent: &mut u8,
+    last_progress: &mut Option<(u64, u64)>,
 ) {
-    if total_bytes == 0 {
+    let progress = (completed_bytes, total_bytes.max(completed_bytes));
+    if *last_progress == Some(progress) {
         return;
     }
-    let percent = completed_bytes
-        .saturating_mul(100)
-        .checked_div(total_bytes)
-        .unwrap_or(0)
-        .min(99) as u8;
-    if percent <= *last_percent {
-        return;
-    }
-    *last_percent = percent;
+    *last_progress = Some(progress);
     let _ = sender.send(FileJobEvent::Progress {
         task_id,
-        completed_bytes,
-        total_bytes,
+        completed_bytes: progress.0,
+        total_bytes: progress.1,
     });
+}
+
+fn ensure_path_writable(path: &Path) {
+    if let Ok(mut perms) = fs::metadata(path).map(|m| m.permissions()) {
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+}
+
+/// 移除單一檔案或符號連結，遇到權限受阻時自動嘗試解除唯讀後重試，並回傳釋放的 byte 數。
+fn remove_file_or_symlink_with_retry(path: &Path) -> io::Result<u64> {
+    let size = fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0);
+    if let Err(err) = fs::remove_file(path) {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            ensure_path_writable(path);
+            if let Some(parent) = path.parent() {
+                ensure_path_writable(parent);
+            }
+            fs::remove_file(path)?;
+            return Ok(size);
+        }
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+    Ok(size)
+}
+
+const DELETE_WORKERS: usize = 8;
+
+/// 高速遞迴刪除子目錄或檔案，遇到唯讀權限受阻時自動嘗試排除。
+fn remove_dir_all_fast_recursive<F>(path: &Path, on_progress: &mut F) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
+    ensure_path_writable(path);
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in read_dir.flatten() {
+        let entry_path = entry.path();
+        if let Ok(file_type) = entry.file_type() {
+            if file_type.is_dir() && !file_type.is_symlink() {
+                let _ = remove_dir_all_fast_recursive(&entry_path, on_progress);
+            } else {
+                let size = remove_file_or_symlink_with_retry(&entry_path).unwrap_or(0);
+                on_progress(size);
+            }
+        } else {
+            let size = remove_file_or_symlink_with_retry(&entry_path).unwrap_or(0);
+            on_progress(size);
+        }
+    }
+    ensure_path_writable(path);
+    if let Err(_) = fs::remove_dir(path) {
+        let _ = fs::remove_dir_all(path);
+    }
+    Ok(())
+}
+
+/// 多執行緒平行刪除目錄，大幅提高 NVMe/SSD 與檔案系統的 unlink 吞吐量並回報 byte 進度。
+fn remove_dir_all_parallel_with_progress<F>(path: &Path, on_progress: &mut F) -> io::Result<()>
+where
+    F: FnMut(u64) + Send,
+{
+    ensure_path_writable(path);
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let entries: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
+    if entries.is_empty() {
+        let _ = fs::remove_dir(path);
+        return Ok(());
+    }
+
+    if entries.len() <= 4 {
+        for child in &entries {
+            if child.is_dir() && !child.is_symlink() {
+                let _ = remove_dir_all_fast_recursive(child, on_progress);
+            } else {
+                let size = remove_file_or_symlink_with_retry(child).unwrap_or(0);
+                on_progress(size);
+            }
+        }
+    } else {
+        let chunk_size = (entries.len() + DELETE_WORKERS - 1) / DELETE_WORKERS;
+        let progress_mutex = std::sync::Mutex::new(on_progress);
+        thread::scope(|scope| {
+            for chunk in entries.chunks(chunk_size) {
+                let chunk = chunk.to_vec();
+                let p_mutex = &progress_mutex;
+                scope.spawn(move || {
+                    let mut local_bytes = 0u64;
+                    let mut local_progress = |increment: u64| {
+                        local_bytes = local_bytes.saturating_add(increment);
+                        if local_bytes >= 1024 * 512 {
+                            if let Ok(mut guard) = p_mutex.lock() {
+                                guard(local_bytes);
+                            }
+                            local_bytes = 0;
+                        }
+                    };
+                    for child in chunk {
+                        if child.is_dir() && !child.is_symlink() {
+                            let _ = remove_dir_all_fast_recursive(&child, &mut local_progress);
+                        } else {
+                            let size = remove_file_or_symlink_with_retry(&child).unwrap_or(0);
+                            local_progress(size);
+                        }
+                    }
+                    if local_bytes > 0 {
+                        if let Ok(mut guard) = p_mutex.lock() {
+                            guard(local_bytes);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    ensure_path_writable(path);
+    if let Err(_) = fs::remove_dir(path) {
+        // 若仍有殘留項目（例如 macOS Finder 動態寫入的 .DS_Store 或特殊屬性），
+        // 執行最終保底清理，確保 100% 清空
+        let _ = fs::remove_dir_all(path);
+    }
+    if path.exists() {
+        ensure_path_writable(path);
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
 
 /// 建立 paste 成功後的狀態文字，讓同步與背景流程使用相同規則。
@@ -11201,7 +12217,7 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":linemode size",
             "ms",
-            "將列表右側欄位切成 size 顯示；資料夾顯示子項目數量，檔案顯示大小",
+            "將列表右側欄位切成 size；資料夾在背景遞迴計算真實容量，檔案顯示大小",
             HelpAction::Command("linemode size"),
         ),
         help_entry(
@@ -12069,14 +13085,40 @@ fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
         .collect()
 }
 
-/// 產生 task 面板的獨立進度欄，讓狀態、時間與完成比例不會互相覆蓋。
+/// 產生 task 面板的 byte 進度欄，讓使用者直接判斷傳輸是否仍在前進。
 ///
 /// 參數：`task: &TaskRecord`，要顯示的 task。
-/// 回傳：`String`；支援進度的工作顯示 `37%`，一般外部工作顯示 `-`。
+/// 回傳：`String`；支援進度的工作顯示 `24.4G / 77.2G`，一般外部工作顯示 `-`。
 fn task_progress_label(task: &TaskRecord) -> String {
-    task.progress_percent
-        .map(|percent| format!("{percent}%"))
-        .unwrap_or_else(|| String::from("-"))
+    match (task.completed_bytes, task.total_bytes) {
+        (Some(completed), Some(total)) if total > 0 => format!(
+            "{} / {}",
+            format_task_bytes(completed),
+            format_task_bytes(total.max(completed))
+        ),
+        (Some(completed), _) if completed > 0 => format_task_bytes(completed),
+        (Some(0), _) => String::from("0B"),
+        _ => String::from("-"),
+    }
+}
+
+/// 把 byte 數量轉成 task 面板使用的緊湊單位。
+///
+/// 參數：`bytes: u64`，要顯示的原始 byte 數。
+/// 回傳：`String`，依大小使用 `B`、`K`、`M`、`G` 或 `T`，並保留最多一位小數。
+fn format_task_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 || value.fract() == 0.0 {
+        format!("{value:.0}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
 }
 
 /// 將 task 狀態轉成簡短標籤。
@@ -12463,7 +13505,7 @@ mod tests {
         key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
         missing_search_tool_status, paste_should_run_in_background, plain_digit_target_pane_id,
         query_zoxide_directories, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end, trash_confirm_panel_id,
+        rename_previous_word_start, rename_word_end, task_progress_label, trash_confirm_panel_id,
         trash_panel_overlay_state_from_pending_action, typed_char_from_key,
     };
     use crate::{
@@ -12482,7 +13524,7 @@ mod tests {
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
-    use std::{fs, thread, time::Duration};
+    use std::{collections::BTreeSet, fs, thread, time::Duration};
 
     #[test]
     /// 驗證狀態列只會把錯誤類訊息判斷為危險色，一般通知不會被誤標紅。
@@ -14844,6 +15886,8 @@ mod tests {
             detail: String::from("first detail"),
             state: TaskState::Done,
             progress_percent: None,
+            completed_bytes: None,
+            total_bytes: None,
             started_at_unix_ms: 0,
             finished_at_unix_ms: Some(1),
         });
@@ -14855,6 +15899,8 @@ mod tests {
             detail: String::from("second detail"),
             state: TaskState::Running,
             progress_percent: None,
+            completed_bytes: None,
+            total_bytes: None,
             started_at_unix_ms: 2,
             finished_at_unix_ms: None,
         });
@@ -16100,9 +17146,9 @@ mod tests {
             Some(TaskState::Done)
         ));
         assert_eq!(
-            app.task_log.last().and_then(|task| task.progress_percent),
-            Some(100),
-            "背景貼上完成後 task 必須明確顯示 100%，不能停在最後一次中途回報"
+            app.task_log.last().and_then(|task| task.completed_bytes),
+            app.task_log.last().and_then(|task| task.total_bytes),
+            "背景貼上完成後已處理 byte 必須等於總 byte，不能停在最後一次中途回報"
         );
     }
 
@@ -16129,6 +17175,8 @@ mod tests {
 
         assert_eq!(task.state, TaskState::Interrupted);
         assert_eq!(task.progress_percent, Some(42));
+        assert_eq!(task.completed_bytes, Some(42));
+        assert_eq!(task.total_bytes, Some(100));
         assert!(task.finished_at_unix_ms.is_some());
         assert!(task.detail.contains("interrupted when PaneFM closed"));
     }
@@ -16152,6 +17200,8 @@ mod tests {
                 detail: String::from("destination: share"),
                 state: TaskState::Running,
                 progress_percent: Some(37),
+                completed_bytes: Some(37),
+                total_bytes: Some(100),
                 started_at_unix_ms: 1_700_000_000_000,
                 finished_at_unix_ms: None,
             }],
@@ -16199,11 +17249,11 @@ mod tests {
     }
 
     #[test]
-    /// 驗證背景進度只能向前增加，且 task 面板會分別顯示狀態、時間與百分比。
+    /// 驗證背景進度採用最新 byte 估算，且 task 面板不再只顯示百分比。
     ///
-    /// 保護目的：網路傳輸事件可能因輪詢批次或估算值順序不同而重複抵達；畫面不可從
-    /// `60%` 倒退成 `20%`，否則使用者會誤以為傳輸重新開始。
-    fn task_progress_is_monotonic_and_visible_in_task_panel() {
+    /// 保護目的：目錄只走訪一次時總量會逐步增加，畫面必須能從早期估算校正成最新
+    /// 比例，否則前幾個檔案完成後可能長時間錯誤停在 99%。
+    fn task_progress_uses_latest_dynamic_estimate_and_is_visible_in_panel() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         let task_id = app.push_task(
@@ -16217,15 +17267,209 @@ mod tests {
         app.update_task_progress(task_id, 20, 100);
         let lines = super::task_panel_lines(&app.task_log);
 
-        assert_eq!(app.task_log[0].progress_percent, Some(60));
+        assert_eq!(app.task_log[0].progress_percent, Some(20));
         assert_eq!(lines[0].state, "RUNNING");
-        assert_eq!(lines[0].progress, "60%");
+        assert_eq!(app.task_log[0].completed_bytes, Some(20));
+        assert_eq!(app.task_log[0].total_bytes, Some(100));
+        assert_eq!(lines[0].progress, "20B / 100B");
         assert_eq!(lines[0].finished_at, "--:--:--");
 
         app.finish_task(task_id, TaskState::Done, String::from("completed"));
         assert_eq!(app.task_log[0].progress_percent, Some(100));
+        assert_eq!(app.task_log[0].completed_bytes, Some(100));
         let lines = super::task_panel_lines(&app.task_log);
         assert_ne!(lines[0].finished_at, "--:--:--");
+    }
+
+    #[test]
+    /// 驗證 task byte 會依數量級切換單位，且不再輸出百分比。
+    ///
+    /// 保護目的：大型本機與 SMB 傳輸即使百分比長時間不變，使用者仍要從 byte 數判斷
+    /// 工作是否前進；格式重構不能把資訊退回只有 `31%`。
+    fn task_progress_label_uses_compact_byte_units_without_percentage() {
+        let mut task = TaskRecord {
+            id: 1,
+            pane_id: 1,
+            kind: String::from("paste"),
+            title: String::from("copy project"),
+            detail: String::new(),
+            state: TaskState::Running,
+            progress_percent: Some(31),
+            completed_bytes: Some(25_589_858_714),
+            total_bytes: Some(82_893_350_912),
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: None,
+        };
+
+        assert_eq!(super::task_progress_label(&task), "23.8G / 77.2G");
+        assert!(!super::task_progress_label(&task).contains('%'));
+        task.completed_bytes = None;
+        task.total_bytes = None;
+        assert_eq!(super::task_progress_label(&task), "-");
+    }
+
+    #[test]
+    /// 驗證 `ms` 會在背景遞迴計算每個直接子目錄的檔案總 byte。
+    ///
+    /// 保護目的：舊版只顯示直接子項目數量，而且同步讀取會拖慢 SMB；這個測試確保
+    /// linemode 立即啟動 worker、主執行緒可持續 poll，最後得到真正內容大小。
+    fn size_linemode_scans_recursive_directory_bytes_in_background() {
+        let dir = tempdir().expect("tempdir");
+        let child = dir.path().join("child");
+        let sibling = dir.path().join("sibling");
+        fs::create_dir_all(child.join("nested")).expect("nested");
+        fs::create_dir(&sibling).expect("sibling");
+        fs::write(child.join("one.bin"), vec![0u8; 7]).expect("first file");
+        fs::write(child.join("nested/two.bin"), vec![0u8; 11]).expect("second file");
+        fs::write(child.join(".hidden.bin"), vec![0u8; 5]).expect("hidden file");
+        fs::write(child.join(".gitignore"), "ignored.bin\n").expect("ignore rules");
+        fs::write(child.join("ignored.bin"), vec![0u8; 17]).expect("ignored file");
+        fs::write(sibling.join("three.bin"), vec![0u8; 13]).expect("third file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.apply_line_mode(1, LineMode::Size)
+            .expect("enable size linemode");
+        assert!(!app.directory_size_jobs.is_empty());
+        assert!(
+            app.panes[&1]
+                .entries
+                .iter()
+                .filter(|entry| entry.is_dir)
+                .all(|entry| entry.directory_size == Some(0) && !entry.directory_size_complete),
+            "啟動背景掃描的當下就要顯示 ~0B，不可長時間停在省略號"
+        );
+        for _ in 0..200 {
+            app.poll_background_tasks();
+            if app.directory_size_jobs.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let entry = app.panes[&1]
+            .entries
+            .iter()
+            .find(|entry| entry.path == child)
+            .expect("child entry");
+        assert_eq!(entry.directory_size, Some(52));
+        assert!(entry.directory_size_complete);
+        let sibling_entry = app.panes[&1]
+            .entries
+            .iter()
+            .find(|entry| entry.path == sibling)
+            .expect("sibling entry");
+        assert_eq!(sibling_entry.directory_size, Some(13));
+        assert!(sibling_entry.directory_size_complete);
+        assert!(app.directory_size_jobs.is_empty());
+    }
+
+    #[test]
+    /// 驗證 `ms` 啟用期間進入下一層目錄，會立即替新列表重新啟動容量掃描。
+    ///
+    /// 保護目的：舊流程只在首次切換 linemode 時排程；使用 `l` 進入已顯示容量的目錄後，
+    /// 舊工作因 cwd 不符被取消，新目錄卻永久顯示 `...`。這個測試固定新工作必須綁定
+    /// 子目錄、子目錄中的資料夾立即顯示部分值，最後取得正確 byte 數。
+    fn size_linemode_restarts_scan_after_entering_directory() {
+        let dir = tempdir().expect("tempdir");
+        let child = dir.path().join("child");
+        let nested = child.join("nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::write(nested.join("payload.bin"), vec![0u8; 29]).expect("payload");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.apply_line_mode(1, LineMode::Size)
+            .expect("enable size linemode");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("enter child directory");
+
+        assert_eq!(app.panes[&1].cwd, child);
+        assert!(app.directory_load_jobs.contains_key(&1));
+        assert!(
+            app.panes[&1].entries.is_empty(),
+            "首次進入時應先交還事件迴圈，不能同步等待目錄 I/O"
+        );
+        for _ in 0..200 {
+            app.poll_background_tasks();
+            if app.directory_load_jobs.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.directory_load_jobs.is_empty());
+        assert_eq!(app.directory_size_jobs[&1].cwd, child);
+        let nested_entry = app.panes[&1]
+            .entries
+            .iter()
+            .find(|entry| entry.path == nested)
+            .expect("nested entry");
+        assert_eq!(nested_entry.directory_size, Some(0));
+        assert!(!nested_entry.directory_size_complete);
+
+        for _ in 0..200 {
+            app.poll_background_tasks();
+            if app.directory_size_jobs.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let nested_entry = app.panes[&1]
+            .entries
+            .iter()
+            .find(|entry| entry.path == nested)
+            .expect("nested entry after scan");
+        assert_eq!(nested_entry.directory_size, Some(29));
+        assert!(nested_entry.directory_size_complete);
+        assert!(app.directory_size_jobs.is_empty());
+
+        // 回到父目錄再立刻重進時，已完成的清單必須在按鍵處直接由快取恢復；背景
+        // refresh 仍會校正磁碟最新狀態，但畫面不能再次短暫變成空白。
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("return to parent");
+        assert!(
+            app.panes[&1]
+                .entries
+                .iter()
+                .any(|entry| entry.path == child)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("re-enter cached child");
+        assert!(
+            app.panes[&1]
+                .entries
+                .iter()
+                .any(|entry| entry.path == nested)
+        );
+    }
+
+    #[test]
+    /// 驗證 `ms` 背景容量在 200ms 邊界才傳回下一份部分結果。
+    ///
+    /// 保護目的：太慢會讓大目錄長時間看不到變化，太快則會對每個檔案發送事件並
+    /// 影響鍵盤操作；測試固定 199ms 不更新、200ms 立即更新的規格。
+    fn directory_size_partial_updates_use_two_hundred_millisecond_interval() {
+        assert!(!super::should_report_directory_size(199, 0));
+        assert!(super::should_report_directory_size(200, 0));
+        assert!(!super::should_report_directory_size(399, 200));
+        assert!(super::should_report_directory_size(400, 200));
+    }
+
+    #[test]
+    /// 驗證離開 size linemode 會取消該 panel 的背景掃描。
+    ///
+    /// 保護目的：使用者可能快速切換模式或目錄；若舊 worker 不取消，會持續讀磁碟／SMB
+    /// 並把晚到結果寫進新的畫面。
+    fn leaving_size_linemode_cancels_panel_scan() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("child")).expect("child");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.apply_line_mode(1, LineMode::Size).expect("enable size");
+        app.apply_line_mode(1, LineMode::None)
+            .expect("disable size");
+
+        assert!(app.directory_size_jobs.is_empty());
     }
 
     #[test]
@@ -16270,26 +17514,51 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 worker 只有在整數百分比前進時才送出進度事件。
+    /// 驗證 worker 會保留原始 byte 變化，而不是只在整數百分比改變時回報。
     ///
     /// 保護目的：若每個 1 MiB buffer 都排入 channel，數十 GB 傳輸會讓主執行緒忙於
-    /// 處理重複比例；測試確保同一百分比只產生一次事件。
-    fn progress_events_are_throttled_to_percentage_changes() {
+    /// 處理重複資料；時間節流由 worker 負責，這裡確保完全相同的快照不會重送。
+    fn progress_events_preserve_byte_changes_and_skip_exact_duplicates() {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let mut last_percent = 0u8;
+        let mut last_progress = None;
 
-        super::send_progress_if_changed(&sender, 7, 10, 1_000, &mut last_percent);
-        super::send_progress_if_changed(&sender, 7, 11, 1_000, &mut last_percent);
-        super::send_progress_if_changed(&sender, 7, 20, 1_000, &mut last_percent);
+        super::send_progress_if_changed(&sender, 7, 10, 1_000, &mut last_progress);
+        super::send_progress_if_changed(&sender, 7, 10, 1_000, &mut last_progress);
+        super::send_progress_if_changed(&sender, 7, 11, 1_000, &mut last_progress);
 
         let events = receiver.try_iter().collect::<Vec<_>>();
         assert_eq!(events.len(), 2);
-        assert_eq!(last_percent, 2);
+        assert_eq!(last_progress, Some((11, 1_000)));
         assert!(matches!(
             events.last(),
             Some(super::FileJobEvent::Progress {
                 task_id: 7,
-                completed_bytes: 20,
+                completed_bytes: 11,
+                total_bytes: 1_000,
+            })
+        ));
+    }
+
+    #[test]
+    /// 驗證單次走訪的動態總量增加時，task 會保留新的 byte 分母。
+    ///
+    /// 保護目的：目錄 producer 會一邊發現檔案、一邊複製；若只允許百分比增加，前幾個
+    /// 小檔完成時若只保留百分比，後續增加總量會掩蓋真實進度。
+    fn progress_events_follow_dynamic_discovered_total() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut last_progress = None;
+
+        super::send_progress_if_changed(&sender, 8, 90, 100, &mut last_progress);
+        super::send_progress_if_changed(&sender, 8, 90, 1_000, &mut last_progress);
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(last_progress, Some((90, 1_000)));
+        assert!(matches!(
+            events.last(),
+            Some(super::FileJobEvent::Progress {
+                task_id: 8,
+                completed_bytes: 90,
                 total_bytes: 1_000,
             })
         ));
@@ -16589,6 +17858,14 @@ mod tests {
 
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm permanent delete");
+
+        for _ in 0..100 {
+            app.poll_background_tasks();
+            if app.file_job_receivers.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
 
         assert!(!file_path.exists());
         assert!(
@@ -19339,5 +20616,272 @@ mod tests {
                 ..
             }) if buffer.is_empty()
         ));
+    }
+
+    #[test]
+    /// 驗證在目錄背景載入尚未完成時按 h 離開，會即時取消舊工作且不把空列表寫入快取。
+    /// 保護目的：確保使用者在大型目錄快速切出時不卡死，且不會把未完成的空清單當作快取。
+    fn navigating_away_during_load_cancels_load_and_guards_cache() {
+        let dir = tempdir().expect("tempdir");
+        let child = dir.path().join("child");
+        fs::create_dir_all(&child).expect("child dir");
+        fs::write(child.join("payload.txt"), "data").expect("payload");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        // 進入 child 目錄，此時啟動背景載入
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("enter child");
+        assert_eq!(app.panes[&1].cwd, child);
+        assert!(app.directory_load_jobs.contains_key(&1));
+
+        // 尚未 poll 完成前立刻按 h 離開回到 parent
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .expect("return to parent");
+        assert_eq!(app.panes[&1].cwd, dir.path());
+
+        // 快取中不能存入 child 的空清單
+        assert_ne!(
+            app.directory_entry_cache.get(&child),
+            Some(&Vec::new()),
+            "載入中離開目錄不得將空陣列存入快取"
+        );
+    }
+
+    #[test]
+    /// 驗證建立新檔案與刪除檔案後，快取會同步更新，重新進入目錄不會讀到陳舊快取。
+    /// 保護目的：防止使用者在目錄操作後離開再進入時，出現已刪除檔案回魂或新檔案消失的現象。
+    fn file_creation_and_deletion_updates_cache_synchronously() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        // 建立檔案
+        app.create_entry_from_command("new_item.txt")
+            .expect("create file");
+
+        let cached = app
+            .directory_entry_cache
+            .get(dir.path())
+            .expect("must have cache");
+        assert!(
+            cached.iter().any(|entry| entry.name == "new_item.txt"),
+            "快取必須包含剛建立的檔案"
+        );
+
+        // 刪除檔案
+        app.start_delete_confirmation(true);
+        app.confirm_delete(1, "new_item.txt", true)
+            .expect("delete file");
+        for _ in 0..100 {
+            app.poll_background_tasks();
+            if app.file_job_receivers.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let cached_after = app
+            .directory_entry_cache
+            .get(dir.path())
+            .expect("must have cache after delete");
+        assert!(
+            !cached_after
+                .iter()
+                .any(|entry| entry.name == "new_item.txt"),
+            "快取中不能殘留已刪除的檔案"
+        );
+    }
+
+    #[test]
+    /// 驗證檔案系統 watcher 觸發重新整理時，快取會同步更新為磁碟最新狀態。
+    /// 保護目的：確保外部編輯器或 Git 操作產生變更後，快取與畫面保持一致。
+    fn watcher_reload_synchronizes_cache() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        fs::write(dir.path().join("external.txt"), "external content").expect("external write");
+        let mut set = BTreeSet::new();
+        set.insert(dir.path().to_path_buf());
+
+        app.reload_watched_directories(&set)
+            .expect("reload watched");
+
+        let cached = app
+            .directory_entry_cache
+            .get(dir.path())
+            .expect("must have cache");
+        assert!(
+            cached.iter().any(|entry| entry.name == "external.txt"),
+            "watcher 刷新後快取必須包含外部新增的檔案"
+        );
+    }
+
+    #[test]
+    /// 驗證大型目錄以串流載入時，首批清單到達後游標即可立刻以 j/k 移動，不需等待全量掃描結束。
+    /// 保護目的：確保使用者在幾萬個檔案的目錄中，畫面在毫秒級反應，游標絕不被背景 I/O 凍結。
+    fn streaming_directory_load_allows_cursor_movement_before_completion() {
+        let dir = tempdir().expect("tempdir");
+        let child = dir.path().join("child");
+        fs::create_dir_all(&child).expect("child");
+        for i in 0..300 {
+            fs::write(child.join(format!("file_{i:03}.txt")), b"test").expect("write");
+        }
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("enter child");
+
+        // 等待首批快速 chunk 到達
+        for _ in 0..100 {
+            app.poll_background_tasks();
+            if !app.panes[&1].entries.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // 首批項目已在畫面上，游標在第 0 筆
+        assert!(!app.panes[&1].entries.is_empty());
+        assert_eq!(app.panes[&1].selected, 0);
+
+        // 立刻按下 j 移動游標，游標必須成功移動到第 1 筆
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move down");
+        assert_eq!(app.panes[&1].selected, 1, "游標必須在載入中立即響應移動");
+
+        // 等待背景全量載入結束
+        for _ in 0..100 {
+            app.poll_background_tasks();
+            if app.directory_load_jobs.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(app.panes[&1].entries.len(), 300);
+        assert_eq!(
+            app.panes[&1].selected, 1,
+            "全量完成後仍必須保留使用者剛剛移動的游標位置"
+        );
+    }
+
+    #[test]
+    /// 驗證當背景有檔案傳輸或寫入進行時，使用者不可進入該正在寫入的目錄。
+    fn cannot_enter_directory_while_transfer_is_in_progress() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let child = app.panes[&1].cwd.join("copying_target");
+        fs::create_dir(&child).expect("create child");
+        app.panes.get_mut(&1).unwrap().reload().expect("reload");
+
+        // 模擬一個正在進行中的背景傳輸工作綁定到 child
+        let task_id = app.push_task(1, "paste", "copy files".to_string(), "dest".to_string());
+        app.active_file_job_busy_paths.insert(task_id, vec![child.clone()]);
+        app.update_task_progress(task_id, 45, 100);
+
+        // 選中該目錄並嘗試進入
+        app.panes.get_mut(&1).unwrap().select_path(&child);
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("press l");
+
+        // 工作目錄不可被切換，且狀態列必須提示傳輸進行中
+        assert_eq!(app.panes[&1].cwd, child.parent().unwrap());
+        assert!(app.status.contains("cannot enter 'copying_target/'"));
+        assert!(app.status.contains("transfer in progress"));
+        assert!(app.status.contains("45%"));
+    }
+
+    #[test]
+    /// 驗證永久刪除大型目錄時使用背景 worker 執行，主執行緒不卡死且完成後正確移除。
+    fn background_delete_removes_directory_and_reports_done() {
+        let dir = tempdir().expect("tempdir");
+        let to_delete = dir.path().join("large_dir");
+        fs::create_dir_all(to_delete.join("nested")).expect("create nested");
+        fs::write(to_delete.join("nested/a.bin"), "payload").expect("write payload");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.panes.get_mut(&1).unwrap().select_path(&to_delete);
+        app.start_delete_confirmation(true);
+        app.confirm_delete(1, "large_dir", true).expect("confirm delete");
+
+        assert!(!app.file_job_receivers.is_empty(), "刪除工作必須進入背景佇列");
+        for _ in 0..100 {
+            app.poll_background_tasks();
+            if app.file_job_receivers.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!to_delete.exists(), "背景刪除完成後目錄必須已從磁碟移除");
+        assert!(app.status.contains("deleted permanently"));
+    }
+
+    #[test]
+    /// 驗證當子目錄或檔案在進行背景傳輸時，其父目錄依然可以正常進入，且進入後該子項目會顯示進度標籤。
+    fn parent_directory_is_enterable_while_child_is_being_transferred() {
+        let dir = tempdir().expect("tempdir");
+        let parent = dir.path().join("AB_Demo");
+        let child = parent.join("terminal-file-manager");
+        fs::create_dir_all(&child).expect("create child dir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        // 模擬背景傳輸工作鎖定子項目 child
+        let task_id = app.push_task(1, "paste", "copy 1 item(s)".to_string(), "dest".to_string());
+        app.active_file_job_busy_paths.insert(task_id, vec![child.clone()]);
+        app.update_task_progress(task_id, 99, 100);
+
+        // 父目錄 parent 必須不受影響，不可被視為 busy
+        assert!(
+            app.active_file_job_for_path(&parent).is_none(),
+            "父目錄不可被子項目的傳輸鎖定"
+        );
+        // 子項目 child 必須被鎖定並能提供 progress badge
+        assert!(app.active_file_job_for_path(&child).is_some());
+        assert_eq!(
+            app.active_job_badge_for_path(&child).as_deref(),
+            Some("[copying 99%]")
+        );
+
+        // 嘗試進入父目錄 parent
+        app.panes.get_mut(&1).unwrap().select_path(&parent);
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("enter parent dir");
+
+        // 必須成功進入父目錄
+        assert_eq!(
+            app.panes[&1].cwd.canonicalize().unwrap(),
+            parent.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    /// 驗證背景刪除任務在執行期間與完成後，Task 紀錄會包含實際刪除的 byte 進度資訊，而非未知的 `-`。
+    fn background_delete_reports_byte_progress_in_task_record() {
+        let dir = tempdir().expect("tempdir");
+        let to_delete = dir.path().join("data_folder");
+        fs::create_dir_all(&to_delete).expect("create dir");
+        fs::write(to_delete.join("file1.dat"), vec![0u8; 1024 * 10]).expect("write file1");
+        fs::write(to_delete.join("file2.dat"), vec![0u8; 1024 * 20]).expect("write file2");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.panes.get_mut(&1).unwrap().select_path(&to_delete);
+        app.start_delete_confirmation(true);
+        app.confirm_delete(1, "data_folder", true).expect("confirm delete");
+
+        // 輪詢等待背景刪除工作完成
+        for _ in 0..100 {
+            app.poll_background_tasks();
+            if app.file_job_receivers.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let task = app.task_log.last().expect("task record");
+        assert_eq!(task.state, TaskState::Done);
+        assert!(task.completed_bytes.unwrap_or(0) >= 1024 * 30, "必須記錄實際刪除的 byte 數: {:?}", task.completed_bytes);
+        assert_eq!(task.completed_bytes, task.total_bytes);
+        let progress_label = task_progress_label(task);
+        assert_ne!(progress_label, "-", "進度標籤不可為未知的 `-`");
+        assert!(progress_label.contains("30K") || progress_label.contains("K") || progress_label.contains("M"));
     }
 }
