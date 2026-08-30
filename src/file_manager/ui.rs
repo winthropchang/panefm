@@ -1705,6 +1705,48 @@ fn wrap_text_for_width(text: &str, max_width: usize, indent: &str) -> Vec<String
     output
 }
 
+/// 依終端機實際顯示寬度截短單行文字，並在內容被省略時加上省略號。
+///
+/// Rust 的 `str::len()` 是 byte 數，`chars().count()` 是 Unicode scalar 數，兩者都不
+/// 等於終端機欄寬；例如大多數中文字會佔兩格。列表若用字元數配置右側欄位，中文
+/// 名稱就會把 size、permissions 等資訊推到 panel 外。這個函數逐字累加
+/// [`UnicodeWidthChar`] 的欄寬，因此 macOS 與 Windows terminal 都使用同一套規則。
+///
+/// 參數：
+/// - `text: &str`：準備顯示的原始單行文字。
+/// - `max_width: usize`：文字最多可佔用的終端機欄數。
+///
+/// 回傳：`String`。未超寬時保留原文；超寬時保留能容納的前綴並加上 `…`；寬度為
+/// 0 時回傳空字串。
+fn truncate_text_to_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+
+    const ELLIPSIS: char = '…';
+    let ellipsis_width = ELLIPSIS.width().unwrap_or(1);
+    if max_width <= ellipsis_width {
+        return ELLIPSIS.to_string();
+    }
+
+    let content_width = max_width - ellipsis_width;
+    let mut output = String::new();
+    let mut used_width = 0usize;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used_width.saturating_add(character_width) > content_width {
+            break;
+        }
+        output.push(character);
+        used_width = used_width.saturating_add(character_width);
+    }
+    output.push(ELLIPSIS);
+    output
+}
+
 /// 根據目前排序模式，產生單一列表列的顯示內容。
 fn render_entry_line(
     entry: &super::entry::FileEntry,
@@ -1734,21 +1776,27 @@ fn render_entry_line(
     } else {
         String::new()
     };
-    let display_name = entry.display_name();
-    let name = format!("{icon}{display_name}");
+    let mut display_name = entry.display_name();
     let badge = list_find_position.map(|(current, total)| format!("[{current}/{total}]"));
     let detail = format_sort_detail(entry, detail_kind);
-    let badge_len = badge
+    let marker_width = UnicodeWidthStr::width(marker);
+    let icon_width = UnicodeWidthStr::width(icon.as_str());
+    let badge_width = badge
         .as_ref()
-        .map(|value| value.chars().count() + 1)
+        .map(|value| UnicodeWidthStr::width(value.as_str()) + 1)
         .unwrap_or(0);
-    let job_badge_len = active_job_badge
-        .as_ref()
-        .map(|value| value.chars().count() + 1)
+    let job_badge_width = active_job_badge
+        .map(|value| UnicodeWidthStr::width(value) + 1)
         .unwrap_or(0);
-    let name_len = marker.chars().count() + name.chars().count() + badge_len + job_badge_len;
+    let detail_width = UnicodeWidthStr::width(detail.as_str());
+    let fixed_width = marker_width
+        .saturating_add(icon_width)
+        .saturating_add(job_badge_width)
+        .saturating_add(badge_width)
+        .saturating_add(detail_width)
+        .saturating_add(1);
 
-    if detail.is_empty() || width < 8 {
+    if detail.is_empty() || width < fixed_width {
         let mut spans = Vec::new();
         if !marker.is_empty() {
             spans.push(Span::raw(marker.to_string()));
@@ -1785,8 +1833,18 @@ fn render_entry_line(
         return Line::from(spans);
     }
 
-    let detail_len = detail.chars().count();
-    let spacer_len = width.saturating_sub(name_len + detail_len).max(1);
+    // 右側資訊比完整檔名更不能遺失：先保留 detail 與至少一格間距，再把剩餘寬度
+    // 分配給名稱。中文或其他寬字元名稱過長時，只截短名稱，不讓 detail 被裁掉。
+    let available_name_width = width.saturating_sub(fixed_width);
+    display_name = truncate_text_to_display_width(&display_name, available_name_width);
+    let name_width = UnicodeWidthStr::width(display_name.as_str());
+    let used_width = marker_width
+        .saturating_add(icon_width)
+        .saturating_add(name_width)
+        .saturating_add(job_badge_width)
+        .saturating_add(badge_width)
+        .saturating_add(detail_width);
+    let spacer_len = width.saturating_sub(used_width).max(1);
 
     let mut spans = Vec::new();
     if !marker.is_empty() {
@@ -2117,6 +2175,7 @@ mod tests {
         format_pane_title, format_permissions_detail, format_size_short, format_sort_detail,
         regex_rename_status_style, render_entry_line, search_empty_message,
         search_list_selected_index, task_panel_display_lines, top_right_input_rect,
+        truncate_text_to_display_width,
     };
     use ratatui::layout::Rect;
     use std::path::Path;
@@ -2171,6 +2230,63 @@ mod tests {
             text.contains("[copying 99%]"),
             "列表列必須包含工作進度標籤: {text}"
         );
+    }
+
+    #[test]
+    /// 驗證中文目錄名稱會依終端顯示寬度截短，而不是把 linemode 資訊推到 panel 外。
+    ///
+    /// 保護目的：一個中文字通常佔兩個終端欄位。若排版誤用 `chars().count()`，size
+    /// 與 permissions 看似沒有資料，實際上是被超寬名稱裁掉。測試同時覆蓋兩種右側
+    /// 資訊，確保所有 `m` 選項共用的列表排版都保留完整 detail。
+    fn render_entry_line_keeps_details_visible_after_wide_chinese_name() {
+        let theme = Theme::from(crate::theme::ThemePreset::Dracula);
+        let mut entry = test_entry("Ch02 單層感知器的數學原理與實作入門", true);
+        entry.directory_size = Some(6 * 1_024);
+        entry.directory_size_complete = true;
+        entry.unix_mode = Some(0o755);
+
+        for (detail_kind, expected_suffix) in [
+            (SortDetailKind::Size, "6K"),
+            (SortDetailKind::Permissions, "drwxr-xr-x"),
+        ] {
+            let line = render_entry_line(
+                &entry,
+                false,
+                false,
+                false,
+                detail_kind,
+                32,
+                theme,
+                false,
+                IconStyle::Ascii,
+                None,
+                None,
+                None,
+            );
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), 32);
+            assert!(
+                text.ends_with(expected_suffix),
+                "右側 linemode 資訊不可被中文名稱裁掉: {text}"
+            );
+        }
+    }
+
+    #[test]
+    /// 驗證顯示寬度截短函數不會把中文誤當成單欄字元。
+    ///
+    /// 保護目的：此函數是列表名稱與右側資訊正確對齊的基礎；未來調整圖示或樣式時，
+    /// 仍須確保輸出寬度不超過限制，且被截短時有明確省略號。
+    fn truncate_text_uses_terminal_width_for_chinese() {
+        let truncated = truncate_text_to_display_width("中文目錄abcdef", 8);
+
+        assert_eq!(truncated, "中文目…");
+        assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 7);
     }
 
     #[test]

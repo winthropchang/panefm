@@ -10429,6 +10429,12 @@ impl App {
                             } else {
                                 pane.extend_entries(entries);
                             }
+                            // `ms` 可能在目錄清單尚未載入完成時就已啟用。每批新加入的
+                            // 目錄都要立刻取得部分容量狀態，否則右側欄位會一直空白，直到
+                            // 完整清單載入並重新啟動容量掃描後才第一次出現內容。
+                            if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
+                                pane.init_directory_sizes_if_missing();
+                            }
                             self.status = format!(
                                 "loading directory: {} ({} items)",
                                 event.cwd.display(),
@@ -10440,14 +10446,22 @@ impl App {
                         job_done = true;
                         self.directory_entry_cache
                             .insert(event.cwd.clone(), entries.clone());
+                        let mut restart_size_scan = false;
                         if let Some(pane) = self.panes.get_mut(&event.pane_id)
                             && pane.cwd == event.cwd
                         {
                             pane.replace_entries_presorted(entries, event.selected_path.as_deref());
                             if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
-                                self.start_directory_size_scan(event.pane_id);
+                                pane.init_directory_sizes_if_missing();
+                                restart_size_scan = true;
                             }
                             self.status = format!("opened directory: {}", event.cwd.display());
+                        }
+                        if restart_size_scan {
+                            // 載入期間可能已有只包含首批目錄的同 cwd 掃描。先取消舊工作
+                            // 才能確保完整清單中的每個直接子目錄都會被納入新一輪計算。
+                            self.cancel_directory_size_scan(event.pane_id);
+                            self.start_directory_size_scan(event.pane_id);
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -13573,18 +13587,18 @@ mod tests {
 
     use super::{
         App, BACKGROUND_FILE_JOB_THRESHOLD_BYTES, BookmarkListMode, ClipboardEntry,
-        ClipboardOperation, ClipboardState, FilterState, GlobalSearchState, ListFindState,
-        PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord,
-        TaskState, TrashConfirmAction, VisualSelectionState, bookmark_panel_lines,
-        command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
-        ctrl_digit_target_pane_id, filtered_bookmark_entries, filtered_global_search_entries,
-        help_entries, is_probably_network_or_external_path, is_windows_drive_path,
-        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
-        key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
-        missing_search_tool_status, paste_should_run_in_background, plain_digit_target_pane_id,
-        query_zoxide_directories, rename_basename_cursor, rename_next_word_start,
-        rename_previous_word_start, rename_word_end, task_progress_label, trash_confirm_panel_id,
-        trash_panel_overlay_state_from_pending_action, typed_char_from_key,
+        ClipboardOperation, ClipboardState, DirectoryLoadEvent, DirectoryLoadJob, FilterState,
+        GlobalSearchState, ListFindState, PanelSearchState, PendingAction, RegexRenameOutcome,
+        RenameMode, SearchMode, TaskRecord, TaskState, TrashConfirmAction, VisualSelectionState,
+        bookmark_panel_lines, command_suggestion_navigation, command_suggestions,
+        command_suggestions_for_buffer, ctrl_digit_target_pane_id, filtered_bookmark_entries,
+        filtered_global_search_entries, help_entries, is_probably_network_or_external_path,
+        is_windows_drive_path, key_matches_ctrl_letter, key_matches_ctrl_shift_letter,
+        key_matches_letter_any_case, key_matches_plain_letter, key_matches_shifted_letter,
+        looks_like_navigation_path, missing_search_tool_status, paste_should_run_in_background,
+        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
+        rename_next_word_start, rename_previous_word_start, rename_word_end, task_progress_label,
+        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -13602,7 +13616,7 @@ mod tests {
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
-    use std::{collections::BTreeSet, fs, thread, time::Duration};
+    use std::{collections::BTreeSet, fs, sync::mpsc, thread, time::Duration};
 
     #[test]
     /// 驗證狀態列只會把錯誤類訊息判斷為危險色，一般通知不會被誤標紅。
@@ -17463,6 +17477,74 @@ mod tests {
         assert_eq!(sibling_entry.directory_size, Some(13));
         assert!(sibling_entry.directory_size_complete);
         assert!(app.directory_size_jobs.is_empty());
+    }
+
+    #[test]
+    /// 驗證目錄清單分批載入期間啟用 `ms`，完整清單抵達後會以全部目錄重啟容量掃描。
+    ///
+    /// 保護目的：舊流程會保留只看過首批項目的同 cwd 掃描，導致稍後加入的目錄右側
+    /// 永久空白。測試刻意讓舊掃描留在工作表中，再送入含新目錄的完成事件，確保舊
+    /// worker 被取消、新目錄立即顯示部分值，且最後能取得正確容量。
+    fn completed_directory_load_restarts_size_scan_for_late_entries() {
+        let dir = tempdir().expect("tempdir");
+        let early = dir.path().join("early");
+        let late = dir.path().join("晚到的目錄");
+        fs::create_dir(&early).expect("early directory");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.apply_line_mode(1, LineMode::Size)
+            .expect("enable size linemode");
+        let old_scan_cancelled = Arc::clone(&app.directory_size_jobs[&1].cancelled);
+
+        fs::create_dir(&late).expect("late directory");
+        fs::write(late.join("payload.bin"), vec![0u8; 31]).expect("late payload");
+        let complete_entries = PaneState::new(dir.path().to_path_buf())
+            .expect("reload complete entries")
+            .entries;
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(DirectoryLoadEvent {
+                pane_id: 1,
+                cwd: dir.path().to_path_buf(),
+                selected_path: None,
+                result: Ok(super::DirectoryLoadProgress::Complete(complete_entries)),
+            })
+            .expect("complete directory event");
+        app.directory_load_jobs.insert(
+            1,
+            DirectoryLoadJob {
+                cwd: dir.path().to_path_buf(),
+                receiver,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        app.poll_directory_load_jobs();
+
+        assert!(old_scan_cancelled.load(Ordering::Relaxed));
+        assert_eq!(app.directory_size_jobs[&1].cwd, dir.path());
+        let late_entry = app.panes[&1]
+            .entries
+            .iter()
+            .find(|entry| entry.path == late)
+            .expect("late entry");
+        assert_eq!(late_entry.directory_size, Some(0));
+        assert!(!late_entry.directory_size_complete);
+
+        for _ in 0..200 {
+            app.poll_background_tasks();
+            if app.directory_size_jobs.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let late_entry = app.panes[&1]
+            .entries
+            .iter()
+            .find(|entry| entry.path == late)
+            .expect("late entry after scan");
+        assert_eq!(late_entry.directory_size, Some(31));
+        assert!(late_entry.directory_size_complete);
     }
 
     #[test]
