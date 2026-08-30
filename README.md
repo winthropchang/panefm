@@ -27,6 +27,7 @@ PaneFM 是一個以 **Vibe Coding** 方式開發的軟體，也是我嘗試使�
 ## 功能
 
 - 多 Panel 分割、關閉與快速切換
+- Finder、Explorer 或其他程式改動目前目錄時自動刷新相關 Panel
 - 檔案與資料夾建立、改名、Regex 批次改名
 - 複製、剪下、貼上、同名覆蓋與跨 Panel 移動
 - Trash 列表、批次選取、還原與永久刪除

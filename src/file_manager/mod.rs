@@ -10,6 +10,7 @@ mod bookmark;
 mod copy;
 mod entry;
 mod fd;
+mod filesystem_watcher;
 mod fuzzy;
 mod fzf;
 mod layout;

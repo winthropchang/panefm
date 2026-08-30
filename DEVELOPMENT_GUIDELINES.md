@@ -174,7 +174,14 @@
 - 單目錄/全目錄快速跳轉：可優先考慮 `fzf`
 - 大量檔案搜尋：優先考慮成熟搜尋工具或分批回傳架構
 
-### 7.1 Copy / Move 效能基準
+### 7.1 檔案系統監看
+
+- 每個目前開啟的 panel 目錄都必須納入 watcher，不能只監看 active panel。
+- 原生事件與 SMB fallback 回報後必須先 debounce，再刷新受影響 panel，不能每個事件都重讀全部目錄。
+- watcher callback 只能送出事件，不可直接修改 `App` 或 `PaneState`；UI 狀態一律由主事件迴圈更新。
+- 外部新增項目時應盡量保留游標原本指向的實際路徑，不可只保留舊列表索引。
+
+### 7.2 Copy / Move 效能基準
 
 - macOS 與 Windows 的本機單檔 copy 使用 `std::fs::copy`，並由預設 3 個
   file workers 執行；資料夾 copy 不可退化成單 worker 逐檔等待。

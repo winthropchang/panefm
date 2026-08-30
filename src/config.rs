@@ -78,6 +78,7 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub pane: PaneConfig,
     pub search: SearchConfig,
+    pub watcher: WatcherConfig,
     pub navigation: NavigationConfig,
     pub behavior: BehaviorConfig,
     pub actions: ActionsConfig,
@@ -140,6 +141,17 @@ pub struct SearchConfig {
     pub global_search_chunk_size: usize,
     pub show_loading: bool,
     pub fzf_follow_links: bool,
+}
+
+/// 表示外部檔案系統變更的自動刷新設定。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatcherConfig {
+    /// 是否監看目前所有 panel 的目錄。
+    pub enabled: bool,
+    /// 同一批檔案事件合併後再刷新列表的等待時間。
+    pub debounce: Duration,
+    /// SMB 等無法可靠送出原生事件時，輪詢 fallback 的掃描間隔。
+    pub fallback_poll_interval: Duration,
 }
 
 /// 表示列表導航手感相關的設定群組。
@@ -258,6 +270,11 @@ impl Default for AppConfig {
                 show_loading: true,
                 fzf_follow_links: true,
             },
+            watcher: WatcherConfig {
+                enabled: true,
+                debounce: Duration::from_millis(120),
+                fallback_poll_interval: Duration::from_millis(2_000),
+            },
             navigation: NavigationConfig {
                 fast_move_step: 5,
                 panel_page_step: 10,
@@ -358,6 +375,7 @@ struct AppConfigFile {
     ui: Option<UiConfigFile>,
     pane: Option<PaneConfigFile>,
     search: Option<SearchConfigFile>,
+    watcher: Option<WatcherConfigFile>,
     navigation: Option<NavigationConfigFile>,
     behavior: Option<BehaviorConfigFile>,
 }
@@ -409,6 +427,14 @@ struct SearchConfigFile {
     global_search_chunk_size: Option<usize>,
     show_loading: Option<bool>,
     fzf_follow_links: Option<bool>,
+}
+
+/// 表示 `[watcher]` 區塊中尚未驗證的可選欄位。
+#[derive(Debug, Default, Deserialize)]
+struct WatcherConfigFile {
+    enabled: Option<bool>,
+    debounce_ms: Option<u64>,
+    fallback_poll_interval_ms: Option<u64>,
 }
 
 /// 表示 `navigation` 區塊的原始設定格式。
@@ -670,6 +696,9 @@ fn apply_new_file(config: &mut AppConfig, file: AppConfigFile) -> Result<()> {
     if let Some(search) = file.search {
         apply_search_config(config, search)?;
     }
+    if let Some(watcher) = file.watcher {
+        apply_watcher_config(config, watcher)?;
+    }
     if let Some(navigation) = file.navigation {
         apply_navigation_config(config, navigation)?;
     }
@@ -801,6 +830,32 @@ fn apply_search_config(config: &mut AppConfig, search: SearchConfigFile) -> Resu
         config.search.fzf_follow_links = fzf_follow_links;
     }
 
+    Ok(())
+}
+
+/// 套用並驗證 `[watcher]` 外部變更監看設定。
+///
+/// 參數：
+/// - `config: &mut AppConfig`，程式真正使用的完整設定。
+/// - `watcher: WatcherConfigFile`，從 TOML 解析但尚未驗證的可選欄位。
+///
+/// 回傳：`Result<()>`；毫秒欄位為零時回傳設定錯誤，避免 watcher 忙迴圈耗盡 CPU。
+fn apply_watcher_config(config: &mut AppConfig, watcher: WatcherConfigFile) -> Result<()> {
+    if let Some(enabled) = watcher.enabled {
+        config.watcher.enabled = enabled;
+    }
+    if let Some(milliseconds) = watcher.debounce_ms {
+        if milliseconds == 0 {
+            bail!("watcher.debounce_ms must be greater than 0");
+        }
+        config.watcher.debounce = Duration::from_millis(milliseconds);
+    }
+    if let Some(milliseconds) = watcher.fallback_poll_interval_ms {
+        if milliseconds == 0 {
+            bail!("watcher.fallback_poll_interval_ms must be greater than 0");
+        }
+        config.watcher.fallback_poll_interval = Duration::from_millis(milliseconds);
+    }
     Ok(())
 }
 
@@ -1084,6 +1139,11 @@ global_search_chunk_size = 16
 show_loading = false
 fzf_follow_links = false
 
+[watcher]
+enabled = false
+debounce_ms = 240
+fallback_poll_interval_ms = 3500
+
 [navigation]
 fast_move_step = 7
 panel_page_step = 14
@@ -1112,6 +1172,12 @@ cancel_search_on_leave = false
         assert_eq!(loaded.config.search.global_search_chunk_size, 16);
         assert!(!loaded.config.search.show_loading);
         assert!(!loaded.config.search.fzf_follow_links);
+        assert!(!loaded.config.watcher.enabled);
+        assert_eq!(loaded.config.watcher.debounce, Duration::from_millis(240));
+        assert_eq!(
+            loaded.config.watcher.fallback_poll_interval,
+            Duration::from_millis(3_500)
+        );
         assert_eq!(loaded.config.navigation.fast_move_step, 7);
         assert_eq!(loaded.config.navigation.panel_page_step, 14);
         assert!(!loaded.config.behavior.cancel_search_on_leave);
@@ -1281,6 +1347,28 @@ fast_move_step = 0
             error
                 .to_string()
                 .contains("navigation.fast_move_step must be greater than 0")
+        );
+    }
+
+    #[test]
+    /// 驗證 watcher 的 debounce 與 fallback 掃描間隔不可為零。
+    /// 保護目的：避免錯誤設定讓背景監看執行緒忙迴圈，造成 PaneFM 持續占用 CPU。
+    fn load_config_rejects_zero_watcher_intervals() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[watcher]
+debounce_ms = 0
+"#,
+        )
+        .expect("config file");
+
+        let error = load_config(dir.path()).expect_err("should reject zero watcher interval");
+        assert!(
+            error
+                .to_string()
+                .contains("watcher.debounce_ms must be greater than 0")
         );
     }
 

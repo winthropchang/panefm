@@ -98,7 +98,7 @@ windows_command = "git -C {parent} log --oneline"
 
 # 範例 4：
 # 只對檔案顯示，使用 Vim 開啟目前檔案。
-# 這類會接管終端的程式，建議使用 `terminal`。
+# 與內建選項同名時，這個外掛定義會覆寫內建動作。
 [[actions.open_with]]
 name = "Vim"
 scope = "file"
@@ -107,7 +107,7 @@ command = "vim {path}"
 
 # 範例 5：
 # 在 macOS Finder 中顯示目前檔案或資料夾的位置。
-# 這種只需要丟給系統處理的動作，適合 `detached`。
+# 與內建選項同名時，這個外掛定義會覆寫內建動作。
 [[actions.open_with]]
 name = "Reveal"
 scope = "both"

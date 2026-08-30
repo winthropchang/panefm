@@ -277,6 +277,9 @@ impl PaneState {
     /// - 成功時代表目錄內容已重新載入。
     /// - 失敗時代表讀目錄過程發生 I/O 錯誤。
     pub(crate) fn reload(&mut self) -> io::Result<()> {
+        // 外部程式可能在游標前方新增或刪除項目。先記住實際路徑，重新排序後再找回
+        // 同一項，避免 watcher 更新列表時游標只依舊索引而跳到另一個檔案。
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
         self.entries = read_dir_entries(&self.cwd)?;
         if matches!(self.active_detail_kind(), SortDetailKind::Size) {
             self.load_directory_child_counts();
@@ -285,6 +288,9 @@ impl PaneState {
             .retain(|path| self.entries.iter().any(|entry| &entry.path == path));
         self.sort_entries();
         self.refresh_visible_entries();
+        if let Some(path) = selected_path {
+            self.select_path(&path);
+        }
         Ok(())
     }
 

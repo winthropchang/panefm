@@ -32,6 +32,14 @@ global_search_chunk_size = 24
 show_loading = true
 fzf_follow_links = true
 
+[watcher]
+# Finder、Explorer 或其他程式改動目前目錄時，自動刷新所有顯示該目錄的 panel。
+enabled = true
+# 合併短時間內重複的檔案事件，避免一次操作造成列表連續重載與游標閃動。
+debounce_ms = 120
+# SMB 掛載點可能不送出原生事件；這個低頻掃描作為跨平台 fallback。
+fallback_poll_interval_ms = 2000
+
 [navigation]
 fast_move_step = 5
 panel_page_step = 10

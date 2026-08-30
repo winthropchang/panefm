@@ -46,6 +46,7 @@ use super::{
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
     debug_timing_log, debug_timing_message,
+    filesystem_watcher::FilesystemWatcher,
     fuzzy::{fuzzy_matched_indices, fuzzy_matched_indices_by_fields},
     layout::{LayoutNode, SplitDirection, SplitPlacement},
     open::{
@@ -541,6 +542,12 @@ pub(crate) struct App {
     pub(crate) task_history_path: PathBuf,
     /// 非阻塞記錄瀏覽目錄，避免同步啟動 zoxide 拖慢 TUI。
     pub(crate) zoxide_tracker: ZoxideTracker,
+    /// 監看 Finder、Explorer 與其他程式對目前 panel 目錄造成的外部變更。
+    filesystem_watcher: Option<FilesystemWatcher>,
+    /// watcher 短時間內回報的目錄先集中在這裡，等 debounce 到期再一起刷新。
+    pending_watched_directories: BTreeSet<PathBuf>,
+    /// 下一次允許套用 watcher 刷新的時間；`None` 代表目前沒有待處理事件。
+    filesystem_refresh_deadline: Option<Instant>,
     /// 要求主事件迴圈在下一幀前清除實體 terminal 與 ratatui buffer。
     pub(crate) full_redraw_requested: bool,
 }
@@ -621,6 +628,25 @@ impl App {
         let mut panes = BTreeMap::new();
         panes.insert(1, pane);
         let theme_preset = config.ui.theme_preset;
+        #[cfg(not(test))]
+        let (filesystem_watcher, watcher_startup_warning) = if config.watcher.enabled {
+            match FilesystemWatcher::new(config.watcher.fallback_poll_interval) {
+                Ok(watcher) => (Some(watcher), None),
+                Err(error) => (
+                    None,
+                    Some(format!("filesystem watcher unavailable: {error}")),
+                ),
+            }
+        } else {
+            (None, None)
+        };
+        // 單元測試會直接注入變更目錄驗證刷新邏輯，不為每個 App 測試建立兩條
+        // 作業系統 watcher thread，避免數百個測試同時消耗平台資源。
+        #[cfg(test)]
+        let (filesystem_watcher, watcher_startup_warning): (
+            Option<FilesystemWatcher>,
+            Option<String>,
+        ) = (None, None);
         let startup_status = match source {
             Some(path) => format!("loaded config: {}", path.display()),
             None => String::from("normal mode"),
@@ -644,6 +670,9 @@ impl App {
             startup_status = format!(
                 "{startup_status}; recovered {recovered_interrupted_tasks} interrupted task(s)"
             );
+        }
+        if let Some(warning) = watcher_startup_warning {
+            startup_status = format!("{startup_status}; {warning}");
         }
 
         let app = Self {
@@ -689,6 +718,9 @@ impl App {
             next_task_id,
             task_history_path,
             zoxide_tracker,
+            filesystem_watcher,
+            pending_watched_directories: BTreeSet::new(),
+            filesystem_refresh_deadline: None,
             full_redraw_requested: false,
         };
         if recovered_interrupted_tasks > 0 {
@@ -5922,20 +5954,44 @@ impl App {
     }
 
     /// 根據目前選取目標與設定檔，組出 Open with 面板應顯示的完整選項。
+    ///
+    /// `plugins.toml` 是使用者客製化層；若自訂動作與內建選項同名（例如 `Vim`
+    /// 或 `Reveal`），自訂動作會在原本的位置覆寫內建動作。不同名的外掛才追加到
+    /// 選單尾端。名稱比較不區分大小寫，也會移除前後空白。
+    ///
+    /// 參數：`target: &OpenTarget`，目前 active panel 選取的檔案或目錄。
+    /// 回傳：`Vec<OpenPickerOption>`，已套用外掛覆寫且名稱不重複的選項。
     fn open_picker_options_for_target(&self, target: &OpenTarget) -> Vec<OpenPickerOption> {
         let mut options = open_picker_options(target);
-        options.extend(
-            self.config
-                .actions
-                .open_with
-                .iter()
-                .filter(|action| custom_action_applies_to_target(action, target))
-                .cloned()
-                .map(|action| OpenPickerOption {
-                    label: action.name.clone(),
-                    action: OpenPickerAction::Custom(action),
-                }),
-        );
+        let mut label_positions = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| (option.label.trim().to_lowercase(), index))
+            .collect::<BTreeMap<_, _>>();
+
+        for action in self
+            .config
+            .actions
+            .open_with
+            .iter()
+            .filter(|action| custom_action_applies_to_target(action, target))
+        {
+            let normalized_label = action.name.trim().to_lowercase();
+            if normalized_label.is_empty() {
+                continue;
+            }
+            let option = OpenPickerOption {
+                label: action.name.clone(),
+                action: OpenPickerAction::Custom(action.clone()),
+            };
+            if let Some(index) = label_positions.get(&normalized_label).copied() {
+                options[index] = option;
+            } else {
+                let index = options.len();
+                options.push(option);
+                label_positions.insert(normalized_label, index);
+            }
+        }
         options
     }
 
@@ -9594,6 +9650,7 @@ impl App {
     /// 每個訊息都核對 panel id 與 query，舊搜尋取消後晚到的 chunk 會被捨棄，不能
     /// 混入使用者後來啟動的新搜尋。
     pub(crate) fn poll_background_tasks(&mut self) {
+        self.poll_filesystem_watcher();
         self.poll_network_goto();
         self.poll_file_jobs();
 
@@ -9698,6 +9755,66 @@ impl App {
         if finished {
             self.cancel_global_search_worker();
         }
+    }
+
+    /// 接收檔案系統 watcher 事件，去重後刷新所有顯示受影響目錄的 panel。
+    ///
+    /// 參數：無；監看目錄來自目前 `panes`，事件來自 [`FilesystemWatcher`] channel。
+    /// 回傳：`()`；watcher 或單一目錄刷新失敗只寫入狀態列，不會結束主事件迴圈。
+    fn poll_filesystem_watcher(&mut self) {
+        let directories = self
+            .panes
+            .values()
+            .map(|pane| pane.cwd.clone())
+            .collect::<BTreeSet<_>>();
+        let (changed, watch_errors) = match self.filesystem_watcher.as_mut() {
+            Some(watcher) => {
+                let errors = watcher.sync_directories(directories);
+                (watcher.changed_directories(), errors)
+            }
+            None => return,
+        };
+
+        if !watch_errors.is_empty() {
+            self.status = format!("filesystem watcher failed: {}", watch_errors.join(" | "));
+        }
+        if !changed.is_empty() {
+            self.pending_watched_directories.extend(changed);
+            // 第一個事件設定 deadline，後續同批事件只合併路徑而不無限延後刷新。
+            self.filesystem_refresh_deadline
+                .get_or_insert_with(|| Instant::now() + self.config.watcher.debounce);
+        }
+
+        if !self
+            .filesystem_refresh_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return;
+        }
+
+        self.filesystem_refresh_deadline = None;
+        let changed = std::mem::take(&mut self.pending_watched_directories);
+        if let Err(error) = self.reload_watched_directories(&changed) {
+            self.status = format!("automatic directory refresh failed: {error}");
+        }
+    }
+
+    /// 重新載入目前工作目錄出現在 watcher 變更集合中的所有 panel。
+    ///
+    /// 參數：`directories: &BTreeSet<PathBuf>`，已經過 debounce 的異動目錄集合。
+    /// 回傳：`io::Result<()>`；任一受影響 panel 無法重新讀取時回傳原始 I/O 錯誤。
+    fn reload_watched_directories(&mut self, directories: &BTreeSet<PathBuf>) -> io::Result<()> {
+        for pane in self
+            .panes
+            .values_mut()
+            .filter(|pane| directories.contains(&pane.cwd))
+        {
+            pane.reload()?;
+        }
+        if !directories.is_empty() {
+            self.full_redraw_requested = true;
+        }
+        Ok(())
     }
 
     /// 非阻塞接收 UNC `goto` 的背景載入結果，完成後才替換指定 panel。
@@ -12357,7 +12474,7 @@ mod tests {
         file_manager::{
             bookmark::{BookmarkEntry, BookmarkTarget},
             layout::{LayoutNode, SplitDirection},
-            open::LaunchMode,
+            open::{LaunchMode, OpenPickerAction},
             pane::{LineMode, PaneState, SortMode},
             search::{GlobalSearchEntry, GlobalSearchEvent},
         },
@@ -14071,6 +14188,76 @@ mod tests {
         assert_eq!(launch.launch.mode, LaunchMode::TerminalBlocking);
         assert!(launch.launch.args.join(" ").contains("git -C"));
         assert!(app.status.contains("running Git log on notes.txt"));
+    }
+
+    #[test]
+    /// 驗證自訂 Open with 動作若與內建選項同名，會在原位置覆寫內建動作。
+    ///
+    /// 保護目的：`plugins.toml` 是使用者客製化層；使用者定義 `Vim` 或 `Reveal`
+    /// 時必須採用外掛命令，不能保留內建動作，也不能在選單中顯示兩次。
+    fn app_open_picker_custom_actions_override_builtin_names() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("notes.txt"), "hello").expect("file");
+
+        let mut loaded = default_loaded_config();
+        for name in ["Vim", " reveal ", "Git log", "git LOG"] {
+            loaded
+                .config
+                .actions
+                .open_with
+                .push(CustomOpenActionConfig {
+                    name: name.to_string(),
+                    scope: ActionTargetScope::Both,
+                    mode: ActionLaunchMode::TerminalBlocking,
+                    command: Some("echo {path}".to_string()),
+                    mac_command: None,
+                    windows_command: None,
+                });
+        }
+
+        let app = App::new(dir.path().to_path_buf(), loaded).expect("app");
+        let target = app.selected_open_target().expect("selected target");
+        let options = app.open_picker_options_for_target(&target);
+
+        assert_eq!(
+            options
+                .iter()
+                .filter(|option| option.label.eq_ignore_ascii_case("Vim"))
+                .count(),
+            1
+        );
+        let vim = options
+            .iter()
+            .find(|option| option.label.eq_ignore_ascii_case("Vim"))
+            .expect("Vim option");
+        assert!(matches!(vim.action, OpenPickerAction::Custom(_)));
+        assert_eq!(
+            options
+                .iter()
+                .filter(|option| option.label.trim().eq_ignore_ascii_case("Reveal"))
+                .count(),
+            1
+        );
+        let reveal = options
+            .iter()
+            .find(|option| option.label.trim().eq_ignore_ascii_case("Reveal"))
+            .expect("Reveal option");
+        assert!(matches!(reveal.action, OpenPickerAction::Custom(_)));
+        assert_eq!(
+            options
+                .iter()
+                .filter(|option| option.label.eq_ignore_ascii_case("Git log"))
+                .count(),
+            1
+        );
+        let git_log = options
+            .iter()
+            .find(|option| option.label.eq_ignore_ascii_case("git LOG"))
+            .expect("Git log option");
+        let OpenPickerAction::Custom(action) = &git_log.action else {
+            panic!("Git log should be a custom action");
+        };
+        assert_eq!(action.name, "git LOG");
     }
 
     #[test]
@@ -17923,6 +18110,49 @@ mod tests {
                 pane.entries
                     .iter()
                     .any(|entry| entry.display_name() == "shared.txt")
+            );
+        }
+    }
+
+    #[test]
+    /// 驗證 Finder／Explorer 在 PaneFM 外部新增或刪除檔案後，所有顯示該目錄的
+    /// panel 都會刷新，而且原本游標指向的檔案不會因排序位置改變而跳走。
+    /// 保護目的：避免 watcher 只更新 active panel，或 reload 只保留舊索引而選錯檔案。
+    fn external_directory_change_refreshes_every_matching_panel_and_keeps_selection() {
+        let dir = tempdir().expect("tempdir");
+        let original = dir.path().join("middle.txt");
+        fs::write(&original, "original").expect("original file");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.split_current(SplitDirection::Vertical).expect("split");
+        for pane in app.panes.values_mut() {
+            pane.select_path(&original);
+        }
+
+        let external = dir.path().join("ahead.txt");
+        fs::write(&external, "created outside PaneFM").expect("external create");
+        app.reload_watched_directories(&std::collections::BTreeSet::from([dir
+            .path()
+            .to_path_buf()]))
+            .expect("watcher refresh after create");
+
+        for pane in app.panes.values() {
+            assert!(pane.entries.iter().any(|entry| entry.path == external));
+            assert_eq!(
+                pane.selected_entry().map(|entry| &entry.path),
+                Some(&original)
+            );
+        }
+
+        fs::remove_file(&external).expect("external delete");
+        app.reload_watched_directories(&std::collections::BTreeSet::from([dir
+            .path()
+            .to_path_buf()]))
+            .expect("watcher refresh after delete");
+        for pane in app.panes.values() {
+            assert!(!pane.entries.iter().any(|entry| entry.path == external));
+            assert_eq!(
+                pane.selected_entry().map(|entry| &entry.path),
+                Some(&original)
             );
         }
     }
