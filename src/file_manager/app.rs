@@ -59,8 +59,8 @@ use super::{
         DEFAULT_HISTORY_LIMIT, FileOperation, FileOperationKind, OperationHistory, OperationItem,
     },
     pane::{
-        DirectoryLoadProgress, LineMode, PaneState, SortDetailKind, SortMode, TransferProgress,
-        path_content_size,
+        DirectoryLoadProgress, FilterMode, LineMode, PaneState, SortDetailKind, SortMode,
+        TransferProgress, path_content_size,
     },
     platform::write_text_to_system_clipboard,
     search::{
@@ -136,12 +136,13 @@ pub(crate) struct ClipboardState {
     pub(crate) operation: ClipboardOperation,
 }
 
-/// 記錄目前 filter 的目標 pane、查詢字串與是否仍在輸入中。
+/// 記錄目前 filter 的目標 pane、查詢字串、比對模式與是否仍在輸入中。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilterState {
     pub(crate) pane_id: usize,
     pub(crate) buffer: String,
     pub(crate) editing: bool,
+    pub(crate) mode: FilterMode,
 }
 
 /// 記錄目前 preview search 的目標 pane、查詢字串與是否仍在輸入中。
@@ -1021,9 +1022,10 @@ impl App {
     /// 分派順序不可隨意調換：暫時面板與文字輸入必須先攔截按鍵，否則使用者在
     /// command 輸入 `d` 時可能同時觸發刪除；一般列表快捷鍵永遠是最後一層。
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        // Help 被允許從任何上下文打開，因此在其他 pending action 之前處理；
+        // Help 被允許從任何上下文打開（F1 永遠支援；~ 僅在非文字輸入狀態下生效，
+        // 避免在 filter、goto 或 rename 中輸入 ~ 被誤當成開啟說明）；
         // `help_return` 會保存原上下文，關閉說明後才能回到原 panel/輸入流程。
-        if key.code == KeyCode::F(1) || key_matches_tilde(&key) {
+        if key.code == KeyCode::F(1) || (key_matches_tilde(&key) && !self.is_text_input_active()) {
             if matches!(self.pending_action, Some(PendingAction::HelpPanel { .. })) {
                 return self.handle_pending_action_key(key);
             }
@@ -1406,7 +1408,14 @@ impl App {
             }
             _ if key_matches_plain_letter(&key, 'f') => {
                 self.clear_pending_count();
-                self.open_filter_input();
+                self.open_filter_input(FilterMode::Normal);
+                self.pending_g = false;
+                self.pending_y = false;
+                true
+            }
+            _ if key_matches_shifted_letter(&key, 'F') => {
+                self.clear_pending_count();
+                self.open_filter_input(FilterMode::Fuzzy);
                 self.pending_g = false;
                 self.pending_y = false;
                 true
@@ -2422,14 +2431,24 @@ impl App {
             return Ok(true);
         };
 
+        if key.code == KeyCode::Tab
+            || key_matches_ctrl_letter(&key, 'f')
+            || key_matches_ctrl_letter(&key, 's')
+        {
+            filter.mode = match filter.mode {
+                FilterMode::Normal => FilterMode::Fuzzy,
+                FilterMode::Fuzzy => FilterMode::Normal,
+            };
+            self.apply_filter_buffer(&filter);
+            self.status = format_filter_status(&filter);
+            self.filter = Some(filter);
+            return Ok(true);
+        }
+
         let edit_result = self.edit_text_buffer(&mut filter.buffer, &key);
         if matches!(edit_result, TextEditResult::Changed) {
             self.apply_filter_buffer(&filter);
-            self.status = if filter.buffer.is_empty() {
-                String::from("filter: all")
-            } else {
-                format!("filter: {}", filter.buffer)
-            };
+            self.status = format_filter_status(&filter);
             self.filter = Some(filter);
             return Ok(true);
         }
@@ -2447,11 +2466,7 @@ impl App {
             }
             KeyCode::Esc | KeyCode::Enter => {
                 filter.editing = false;
-                self.status = if filter.buffer.is_empty() {
-                    String::from("filter active")
-                } else {
-                    format!("filter locked: {}", filter.buffer)
-                };
+                self.status = format_filter_status(&filter);
                 self.filter = Some(filter);
             }
             _ => {
@@ -5237,7 +5252,8 @@ impl App {
             "preview" => self.open_preview_focus(),
             "preview-search" => self.open_preview_search_input(),
             "search" => self.open_global_search()?,
-            "search-content" | "grep" => self.open_content_search()?,
+            "filter" => self.open_filter_input(FilterMode::Normal),
+            "filter-fuzzy" | "filter fuzzy" | "fuzzy" => self.open_filter_input(FilterMode::Fuzzy),
             "linemode" => self.open_linemode_picker(),
             "bookmark" => self.open_bookmark_picker(),
             "bookmark add" => self.add_bookmark_with_auto_key(self.focused_pane)?,
@@ -6773,16 +6789,17 @@ impl App {
     }
 
     /// 打開 filter 輸入框，並以目前焦點 pane 作為過濾目標。
-    pub(crate) fn open_filter_input(&mut self) {
+    pub(crate) fn open_filter_input(&mut self, mode: FilterMode) {
         self.text_input_mode = RenameMode::Insert;
         self.text_input_cursor = 0;
         let filter = FilterState {
             pane_id: self.focused_pane,
             buffer: String::new(),
             editing: true,
+            mode,
         };
         self.apply_filter_buffer(&filter);
-        self.status = String::from("filter: all");
+        self.status = format_filter_status(&filter);
         self.filter = Some(filter);
     }
 
@@ -8137,7 +8154,8 @@ impl App {
                 }
             }
             HelpAction::Delete => self.start_delete_confirmation(false),
-            HelpAction::Filter => self.open_filter_input(),
+            HelpAction::Filter => self.open_filter_input(FilterMode::Normal),
+            HelpAction::FuzzyFilter => self.open_filter_input(FilterMode::Fuzzy),
             HelpAction::Sort => self.open_sort_picker(),
             HelpAction::Hidden => {
                 self.toggle_hidden_files()?;
@@ -8316,8 +8334,63 @@ impl App {
     /// 將 filter 文字套用到指定 pane。
     fn apply_filter_buffer(&mut self, filter: &FilterState) {
         if let Some(pane) = self.panes.get_mut(&filter.pane_id) {
-            pane.set_filter_query(&filter.buffer);
+            pane.set_filter_query(&filter.buffer, filter.mode);
         }
+    }
+
+    /// 判斷目前畫面上是否有正在輸入中的文字框。
+    fn is_text_input_active(&self) -> bool {
+        if self.command_mode {
+            return true;
+        }
+        if self.filter.as_ref().is_some_and(|filter| filter.editing) {
+            return true;
+        }
+        if self
+            .preview_search
+            .as_ref()
+            .is_some_and(|search| search.editing)
+        {
+            return true;
+        }
+        if self.list_find.is_some() {
+            return true;
+        }
+        if self
+            .global_search
+            .as_ref()
+            .is_some_and(|s| s.editing || s.filter.editing)
+        {
+            return true;
+        }
+        matches!(
+            self.pending_action,
+            Some(
+                PendingAction::Rename { .. }
+                    | PendingAction::CreateEntry { .. }
+                    | PendingAction::RegexRename { .. }
+                    | PendingAction::TrashPanel {
+                        search: PanelSearchState { editing: true, .. },
+                        ..
+                    }
+                    | PendingAction::HelpPanel {
+                        search: PanelSearchState { editing: true, .. },
+                        ..
+                    }
+                    | PendingAction::TaskPanel {
+                        search: PanelSearchState { editing: true, .. },
+                        ..
+                    }
+                    | PendingAction::BookmarkList {
+                        search: PanelSearchState { editing: true, .. },
+                        ..
+                    }
+                    | PendingAction::ZoxideList {
+                        search: PanelSearchState { editing: true, .. },
+                        ..
+                    }
+            )
+        )
     }
 
     /// 將 preview search 文字套用到指定 pane，並讓 preview 跳到命中位置。
@@ -9981,10 +10054,15 @@ impl App {
             && filter.editing
             && let Some(area) = pane_rects.get(&filter.pane_id)
         {
+            let title = match filter.mode {
+                FilterMode::Normal => " Filter [Normal] (Tab: Fuzzy) ",
+                FilterMode::Fuzzy => " Filter [Fuzzy] (Tab: Normal) ",
+            };
             let filter_cursor = render_filter_input(
                 frame,
                 *area,
                 self.theme,
+                title,
                 &filter.buffer,
                 self.text_input_cursor,
             );
@@ -10030,6 +10108,7 @@ impl App {
                     frame,
                     *area,
                     self.theme,
+                    " Filter Results ",
                     &search.filter.buffer,
                     self.text_input_cursor,
                 );
@@ -11005,7 +11084,7 @@ fn zoxide_panel_lines(entries: Vec<PathBuf>) -> Vec<ZoxidePanelLine> {
 
 /// 依照搜尋字串過濾 zoxide 回傳的目錄列表，保留路徑中包含關鍵字的項目。
 fn filtered_zoxide_entries(entries: &[PathBuf], query: &str) -> Vec<PathBuf> {
-    fuzzy_matched_indices(entries, query, |path| path.display().to_string())
+    fuzzy_matched_indices(entries, query, |path| path.display().to_string().into())
         .into_iter()
         .map(|index| entries[index].clone())
         .collect()
@@ -11043,7 +11122,7 @@ fn filtered_global_search_entries(
     entries: &[GlobalSearchEntry],
     query: &str,
 ) -> Vec<GlobalSearchEntry> {
-    fuzzy_matched_indices(entries, query, |entry| entry.relative_path.clone())
+    fuzzy_matched_indices(entries, query, |entry| entry.relative_path.clone().into())
         .into_iter()
         .map(|index| entries[index].clone())
         .collect()
@@ -12060,8 +12139,8 @@ fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
             label: "search",
         },
         StatusShortcutHint {
-            key: "f",
-            label: "filter",
+            key: "f/F",
+            label: "filter/fuzzy",
         },
         StatusShortcutHint {
             key: "r",
@@ -12194,6 +12273,7 @@ enum HelpAction {
     Command(&'static str),
     Delete,
     Filter,
+    FuzzyFilter,
     Sort,
     Hidden,
     Visual,
@@ -12651,8 +12731,14 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":filter",
             "f",
-            "用不連續字元即時模糊過濾目前列表，並依相關性排序",
+            "開啟一般子字串過濾（可於輸入框按 Tab 切換模糊模式）",
             HelpAction::Filter,
+        ),
+        help_entry(
+            ":filter fuzzy",
+            "F",
+            "開啟模糊搜尋過濾（Fuzzy filter，依相關性評分排序）",
+            HelpAction::FuzzyFilter,
         ),
         help_entry(":sort", ",", "打開排序方式快捷鍵面板", HelpAction::Sort),
         help_entry(
@@ -13352,6 +13438,21 @@ fn global_search_visible_len(search: &GlobalSearchState) -> usize {
     filtered_global_search_entries(&search.results, &search.filter.buffer).len()
 }
 
+/// 建立 filter 狀態列文字。
+fn format_filter_status(filter: &FilterState) -> String {
+    let mode_label = match filter.mode {
+        FilterMode::Normal => "normal",
+        FilterMode::Fuzzy => "fuzzy",
+    };
+    if filter.buffer.is_empty() {
+        format!("filter [{mode_label}]: all (Tab to switch)")
+    } else if filter.editing {
+        format!("filter [{mode_label}]: {}", filter.buffer)
+    } else {
+        format!("filter locked [{mode_label}]: {}", filter.buffer)
+    }
+}
+
 /// 依照 global search 的模糊 filter 狀態產生狀態列訊息。
 ///
 /// 參數：
@@ -13648,7 +13749,7 @@ mod tests {
             bookmark::{BookmarkEntry, BookmarkTarget},
             layout::{LayoutNode, SplitDirection},
             open::{LaunchMode, OpenPickerAction},
-            pane::{LineMode, PaneState, SortMode},
+            pane::{FilterMode, LineMode, PaneState, SortMode},
             search::{GlobalSearchEntry, GlobalSearchEvent},
         },
         theme::{Theme, ThemePreset},
@@ -18395,7 +18496,7 @@ mod tests {
         app.focus_pane_by_id(1);
         assert_eq!(app.focused_pane, 1);
 
-        app.open_filter_input();
+        app.open_filter_input(FilterMode::Normal);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -18493,13 +18594,14 @@ mod tests {
                 pane_id: 1,
                 buffer: String::new(),
                 editing: true,
+                mode: FilterMode::Normal,
             })
         );
-        assert_eq!(app.status, "filter: all");
+        assert_eq!(app.status, "filter [normal]: all (Tab to switch)");
     }
 
     #[test]
-    /// 驗證 filter 輸入框中的 `Tab` 不會被當成 command 補齊，避免誤改目前查詢字串。
+    /// 驗證 filter 輸入框中的 `Tab` 不會被當成 command 補齊，而是切換為模糊過濾模式（Fuzzy）。
     /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_filter_input_tab_does_not_apply_command_autocomplete() {
         let dir = tempdir().expect("tempdir");
@@ -18522,25 +18624,26 @@ mod tests {
                 pane_id: 1,
                 buffer: String::from("re"),
                 editing: true,
+                mode: FilterMode::Fuzzy,
             })
         );
-        assert_eq!(app.status, "filter: re");
+        assert_eq!(app.status, "filter [fuzzy]: re");
     }
 
     #[test]
-    /// 驗證一般檔案列表的 `f` 使用共用模糊比對，不要求查詢字元在檔名中連續出現。
-    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
-    fn app_file_list_filter_matches_fuzzy_character_sequence() {
+    /// 驗證一般檔案列表的 `f` 預設以逐詞包含過濾，不接受不連續字元命中。
+    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，意外讓大型目錄回到昂貴的模糊排序。
+    fn app_file_list_filter_uses_all_terms_as_contiguous_substrings() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("file-manager-app.rs"), "app").expect("app");
         fs::write(dir.path().join("sample.txt"), "sample").expect("sample");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
-            .expect("open fuzzy filter");
-        for ch in ['f', 'm', 'a'] {
+            .expect("open filter");
+        for ch in ['f', 'i', 'l', 'e', ' ', 'a', 'p', 'p'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .expect("type fuzzy filter");
+                .expect("type filter");
         }
 
         let visible: Vec<String> = app
@@ -18552,6 +18655,33 @@ mod tests {
             .map(|entry| entry.display_name())
             .collect();
         assert_eq!(visible, vec![String::from("file-manager-app.rs")]);
+    }
+
+    #[test]
+    /// 驗證包含 `~` 符號的特殊檔名在一般過濾模式下能被精確連續字串比對，不會被誤當成模式切換語法。
+    fn app_file_list_filter_matches_literal_tilde_in_filenames() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("~backup.rs"), "app").expect("app");
+        fs::write(dir.path().join("sample.txt"), "sample").expect("sample");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("open filter");
+        for ch in ['~', 'b', 'a', 'c', 'k'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type filter with tilde");
+        }
+        assert_eq!(app.filter.as_ref().expect("filter").buffer, "~back");
+
+        let visible: Vec<String> = app
+            .panes
+            .get(&1)
+            .expect("pane")
+            .visible_entries()
+            .into_iter()
+            .map(|entry| entry.display_name())
+            .collect();
+        assert_eq!(visible, vec![String::from("~backup.rs")]);
     }
 
     #[test]
@@ -20651,7 +20781,7 @@ mod tests {
         fs::write(dir.path().join("aXbc.txt"), "demo").expect("file");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
-        app.open_filter_input();
+        app.open_filter_input(FilterMode::Normal);
         for character in ['a', 'b', 'c'] {
             app.handle_filter_input_key(KeyEvent::new(
                 KeyCode::Char(character),
@@ -20739,7 +20869,7 @@ mod tests {
         fs::write(dir.path().join("alpha.txt"), "demo").expect("file");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
-        app.open_filter_input();
+        app.open_filter_input(FilterMode::Normal);
         app.handle_filter_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .expect("close empty filter input");
 
@@ -21164,6 +21294,72 @@ mod tests {
             progress_label.contains("30K")
                 || progress_label.contains("K")
                 || progress_label.contains("M")
+        );
+    }
+
+    #[test]
+    /// 驗證按下 `f` 開啟一般過濾、按下 `F` 開啟模糊搜尋過濾，且在過濾輸入框內按 `Tab` 可無縫切換模式。
+    fn filter_f_and_shift_f_open_normal_and_fuzzy_modes_and_tab_toggles() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("libpanefm-6510b5220d8becac.rlib"), "bin").expect("write1");
+        fs::write(dir.path().join("terminal_file_manager.d"), "bin").expect("write2");
+        fs::write(dir.path().join("other_file.txt"), "bin").expect("write3");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        // 1. 按下 'f' 開啟一般過濾模式
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("press f");
+        assert!(app.filter.is_some());
+        assert_eq!(app.filter.as_ref().unwrap().mode, FilterMode::Normal);
+        assert!(app.status.contains("filter [normal]"));
+
+        // 輸入 "pnefm"（非連續子字串，一般模式下不會命中）
+        for c in ['p', 'n', 'e', 'f', 'm'] {
+            app.handle_filter_input_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type char");
+        }
+        assert_eq!(app.panes[&1].visible_indices.len(), 0, "一般模式連續子字串比對不應命中");
+
+        // 2. 按下 Tab 切換為模糊過濾模式（Fuzzy）
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("press tab");
+        assert_eq!(app.filter.as_ref().unwrap().mode, FilterMode::Fuzzy);
+        assert!(app.status.contains("filter [fuzzy]"));
+        assert_eq!(app.panes[&1].visible_indices.len(), 1, "模糊搜尋應命中 libpanefm-*.rlib");
+        assert_eq!(
+            app.panes[&1].entries[app.panes[&1].visible_indices[0]].name,
+            "libpanefm-6510b5220d8becac.rlib"
+        );
+
+        // 3. 再次按 Tab 切回一般模式
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("press tab back");
+        assert_eq!(app.filter.as_ref().unwrap().mode, FilterMode::Normal);
+        assert_eq!(app.panes[&1].visible_indices.len(), 0);
+
+        // 關閉當前 filter
+        app.handle_filter_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+        app.panes.get_mut(&1).unwrap().clear_filter();
+        app.filter = None;
+
+        // 4. 按下 'F' (Shift+F) 直接開啟模糊搜尋過濾模式
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT))
+            .expect("press Shift+F");
+        assert!(app.filter.is_some());
+        assert_eq!(app.filter.as_ref().unwrap().mode, FilterMode::Fuzzy);
+        assert!(app.status.contains("filter [fuzzy]"));
+
+        // 輸入 "tfm" 模糊搜尋
+        for c in ['t', 'f', 'm'] {
+            app.handle_filter_input_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type char");
+        }
+        assert!(
+            app.panes[&1].visible_indices.iter().any(|idx| {
+                app.panes[&1].entries[*idx].name == "terminal_file_manager.d"
+            }),
+            "模糊搜尋 'tfm' 必須命中 terminal_file_manager.d"
         );
     }
 }

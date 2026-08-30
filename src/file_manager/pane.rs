@@ -103,6 +103,8 @@ pub(crate) struct PaneState {
     pub(crate) list_viewport_height: usize,
     /// 目前啟用中的過濾字串，`None` 代表沒有啟用 filter。
     pub(crate) filter_query: Option<String>,
+    /// 目前使用的過濾模式（一般子字串過濾或模糊匹配）。
+    pub(crate) filter_mode: FilterMode,
     /// 目前實際顯示在列表中的項目索引。
     pub(crate) visible_indices: Vec<usize>,
     /// 是否顯示以 `.` 開頭的隱藏檔案與資料夾。
@@ -130,6 +132,29 @@ pub(crate) struct PaneState {
     pub(crate) list_find_query: Option<String>,
     /// 目前在這個 pane 中已被標記的項目路徑。
     pub(crate) marked_paths: BTreeSet<PathBuf>,
+    /// 記錄上一次 filter 的命中集合，讓連續輸入時可只在較小候選集內重新比對。
+    filter_cache: Option<FilterCache>,
+    /// 每次 entries 順序或內容變動都遞增，避免沿用失效的 filter cache。
+    entry_revision: u64,
+}
+
+/// 描述列表過濾目前使用的比對模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FilterMode {
+    /// 一般模式：以空白拆分關鍵字，要求各詞皆為連續子字串。
+    #[default]
+    Normal,
+    /// 模糊搜尋模式：使用 Nucleo 進行子序列模糊匹配與相關性評分排序。
+    Fuzzy,
+}
+
+#[derive(Debug, Clone)]
+struct FilterCache {
+    query: String,
+    is_fuzzy: bool,
+    show_hidden: bool,
+    entry_revision: u64,
+    matched_indices: Vec<usize>,
 }
 
 /// 描述 pane 目前使用的排序方式。
@@ -247,6 +272,7 @@ impl PaneState {
             list_state: ListState::default(),
             list_viewport_height: 1,
             filter_query: None,
+            filter_mode: FilterMode::Normal,
             visible_indices: Vec::new(),
             show_hidden: false,
             sort_mode: SortMode::Natural { reverse: false },
@@ -259,6 +285,8 @@ impl PaneState {
             preview_current_match: None,
             list_find_query: None,
             marked_paths: BTreeSet::new(),
+            filter_cache: None,
+            entry_revision: 0,
         };
         pane.reload()?;
         Ok(pane)
@@ -318,6 +346,7 @@ impl PaneState {
             })
             .collect::<BTreeMap<_, _>>();
         self.entries = read_dir_entries(&self.cwd)?;
+        self.bump_entry_revision();
         for entry in &mut self.entries {
             if let Some((size, complete)) = cached_directory_sizes.get(&entry.path) {
                 entry.directory_size = *size;
@@ -693,6 +722,7 @@ impl PaneState {
         selected_path: Option<&Path>,
     ) {
         self.entries = entries;
+        self.bump_entry_revision();
         self.sort_entries();
         self.refresh_visible_entries();
         if let Some(path) = selected_path {
@@ -707,6 +737,7 @@ impl PaneState {
         selected_path: Option<&Path>,
     ) {
         self.entries = entries;
+        self.bump_entry_revision();
         self.refresh_visible_entries();
         if let Some(path) = selected_path {
             self.select_path(path);
@@ -716,6 +747,7 @@ impl PaneState {
     /// 增量追加載入中的目錄項目，並在保留目前可見游標索引的前提下即時更新畫面。
     pub(crate) fn extend_entries(&mut self, new_entries: Vec<FileEntry>) {
         self.entries.extend(new_entries);
+        self.bump_entry_revision();
         self.refresh_visible_entries();
     }
 
@@ -1594,14 +1626,15 @@ impl PaneState {
         self.preview_scroll = 0;
     }
 
-    /// 套用新的 filter 字串，並立即更新可見清單。
-    pub(crate) fn set_filter_query(&mut self, query: &str) {
+    /// 套用新的 filter 字串與模式，並立即更新可見清單。
+    pub(crate) fn set_filter_query(&mut self, query: &str, mode: FilterMode) {
         let trimmed = query.trim();
         self.filter_query = if trimmed.is_empty() {
             None
         } else {
             Some(trimmed.to_string())
         };
+        self.filter_mode = mode;
         self.refresh_visible_entries();
     }
 
@@ -1772,28 +1805,38 @@ impl PaneState {
     fn refresh_visible_entries(&mut self) {
         self.visible_indices = match &self.filter_query {
             Some(query) => {
-                let candidates: Vec<usize> = self
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| self.show_hidden || !is_hidden_name(&entry.name))
-                    .map(|(index, _)| index)
-                    .collect();
-                fuzzy_matched_indices(&candidates, query, |index| {
-                    self.entries[*index].name.clone()
-                })
-                .into_iter()
-                .map(|matched_index| candidates[matched_index])
-                .collect()
+                let is_fuzzy = matches!(self.filter_mode, FilterMode::Fuzzy);
+                let candidates = self.filter_candidates(query, is_fuzzy);
+                if is_fuzzy {
+                    fuzzy_matched_indices(&candidates, query, |index| {
+                        self.entries[*index].name.clone().into()
+                    })
+                    .into_iter()
+                    .map(|matched_index| candidates[matched_index])
+                    .collect()
+                } else {
+                    candidates
+                        .into_iter()
+                        .filter(|index| normal_filter_matches(&self.entries[*index].name, query))
+                        .collect()
+                }
             }
-            None => self
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| self.show_hidden || !is_hidden_name(&entry.name))
-                .map(|(index, _)| index)
-                .collect(),
+            None => {
+                self.filter_cache = None;
+                self.base_visible_candidates()
+            }
         };
+
+        if let Some(query) = &self.filter_query {
+            let is_fuzzy = matches!(self.filter_mode, FilterMode::Fuzzy);
+            self.filter_cache = Some(FilterCache {
+                query: query.clone(),
+                is_fuzzy,
+                show_hidden: self.show_hidden,
+                entry_revision: self.entry_revision,
+                matched_indices: self.visible_indices.clone(),
+            });
+        }
 
         if self.visible_indices.is_empty() {
             self.selected = 0;
@@ -1810,7 +1853,57 @@ impl PaneState {
     /// 依照目前排序模式重排完整項目列表。
     fn sort_entries(&mut self) {
         sort_file_entries(&mut self.entries, self.sort_mode, self.random_seed);
+        self.bump_entry_revision();
     }
+
+    fn base_visible_candidates(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| self.show_hidden || !is_hidden_name(&entry.name))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn filter_candidates(&self, query: &str, is_fuzzy: bool) -> Vec<usize> {
+        if let Some(cache) = &self.filter_cache {
+            let is_incremental_narrowing =
+                query.starts_with(&cache.query) && query.len() > cache.query.len();
+            if is_incremental_narrowing
+                && cache.is_fuzzy == is_fuzzy
+                && cache.show_hidden == self.show_hidden
+                && cache.entry_revision == self.entry_revision
+            {
+                return cache.matched_indices.clone();
+            }
+        }
+        self.base_visible_candidates()
+    }
+
+    fn bump_entry_revision(&mut self) {
+        self.entry_revision = self.entry_revision.wrapping_add(1);
+        self.filter_cache = None;
+    }
+}
+
+/// 一般 filter 以空白拆成多個詞，每個詞都必須是檔名的一段連續文字。
+/// ASCII 使用零配置的大小寫不敏感比較；非 ASCII 則保留 Unicode 大小寫語意。
+fn normal_filter_matches(name: &str, query: &str) -> bool {
+    query
+        .split_whitespace()
+        .all(|term| contains_case_insensitive(name, term))
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_ascii() {
+        let needle = needle.as_bytes();
+        return haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|candidate| candidate.eq_ignore_ascii_case(needle));
+    }
+
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 /// 依照指定的排序模式與種子對項目清單進行就地排序（可在背景執行緒執行）。

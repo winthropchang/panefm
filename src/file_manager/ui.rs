@@ -1054,10 +1054,11 @@ pub(crate) fn render_filter_input(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     theme: Theme,
+    title: &str,
     buffer: &str,
     cursor: usize,
 ) -> (u16, u16) {
-    render_top_right_input(frame, area, theme, " Filter ", buffer, cursor)
+    render_top_right_input(frame, area, theme, title, buffer, cursor)
 }
 
 /// 在畫面右上方繪製 preview search 輸入框，並回傳游標應該停留的位置。
