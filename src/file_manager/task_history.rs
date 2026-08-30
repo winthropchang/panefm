@@ -127,10 +127,11 @@ mod tests {
     use super::*;
     use crate::file_manager::app::TaskState;
 
-    /// 驗證 task 歷史可完整保存並重新載入所有狀態、時間與 byte 進度。
+    /// 驗證 task 歷史可完整保存並重新載入狀態、時間、byte 進度、來源與目的地。
     ///
     /// 保護目的：task 歷史是長時間 SMB copy 的診斷依據；若序列化漏掉任一欄位，
-    /// 使用者重開 PaneFM 後就無法判斷工作何時開始、何時結束或停在哪個進度。
+    /// 使用者重開 PaneFM 後就無法判斷工作何時開始、資料從哪裡來、寫到哪裡或停在
+    /// 哪個進度。
     #[test]
     fn task_history_round_trip_preserves_diagnostic_fields() {
         let dir = tempdir().expect("tempdir");
@@ -141,6 +142,8 @@ mod tests {
             kind: String::from("paste"),
             title: String::from("copy archive.zip"),
             detail: String::from("destination: share"),
+            source_locations: vec![String::from("/source/archive.zip")],
+            destination_location: Some(String::from("/destination")),
             state: TaskState::Done,
             progress_percent: Some(100),
             completed_bytes: Some(1_024),
@@ -173,6 +176,8 @@ mod tests {
         assert_eq!(tasks[0].progress_percent, Some(42));
         assert_eq!(tasks[0].completed_bytes, None);
         assert_eq!(tasks[0].total_bytes, None);
+        assert!(tasks[0].source_locations.is_empty());
+        assert_eq!(tasks[0].destination_location, None);
     }
 
     /// 驗證沒有歷史檔時會回傳空清單，而不是阻止 PaneFM 第一次啟動。

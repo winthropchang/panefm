@@ -232,6 +232,13 @@ pub(crate) struct TaskRecord {
     pub(crate) kind: String,
     pub(crate) title: String,
     pub(crate) detail: String,
+    /// 任務讀取或操作的來源位置。多選 copy、move、compress、extract 與 delete 會保留
+    /// 每一筆來源，讓 task 歷史在工作完成後仍能回答「資料從哪裡來」。
+    #[serde(default)]
+    pub(crate) source_locations: Vec<String>,
+    /// 任務寫入或跳轉的目的位置；純刪除或只讀工作沒有目的地時為 `None`。
+    #[serde(default)]
+    pub(crate) destination_location: Option<String>,
     pub(crate) state: TaskState,
     /// 背景檔案工作目前完成百分比；不支援進度的外部工作使用 `None`。
     ///
@@ -1252,7 +1259,9 @@ impl App {
                 let pane_id = self.focused_pane;
                 if let Some(entry) = self.panes.get(&pane_id).and_then(|p| p.selected_entry()) {
                     if entry.is_dir {
-                        if let Some((task_id, title, progress)) = self.active_file_job_for_path(&entry.path) {
+                        if let Some((task_id, title, progress)) =
+                            self.active_file_job_for_path(&entry.path)
+                        {
                             let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
                             self.status = format!(
                                 "cannot enter '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
@@ -5886,6 +5895,8 @@ impl App {
                     "smb",
                     format!("mount {}", location.url),
                     format!("expected mount path: {}", local_path.display()),
+                    vec![location.url.clone()],
+                    Some(local_path.display().to_string()),
                 );
                 self.pending_launch = Some(QueuedLaunch { task_id, launch });
                 self.status = format!(
@@ -6150,7 +6161,14 @@ impl App {
             OpenAction::Reveal => format!("reveal {}", target.display_name),
         };
         let detail = format!("{} {}", launch.program, launch.args.join(" "));
-        let task_id = self.push_task(self.focused_pane, "open", title, detail);
+        let task_id = self.push_task(
+            self.focused_pane,
+            "open",
+            title,
+            detail,
+            vec![target.path.display().to_string()],
+            None,
+        );
         self.pending_launch = Some(QueuedLaunch { task_id, launch });
         self.status = match action {
             OpenAction::Editor => format!("opening {} with editor", target.display_name),
@@ -6182,6 +6200,8 @@ impl App {
             "terminal",
             format!("open terminal: {}", cwd.display()),
             detail,
+            vec![cwd.display().to_string()],
+            None,
         );
         self.pending_launch = Some(QueuedLaunch { task_id, launch });
         self.status = format!("opening terminal: {}", cwd.display());
@@ -6242,7 +6262,14 @@ impl App {
                 let launch = build_custom_launch_spec(&target, &action)?;
                 let title = format!("run {} on {}", action.name, target.display_name);
                 let detail = format!("{} {}", launch.program, launch.args.join(" "));
-                let task_id = self.push_task(self.focused_pane, "open", title, detail);
+                let task_id = self.push_task(
+                    self.focused_pane,
+                    "open",
+                    title,
+                    detail,
+                    vec![target.path.display().to_string()],
+                    None,
+                );
                 self.pending_launch = Some(QueuedLaunch { task_id, launch });
                 self.status = format!("running {} on {}", action.name, target.display_name);
                 Ok(())
@@ -6881,6 +6908,8 @@ impl App {
             "jump",
             format!("fzf jump in {}", root_dir.display()),
             String::from("waiting for fzf"),
+            vec![root_dir.display().to_string()],
+            None,
         );
         self.pending_fzf_jump = Some(FzfJumpRequest {
             pane_id: self.focused_pane,
@@ -7299,12 +7328,25 @@ impl App {
     }
 
     /// 建立新的 task 紀錄並加入 task log，回傳這筆任務的 id。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`：啟動工作的 panel 編號。
+    /// - `kind: &'static str`：供取消、搜尋與診斷使用的穩定工作種類。
+    /// - `title: String`：使用者可閱讀的操作說明，例如 `copy 2 item(s)`。
+    /// - `detail: String`：執行中說明，完成時可由 [`Self::finish_task`] 改成結果或錯誤。
+    /// - `source_locations: Vec<String>`：工作實際讀取或修改的所有來源路徑／URI。
+    /// - `destination_location: Option<String>`：工作寫入或跳轉的目的位置。
+    ///
+    /// 回傳：`usize`，新 task 的唯一 id。來源與目的地會獨立持久化，因此即使完成時
+    /// `detail` 被結果覆寫，task 面板仍能完整說明檔案操作方向。
     fn push_task(
         &mut self,
         pane_id: usize,
         kind: &'static str,
         title: String,
         detail: String,
+        source_locations: Vec<String>,
+        destination_location: Option<String>,
     ) -> usize {
         let id = self.next_task_id;
         self.next_task_id += 1;
@@ -7314,6 +7356,8 @@ impl App {
             kind: kind.to_string(),
             title,
             detail,
+            source_locations,
+            destination_location,
             state: TaskState::Running,
             progress_percent: None,
             completed_bytes: None,
@@ -7610,6 +7654,11 @@ impl App {
             "compress",
             format!("compress {entry_count} item(s)"),
             format!("output: {}", target_dir.display()),
+            entries
+                .iter()
+                .map(|entry| entry.path.display().to_string())
+                .collect(),
+            Some(target_dir.display().to_string()),
         );
         let busy_paths = entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
         self.active_file_job_busy_paths.insert(task_id, busy_paths);
@@ -7675,6 +7724,11 @@ impl App {
             "extract",
             format!("extract {entry_count} item(s)"),
             format!("output: {}", target_dir.display()),
+            entries
+                .iter()
+                .map(|entry| entry.path.display().to_string())
+                .collect(),
+            Some(target_dir.display().to_string()),
         );
         let busy_paths = vec![target_dir.clone()];
         self.active_file_job_busy_paths.insert(task_id, busy_paths);
@@ -7767,6 +7821,11 @@ impl App {
             "delete",
             format!("delete {entry_count} item(s)"),
             format!("target: {target_name}"),
+            entries
+                .iter()
+                .map(|entry| entry.path.display().to_string())
+                .collect(),
+            None,
         );
         let mut busy_paths = Vec::new();
         let mut delete_targets = Vec::new();
@@ -7778,9 +7837,8 @@ impl App {
             busy_paths.push(entry.path.clone());
             if entry.is_dir {
                 if let Some(parent) = entry.path.parent() {
-                    let staging_path = parent.join(format!(
-                        ".panefm-del-{pid}-{task_id}-{idx}-{now_ms}"
-                    ));
+                    let staging_path =
+                        parent.join(format!(".panefm-del-{pid}-{task_id}-{idx}-{now_ms}"));
                     if fs::rename(&entry.path, &staging_path).is_ok() {
                         busy_paths.push(staging_path.clone());
                         delete_targets.push((staging_path, entry.path.clone(), true));
@@ -8312,6 +8370,8 @@ impl App {
                 if query.is_empty() { "<all>" } else { &query }
             ),
             format!("root: {}", root_dir.display()),
+            vec![root_dir.display().to_string()],
+            None,
         );
         thread::spawn(move || {
             match mode {
@@ -9003,6 +9063,12 @@ impl App {
             "paste",
             format!("{operation_label} {entry_count} item(s)"),
             format!("destination: {}", target_dir.display()),
+            clipboard
+                .entries
+                .iter()
+                .map(|entry| entry.source_path.display().to_string())
+                .collect(),
+            Some(target_dir.display().to_string()),
         );
         let mut busy = Vec::new();
         for entry in &clipboard.entries {
@@ -9295,6 +9361,8 @@ impl App {
             "goto",
             format!("goto {}", target_path.display()),
             String::from("loading UNC path in background"),
+            Vec::new(),
+            Some(target_path.display().to_string()),
         );
         let (sender, receiver) = mpsc::channel();
         let worker_target = target_path.clone();
@@ -10354,7 +10422,10 @@ impl App {
                             && pane.cwd == event.cwd
                         {
                             if is_first_chunk {
-                                pane.replace_entries_presorted(entries, event.selected_path.as_deref());
+                                pane.replace_entries_presorted(
+                                    entries,
+                                    event.selected_path.as_deref(),
+                                );
                             } else {
                                 pane.extend_entries(entries);
                             }
@@ -10639,9 +10710,8 @@ impl App {
             }
             if let Some(target_dir) = refresh_target {
                 if let Err(error) = self.reload_panes_in_tree(&target_dir) {
-                    self.status = format!(
-                        "background paste started; destination refresh failed: {error}"
-                    );
+                    self.status =
+                        format!("background paste started; destination refresh failed: {error}");
                 }
                 self.full_redraw_requested = true;
             }
@@ -10890,14 +10960,20 @@ fn filtered_zoxide_entries(entries: &[PathBuf], query: &str) -> Vec<PathBuf> {
 }
 
 /// 依照搜尋字串過濾 task 清單，方便在任務很多時快速縮小範圍。
+///
+/// 參數：`tasks: &[TaskRecord]` 是原始任務；`query: &str` 是面板搜尋文字。
+/// 回傳：`Vec<TaskRecord>`，會比對狀態、操作、結果、種類、所有來源與目的地。
 fn filtered_task_entries(tasks: &[TaskRecord], query: &str) -> Vec<TaskRecord> {
     fuzzy_matched_indices_by_fields(tasks, query, |task| {
-        vec![
+        let mut fields = vec![
             task_state_label(task.state).to_string(),
             task.title.clone(),
             task.detail.clone(),
             task.kind.to_string(),
-        ]
+        ];
+        fields.extend(task.source_locations.iter().cloned());
+        fields.extend(task.destination_location.iter().cloned());
+        fields
     })
     .into_iter()
     .map(|index| tasks[index].clone())
@@ -13080,6 +13156,8 @@ fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
                 .unwrap_or_else(|| String::from("--:--:--")),
             progress: task_progress_label(task),
             title: task.title.clone(),
+            source_locations: task.source_locations.clone(),
+            destination_location: task.destination_location.clone(),
             detail: task.detail.clone(),
         })
         .collect()
@@ -15873,8 +15951,9 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 task 面板支援 `f` 搜尋，並可只保留符合條件的任務後再查看細節。
-    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
+    /// 驗證 task 面板支援 `f` 搜尋，且來源／目的地也能用來篩選任務。
+    /// 保護目的：檔案操作完成後，使用者常只記得 share 或目錄名稱；若搜尋只比對標題，
+    /// 新增的診斷位置雖然看得到，卻無法在長期歷史中快速找回。
     fn app_task_panel_supports_filtering() {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -15884,6 +15963,8 @@ mod tests {
             kind: String::from("search"),
             title: String::from("alpha task"),
             detail: String::from("first detail"),
+            source_locations: Vec::new(),
+            destination_location: None,
             state: TaskState::Done,
             progress_percent: None,
             completed_bytes: None,
@@ -15897,6 +15978,8 @@ mod tests {
             kind: String::from("search"),
             title: String::from("beta task"),
             detail: String::from("second detail"),
+            source_locations: vec![String::from("/source/report.txt")],
+            destination_location: Some(String::from("/share/beta-destination")),
             state: TaskState::Running,
             progress_percent: None,
             completed_bytes: None,
@@ -15908,7 +15991,7 @@ mod tests {
         app.open_task_panel();
         app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
             .expect("start task filter");
-        for ch in ['b', 'e', 't', 'a'] {
+        for ch in "destination".chars() {
             app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .expect("type task query");
         }
@@ -15920,7 +16003,7 @@ mod tests {
                 selected, search, ..
             }) => {
                 assert_eq!(*selected, 0);
-                assert_eq!(search.buffer, "beta");
+                assert_eq!(search.buffer, "destination");
                 assert!(!search.editing);
             }
             other => panic!("unexpected pending action: {other:?}"),
@@ -17145,6 +17228,17 @@ mod tests {
             app.task_log.last().map(|task| task.state),
             Some(TaskState::Done)
         ));
+        let task = app.task_log.last().expect("background paste task");
+        assert_eq!(
+            task.source_locations,
+            vec![source_file.display().to_string()],
+            "背景貼上必須永久保存實際來源，不可只留下完成訊息"
+        );
+        assert_eq!(
+            task.destination_location,
+            Some(target_dir.display().to_string()),
+            "背景貼上完成後仍必須能辨識目的目錄"
+        );
         assert_eq!(
             app.task_log.last().and_then(|task| task.completed_bytes),
             app.task_log.last().and_then(|task| task.total_bytes),
@@ -17166,6 +17260,8 @@ mod tests {
             "paste",
             String::from("copy large.zip"),
             String::from("destination: share"),
+            vec![String::from("/source/large.zip")],
+            Some(String::from("/destination/share")),
         );
         app.update_task_progress(task_id, 42, 100);
 
@@ -17198,6 +17294,8 @@ mod tests {
                 kind: String::from("paste"),
                 title: String::from("copy build"),
                 detail: String::from("destination: share"),
+                source_locations: vec![String::from("/source/build")],
+                destination_location: Some(String::from("/destination/share")),
                 state: TaskState::Running,
                 progress_percent: Some(37),
                 completed_bytes: Some(37),
@@ -17261,6 +17359,8 @@ mod tests {
             "paste",
             String::from("copy large.zip"),
             String::from("destination: target"),
+            vec![String::from("/source/large.zip")],
+            Some(String::from("/destination/target")),
         );
 
         app.update_task_progress(task_id, 60, 100);
@@ -17293,6 +17393,8 @@ mod tests {
             kind: String::from("paste"),
             title: String::from("copy project"),
             detail: String::new(),
+            source_locations: vec![String::from("/source/project")],
+            destination_location: Some(String::from("/destination")),
             state: TaskState::Running,
             progress_percent: Some(31),
             completed_bytes: Some(25_589_858_714),
@@ -19286,6 +19388,8 @@ mod tests {
             "search",
             String::from("content search: needle"),
             format!("root: {}", dir.path().display()),
+            vec![dir.path().display().to_string()],
+            None,
         );
         app.global_search = Some(GlobalSearchState {
             pane_id: 1,
@@ -19334,6 +19438,8 @@ mod tests {
             "search",
             String::from("content search: needle"),
             format!("root: {}", dir.path().display()),
+            vec![dir.path().display().to_string()],
+            None,
         );
         app.global_search = Some(GlobalSearchState {
             pane_id: 1,
@@ -19447,6 +19553,8 @@ mod tests {
             "search",
             String::from("content search: target"),
             format!("root: {}", dir.path().display()),
+            vec![dir.path().display().to_string()],
+            None,
         );
         app.active_global_search_task_id = Some(task_id);
 
@@ -20773,8 +20881,16 @@ mod tests {
         app.panes.get_mut(&1).unwrap().reload().expect("reload");
 
         // 模擬一個正在進行中的背景傳輸工作綁定到 child
-        let task_id = app.push_task(1, "paste", "copy files".to_string(), "dest".to_string());
-        app.active_file_job_busy_paths.insert(task_id, vec![child.clone()]);
+        let task_id = app.push_task(
+            1,
+            "paste",
+            "copy files".to_string(),
+            "dest".to_string(),
+            vec![child.display().to_string()],
+            Some(dir.path().display().to_string()),
+        );
+        app.active_file_job_busy_paths
+            .insert(task_id, vec![child.clone()]);
         app.update_task_progress(task_id, 45, 100);
 
         // 選中該目錄並嘗試進入
@@ -20800,9 +20916,13 @@ mod tests {
 
         app.panes.get_mut(&1).unwrap().select_path(&to_delete);
         app.start_delete_confirmation(true);
-        app.confirm_delete(1, "large_dir", true).expect("confirm delete");
+        app.confirm_delete(1, "large_dir", true)
+            .expect("confirm delete");
 
-        assert!(!app.file_job_receivers.is_empty(), "刪除工作必須進入背景佇列");
+        assert!(
+            !app.file_job_receivers.is_empty(),
+            "刪除工作必須進入背景佇列"
+        );
         for _ in 0..100 {
             app.poll_background_tasks();
             if app.file_job_receivers.is_empty() {
@@ -20813,6 +20933,10 @@ mod tests {
 
         assert!(!to_delete.exists(), "背景刪除完成後目錄必須已從磁碟移除");
         assert!(app.status.contains("deleted permanently"));
+        let task = app.task_log.last().expect("background delete task");
+        assert_eq!(task.title, "delete 1 item(s)");
+        assert_eq!(task.source_locations, vec![to_delete.display().to_string()]);
+        assert_eq!(task.destination_location, None);
     }
 
     #[test]
@@ -20825,8 +20949,16 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
         // 模擬背景傳輸工作鎖定子項目 child
-        let task_id = app.push_task(1, "paste", "copy 1 item(s)".to_string(), "dest".to_string());
-        app.active_file_job_busy_paths.insert(task_id, vec![child.clone()]);
+        let task_id = app.push_task(
+            1,
+            "paste",
+            "copy 1 item(s)".to_string(),
+            "dest".to_string(),
+            vec![child.display().to_string()],
+            Some(parent.display().to_string()),
+        );
+        app.active_file_job_busy_paths
+            .insert(task_id, vec![child.clone()]);
         app.update_task_progress(task_id, 99, 100);
 
         // 父目錄 parent 必須不受影響，不可被視為 busy
@@ -20865,7 +20997,8 @@ mod tests {
 
         app.panes.get_mut(&1).unwrap().select_path(&to_delete);
         app.start_delete_confirmation(true);
-        app.confirm_delete(1, "data_folder", true).expect("confirm delete");
+        app.confirm_delete(1, "data_folder", true)
+            .expect("confirm delete");
 
         // 輪詢等待背景刪除工作完成
         for _ in 0..100 {
@@ -20878,10 +21011,18 @@ mod tests {
 
         let task = app.task_log.last().expect("task record");
         assert_eq!(task.state, TaskState::Done);
-        assert!(task.completed_bytes.unwrap_or(0) >= 1024 * 30, "必須記錄實際刪除的 byte 數: {:?}", task.completed_bytes);
+        assert!(
+            task.completed_bytes.unwrap_or(0) >= 1024 * 30,
+            "必須記錄實際刪除的 byte 數: {:?}",
+            task.completed_bytes
+        );
         assert_eq!(task.completed_bytes, task.total_bytes);
         let progress_label = task_progress_label(task);
         assert_ne!(progress_label, "-", "進度標籤不可為未知的 `-`");
-        assert!(progress_label.contains("30K") || progress_label.contains("K") || progress_label.contains("M"));
+        assert!(
+            progress_label.contains("30K")
+                || progress_label.contains("K")
+                || progress_label.contains("M")
+        );
     }
 }

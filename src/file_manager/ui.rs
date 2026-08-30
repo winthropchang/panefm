@@ -124,6 +124,10 @@ pub(crate) struct TaskPanelLine {
     pub(crate) finished_at: String,
     pub(crate) progress: String,
     pub(crate) title: String,
+    /// 任務來源位置；多選操作可包含多筆，渲染時會限制展開數量避免面板過長。
+    pub(crate) source_locations: Vec<String>,
+    /// 任務目的位置；刪除等沒有目的地的工作使用 `None`。
+    pub(crate) destination_location: Option<String>,
     pub(crate) detail: String,
 }
 
@@ -389,7 +393,8 @@ pub(crate) fn render_pane(
                     if index < view_start || index >= view_end {
                         ListItem::new("")
                     } else {
-                        let active_job_badge = active_job_badges.get(&entry.path).map(|s| s.as_str());
+                        let active_job_badge =
+                            active_job_badges.get(&entry.path).map(|s| s.as_str());
                         ListItem::new(render_entry_line(
                             entry,
                             pane.is_marked(entry),
@@ -1591,9 +1596,9 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 
 /// 將 task 紀錄整理成可在窄 panel 中完整閱讀的多行內容。
 ///
-/// 第一行只放狀態、開始／結束時間、進度與簡短標題；完整目的地或錯誤內容固定從
-/// 下一行開始。這樣 detail 不會被前方固定欄位擠到只剩一個 `/`，超過 panel 寬度時
-/// 也會繼續換行，而不是由 terminal 直接裁掉。
+/// 第一行只放狀態、開始／結束時間與進度；操作、來源、目的地及結果各自使用有標籤的
+/// 後續行。這樣工作完成後不會因 `detail` 被結果覆寫而遺失來源與目的地，超過 panel
+/// 寬度時也會繼續換行，而不是由 terminal 直接裁掉。
 ///
 /// 參數：
 /// - `task: &TaskPanelLine`，已格式化的 task 顯示資料。
@@ -1602,15 +1607,63 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 /// 回傳：`Vec<Line<'static>>`，可直接交給單一 [`ListItem`] 顯示的多行文字。
 fn task_panel_display_lines(task: &TaskPanelLine, max_width: usize) -> Vec<Line<'static>> {
     let summary = format!(
-        "{:<11} start {}  end {}  {}  {}",
+        "{:<11} start {}  end {}  {}",
         truncate_text(&task.state, 11),
         truncate_text(&task.started_at, 8),
         truncate_text(&task.finished_at, 8),
-        task.progress,
-        task.title
+        task.progress
     );
     let mut lines = wrap_text_for_width(&summary, max_width, "");
-    lines.extend(wrap_text_for_width(&task.detail, max_width, "  "));
+    lines.extend(wrap_text_for_width(
+        &format!("operation: {}", task.title),
+        max_width,
+        "  ",
+    ));
+
+    // 多選數百或數千個檔案時，完整來源仍保存在 task-history.json；面板只展開前五筆，
+    // 讓後續 task 不會被單一工作推到畫面之外。
+    const MAX_VISIBLE_SOURCES: usize = 5;
+    for (index, source) in task
+        .source_locations
+        .iter()
+        .take(MAX_VISIBLE_SOURCES)
+        .enumerate()
+    {
+        let label = if task.source_locations.len() == 1 {
+            "source".to_string()
+        } else {
+            format!("source {}", index + 1)
+        };
+        lines.extend(wrap_text_for_width(
+            &format!("{label}: {source}"),
+            max_width,
+            "  ",
+        ));
+    }
+    if task.source_locations.len() > MAX_VISIBLE_SOURCES {
+        lines.extend(wrap_text_for_width(
+            &format!(
+                "source: ... and {} more",
+                task.source_locations.len() - MAX_VISIBLE_SOURCES
+            ),
+            max_width,
+            "  ",
+        ));
+    }
+    if let Some(destination) = &task.destination_location {
+        lines.extend(wrap_text_for_width(
+            &format!("destination: {destination}"),
+            max_width,
+            "  ",
+        ));
+    }
+    if !task.detail.trim().is_empty() {
+        lines.extend(wrap_text_for_width(
+            &format!("result: {}", task.detail),
+            max_width,
+            "  ",
+        ));
+    }
     lines.into_iter().map(Line::from).collect()
 }
 
@@ -2161,29 +2214,77 @@ mod tests {
             finished_at: String::from("--:--:--"),
             progress: String::from("24.4G / 77.2G"),
             title: String::from("copy 1 item(s)"),
-            detail: String::from(
-                "destination: /Users/otto/Documents/AB_Demo/very-long-target-directory",
-            ),
+            source_locations: vec![String::from(
+                "/Users/otto/Documents/source/large-archive.zip",
+            )],
+            destination_location: Some(String::from(
+                "/Users/otto/Documents/AB_Demo/very-long-target-directory",
+            )),
+            detail: String::from("pasted copy: 1 item"),
         };
 
         let rendered = task_panel_display_lines(&task, 32);
         let rendered_text = rendered.iter().map(ToString::to_string).collect::<Vec<_>>();
 
         assert!(rendered_text.len() >= 4);
-        let detail_start = rendered_text
+        let source_start = rendered_text
+            .iter()
+            .position(|line| line.starts_with("  source:"))
+            .expect("source must start on its own indented line");
+        let destination_start = rendered_text
             .iter()
             .position(|line| line.starts_with("  destination:"))
-            .expect("detail must start on its own indented line");
-        let reconstructed_detail = rendered_text[detail_start..]
+            .expect("destination must start on its own indented line");
+        let result_start = rendered_text
+            .iter()
+            .position(|line| line.starts_with("  result:"))
+            .expect("result must start on its own indented line");
+        let reconstructed_source = rendered_text[source_start..destination_start]
             .iter()
             .map(|line| line.trim_start())
             .collect::<String>();
-        assert!(reconstructed_detail.contains("very-long-target-directory"));
+        let reconstructed_destination = rendered_text[destination_start..result_start]
+            .iter()
+            .map(|line| line.trim_start())
+            .collect::<String>();
+        assert!(reconstructed_source.contains("large-archive.zip"));
+        assert!(reconstructed_destination.contains("very-long-target-directory"));
         assert!(
             rendered_text
                 .iter()
                 .all(|line| UnicodeWidthStr::width(line.as_str()) <= 32)
         );
+    }
+
+    #[test]
+    /// 驗證多選工作只在面板展開前五個來源，並清楚顯示尚有多少來源未展開。
+    ///
+    /// 保護目的：完整來源必須寫進歷史供診斷，但一次操作數百個檔案時不能讓單一 task
+    /// 佔滿整個 panel；此測試固定 UI 摘要與持久化資料必須彼此獨立。
+    fn task_panel_summarizes_large_source_batches_without_losing_the_count() {
+        let task = TaskPanelLine {
+            state: String::from("RUNNING"),
+            started_at: String::from("10:00:00"),
+            finished_at: String::from("--:--:--"),
+            progress: String::from("1M / 8M"),
+            title: String::from("move 8 item(s)"),
+            source_locations: (1..=8)
+                .map(|index| format!("/source/file-{index}.txt"))
+                .collect(),
+            destination_location: Some(String::from("/destination")),
+            detail: String::from("running"),
+        };
+
+        let rendered = task_panel_display_lines(&task, 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("source 5: /source/file-5.txt"));
+        assert!(rendered.contains("source: ... and 3 more"));
+        assert!(!rendered.contains("file-6.txt"));
+        assert!(rendered.contains("destination: /destination"));
     }
 
     #[test]

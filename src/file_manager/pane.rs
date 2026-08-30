@@ -3928,8 +3928,6 @@ pub(crate) enum DirectoryLoadProgress {
     Complete(Vec<FileEntry>),
 }
 
-
-
 /// 快速讀取目錄：在背景多執行緒讀取 metadata 並完成自然排序，直接送出 100% 正確排序的完整清單，徹底避免畫面列表跳動。
 pub(crate) fn stream_dir_entries_with_cancellation<F>(
     path: &Path,
@@ -4232,8 +4230,7 @@ mod tests {
         copy_file_native_with_progress, copy_file_native_with_progress_using,
         copy_file_with_native_fallback, copy_path_direct_with_cleanup,
         copy_path_transactional_with, natural_cmp, read_dir_entries,
-        read_dir_entries_with_cancellation,
-        stream_dir_entries_with_cancellation,
+        read_dir_entries_with_cancellation, stream_dir_entries_with_cancellation,
     };
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
