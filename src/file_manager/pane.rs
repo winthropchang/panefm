@@ -4001,35 +4001,12 @@ where
         ));
     }
 
-    let needs_metadata = matches!(
-        sort_mode,
-        SortMode::Size { .. } | SortMode::Modified { .. } | SortMode::Created { .. }
-    );
-
-    let mut final_entries = if needs_metadata {
-        read_metadata_for_dir_entries(items, cancelled)?
-    } else {
-        let mut entries = Vec::with_capacity(items.len());
-        for item in items {
-            let file_type = item.file_type().ok();
-            let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
-            let name = item.file_name().to_string_lossy().into_owned();
-            let entry_path = item.path();
-            entries.push(FileEntry {
-                name,
-                path: entry_path,
-                is_dir,
-                size: 0,
-                directory_size: None,
-                directory_size_complete: false,
-                modified: SystemTime::UNIX_EPOCH,
-                created: SystemTime::UNIX_EPOCH,
-                readonly: false,
-                unix_mode: None,
-            });
-        }
-        entries
-    };
+    // 第一批暫存清單只負責讓大型目錄立刻可見；Complete 則一定要在背景補齊
+    // metadata。不能因為目前採 natural 排序就省略 metadata，因為使用者可能在進入
+    // 目錄前已啟用 `ms`，或進入後才切換 size/permissions/mtime/btime。舊實作會讓
+    // 這些背景載入的項目永久保留 size = 0，而直接建立的新 panel 卻有正確資料，造成
+    // 同一路徑的兩個 panel 顯示不一致。這裡仍在 worker 執行緒平行讀取，不會阻塞 TUI。
+    let mut final_entries = read_metadata_for_dir_entries(items, cancelled)?;
 
     if cancelled.load(AtomicOrdering::Relaxed) {
         return Err(io::Error::new(
@@ -5513,8 +5490,11 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 stream_dir_entries_with_cancellation 會直接回傳正確排序的完整清單。
-    /// 保護目的：確保大型目錄進入時，畫面呈現即為最終自然排序，完全不會有列表跳動或錯位。
+    /// 驗證 stream_dir_entries_with_cancellation 會回傳正確排序且 metadata 完整的清單。
+    ///
+    /// 保護目的：背景導航採 natural 排序時仍須補齊檔案大小。舊實作為了縮短載入時間，
+    /// 在 natural 排序的 Complete 事件也把 size 固定為 0，導致已啟用 `ms` 的舊 panel
+    /// 永久顯示 0B；同一路徑另開的新 panel 卻正常。此測試同時保護排序與非零大小。
     fn stream_dir_entries_with_cancellation_loads_and_completes_sorted() {
         let dir = tempdir().expect("tempdir");
         for i in 0..300 {
@@ -5536,6 +5516,10 @@ mod tests {
                         assert_eq!(entries.len(), 300);
                         assert_eq!(entries[0].name, "file_000.txt");
                         assert_eq!(entries[299].name, "file_299.txt");
+                        assert!(
+                            entries.iter().all(|entry| entry.size == 6),
+                            "natural 排序的背景完整結果也必須包含真實檔案大小"
+                        );
                         got_complete = true;
                     }
                 }
