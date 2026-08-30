@@ -296,6 +296,10 @@ pub(crate) fn render_pane(
     let content_width = area.width.saturating_sub(4) as usize;
     let list_viewport_height = area.height.saturating_sub(2).max(1) as usize;
     pane.set_list_viewport_height(list_viewport_height);
+    // 一般檔案列表只建立目前 viewport 內的 widget。大型目錄可能有數萬筆項目，
+    // 若每一幀仍替畫面外項目配置空白 ListItem，單次 j/k 也會產生 O(n) 配置並卡住。
+    // panel overlay 的資料量通常很小，維持原本完整列表即可。
+    let mut normal_list_window_start = None;
     let items: Vec<ListItem<'static>> = if let Some(panel_state) = panel_state {
         match panel_state {
             PaneListState::Search(search_state) => {
@@ -377,45 +381,46 @@ pub(crate) fn render_pane(
                 .collect(),
         }
     } else {
-        let visible_entries = pane.visible_entries();
+        let visible_len = pane.visible_indices.len();
         let detail_kind = pane.active_detail_kind();
         let find_match_position = pane.list_find_match_position();
-        if visible_entries.is_empty() {
+        if visible_len == 0 {
             vec![ListItem::new(Line::from("empty directory"))]
         } else {
-            let offset = pane.list_state.offset();
-            let view_start = offset.saturating_sub(10);
-            let view_end = (offset + list_viewport_height + 10).min(visible_entries.len());
-            visible_entries
-                .into_iter()
+            let (view_start, view_end) = visible_list_window_range(
+                visible_len,
+                pane.selected,
+                list_viewport_height,
+                pane.list_state.offset(),
+            );
+            normal_list_window_start = Some(view_start);
+            pane.visible_indices[view_start..view_end]
+                .iter()
+                .filter_map(|entry_index| pane.entries.get(*entry_index))
                 .enumerate()
                 .map(|(index, entry)| {
-                    if index < view_start || index >= view_end {
-                        ListItem::new("")
-                    } else {
-                        let active_job_badge =
-                            active_job_badges.get(&entry.path).map(|s| s.as_str());
-                        ListItem::new(render_entry_line(
-                            entry,
-                            pane.is_marked(entry),
-                            mark_column_active,
-                            visual_range
-                                .map(|(start, end)| {
-                                    let range_start = start.min(end);
-                                    let range_end = start.max(end);
-                                    index >= range_start && index <= range_end
-                                })
-                                .unwrap_or(false),
-                            detail_kind,
-                            content_width,
-                            theme,
-                            config.ui.icons.enabled,
-                            config.ui.icons.style,
-                            pane.list_find_query(),
-                            find_match_position.filter(|_| index == pane.selected),
-                            active_job_badge,
-                        ))
-                    }
+                    let visible_index = view_start + index;
+                    let active_job_badge = active_job_badges.get(&entry.path).map(|s| s.as_str());
+                    ListItem::new(render_entry_line(
+                        entry,
+                        pane.is_marked(entry),
+                        mark_column_active,
+                        visual_range
+                            .map(|(start, end)| {
+                                let range_start = start.min(end);
+                                let range_end = start.max(end);
+                                visible_index >= range_start && visible_index <= range_end
+                            })
+                            .unwrap_or(false),
+                        detail_kind,
+                        content_width,
+                        theme,
+                        config.ui.icons.enabled,
+                        config.ui.icons.style,
+                        pane.list_find_query(),
+                        find_match_position.filter(|_| visible_index == pane.selected),
+                        active_job_badge,
+                    ))
                 })
                 .collect()
         }
@@ -457,7 +462,18 @@ pub(crate) fn render_pane(
         }
         frame.render_stateful_widget(list, area, &mut list_state);
     } else {
-        frame.render_stateful_widget(list, area, &mut pane.list_state);
+        if let Some(window_start) = normal_list_window_start {
+            // 傳給 ratatui 的 items 已是局部 viewport，因此 selected 也必須轉成局部索引。
+            // PaneState 仍保存完整列表索引與 window 起點，鍵盤、find、mark 等邏輯不會
+            // 因虛擬化而改變語意。
+            let mut viewport_state = ListState::default();
+            viewport_state.select(Some(pane.selected.saturating_sub(window_start)));
+            frame.render_stateful_widget(list, area, &mut viewport_state);
+            pane.list_state.select(Some(pane.selected));
+            *pane.list_state.offset_mut() = window_start;
+        } else {
+            frame.render_stateful_widget(list, area, &mut pane.list_state);
+        }
     }
 
     let mut editor_cursor = None;
@@ -552,6 +568,40 @@ fn search_list_selected_index(search_state: &SearchListState<'_>) -> Option<usiz
             .selected
             .min(search_state.results.len().saturating_sub(1))
     })
+}
+
+/// 計算大型一般列表本幀真正需要建立 widget 的 viewport 範圍。
+///
+/// 參數：
+/// - `total: usize`：filter 後列表的完整項目數。
+/// - `selected: usize`：完整列表中的游標索引。
+/// - `viewport_height: usize`：panel 目前可顯示的資料列數。
+/// - `previous_start: usize`：上一幀 viewport 的起點，用來避免游標移動時畫面無故跳動。
+///
+/// 回傳：`(usize, usize)`，採 Rust range 的 `[start, end)` 格式。範圍一定包含合法的
+/// `selected`，且長度不超過 viewport。渲染端只走訪這段資料，因此大型目錄按 j/k
+/// 不再隨完整項目數增加配置成本。
+pub(crate) fn visible_list_window_range(
+    total: usize,
+    selected: usize,
+    viewport_height: usize,
+    previous_start: usize,
+) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+
+    let height = viewport_height.max(1).min(total);
+    let selected = selected.min(total - 1);
+    let max_start = total.saturating_sub(height);
+    let mut start = previous_start.min(max_start);
+    if selected < start {
+        start = selected;
+    } else if selected >= start + height {
+        start = selected + 1 - height;
+    }
+    let end = (start + height).min(total);
+    (start, end)
 }
 
 /// 根據 regex 批次改名預覽狀態套用主題語意色。
@@ -807,7 +857,9 @@ fn render_inline_editor(
     let selected_row = if pane.entries.is_empty() {
         inner.y
     } else {
-        inner.y.saturating_add(pane.selected as u16)
+        inner
+            .y
+            .saturating_add(pane.selected.saturating_sub(pane.list_state.offset()) as u16)
     };
     let box_y = selected_row.saturating_add(1);
 
@@ -856,7 +908,9 @@ fn render_inline_picker(
     let selected_row = if pane.entries.is_empty() {
         inner.y
     } else {
-        inner.y.saturating_add(pane.selected as u16)
+        inner
+            .y
+            .saturating_add(pane.selected.saturating_sub(pane.list_state.offset()) as u16)
     };
     let box_y = selected_row.saturating_add(1);
     let height = state.options.len().min(6) as u16 + 2;
@@ -2175,7 +2229,7 @@ mod tests {
         format_pane_title, format_permissions_detail, format_size_short, format_sort_detail,
         regex_rename_status_style, render_entry_line, search_empty_message,
         search_list_selected_index, task_panel_display_lines, top_right_input_rect,
-        truncate_text_to_display_width,
+        truncate_text_to_display_width, visible_list_window_range,
     };
     use ratatui::layout::Rect;
     use std::path::Path;
@@ -2287,6 +2341,29 @@ mod tests {
 
         assert_eq!(truncated, "中文目…");
         assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 7);
+    }
+
+    #[test]
+    /// 驗證大型目錄只會渲染 viewport 內的少量項目，而不是替完整列表建立 widget。
+    ///
+    /// 保護目的：`target/debug/deps` 類型的目錄可能包含上萬個檔案。若一次 j/k 仍建立
+    /// 10,000 個 ListItem，游標操作會明顯停頓；此測試固定要求 10,000 筆資料只選出
+    /// 20 列，並確保游標離開舊畫面時 viewport 會跟隨但仍包含目前項目。
+    fn large_list_window_only_contains_visible_rows() {
+        let (start, end) = visible_list_window_range(10_000, 5_432, 20, 0);
+
+        assert_eq!(end - start, 20);
+        assert!(start <= 5_432 && 5_432 < end);
+        assert_eq!((start, end), (5_413, 5_433));
+    }
+
+    #[test]
+    /// 驗證游標仍在原 viewport 內時保持畫面起點，避免每按一次 j/k 整頁就跟著跳動。
+    ///
+    /// 保護目的：虛擬化不能只追求速度，也必須保留一般檔案管理器穩定的捲動體驗。
+    fn list_window_keeps_previous_start_while_selection_is_visible() {
+        assert_eq!(visible_list_window_range(10_000, 510, 30, 500), (500, 530));
+        assert_eq!(visible_list_window_range(10_000, 499, 30, 500), (499, 529));
     }
 
     #[test]

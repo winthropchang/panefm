@@ -78,7 +78,7 @@ use super::{
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
         render_theme_picker, render_trash_confirm_dialog, render_window_picker,
-        render_zoxide_picker,
+        render_zoxide_picker, visible_list_window_range,
     },
     zoxide::{ZoxideTracker, query_zoxide_directories},
 };
@@ -6073,6 +6073,9 @@ impl App {
         &self,
         path: &Path,
     ) -> Option<(usize, String, Option<u8>)> {
+        if self.active_file_job_busy_paths.is_empty() {
+            return None;
+        }
         let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         for (task_id, busy_paths) in &self.active_file_job_busy_paths {
             if busy_paths.iter().any(|busy| {
@@ -6100,15 +6103,18 @@ impl App {
 
     /// 回傳指定路徑目前正處於背景工作中的狀態標籤（例如 `[copying 99%]` 或 `[deleting...]`），若無進行中工作則回傳 `None`。
     pub(crate) fn active_job_badge_for_path(&self, path: &Path) -> Option<String> {
-        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // 一般瀏覽狀態沒有背景工作時是最常見路徑，必須在 canonicalize 前返回。
+        // 否則大型目錄即使完全沒有 task，畫一幀仍會對每個可見路徑做同步磁碟查詢。
+        if self.active_file_job_busy_paths.is_empty() {
+            return None;
+        }
         for (task_id, busy_paths) in &self.active_file_job_busy_paths {
-            if busy_paths.iter().any(|busy| {
-                let canon_busy = busy.canonicalize().unwrap_or_else(|_| busy.to_path_buf());
-                canon_path == canon_busy
-                    || canon_path.starts_with(&canon_busy)
-                    || path == busy
-                    || path.starts_with(busy)
-            }) {
+            // UI badge 的 busy path 與 pane entry 都由 PaneFM 內部產生，已使用同一套完整
+            // 路徑；render 熱路徑只做字面前綴比較，不能再觸發同步檔案系統 I/O。
+            if busy_paths
+                .iter()
+                .any(|busy| path == busy || path.starts_with(busy))
+            {
                 let task = self.task_log.iter().find(|t| t.id == *task_id)?;
                 let action = match task.kind.as_str() {
                     "paste" => {
@@ -9646,7 +9652,11 @@ impl App {
 
         let mut pane_rects = BTreeMap::new();
         self.layout.render_rects(outer[0], &mut pane_rects);
-        let tool_statuses = external_tool_statuses();
+        // PATH 掃描只在 dependency 面板真正顯示時執行。一般檔案列表每幀都重查四個
+        // 外部命令不但沒有畫面用途，也會讓鍵盤回應時間受磁碟與網路 PATH 影響。
+        let tool_statuses = matches!(self.pending_action, Some(PendingAction::ToolPanel { .. }))
+            .then(external_tool_statuses)
+            .unwrap_or_default();
         let mut cursor_position = None;
         for (&pane_id, &rect) in &pane_rects {
             let trash_overlay_state =
@@ -9732,19 +9742,25 @@ impl App {
                 .map(|search| {
                     filtered_global_search_entries(&search.results, &search.filter.buffer)
                 });
-            let active_job_badges = self
-                .panes
-                .get(&pane_id)
-                .map(|pane| {
-                    pane.entries
-                        .iter()
-                        .filter_map(|entry| {
-                            self.active_job_badge_for_path(&entry.path)
-                                .map(|badge| (entry.path.clone(), badge))
-                        })
-                        .collect::<std::collections::HashMap<_, _>>()
-                })
-                .unwrap_or_default();
+            // 工作標籤只可能出現在目前 viewport。舊實作會對大型目錄的全部項目呼叫
+            // canonicalize；`deps` 有六萬筆時，單次 render 就產生六萬次同步 I/O，連
+            // j/k、mn、T 都會被阻塞。這裡只檢查畫面實際看得到的數十筆路徑。
+            let active_job_badges = if self.active_file_job_busy_paths.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                self.panes
+                    .get(&pane_id)
+                    .map(|pane| {
+                        visible_job_badge_paths(pane, rect.height.saturating_sub(2) as usize)
+                            .into_iter()
+                            .filter_map(|path| {
+                                self.active_job_badge_for_path(&path)
+                                    .map(|badge| (path, badge))
+                            })
+                            .collect::<std::collections::HashMap<_, _>>()
+                    })
+                    .unwrap_or_default()
+            };
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 let rename_buffer = match &self.pending_action {
                     Some(PendingAction::Rename {
@@ -10905,6 +10921,28 @@ fn apply_config_to_pane(config: &AppConfig, pane: &mut PaneState) {
         config.pane.default_sort,
         config.pane.default_sort_reverse,
     ));
+}
+
+/// 收集目前 viewport 中需要查詢背景工作標籤的檔案路徑。
+///
+/// 參數：
+/// - `pane: &PaneState`：提供 filter 後索引、游標與上一幀捲動位置的 panel。
+/// - `viewport_height: usize`：列表實際可顯示的資料列數。
+///
+/// 回傳：`Vec<PathBuf>`，最多只包含一個 viewport 的路徑。刻意不回傳完整目錄清單，
+/// 避免 task badge 查詢在大型目錄每幀對數萬個檔案執行 `canonicalize()`。
+fn visible_job_badge_paths(pane: &PaneState, viewport_height: usize) -> Vec<PathBuf> {
+    let (start, end) = visible_list_window_range(
+        pane.visible_indices.len(),
+        pane.selected,
+        viewport_height.max(1),
+        pane.list_state.offset(),
+    );
+    pane.visible_indices[start..end]
+        .iter()
+        .filter_map(|entry_index| pane.entries.get(*entry_index))
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 /// 將設定檔中的排序偏好轉成 pane 實際使用的排序模式。
@@ -13599,6 +13637,7 @@ mod tests {
         plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
         rename_next_word_start, rename_previous_word_start, rename_word_end, task_progress_label,
         trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action, typed_char_from_key,
+        visible_job_badge_paths,
     };
     use crate::{
         config::{
@@ -20951,6 +20990,26 @@ mod tests {
             app.panes[&1].selected, 1,
             "全量完成後仍必須保留使用者剛剛移動的游標位置"
         );
+    }
+
+    #[test]
+    /// 驗證大型目錄的 task badge 查詢只接觸 viewport，不會走訪完整檔案列表。
+    ///
+    /// 保護目的：舊版 render 會對每個項目執行 `canonicalize()`；實際 `deps` 超過六萬筆
+    /// 時，每次 j/k 都被同步檔案 I/O 阻塞約半秒。此測試建立 200 筆並固定 viewport
+    /// 為 18 列，確保未來重構不能再次把完整列表送進 badge 查詢。
+    fn task_badge_paths_are_limited_to_visible_viewport() {
+        let dir = tempdir().expect("tempdir");
+        for index in 0..200 {
+            fs::write(dir.path().join(format!("file_{index:03}.txt")), b"x").expect("write");
+        }
+        let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+        pane.selected = 150;
+
+        let paths = visible_job_badge_paths(&pane, 18);
+
+        assert_eq!(paths.len(), 18);
+        assert!(paths.iter().all(|path| path.starts_with(dir.path())));
     }
 
     #[test]
