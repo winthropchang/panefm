@@ -8,12 +8,17 @@ use std::{
     cmp::Ordering,
     collections::BTreeSet,
     collections::hash_map::DefaultHasher,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
-    time::SystemTime,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, SystemTime},
 };
 
 use ratatui::{
@@ -31,6 +36,12 @@ use super::{
 
 /// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
 static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// 與 mature-reference 預設值一致的檔案複製 worker 數量。
+///
+/// 目錄走訪只負責建立資料夾與排入單檔工作，實際 copy 由固定數量 worker 並行處理。
+/// 固定上限可提升大量小檔案的速度，同時避免對 SMB 或較慢磁碟產生無限制 I/O 壓力。
+const COPY_FILE_WORKERS: usize = 3;
 
 /// 描述一次貼上實際完成後，可供上層建立 Undo 紀錄的檔案系統結果。
 ///
@@ -1252,6 +1263,112 @@ impl PaneState {
         target_path_for_paste(source_path, &self.cwd, file_name, overwrite)
     }
 
+    /// 在沒有借用 panel 狀態時，計算來源貼到指定目錄後的預定完整路徑。
+    ///
+    /// 參數：`source_path: &Path` 為來源；`target_dir: &Path` 為目的目錄；
+    /// `overwrite: bool` 表示是否沿用原檔名覆蓋。
+    /// 回傳：`io::Result<PathBuf>`，可供背景 paste 工作建立錯誤訊息與實際傳輸。
+    pub(crate) fn planned_paste_target_in_dir(
+        source_path: &Path,
+        target_dir: &Path,
+        overwrite: bool,
+    ) -> io::Result<PathBuf> {
+        let file_name = source_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
+        })?;
+        target_path_for_paste(source_path, target_dir, file_name, overwrite)
+    }
+
+    /// 在背景工作中複製路徑，並於每次寫入資料後回報新增完成的 byte 數。
+    ///
+    /// 參數：`source_path: &Path` 為來源；`target_dir: &Path` 為目的目錄；
+    /// `overwrite: bool` 表示是否覆蓋；`progress: &mut F` 接收本次新增完成量。
+    /// 回傳：`io::Result<PasteOutcome>`；不重新載入 panel，適合 worker thread 使用。
+    pub(crate) fn copy_path_to_dir_with_history_progress<F>(
+        source_path: &Path,
+        target_dir: &Path,
+        overwrite: bool,
+        progress: &mut F,
+    ) -> io::Result<PasteOutcome>
+    where
+        F: FnMut(u64),
+    {
+        copy_path_into_dir_with_progress(source_path, target_dir, overwrite, true, progress)
+    }
+
+    /// 在背景工作中移動路徑；跨磁碟或 SMB 無法 rename 時改採 copy 後刪除來源。
+    ///
+    /// 參數：`source_path: &Path` 為來源；`target_dir: &Path` 為目的目錄；
+    /// `overwrite: bool` 表示是否覆蓋；`progress: &mut F` 接收新增完成的 byte 數。
+    /// 回傳：`io::Result<PasteOutcome>`；同磁碟 rename 會立即完成，跨裝置則可持續回報。
+    pub(crate) fn move_path_to_dir_with_history_progress<F>(
+        source_path: &Path,
+        target_dir: &Path,
+        overwrite: bool,
+        progress: &mut F,
+    ) -> io::Result<PasteOutcome>
+    where
+        F: FnMut(u64),
+    {
+        Self::move_path_to_dir_with_history_progress_using_rename(
+            source_path,
+            target_dir,
+            overwrite,
+            progress,
+            |source, target| fs::rename(source, target),
+        )
+    }
+
+    /// 以可替換的原生 rename 執行背景 move，讓 fallback 規則可被單元測試完整覆蓋。
+    ///
+    /// 參數：`source_path`、`target_dir`、`overwrite` 與 `progress` 和公開入口相同；
+    /// `rename_source` 型別為 `FnOnce(&Path, &Path) -> io::Result<()>`，只負責把來源移到
+    /// 最終目標。回傳：`io::Result<PasteOutcome>`；rename 失敗時會依 mature-reference 流程改用
+    /// 原生 copy，驗證成功後才刪除來源。
+    fn move_path_to_dir_with_history_progress_using_rename<F, R>(
+        source_path: &Path,
+        target_dir: &Path,
+        overwrite: bool,
+        progress: &mut F,
+        rename_source: R,
+    ) -> io::Result<PasteOutcome>
+    where
+        F: FnMut(u64),
+        R: FnOnce(&Path, &Path) -> io::Result<()>,
+    {
+        // 一般檔案可用單次 metadata 提供完成量；目錄不可在 rename 前遞迴掃描，否則
+        // 原本應瞬間完成的同磁碟 move 會因數萬個子項目而先卡住數秒。
+        let source_file_size = fs::metadata(source_path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len());
+        match move_path_into_dir_with_source_rename(
+            source_path,
+            target_dir,
+            overwrite,
+            true,
+            rename_source,
+        ) {
+            Ok(outcome) => {
+                if let Some(source_file_size) = source_file_size {
+                    progress(source_file_size);
+                }
+                Ok(outcome)
+            }
+            Err(_rename_error) => {
+                let outcome = copy_path_into_dir_with_progress(
+                    source_path,
+                    target_dir,
+                    overwrite,
+                    true,
+                    progress,
+                )?;
+                remove_existing_target(source_path)?;
+                Ok(outcome)
+            }
+        }
+    }
+
     /// 移動項目並保留建立 Undo 所需的完整結果。
     ///
     /// 參數：`source_path: &Path`，要移動的來源檔案或資料夾；`overwrite: bool`，是否覆蓋。
@@ -1335,7 +1452,7 @@ impl PaneState {
     /// - `path: &Path`，希望聚焦的新項目路徑。
     ///
     /// 回傳：`()`
-    fn select_path(&mut self, path: &Path) {
+    pub(crate) fn select_path(&mut self, path: &Path) {
         if let Some(index) = self.visible_indices.iter().position(|visible_index| {
             self.entries
                 .get(*visible_index)
@@ -2250,6 +2367,77 @@ fn copy_path_into_dir(
     })
 }
 
+/// 將單一路徑複製到目標資料夾，並持續回報實際讀寫完成量。
+///
+/// 參數與 [`copy_path_into_dir`] 相同；`progress` 的參數是本次新增完成的 byte 數。
+/// 回傳：`io::Result<PasteOutcome>`；失敗時沿用 partial target 清理與 Undo 備份規則。
+fn copy_path_into_dir_with_progress<F>(
+    source_path: &Path,
+    target_dir: &Path,
+    overwrite: bool,
+    retain_backup: bool,
+    progress: &mut F,
+) -> io::Result<PasteOutcome>
+where
+    F: FnMut(u64),
+{
+    let file_name = source_path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
+    })?;
+    let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
+    let backup_path = if overwrite {
+        let staged_path = unique_transfer_path(&target_path, "part");
+        let copy_result = copy_path_with_progress(source_path, &staged_path, progress);
+        if let Err(error) = copy_result {
+            let _ = remove_transfer_path(&staged_path);
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "copy {} to {} failed: {error}",
+                    source_path.display(),
+                    target_path.display()
+                ),
+            ));
+        }
+        commit_staged_copy(&staged_path, &target_path, true, retain_backup)?
+    } else {
+        copy_path_direct_with_cleanup(source_path, &target_path, |source, target| {
+            copy_path_with_progress(source, target, progress)
+        })?;
+        None
+    };
+
+    let display_name = if source_path.is_dir() {
+        format!("{}/", target_path_file_name(&target_path))
+    } else {
+        target_path_file_name(&target_path)
+    };
+    Ok(PasteOutcome {
+        display_name,
+        target_path,
+        backup_path,
+    })
+}
+
+/// 依來源型別選擇可回報進度的單檔或遞迴資料夾複製。
+///
+/// 參數：`source_path`、`target_path` 為來源與目標；`progress` 接收新增完成量。
+/// 回傳：`io::Result<()>`；任一子項目失敗會交由外層清理整批目標。
+fn copy_path_with_progress<F>(
+    source_path: &Path,
+    target_path: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
+    if source_path.is_dir() {
+        copy_dir_recursive_with_progress(source_path, target_path, progress)
+    } else {
+        copy_file_native_with_progress(source_path, target_path, progress)
+    }
+}
+
 /// 直接複製到正式目標，失敗時清除本次建立的部分內容。
 ///
 /// 一般貼上採用這條路徑，與 mature-reference 在 macOS/Windows 的本機檔案引擎一致，
@@ -2310,6 +2498,33 @@ fn move_path_into_dir(
     overwrite: bool,
     retain_backup: bool,
 ) -> io::Result<PasteOutcome> {
+    move_path_into_dir_with_source_rename(
+        source_path,
+        target_dir,
+        overwrite,
+        retain_backup,
+        |source, target| fs::rename(source, target),
+    )
+}
+
+/// 使用可替換的來源 rename 實作 move 的原生快速路徑。
+///
+/// 覆蓋既有目標時，舊內容仍由本函數先移到 Undo backup；`rename_source` 只處理來源
+/// 到正式目標的那一步。這種切分讓測試能穩定模擬 Windows／SMB 回傳 unsupported，
+/// 不需要依賴測試機器真的掛載另一個檔案系統。
+///
+/// 參數：前四項與 [`move_path_into_dir`] 相同；`rename_source` 是來源 rename 函數。
+/// 回傳：`io::Result<PasteOutcome>`；rename 失敗時會先恢復覆蓋前目標，再回傳原始錯誤。
+fn move_path_into_dir_with_source_rename<R>(
+    source_path: &Path,
+    target_dir: &Path,
+    overwrite: bool,
+    retain_backup: bool,
+    rename_source: R,
+) -> io::Result<PasteOutcome>
+where
+    R: FnOnce(&Path, &Path) -> io::Result<()>,
+{
     let file_name = source_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
@@ -2320,7 +2535,7 @@ fn move_path_into_dir(
     if let Some(backup_path) = &backup_path {
         fs::rename(&target_path, backup_path)?;
     }
-    if let Err(error) = fs::rename(source_path, &target_path) {
+    if let Err(error) = rename_source(source_path, &target_path) {
         if let Some(backup_path) = &backup_path {
             let _ = fs::rename(backup_path, &target_path);
         }
@@ -2475,25 +2690,113 @@ where
     Ok(())
 }
 
-/// 複製單一檔案，強制送出緩衝資料，並在關閉後重新確認目標大小。
+/// 使用平台原生 copy 複製單一檔案，並在完成後確認來源、回報值與目標大小一致。
 ///
-/// `fs::copy` 會使用 Rust 標準函式庫針對目前平台提供的檔案複製實作，比自行用
-/// `io::copy` 串流更能遵守 Windows UNC/SMB 與 macOS 掛載磁碟的原生語意。複製 API
-/// 回傳後仍會重新開啟目標並執行 `sync_all`，最後只有來源大小、API 回報寫入量與
-/// 目標大小完全一致才算成功。
+/// 這條路徑刻意與 mature-reference 在 macOS／Windows 的 local engine 保持一致：不依 UNC、
+/// `/Volumes` 或一般本機路徑切換成另一套手寫串流，而是統一交給 `std::fs::copy`。
+/// 這可讓 Rust 標準函式庫與作業系統處理 SMB redirector、clone 與平台細節。
 ///
 /// 參數：
 /// - `source_path: &Path`，來源檔案。
 /// - `staged_path: &Path`，要寫入的目標檔；可能是正式名稱或交易式暫存名稱。
 ///
-/// 回傳：`io::Result<()>`；成功代表資料已同步、寫入 handle 已關閉，且兩端大小一致。
+/// 回傳：`io::Result<()>`；成功代表原生 copy 已返回，且兩端大小一致。
 fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()> {
     copy_file_and_verify_with(source_path, staged_path, |source, target| {
         fs::copy(source, target)
     })
 }
 
-/// 執行可注入平台複製器的單檔驗證核心，供 SMB 不完整寫入情境做回歸測試。
+/// 使用平台原生 copy 複製檔案，並在 copy 執行期間輪詢目的檔大小更新背景進度。
+///
+/// mature-reference 的 progressive copy 會讓原生 copy 在 blocking worker 中執行，另一個非同步
+/// 工作定期讀取目的檔 metadata。PaneFM 使用相同分工；輪詢週期縮短為 200ms，讓大型
+/// 檔案在 task 面板中有較即時的百分比，但輪詢本身不接管或改寫資料傳輸。
+///
+/// 參數：`source_path`、`target_path` 為來源與目標；`progress` 在單檔完整完成後收到
+/// 寫入增量。回傳：`io::Result<()>`；原生 copy 或大小驗證失敗時回傳原始 I/O 錯誤。
+fn copy_file_native_with_progress<F>(
+    source_path: &Path,
+    target_path: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64) + ?Sized,
+{
+    copy_file_native_with_progress_using(source_path, target_path, progress, |source, target| {
+        fs::copy(source, target)
+    })
+}
+
+/// 執行可注入原生 copy 的 progressive copy 核心，供 metadata 輪詢行為做回歸測試。
+///
+/// 參數：`source_path`、`target_path` 與 `progress` 和公開核心相同；`native_copy` 型別為
+/// `FnOnce(&Path, &Path) -> io::Result<u64> + Send`，會在 scoped worker 中執行。
+/// 回傳：`io::Result<()>`；copy 進行中依目標檔大小回報增量，結束後驗證完整大小。
+fn copy_file_native_with_progress_using<F, C>(
+    source_path: &Path,
+    target_path: &Path,
+    progress: &mut F,
+    native_copy: C,
+) -> io::Result<()>
+where
+    F: FnMut(u64) + ?Sized,
+    C: FnOnce(&Path, &Path) -> io::Result<u64> + Send,
+{
+    if target_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("copy target already exists: {}", target_path.display()),
+        ));
+    }
+
+    let expected_size = fs::metadata(source_path)?.len();
+    let mut reported_size = 0u64;
+    let copied_size = thread::scope(|scope| -> io::Result<u64> {
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        scope.spawn(move || {
+            // 不能只靠固定 sleep 輪詢 `is_finished()`。小檔案通常在幾毫秒內完成，
+            // 若每個檔案仍睡滿 200ms，大型 build 目錄會被人為拖慢到數十分鐘。
+            // completion channel 會在 copy 返回時立即喚醒目前執行緒；只有大檔仍在
+            // 傳輸時，timeout 才負責定期讀取 metadata 更新百分比。
+            let _ = done_sender.send(native_copy(source_path, target_path));
+        });
+
+        loop {
+            match done_receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let stored_size = fs::metadata(target_path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0)
+                        .min(expected_size);
+                    if stored_size > reported_size {
+                        progress(stored_size - reported_size);
+                        reported_size = stored_size;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(io::Error::other("native copy worker panicked"));
+                }
+            }
+        }
+    })?;
+    let stored_size = fs::metadata(target_path)?.len();
+    if copied_size != expected_size || stored_size != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "incomplete native copy: expected {expected_size} bytes, copied {copied_size}, stored {stored_size}"
+            ),
+        ));
+    }
+    if copied_size > reported_size {
+        progress(copied_size - reported_size);
+    }
+    Ok(())
+}
+
+/// 執行可注入平台複製器的單檔驗證核心，供不完整寫入情境做回歸測試。
 ///
 /// 參數：
 /// - `source_path: &Path`，來源檔案。
@@ -2501,7 +2804,7 @@ fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()
 /// - `platform_copy: F`，平台複製函數，型別為
 ///   `FnOnce(&Path, &Path) -> io::Result<u64>`，回傳宣稱已複製的 byte 數。
 ///
-/// 回傳：`io::Result<()>`；只有平台複製、同步及關閉後大小驗證全部成功才回傳 `Ok`。
+/// 回傳：`io::Result<()>`；只有平台 copy 返回且來源、回報值、目標大小一致才成功。
 fn copy_file_and_verify_with<F>(
     source_path: &Path,
     staged_path: &Path,
@@ -2519,12 +2822,6 @@ where
 
     let expected_size = File::open(source_path)?.metadata()?.len();
     let copied_size = platform_copy(source_path, staged_path)?;
-
-    // 平台 copy 已關閉它自己的寫入 handle；重新開啟後同步，避免只把資料留在
-    // Windows redirector 或 SMB client cache，卻先讓 UI 誤以為傳輸完成。
-    let target_file = OpenOptions::new().write(true).open(staged_path)?;
-    target_file.sync_all()?;
-    drop(target_file);
 
     let source_size_after_copy = File::open(source_path)?.metadata()?.len();
     let stored_size = File::open(staged_path)?.metadata()?.len();
@@ -2667,6 +2964,238 @@ fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// 遞迴複製資料夾並以檔案實際寫入量更新背景 task。
+///
+/// 參數：`source_dir`、`target_dir` 為來源與目標；`progress` 接收新增完成的 byte 數。
+/// 回傳：`io::Result<()>`；任一檔案不完整就停止並由外層清除 partial 目錄。
+fn copy_dir_recursive_with_progress<F>(
+    source_dir: &Path,
+    target_dir: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
+    copy_dir_parallel_with_progress(
+        source_dir,
+        target_dir,
+        progress,
+        |source_path, target_path, file_progress| {
+            copy_file_native_with_progress(source_path, target_path, file_progress)
+        },
+    )
+}
+
+/// 表示目錄走訪器交給 file worker 的單一複製工作。
+#[derive(Debug)]
+struct CopyFileJob {
+    source_path: PathBuf,
+    target_path: PathBuf,
+}
+
+/// 表示 file worker 完成一個工作後回傳給協調執行緒的結果。
+#[derive(Debug)]
+enum CopyFileResult {
+    Progress(u64),
+    Copied,
+    Failed(io::Error),
+}
+
+/// 以有界工作佇列與固定 worker 數並行複製目錄中的檔案。
+///
+/// 這個流程參考 mature-reference 的 scheduler：走訪器一邊發現檔案，一邊把單檔 copy 排給多個
+/// worker，不會等上一個檔案完成後才處理下一個。`sync_channel` 限制尚未處理的工作量，
+/// 因此即使目錄有數十萬個檔案，也不會一次把全部路徑保留在記憶體。
+///
+/// 參數：
+/// - `source_dir: &Path`，來源目錄。
+/// - `target_dir: &Path`，要建立的目標目錄。
+/// - `progress: &mut F`，接收各 worker 回報的新增完成 byte 數。
+/// - `copy_file: C`，平台原生單檔複製函數；第三個參數負責回報該檔案進度。
+///
+/// 回傳：`io::Result<()>`；走訪、建立目錄或任一 worker 失敗時回傳第一個錯誤。
+fn copy_dir_parallel_with_progress<F, C>(
+    source_dir: &Path,
+    target_dir: &Path,
+    progress: &mut F,
+    copy_file: C,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+    C: Fn(&Path, &Path, &mut dyn FnMut(u64)) -> io::Result<()> + Sync,
+{
+    // 第一層目標一建立就通知 App 刷新目的 panel。這個 0 不是完成 byte 數，而是
+    // 「目標已可見」訊號；真正百分比仍只由後續成功複製的 byte 累計。
+    fs::create_dir(target_dir)?;
+    progress(0);
+
+    let (job_sender, job_receiver) = mpsc::sync_channel::<CopyFileJob>(COPY_FILE_WORKERS * 8);
+    let job_receiver = Arc::new(Mutex::new(job_receiver));
+    let (result_sender, result_receiver) = mpsc::channel::<CopyFileResult>();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut traversal_error = None;
+
+    thread::scope(|scope| {
+        for _ in 0..COPY_FILE_WORKERS {
+            let jobs = Arc::clone(&job_receiver);
+            let results = result_sender.clone();
+            let cancelled = Arc::clone(&cancelled);
+            let copy_file = &copy_file;
+            scope.spawn(move || {
+                loop {
+                    if cancelled.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    let job = match jobs.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => break,
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let mut file_progress = |increment| {
+                        let _ = results.send(CopyFileResult::Progress(increment));
+                    };
+                    match copy_file(&job.source_path, &job.target_path, &mut file_progress) {
+                        Ok(()) => {
+                            if results.send(CopyFileResult::Copied).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            cancelled.store(true, AtomicOrdering::Relaxed);
+                            let _ = results.send(CopyFileResult::Failed(error));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        // 走訪器必須和結果接收端同時執行。若在目前執行緒先完整走訪再讀 result，
+        // 大型目錄會等掃描結束後才把 worker 進度交給 App，畫面因此長時間停在
+        // RUNNING。獨立 producer 一邊建立目錄、一邊送出檔案工作，下面的 consumer
+        // 則能從第一個檔案開始立即轉送進度。
+        let producer_cancelled = Arc::clone(&cancelled);
+        let producer_results = result_sender.clone();
+        let producer = scope.spawn(move || {
+            if let Err(error) = enqueue_copy_tree(
+                source_dir,
+                target_dir,
+                &job_sender,
+                producer_cancelled.as_ref(),
+            ) {
+                producer_cancelled.store(true, AtomicOrdering::Relaxed);
+                let _ = producer_results.send(CopyFileResult::Failed(error));
+            }
+        });
+        drop(result_sender);
+
+        for result in result_receiver {
+            match result {
+                CopyFileResult::Progress(increment) => progress(increment),
+                CopyFileResult::Copied => {}
+                CopyFileResult::Failed(error) if traversal_error.is_none() => {
+                    traversal_error = Some(error);
+                }
+                CopyFileResult::Failed(_) => {}
+            }
+        }
+
+        if producer.join().is_err() && traversal_error.is_none() {
+            traversal_error = Some(io::Error::other("copy tree producer panicked"));
+        }
+    });
+
+    match traversal_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// 遞迴建立目標目錄，並把每個一般檔案送入有界 worker 佇列。
+///
+/// 參數：`source_dir` 與 `target_dir` 為目前走訪層級；`jobs` 是工作 sender；
+/// `cancelled` 在任一 worker 失敗後停止繼續發現新工作。
+/// 回傳：`io::Result<()>`；讀取來源或建立目標失敗時保留原始作業系統錯誤。
+fn enqueue_copy_tree(
+    source_dir: &Path,
+    target_dir: &Path,
+    jobs: &mpsc::SyncSender<CopyFileJob>,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    for item in fs::read_dir(source_dir)? {
+        if cancelled.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        let item = item?;
+        let source_path = item.path();
+        let target_path = target_dir.join(item.file_name());
+        if item.file_type()?.is_dir() {
+            fs::create_dir(&target_path)?;
+            enqueue_copy_tree(&source_path, &target_path, jobs, cancelled)?;
+        } else {
+            send_copy_job(
+                jobs,
+                cancelled,
+                CopyFileJob {
+                    source_path,
+                    target_path,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 將工作放入有界佇列，並在其他 worker 失敗後立即停止等待。
+///
+/// 直接呼叫阻塞式 `SyncSender::send` 時，如果佇列已滿且所有 worker 因錯誤停止，走訪器
+/// 可能永遠卡住。這裡使用 `try_send` 定期檢查取消旗標，確保 SMB 斷線或權限錯誤不會
+/// 讓整個背景 task 無法結束。
+///
+/// 參數：`jobs` 為有界佇列；`cancelled` 是共享取消狀態；`job` 是待排入的檔案工作。
+/// 回傳：`io::Result<()>`；佇列斷線時回傳錯誤，已取消時不再排入並正常返回。
+fn send_copy_job(
+    jobs: &mpsc::SyncSender<CopyFileJob>,
+    cancelled: &AtomicBool,
+    mut job: CopyFileJob,
+) -> io::Result<()> {
+    loop {
+        if cancelled.load(AtomicOrdering::Relaxed) {
+            return Ok(());
+        }
+        match jobs.try_send(job) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(returned_job)) => {
+                job = returned_job;
+                thread::yield_now();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(io::Error::other("copy worker queue disconnected"));
+            }
+        }
+    }
+}
+
+/// 計算檔案或資料夾樹中一般檔案的總 byte 數，供 task 百分比分母使用。
+///
+/// 參數：`path: &Path`，要統計的來源。
+/// 回傳：`io::Result<u64>`；資料夾會遞迴加總，無法讀取時回傳原始 I/O 錯誤。
+pub(crate) fn path_content_size(path: &Path) -> io::Result<u64> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        total = total.saturating_add(path_content_size(&entry?.path())?);
+    }
+    Ok(total)
 }
 
 /// 根據目標資料夾現況，產生一個不與既有項目衝突的新路徑。
@@ -2896,13 +3425,24 @@ fn read_unix_mode(_: &fs::Metadata) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
     use tempfile::tempdir;
 
     use super::{
-        PaneState, SortMode, copy_file_and_verify, copy_file_and_verify_with,
-        copy_path_direct_with_cleanup, copy_path_transactional_with,
+        PaneState, SortMode, copy_dir_parallel_with_progress, copy_file_and_verify,
+        copy_file_and_verify_with, copy_file_native_with_progress,
+        copy_file_native_with_progress_using, copy_path_direct_with_cleanup,
+        copy_path_transactional_with,
     };
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
@@ -3182,6 +3722,307 @@ mod tests {
             std::io::ErrorKind::ConnectionReset
         );
         assert!(!target.exists());
+    }
+
+    #[test]
+    /// 驗證 mature-reference 風格的原生 copy 會完整複製內容，並回報正確 byte 數。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若目標內容或進度累計與來源不同，測試失敗。
+    /// 保護目的：本機、Windows UNC 與 macOS 掛載路徑統一改用原生 API 後，仍須驗證
+    /// 回報進度與目標內容，避免為了與 mature-reference 對齊而把不完整檔案當成成功。
+    fn native_copy_verifies_content_and_reports_progress() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.bin");
+        let target = dir.path().join("target.bin");
+        let bytes = b"native local copy content";
+        fs::write(&source, bytes).expect("source");
+        let mut completed = 0u64;
+
+        copy_file_native_with_progress(&source, &target, &mut |increment| {
+            completed = completed.saturating_add(increment);
+        })
+        .expect("native copy");
+
+        assert_eq!(completed, bytes.len() as u64);
+        assert_eq!(fs::read(&target).expect("target"), bytes);
+    }
+
+    #[test]
+    /// 驗證原生 copy 尚未完成時，metadata 輪詢就能先回報部分進度。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 progress 只能在整個 copy 結束後一次跳到 100%，或累計 byte 不等於
+    /// 來源大小，測試就會失敗。
+    /// 保護目的：PaneFM 改用 mature-reference 的原生 copy 後，不能為了顯示百分比退回手寫串流；
+    /// 此測試保護「copy 引擎與進度 metadata 輪詢互相獨立」的核心設計。
+    fn native_copy_polls_destination_metadata_before_completion() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.bin");
+        let target = dir.path().join("target.bin");
+        let bytes = b"12345678";
+        fs::write(&source, bytes).expect("source");
+        let mut increments = Vec::new();
+
+        copy_file_native_with_progress_using(
+            &source,
+            &target,
+            &mut |increment| increments.push(increment),
+            |source, target| {
+                let source_bytes = fs::read(source)?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(target)?;
+                output.write_all(&source_bytes[..4])?;
+                output.flush()?;
+                thread::sleep(Duration::from_millis(450));
+                output.write_all(&source_bytes[4..])?;
+                output.flush()?;
+                Ok(source_bytes.len() as u64)
+            },
+        )
+        .expect("progressive native copy");
+
+        assert!(increments.len() >= 2, "應在完成前至少回報一次部分進度");
+        assert_eq!(increments.iter().sum::<u64>(), bytes.len() as u64);
+        assert_eq!(fs::read(&target).expect("target"), bytes);
+    }
+
+    #[test]
+    /// 驗證快速完成的小檔案 copy 不會因進度輪詢而被強制延遲 200ms。
+    ///
+    /// 參數：無。
+    /// 回傳：無；四個各耗時約 10ms 的 copy 若累計超過 500ms，測試失敗。
+    /// 保護目的：舊實作使用 `is_finished` 後固定 sleep 200ms，導致每個小檔都可能
+    /// 多等一次完整輪詢週期；只有三個 worker 時，數千個檔案會被拖到數十分鐘。
+    fn completed_small_file_copy_wakes_progress_waiter_immediately() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.bin");
+        fs::write(&source, b"small file").expect("source");
+        let started = Instant::now();
+
+        for index in 0..4 {
+            let target = dir.path().join(format!("target-{index}.bin"));
+            copy_file_native_with_progress_using(
+                &source,
+                &target,
+                &mut |_| {},
+                |source, target| {
+                    thread::sleep(Duration::from_millis(10));
+                    fs::copy(source, target)
+                },
+            )
+            .expect("small native copy");
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "small copies were delayed by progress polling: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    /// 驗證同磁碟移動資料夾會直接使用 rename，成功前不遞迴掃描內容或假造 byte 進度。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若來源仍存在、目標內容遺失或 rename 路徑回報 byte 進度則測試失敗。
+    /// 保護目的：大型目錄本可由檔案系統瞬間改名，過去卻先呼叫 `path_content_size`
+    /// 走訪整棵樹，導致 cut/paste 平白停頓數秒。
+    fn same_device_directory_move_renames_without_prescanning_for_progress() {
+        let dir = tempdir().expect("tempdir");
+        let source_parent = dir.path().join("source-parent");
+        let target_parent = dir.path().join("target-parent");
+        let source = source_parent.join("build-output");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::create_dir(&target_parent).expect("target parent");
+        fs::write(source.join("artifact.bin"), b"artifact").expect("source file");
+        let mut progress_calls = Vec::new();
+
+        let outcome = PaneState::move_path_to_dir_with_history_progress(
+            &source,
+            &target_parent,
+            false,
+            &mut |increment| progress_calls.push(increment),
+        )
+        .expect("same-device move");
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(outcome.target_path.join("artifact.bin")).expect("moved content"),
+            b"artifact"
+        );
+        assert!(progress_calls.is_empty());
+    }
+
+    #[test]
+    /// 模擬 SMB 不支援 rename，驗證 move 會像 mature-reference 一樣改用原生 copy 後刪除來源。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若 rename 錯誤直接中止、目標內容不完整、來源提早刪除或進度不正確，
+    /// 測試就會失敗。
+    /// 保護目的：Windows UNC 與 macOS 掛載 share 可能拒絕 rename，但仍允許 copy；move
+    /// 不可因此失效，而且只有完整 copy 通過大小驗證後才可移除來源。
+    fn unsupported_rename_falls_back_to_copy_then_removes_source() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source = source_dir.join("archive.zip");
+        let bytes = b"complete archive bytes";
+        fs::write(&source, bytes).expect("source file");
+        let mut completed = 0u64;
+
+        let outcome = PaneState::move_path_to_dir_with_history_progress_using_rename(
+            &source,
+            &target_dir,
+            false,
+            &mut |increment| completed = completed.saturating_add(increment),
+            |_, _| Err(std::io::Error::from_raw_os_error(45)),
+        )
+        .expect("copy fallback");
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&outcome.target_path).expect("target"), bytes);
+        assert_eq!(completed, bytes.len() as u64);
+    }
+
+    #[test]
+    /// 驗證目錄複製會同時執行多個單檔工作，而不是退化成逐檔等待。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若目標未先變成可見、最高同時工作數小於 2、內容遺失或進度錯誤，
+    /// 測試就會失敗。
+    /// 保護目的：PaneFM 過去複製包含大量小檔案的 `target` 目錄時只用一條 worker，
+    /// 比 mature-reference 的三條 file worker 慢很多；此測試防止後續重構再次移除並行 scheduler。
+    fn directory_copy_uses_multiple_workers_and_preserves_content() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+        for index in 0..9 {
+            fs::write(
+                source.join(format!("file-{index}.txt")),
+                format!("data-{index}"),
+            )
+            .expect("source file");
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let active_for_copy = Arc::clone(&active);
+        let maximum_for_copy = Arc::clone(&maximum);
+        let mut completed = 0u64;
+        let mut target_became_visible = false;
+        copy_dir_parallel_with_progress(
+            &source,
+            &target,
+            &mut |increment| {
+                if increment == 0 {
+                    target_became_visible = target.is_dir();
+                } else {
+                    completed = completed.saturating_add(increment);
+                }
+            },
+            move |from, to, progress| {
+                let running = active_for_copy.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum_for_copy.fetch_max(running, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(15));
+                let result = fs::copy(from, to).map(|copied| progress(copied));
+                active_for_copy.fetch_sub(1, Ordering::SeqCst);
+                result
+            },
+        )
+        .expect("parallel directory copy");
+
+        assert!(target_became_visible);
+        assert!(maximum.load(Ordering::SeqCst) >= 2);
+        let expected_bytes = (0..9)
+            .map(|index| format!("data-{index}").len() as u64)
+            .sum::<u64>();
+        assert_eq!(completed, expected_bytes);
+        for index in 0..9 {
+            assert_eq!(
+                fs::read_to_string(target.join(format!("file-{index}.txt"))).expect("target file"),
+                format!("data-{index}")
+            );
+        }
+    }
+
+    #[test]
+    /// 驗證 producer 尚在排入大型目錄內容時，已完成檔案的進度就會立刻送到呼叫端。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若第一筆進度必須等大部分工作都排完或複製完才出現，測試失敗。
+    /// 保護目的：舊流程在目前執行緒完整呼叫 `enqueue_copy_tree` 後才讀 result channel，
+    /// 大型 `target` 目錄會長時間只顯示 RUNNING。此測試確保走訪 producer 與進度
+    /// consumer 保持真正並行，第一批檔案完成時 UI 就有資料可更新。
+    fn directory_copy_reports_progress_while_producer_is_still_working() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+        for index in 0..100 {
+            fs::write(source.join(format!("file-{index}.txt")), b"data").expect("source file");
+        }
+
+        let finished = Arc::new(AtomicUsize::new(0));
+        let finished_for_copy = Arc::clone(&finished);
+        let mut finished_when_first_progress_arrived = None;
+        copy_dir_parallel_with_progress(
+            &source,
+            &target,
+            &mut |increment| {
+                if increment > 0 && finished_when_first_progress_arrived.is_none() {
+                    finished_when_first_progress_arrived = Some(finished.load(Ordering::SeqCst));
+                }
+            },
+            move |from, to, progress| {
+                thread::sleep(Duration::from_millis(5));
+                let copied = fs::copy(from, to)?;
+                finished_for_copy.fetch_add(1, Ordering::SeqCst);
+                progress(copied);
+                Ok(())
+            },
+        )
+        .expect("parallel directory copy");
+
+        assert!(
+            finished_when_first_progress_arrived.is_some_and(|count| count < 20),
+            "first progress arrived too late: {finished_when_first_progress_arrived:?}"
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    /// 驗證任一並行 worker 失敗後，有界工作佇列會停止接受新檔案並回傳錯誤。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若模擬 I/O 錯誤被忽略或函數無法結束，測試失敗。
+    /// 保護目的：大量 SMB 工作塞滿佇列時，若 server 斷線，阻塞式 send 曾可能永遠
+    /// 等待已停止的 worker；此測試保護錯誤取消路徑，避免背景 task 永久停在 RUNNING。
+    fn parallel_directory_copy_stops_when_a_worker_fails() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+        for index in 0..40 {
+            fs::write(source.join(format!("file-{index}.txt")), b"data").expect("source file");
+        }
+
+        let result = copy_dir_parallel_with_progress(&source, &target, &mut |_| {}, |_, _, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated SMB disconnect",
+            ))
+        });
+
+        assert_eq!(
+            result.expect_err("copy must fail").kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
     }
 
     #[test]

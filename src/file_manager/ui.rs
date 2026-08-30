@@ -12,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::path::Path;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     config::{AppConfig, IconStyle},
@@ -119,7 +120,9 @@ pub(crate) struct HelpPanelLine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskPanelLine {
     pub(crate) state: String,
-    pub(crate) time: String,
+    pub(crate) started_at: String,
+    pub(crate) finished_at: String,
+    pub(crate) progress: String,
     pub(crate) title: String,
     pub(crate) detail: String,
 }
@@ -306,15 +309,7 @@ pub(crate) fn render_pane(
             }
             PaneListState::Tasks { lines, .. } => lines
                 .iter()
-                .map(|line| {
-                    ListItem::new(Line::from(format!(
-                        "{:<10} {:<8} {:<24} {}",
-                        truncate_text(&line.state, 10),
-                        truncate_text(&line.time, 8),
-                        truncate_text(&line.title, 24),
-                        line.detail
-                    )))
-                })
+                .map(|line| ListItem::new(task_panel_display_lines(line, content_width)))
                 .collect(),
             PaneListState::Trash { lines, .. } if lines.is_empty() => {
                 vec![ListItem::new(Line::from("Trash is empty"))]
@@ -1584,6 +1579,69 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
         + "…"
 }
 
+/// 將 task 紀錄整理成可在窄 panel 中完整閱讀的多行內容。
+///
+/// 第一行只放狀態、開始／結束時間、進度與簡短標題；完整目的地或錯誤內容固定從
+/// 下一行開始。這樣 detail 不會被前方固定欄位擠到只剩一個 `/`，超過 panel 寬度時
+/// 也會繼續換行，而不是由 terminal 直接裁掉。
+///
+/// 參數：
+/// - `task: &TaskPanelLine`，已格式化的 task 顯示資料。
+/// - `max_width: usize`，panel 邊框內可用的終端顯示寬度。
+///
+/// 回傳：`Vec<Line<'static>>`，可直接交給單一 [`ListItem`] 顯示的多行文字。
+fn task_panel_display_lines(task: &TaskPanelLine, max_width: usize) -> Vec<Line<'static>> {
+    let summary = format!(
+        "{:<11} start {}  end {}  {:>4}  {}",
+        truncate_text(&task.state, 11),
+        truncate_text(&task.started_at, 8),
+        truncate_text(&task.finished_at, 8),
+        truncate_text(&task.progress, 4),
+        task.title
+    );
+    let mut lines = wrap_text_for_width(&summary, max_width, "");
+    lines.extend(wrap_text_for_width(&task.detail, max_width, "  "));
+    lines.into_iter().map(Line::from).collect()
+}
+
+/// 依終端顯示寬度切割文字，並讓每一個輸出行保留相同縮排。
+///
+/// 這裡使用 Unicode display width 而非 byte 或字元數，避免中文路徑在 macOS／Windows
+/// terminal 中被錯算寬度。單一長路徑即使沒有空格也會硬換行，確保尾端 OS error
+/// 仍能看見。
+///
+/// 參數：`text` 是原始文字；`max_width` 是每行可用寬度；`indent` 是每行前綴。
+/// 回傳：`Vec<String>`，至少包含一行，且每行顯示寬度不超過 `max_width`。
+fn wrap_text_for_width(text: &str, max_width: usize, indent: &str) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let indent_width = UnicodeWidthStr::width(indent);
+    let effective_indent = if indent_width < max_width { indent } else { "" };
+    let effective_indent_width = UnicodeWidthStr::width(effective_indent);
+    let content_width = max_width.saturating_sub(effective_indent_width).max(1);
+    let mut output = Vec::new();
+
+    for logical_line in text.split('\n') {
+        let mut current = String::from(effective_indent);
+        let mut current_width = 0usize;
+        for character in logical_line.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if current_width > 0 && current_width.saturating_add(character_width) > content_width {
+                output.push(current);
+                current = String::from(effective_indent);
+                current_width = 0;
+            }
+            current.push(character);
+            current_width = current_width.saturating_add(character_width);
+        }
+        output.push(current);
+    }
+
+    if output.is_empty() {
+        output.push(String::from(effective_indent));
+    }
+    output
+}
+
 /// 根據目前排序模式，產生單一列表列的顯示內容。
 fn render_entry_line(
     entry: &super::entry::FileEntry,
@@ -1946,13 +2004,15 @@ fn format_compact_size(value: f64, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileCategory, IconStyle, SearchListState, entry_icon, file_category, format_pane_title,
-        format_permissions_detail, format_size_short, regex_rename_status_style,
-        search_empty_message, search_list_selected_index, top_right_input_rect,
+        FileCategory, IconStyle, SearchListState, TaskPanelLine, entry_icon, file_category,
+        format_pane_title, format_permissions_detail, format_size_short, regex_rename_status_style,
+        search_empty_message, search_list_selected_index, task_panel_display_lines,
+        top_right_input_rect,
     };
     use ratatui::layout::Rect;
     use std::path::Path;
     use std::time::SystemTime;
+    use unicode_width::UnicodeWidthStr;
 
     use crate::file_manager::entry::FileEntry;
     use crate::file_manager::search::GlobalSearchEntry;
@@ -1998,6 +2058,45 @@ mod tests {
         assert_eq!(popup, Rect::new(12, 5, 9, 1));
         assert!(popup.right() <= panel.right());
         assert!(popup.bottom() <= panel.bottom());
+    }
+
+    #[test]
+    /// 驗證 task 的完整目的路徑會移到摘要下方，並依窄 panel 寬度換成多行。
+    ///
+    /// 參數：無。
+    /// 回傳：無；若目的地尾端被裁掉，或任一行超出 panel 寬度，測試失敗。
+    /// 保護目的：大型 copy 最重要的診斷資訊位於 detail 尾端；過去與固定欄位塞在
+    /// 同一行，只看得到 `destination: /`，無法判斷工作實際寫到哪個目錄。
+    fn task_detail_wraps_without_losing_the_destination_tail() {
+        let task = TaskPanelLine {
+            state: String::from("RUNNING"),
+            started_at: String::from("14:30:47"),
+            finished_at: String::from("--:--:--"),
+            progress: String::from("32%"),
+            title: String::from("copy 1 item(s)"),
+            detail: String::from(
+                "destination: /Users/otto/Documents/AB_Demo/very-long-target-directory",
+            ),
+        };
+
+        let rendered = task_panel_display_lines(&task, 32);
+        let rendered_text = rendered.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert!(rendered_text.len() >= 4);
+        let detail_start = rendered_text
+            .iter()
+            .position(|line| line.starts_with("  destination:"))
+            .expect("detail must start on its own indented line");
+        let reconstructed_detail = rendered_text[detail_start..]
+            .iter()
+            .map(|line| line.trim_start())
+            .collect::<String>();
+        assert!(reconstructed_detail.contains("very-long-target-directory"));
+        assert!(
+            rendered_text
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 32)
+        );
     }
 
     #[test]

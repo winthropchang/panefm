@@ -41,6 +41,22 @@ pub(crate) struct ExtractedArchive {
 /// - 成功時回傳實際建立出的 zip 路徑。
 /// - 失敗時回傳建立檔案、走訪目錄或寫入壓縮內容時的錯誤。
 pub(crate) fn compress_entries_to_zip(cwd: &Path, entries: &[FileEntry]) -> io::Result<PathBuf> {
+    compress_entries_to_zip_with_progress(cwd, entries, &mut |_| {})
+}
+
+/// 將選取項目壓成 ZIP，並以讀取來源內容的 byte 數回報背景進度。
+///
+/// 參數：`cwd`、`entries` 與 [`compress_entries_to_zip`] 相同；`progress` 接收本輪
+/// 新讀取的 byte 數。
+/// 回傳：`io::Result<PathBuf>`；成功時回傳完整關閉後的 ZIP 路徑。
+pub(crate) fn compress_entries_to_zip_with_progress<F>(
+    cwd: &Path,
+    entries: &[FileEntry],
+    progress: &mut F,
+) -> io::Result<PathBuf>
+where
+    F: FnMut(u64),
+{
     if entries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -63,6 +79,7 @@ pub(crate) fn compress_entries_to_zip(cwd: &Path, entries: &[FileEntry]) -> io::
             &relative_path,
             file_options,
             dir_options,
+            progress,
         )?;
     }
 
@@ -83,6 +100,21 @@ pub(crate) fn extract_entries(
     cwd: &Path,
     entries: &[FileEntry],
 ) -> io::Result<(Vec<ExtractedArchive>, usize)> {
+    extract_entries_with_progress(cwd, entries, &mut |_| {})
+}
+
+/// 解壓選取項目，並以寫入輸出內容的 byte 數回報背景進度。
+///
+/// 參數：`cwd`、`entries` 與 [`extract_entries`] 相同；`progress` 接收本輪寫入量。
+/// 回傳：`io::Result<(Vec<ExtractedArchive>, usize)>`，包含成功結果與略過數量。
+pub(crate) fn extract_entries_with_progress<F>(
+    cwd: &Path,
+    entries: &[FileEntry],
+    progress: &mut F,
+) -> io::Result<(Vec<ExtractedArchive>, usize)>
+where
+    F: FnMut(u64),
+{
     let mut extracted = Vec::new();
     let mut skipped = 0usize;
 
@@ -99,10 +131,10 @@ pub(crate) fn extract_entries(
 
         let output_path = default_extract_output_path(cwd, &entry.path, format);
         match format {
-            ArchiveFormat::Zip => extract_zip_archive(&entry.path, &output_path)?,
-            ArchiveFormat::TarGz => extract_tar_gz_archive(&entry.path, &output_path)?,
-            ArchiveFormat::Tar => extract_tar_archive(&entry.path, &output_path)?,
-            ArchiveFormat::Gz => extract_gz_file(&entry.path, &output_path)?,
+            ArchiveFormat::Zip => extract_zip_archive(&entry.path, &output_path, progress)?,
+            ArchiveFormat::TarGz => extract_tar_gz_archive(&entry.path, &output_path, progress)?,
+            ArchiveFormat::Tar => extract_tar_archive(&entry.path, &output_path, progress)?,
+            ArchiveFormat::Gz => extract_gz_file(&entry.path, &output_path, progress)?,
         }
 
         extracted.push(ExtractedArchive {
@@ -162,13 +194,17 @@ fn default_archive_name(entries: &[FileEntry]) -> String {
 }
 
 /// 將指定路徑遞迴寫入 zip，保留目前 pane 目錄下看到的相對名稱。
-fn add_path_to_zip(
+fn add_path_to_zip<F>(
     zip: &mut ZipWriter<File>,
     source_path: &Path,
     relative_path: &Path,
     file_options: FileOptions,
     dir_options: FileOptions,
-) -> io::Result<()> {
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
     let archive_name = normalize_archive_path(relative_path);
     if source_path.is_dir() {
         let dir_name = if archive_name.ends_with('/') {
@@ -180,18 +216,32 @@ fn add_path_to_zip(
         for item in fs::read_dir(source_path)? {
             let item = item?;
             let next_relative = relative_path.join(item.file_name());
-            add_path_to_zip(zip, &item.path(), &next_relative, file_options, dir_options)?;
+            add_path_to_zip(
+                zip,
+                &item.path(),
+                &next_relative,
+                file_options,
+                dir_options,
+                progress,
+            )?;
         }
     } else {
         zip.start_file(archive_name, file_options)?;
         let mut file = File::open(source_path)?;
-        io::copy(&mut file, zip)?;
+        copy_with_progress(&mut file, zip, progress)?;
     }
     Ok(())
 }
 
 /// 解開 zip 壓縮檔到指定輸出目錄。
-fn extract_zip_archive(archive_path: &Path, output_dir: &Path) -> io::Result<()> {
+fn extract_zip_archive<F>(
+    archive_path: &Path,
+    output_dir: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
     fs::create_dir_all(output_dir)?;
     let file = File::open(archive_path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -212,43 +262,68 @@ fn extract_zip_archive(archive_path: &Path, output_dir: &Path) -> io::Result<()>
             fs::create_dir_all(parent)?;
         }
         let mut output_file = File::create(&target_path)?;
-        io::copy(&mut entry, &mut output_file)?;
+        copy_with_progress(&mut entry, &mut output_file, progress)?;
     }
 
     Ok(())
 }
 
 /// 解開 tar.gz 壓縮檔到指定輸出目錄。
-fn extract_tar_gz_archive(archive_path: &Path, output_dir: &Path) -> io::Result<()> {
+fn extract_tar_gz_archive<F>(
+    archive_path: &Path,
+    output_dir: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
     fs::create_dir_all(output_dir)?;
     let file = File::open(archive_path)?;
     let decoder = GzDecoder::new(file);
     let mut archive = TarArchive::new(decoder);
-    unpack_tar_archive(&mut archive, output_dir)
+    unpack_tar_archive(&mut archive, output_dir, progress)
 }
 
 /// 解開 tar 壓縮檔到指定輸出目錄。
-fn extract_tar_archive(archive_path: &Path, output_dir: &Path) -> io::Result<()> {
+fn extract_tar_archive<F>(
+    archive_path: &Path,
+    output_dir: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
     fs::create_dir_all(output_dir)?;
     let file = File::open(archive_path)?;
     let mut archive = TarArchive::new(file);
-    unpack_tar_archive(&mut archive, output_dir)
+    unpack_tar_archive(&mut archive, output_dir, progress)
 }
 
 /// 解開單一 `.gz` 壓縮檔到指定輸出檔案。
-fn extract_gz_file(archive_path: &Path, output_file: &Path) -> io::Result<()> {
+fn extract_gz_file<F>(archive_path: &Path, output_file: &Path, progress: &mut F) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
     let file = File::open(archive_path)?;
     let mut decoder = GzDecoder::new(file);
     if let Some(parent) = output_file.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut output = File::create(output_file)?;
-    io::copy(&mut decoder, &mut output)?;
+    copy_with_progress(&mut decoder, &mut output, progress)?;
     Ok(())
 }
 
 /// 將 tar 類壓縮檔安全地解開到指定目錄，避免路徑穿越寫出到目標外。
-fn unpack_tar_archive<R: Read>(archive: &mut TarArchive<R>, output_dir: &Path) -> io::Result<()> {
+fn unpack_tar_archive<R, F>(
+    archive: &mut TarArchive<R>,
+    output_dir: &Path,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    R: Read,
+    F: FnMut(u64),
+{
     for entry in archive.entries()? {
         let mut entry = entry?;
         let Some(path) = sanitize_archive_member_path(&entry.path()?) else {
@@ -259,9 +334,38 @@ fn unpack_tar_archive<R: Read>(archive: &mut TarArchive<R>, output_dir: &Path) -
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        entry.unpack(target_path)?;
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&target_path)?;
+        } else {
+            let mut output = File::create(&target_path)?;
+            copy_with_progress(&mut entry, &mut output, progress)?;
+        }
     }
     Ok(())
+}
+
+/// 以固定 buffer 搬移資料並回報每輪完成量，避免 `io::copy` 無法觀察進度。
+///
+/// 參數：`reader`、`writer` 為來源與輸出；`progress` 接收每輪寫入 byte 數。
+/// 回傳：`io::Result<u64>`，代表總寫入量。
+fn copy_with_progress<R, W, F>(reader: &mut R, writer: &mut W, progress: &mut F) -> io::Result<u64>
+where
+    R: Read,
+    W: io::Write,
+    F: FnMut(u64),
+{
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        total = total.saturating_add(read as u64);
+        progress(read as u64);
+    }
+    Ok(total)
 }
 
 /// 把 zip 內部路徑轉成穩定的 `/` 形式，避免不同平台分隔符不一致。
@@ -370,7 +474,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ArchiveFormat, compress_entries_to_zip, default_extract_output_path, detect_archive_format,
+        ArchiveFormat, compress_entries_to_zip, compress_entries_to_zip_with_progress,
+        default_extract_output_path, detect_archive_format, extract_entries_with_progress,
     };
     use crate::file_manager::entry::FileEntry;
 
@@ -442,5 +547,55 @@ mod tests {
             Some("notes.txt.zip")
         );
         assert!(archive.exists());
+    }
+
+    #[test]
+    /// 驗證背景壓縮與解壓會在實際搬移內容時持續回報 byte 數。
+    ///
+    /// 保護目的：task 百分比不能只在完成時跳到 100%；若 archive 內部改回無 callback
+    /// 的 `io::copy`，這個測試會立即指出執行中進度已失效。
+    fn archive_operations_report_non_zero_progress() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("progress.txt");
+        let content = vec![b'x'; 64 * 1024];
+        fs::write(&source, &content).expect("source");
+        let source_entry = FileEntry {
+            name: String::from("progress.txt"),
+            path: source,
+            is_dir: false,
+            size: content.len() as u64,
+            child_count: None,
+            modified: std::time::SystemTime::now(),
+            created: std::time::SystemTime::now(),
+            readonly: false,
+            unix_mode: None,
+        };
+        let mut compressed_bytes = 0u64;
+        let archive =
+            compress_entries_to_zip_with_progress(dir.path(), &[source_entry], &mut |increment| {
+                compressed_bytes += increment
+            })
+            .expect("compress with progress");
+        let archive_size = fs::metadata(&archive).expect("archive metadata").len();
+        let archive_entry = FileEntry {
+            name: String::from("progress.txt.zip"),
+            path: archive,
+            is_dir: false,
+            size: archive_size,
+            child_count: None,
+            modified: std::time::SystemTime::now(),
+            created: std::time::SystemTime::now(),
+            readonly: false,
+            unix_mode: None,
+        };
+        let mut extracted_bytes = 0u64;
+
+        extract_entries_with_progress(dir.path(), &[archive_entry], &mut |increment| {
+            extracted_bytes += increment
+        })
+        .expect("extract with progress");
+
+        assert_eq!(compressed_bytes, content.len() as u64);
+        assert_eq!(extracted_bytes, content.len() as u64);
     }
 }

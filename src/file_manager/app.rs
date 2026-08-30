@@ -17,7 +17,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -30,6 +30,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
@@ -38,7 +39,10 @@ use crate::{
 };
 
 use super::{
-    archive::{ExtractedArchive, compress_entries_to_zip, extract_entries},
+    archive::{
+        ExtractedArchive, compress_entries_to_zip, compress_entries_to_zip_with_progress,
+        extract_entries, extract_entries_with_progress,
+    },
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
     debug_timing_log, debug_timing_message,
@@ -52,12 +56,13 @@ use super::{
     operation_history::{
         DEFAULT_HISTORY_LIMIT, FileOperation, FileOperationKind, OperationHistory, OperationItem,
     },
-    pane::{LineMode, PaneState, SortDetailKind, SortMode},
+    pane::{LineMode, PaneState, SortDetailKind, SortMode, path_content_size},
     platform::write_text_to_system_clipboard,
     search::{
         GlobalSearchEntry, GlobalSearchEvent, stream_content_search_entries, stream_search_entries,
     },
     smb::{ResolvedSmbLocation, build_smb_mount_launch, parse_smb_location},
+    task_history::{load_task_history, save_task_history, task_history_file_path},
     tools::external_tool_statuses,
     trash::{TrashListEntry, TrashStore},
     ui::{
@@ -204,23 +209,27 @@ impl SearchMode {
 }
 
 /// 描述目前 task manager 中單一任務的狀態。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TaskState {
     Running,
     Done,
     Failed,
     Cancelled,
+    Interrupted,
 }
 
 /// 描述單一背景或外部任務在 task manager 中的紀錄。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TaskRecord {
     pub(crate) id: usize,
     pub(crate) pane_id: usize,
-    pub(crate) kind: &'static str,
+    pub(crate) kind: String,
     pub(crate) title: String,
     pub(crate) detail: String,
     pub(crate) state: TaskState,
+    /// 背景檔案工作目前完成百分比；不支援進度的外部工作使用 `None`。
+    pub(crate) progress_percent: Option<u8>,
     pub(crate) started_at_unix_ms: u64,
     pub(crate) finished_at_unix_ms: Option<u64>,
 }
@@ -246,6 +255,56 @@ struct NetworkGotoEvent {
     target: PathBuf,
     /// 背景載入完成的 panel 狀態，或作業系統回傳的 I/O 錯誤。
     result: io::Result<PaneState>,
+}
+
+/// 大型檔案工作完成後送回主執行緒的事件。
+///
+/// worker 只處理檔案 I/O，不直接修改 [`App`]；操作歷史、panel reload 與狀態列都在
+/// 主迴圈收到事件後更新，避免跨執行緒共享可變 UI 狀態。
+#[derive(Debug)]
+enum FileJobEvent {
+    /// 背景貼上已建立第一層目標，主執行緒可立即刷新目的 panel，不必等待整批完成。
+    DestinationVisible { target_dir: PathBuf },
+    /// worker 定期回報累計完成量，主執行緒再換算成百分比更新 task 面板。
+    Progress {
+        task_id: usize,
+        completed_bytes: u64,
+        total_bytes: u64,
+    },
+    Paste {
+        task_id: usize,
+        clipboard: ClipboardState,
+        overwrite: bool,
+        result: PasteJobResult,
+    },
+    Compress {
+        task_id: usize,
+        pane_id: usize,
+        entry_count: usize,
+        first_name: String,
+        result: io::Result<PathBuf>,
+    },
+    Extract {
+        task_id: usize,
+        pane_id: usize,
+        result: io::Result<(Vec<ExtractedArchive>, usize)>,
+    },
+}
+
+/// 背景 paste 完成的批次結果，包含成功項目及第一個失敗原因。
+#[derive(Debug)]
+struct PasteJobResult {
+    history_items: Vec<OperationItem>,
+    pasted_count: usize,
+    failure: Option<PasteJobFailure>,
+}
+
+/// 記錄背景 paste 的失敗項目，供主執行緒顯示完整來源、目的與 OS error。
+#[derive(Debug)]
+struct PasteJobFailure {
+    display_name: String,
+    planned_target: PathBuf,
+    error: io::Error,
 }
 
 /// 記錄目前是否處於範圍標記模式，以及起點和目前游標位置。
@@ -469,6 +528,8 @@ pub(crate) struct App {
     network_goto_rx: Option<Receiver<NetworkGotoEvent>>,
     /// 目前 UNC `goto` 對應的 task id，供 Esc 與 task panel 取消後捨棄晚到結果。
     active_network_goto_task_id: Option<usize>,
+    /// 所有大型 paste/compress/extract 工作接收端，以 task id 區分並允許並行完成。
+    file_job_receivers: BTreeMap<usize, Receiver<FileJobEvent>>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,
@@ -476,6 +537,8 @@ pub(crate) struct App {
     pub(crate) pending_fzf_jump: Option<FzfJumpRequest>,
     pub(crate) task_log: Vec<TaskRecord>,
     pub(crate) next_task_id: usize,
+    /// task 歷史的實際檔案位置；每次狀態變更與關閉前都會同步寫入。
+    pub(crate) task_history_path: PathBuf,
     /// 非阻塞記錄瀏覽目錄，避免同步啟動 zoxide 拖慢 TUI。
     pub(crate) zoxide_tracker: ZoxideTracker,
     /// 要求主事件迴圈在下一幀前清除實體 terminal 與 ratatui buffer。
@@ -516,6 +579,39 @@ impl App {
         let trash_store = TrashStore::new(&cwd)?;
         let LoadedConfig { config, source } = loaded_config;
         let config_source = source.clone().unwrap_or_else(|| cwd.join("config.toml"));
+        let task_history_path = task_history_file_path(&cwd, source.as_deref());
+        let (mut task_log, task_history_warning) = match load_task_history(&task_history_path) {
+            Ok(tasks) => (tasks, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("task history could not be loaded: {error}")),
+            ),
+        };
+        let now = unix_time_ms_now();
+        let mut recovered_interrupted_tasks = 0usize;
+        for task in &mut task_log {
+            // 上次程序若在 task 尚未完成時被關閉，背景 thread 已隨 process 消失。
+            // 不可把它繼續顯示成 RUNNING，更不可未經確認就重新覆寫 SMB 目標。
+            if task.state == TaskState::Running {
+                task.state = TaskState::Interrupted;
+                task.finished_at_unix_ms = Some(now);
+                task.detail = format!("{}; interrupted when PaneFM closed", task.detail);
+                recovered_interrupted_tasks += 1;
+            }
+            // 新 session 只建立 panel #1；把歷史歸到可見 panel，避免舊 panel id 讓
+            // 使用者按 T 後找不到紀錄。原始目標仍完整保存在 title/detail。
+            task.pane_id = 1;
+        }
+        if task_log.len() > 200 {
+            let overflow = task_log.len() - 200;
+            task_log.drain(0..overflow);
+        }
+        let next_task_id = task_log
+            .iter()
+            .map(|task| task.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let bookmark_store = BookmarkStore::load(bookmark_file_path(&cwd, source.as_deref()))
             .map_err(|error| io::Error::other(error.to_string()))?;
         let zoxide_tracker = ZoxideTracker::new();
@@ -534,7 +630,7 @@ impl App {
             .filter(|tool| !tool.installed)
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        let startup_status = if missing_tools.is_empty() {
+        let mut startup_status = if missing_tools.is_empty() {
             startup_status
         } else {
             format!(
@@ -542,8 +638,15 @@ impl App {
                 missing_tools.join(", ")
             )
         };
+        if let Some(warning) = task_history_warning {
+            startup_status = format!("{startup_status}; {warning}");
+        } else if recovered_interrupted_tasks > 0 {
+            startup_status = format!(
+                "{startup_status}; recovered {recovered_interrupted_tasks} interrupted task(s)"
+            );
+        }
 
-        Ok(Self {
+        let app = Self {
             config,
             config_source,
             theme: theme_preset.into(),
@@ -576,16 +679,22 @@ impl App {
             active_global_search_task_id: None,
             network_goto_rx: None,
             active_network_goto_task_id: None,
+            file_job_receivers: BTreeMap::new(),
             visual_selection: None,
             pending_action: None,
             help_return: None,
             pending_launch: None,
             pending_fzf_jump: None,
-            task_log: Vec::new(),
-            next_task_id: 1,
+            task_log,
+            next_task_id,
+            task_history_path,
             zoxide_tracker,
             full_redraw_requested: false,
-        })
+        };
+        if recovered_interrupted_tasks > 0 {
+            save_task_history(&app.task_history_path, &app.task_log)?;
+        }
+        Ok(app)
     }
 
     /// 嘗試把目前按鍵視為 count prefix 的下一個數字。
@@ -6911,10 +7020,11 @@ impl App {
         self.task_log.push(TaskRecord {
             id,
             pane_id,
-            kind,
+            kind: kind.to_string(),
             title,
             detail,
             state: TaskState::Running,
+            progress_percent: None,
             started_at_unix_ms: unix_time_ms_now(),
             finished_at_unix_ms: None,
         });
@@ -6922,16 +7032,85 @@ impl App {
             let overflow = self.task_log.len() - 200;
             self.task_log.drain(0..overflow);
         }
+        self.persist_task_history_best_effort();
         id
     }
 
     /// 更新指定 task 的最終狀態與說明文字。
     fn finish_task(&mut self, task_id: usize, state: TaskState, detail: String) {
+        let mut changed = false;
         if let Some(task) = self.task_log.iter_mut().find(|task| task.id == task_id) {
             task.state = state;
             task.detail = detail;
+            if state == TaskState::Done && task.progress_percent.is_some() {
+                task.progress_percent = Some(100);
+            }
             task.finished_at_unix_ms = Some(unix_time_ms_now());
+            changed = true;
         }
+        if changed {
+            self.persist_task_history_best_effort();
+        }
+    }
+
+    /// 更新背景檔案工作的完成比例，百分比只允許向前增加。
+    ///
+    /// 參數：`task_id: usize` 為 task 編號；`completed_bytes: u64` 為已完成量；
+    /// `total_bytes: u64` 為預估總量。
+    /// 回傳：`() `；找不到 task 或總量為零時不修改狀態。
+    fn update_task_progress(&mut self, task_id: usize, completed_bytes: u64, total_bytes: u64) {
+        if total_bytes == 0 {
+            return;
+        }
+        let percent = completed_bytes
+            .saturating_mul(100)
+            .checked_div(total_bytes)
+            .unwrap_or(0)
+            .min(99) as u8;
+        let mut changed = false;
+        if let Some(task) = self.task_log.iter_mut().find(|task| task.id == task_id) {
+            let previous = task.progress_percent.unwrap_or(0);
+            let next = previous.max(percent);
+            if task.progress_percent != Some(next) {
+                task.progress_percent = Some(next);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_task_history_best_effort();
+        }
+    }
+
+    /// 立即保存目前 task 歷史；失敗時保留應用程式運作並把原因顯示在狀態列。
+    ///
+    /// 參數：無。
+    /// 回傳：`() `。持久化錯誤不應讓進行中的檔案工作崩潰，但必須讓使用者知道
+    /// 關閉後可能看不到最新歷史。
+    fn persist_task_history_best_effort(&mut self) {
+        if let Err(error) = save_task_history(&self.task_history_path, &self.task_log) {
+            self.status = format!("task history save failed: {error}");
+        }
+    }
+
+    /// 執行正常關閉前的 task 收尾與持久化。
+    ///
+    /// 尚在背景 thread 執行的工作不能跨 process 真正暫停；PaneFM 會把它們標記為
+    /// `Interrupted`，保留當下百分比與診斷資料，但不在下次啟動時自動覆寫目的地。
+    /// 即使程式被強制關閉、來不及執行本函數，啟動載入也會把磁碟上的 `Running`
+    /// 紀錄轉成 `Interrupted`。
+    ///
+    /// 參數：無。
+    /// 回傳：`io::Result<()>`，確保離開主迴圈前最後一份歷史已寫入磁碟。
+    pub(crate) fn prepare_for_shutdown(&mut self) -> io::Result<()> {
+        let finished_at = unix_time_ms_now();
+        for task in &mut self.task_log {
+            if task.state == TaskState::Running {
+                task.state = TaskState::Interrupted;
+                task.finished_at_unix_ms = Some(finished_at);
+                task.detail = format!("{}; interrupted when PaneFM closed", task.detail);
+            }
+        }
+        save_task_history(&self.task_history_path, &self.task_log)
     }
 
     /// 取消指定 task；目前支援 search worker 與尚未執行的 queued open / fzf jump。
@@ -7043,6 +7222,9 @@ impl App {
         }
 
         let target_dir = pane.cwd.clone();
+        if entries_should_run_in_background(&entries) {
+            return self.start_background_compress(self.focused_pane, target_dir, entries);
+        }
         let archive_path = compress_entries_to_zip(&target_dir, &entries)?;
         self.reload_all_panes()?;
         let _ = self.reveal_path_and_track(self.focused_pane, &archive_path);
@@ -7083,6 +7265,9 @@ impl App {
         }
 
         let target_dir = pane.cwd.clone();
+        if entries_should_run_in_background(&entries) {
+            return self.start_background_extract(self.focused_pane, target_dir, entries);
+        }
         let (extracted, skipped) = extract_entries(&target_dir, &entries)?;
         if extracted.is_empty() {
             self.status = if skipped == 0 {
@@ -7097,6 +7282,120 @@ impl App {
         self.reveal_first_extracted_output(&extracted)?;
 
         self.status = extraction_status_label(&extracted, skipped);
+        Ok(())
+    }
+
+    /// 把大型壓縮工作排入背景執行，避免 ZIP deflate 長時間占住 TUI 主執行緒。
+    ///
+    /// 參數：`pane_id: usize` 為來源 panel；`target_dir: PathBuf` 為輸出目錄；
+    /// `entries: Vec<FileEntry>` 為本次要壓縮的項目。
+    /// 回傳：`io::Result<()>`；成功代表工作已排入 task manager。
+    fn start_background_compress(
+        &mut self,
+        pane_id: usize,
+        target_dir: PathBuf,
+        entries: Vec<super::entry::FileEntry>,
+    ) -> io::Result<()> {
+        let entry_count = entries.len();
+        let first_name = entries
+            .first()
+            .map(|entry| entry.display_name())
+            .unwrap_or_else(|| String::from("item"));
+        let task_id = self.push_task(
+            pane_id,
+            "compress",
+            format!("compress {entry_count} item(s)"),
+            format!("output: {}", target_dir.display()),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            // 計算大型目錄的內容總量也會遞迴碰觸檔案系統，必須跟壓縮本體一起留在
+            // worker，否則「已使用背景壓縮」仍會在按下 C 時先凍結 TUI。
+            let total_bytes = entries
+                .iter()
+                .filter_map(|entry| path_content_size(&entry.path).ok())
+                .fold(0u64, u64::saturating_add);
+            let _ = sender.send(FileJobEvent::Progress {
+                task_id,
+                completed_bytes: 0,
+                total_bytes,
+            });
+            let progress_sender = sender.clone();
+            let mut completed_bytes = 0u64;
+            let mut last_percent = 0u8;
+            let mut progress = |increment: u64| {
+                completed_bytes = completed_bytes.saturating_add(increment);
+                send_progress_if_changed(
+                    &progress_sender,
+                    task_id,
+                    completed_bytes,
+                    total_bytes,
+                    &mut last_percent,
+                );
+            };
+            let result =
+                compress_entries_to_zip_with_progress(&target_dir, &entries, &mut progress);
+            let _ = sender.send(FileJobEvent::Compress {
+                task_id,
+                pane_id,
+                entry_count,
+                first_name,
+                result,
+            });
+        });
+        self.file_job_receivers.insert(task_id, receiver);
+        self.status = format!("compressing {entry_count} item(s) in background [task {task_id}]");
+        Ok(())
+    }
+
+    /// 把大型解壓工作排入背景執行，讓使用者可在其他 panel 繼續操作。
+    ///
+    /// 參數：`pane_id: usize` 為來源 panel；`target_dir: PathBuf` 為輸出目錄；
+    /// `entries: Vec<FileEntry>` 為選取的壓縮檔。
+    /// 回傳：`io::Result<()>`；成功代表工作已排入 task manager。
+    fn start_background_extract(
+        &mut self,
+        pane_id: usize,
+        target_dir: PathBuf,
+        entries: Vec<super::entry::FileEntry>,
+    ) -> io::Result<()> {
+        let entry_count = entries.len();
+        let task_id = self.push_task(
+            pane_id,
+            "extract",
+            format!("extract {entry_count} item(s)"),
+            format!("output: {}", target_dir.display()),
+        );
+        let (sender, receiver) = mpsc::channel();
+        // 解壓後資料通常比壓縮檔大，因此這是估算分母；完成事件一定會校正成 100%。
+        let total_bytes = entries
+            .iter()
+            .map(|entry| entry.size)
+            .fold(0u64, u64::saturating_add);
+        self.update_task_progress(task_id, 0, total_bytes);
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let mut completed_bytes = 0u64;
+            let mut last_percent = 0u8;
+            let mut progress = |increment: u64| {
+                completed_bytes = completed_bytes.saturating_add(increment);
+                send_progress_if_changed(
+                    &progress_sender,
+                    task_id,
+                    completed_bytes,
+                    total_bytes,
+                    &mut last_percent,
+                );
+            };
+            let result = extract_entries_with_progress(&target_dir, &entries, &mut progress);
+            let _ = sender.send(FileJobEvent::Extract {
+                task_id,
+                pane_id,
+                result,
+            });
+        });
+        self.file_job_receivers.insert(task_id, receiver);
+        self.status = format!("extracting {entry_count} item(s) in background [task {task_id}]");
         Ok(())
     }
 
@@ -8089,6 +8388,15 @@ impl App {
             }
         };
 
+        if paste_should_run_in_background(&clipboard, &target_dir) {
+            return self.start_background_paste(
+                self.focused_pane,
+                target_dir,
+                clipboard,
+                overwrite,
+            );
+        }
+
         let mut pasted_count = 0usize;
         let mut history_items = Vec::new();
         for entry in &clipboard.entries {
@@ -8148,30 +8456,133 @@ impl App {
         }
 
         self.reload_all_panes()?;
-        self.status = match clipboard.operation {
-            ClipboardOperation::Copy if overwrite && pasted_count == 1 => {
-                String::from("pasted copy with overwrite: 1 item")
-            }
-            ClipboardOperation::Copy if overwrite => {
-                format!("pasted copy with overwrite: {pasted_count} items")
-            }
-            ClipboardOperation::Copy if pasted_count == 1 => String::from("pasted copy: 1 item"),
-            ClipboardOperation::Copy => format!("pasted copy: {pasted_count} items"),
-            ClipboardOperation::Cut if overwrite && pasted_count == 1 => {
-                String::from("moved with overwrite: 1 item")
-            }
-            ClipboardOperation::Cut if overwrite => {
-                format!("moved with overwrite: {pasted_count} items")
-            }
-            ClipboardOperation::Cut if pasted_count == 1 => String::from("moved: 1 item"),
-            ClipboardOperation::Cut => format!("moved: {pasted_count} items"),
-        };
+        self.status = paste_success_status(clipboard.operation, overwrite, pasted_count);
 
         if clipboard.operation == ClipboardOperation::Cut {
             self.clipboard = None;
         }
         self.record_file_operation(clipboard.operation, history_items);
 
+        Ok(())
+    }
+
+    /// 把大型或網路目的地 paste 排入背景 task，避免傳輸期間凍結 TUI。
+    ///
+    /// 參數：
+    /// - `pane_id: usize`，啟動貼上的目標 panel。
+    /// - `target_dir: PathBuf`，實際目的目錄，可能是 UNC 或 macOS `/Volumes`。
+    /// - `clipboard: ClipboardState`，本次固定使用的來源批次與 copy/cut 模式。
+    /// - `overwrite: bool`，是否允許覆蓋同名項目。
+    ///
+    /// 回傳：`io::Result<()>`；成功表示工作已排入背景，完成結果稍後由主迴圈套用。
+    fn start_background_paste(
+        &mut self,
+        pane_id: usize,
+        target_dir: PathBuf,
+        clipboard: ClipboardState,
+        overwrite: bool,
+    ) -> io::Result<()> {
+        let entry_count = clipboard.entries.len();
+        let operation = clipboard.operation;
+        let operation_label = match operation {
+            ClipboardOperation::Copy => "copy",
+            ClipboardOperation::Cut => "move",
+        };
+        let task_id = self.push_task(
+            pane_id,
+            "paste",
+            format!("{operation_label} {entry_count} item(s)"),
+            format!("destination: {}", target_dir.display()),
+        );
+        // 背景 paste 一排入就顯示 0%，避免總大小掃描尚未完成時 task 面板只有
+        // RUNNING 而沒有任何進度資訊。後續實際 byte 事件只會讓比例向前增加。
+        self.update_task_progress(task_id, 0, 1);
+        let (sender, receiver) = mpsc::channel();
+        let worker_clipboard = clipboard.clone();
+        let worker_target_dir = target_dir.clone();
+        thread::spawn(move || {
+            // 容量掃描與真正複製必須同時開始。過去先完整掃描再複製，含大量小檔案的
+            // build 目錄會被走訪兩次且兩段時間相加，造成目標數秒後才出現在列表。
+            let size_clipboard = worker_clipboard.clone();
+            let (size_sender, size_receiver) = mpsc::sync_channel(1);
+            let size_worker = thread::spawn(move || {
+                let total_bytes = size_clipboard
+                    .entries
+                    .iter()
+                    .filter_map(|entry| path_content_size(&entry.source_path).ok())
+                    .fold(0u64, u64::saturating_add);
+                let _ = size_sender.send(total_bytes);
+            });
+            let progress_sender = sender.clone();
+            let progress_target_dir = worker_target_dir.clone();
+            let mut completed_bytes = 0u64;
+            let mut total_bytes = None;
+            let mut last_percent = 0u8;
+            let mut last_destination_refresh = Instant::now();
+            let mut progress = |increment: u64| {
+                if increment == 0 {
+                    let _ = progress_sender.send(FileJobEvent::DestinationVisible {
+                        target_dir: progress_target_dir.clone(),
+                    });
+                    last_destination_refresh = Instant::now();
+                    return;
+                }
+                completed_bytes = completed_bytes.saturating_add(increment);
+                // 正在複製的目錄可能已被使用者打開；固定節流後要求主執行緒刷新目的
+                // 樹，讓已落盤的檔案逐步出現在列表，而不是整批完成後一次跳出。
+                if last_destination_refresh.elapsed() >= Duration::from_millis(250) {
+                    let _ = progress_sender.send(FileJobEvent::DestinationVisible {
+                        target_dir: progress_target_dir.clone(),
+                    });
+                    last_destination_refresh = Instant::now();
+                }
+                if total_bytes.is_none() {
+                    total_bytes = size_receiver.try_recv().ok();
+                }
+                if let Some(total_bytes) = total_bytes {
+                    send_progress_if_changed(
+                        &progress_sender,
+                        task_id,
+                        completed_bytes,
+                        total_bytes,
+                        &mut last_percent,
+                    );
+                }
+            };
+            let result = perform_paste_job(
+                &worker_clipboard,
+                &worker_target_dir,
+                overwrite,
+                &mut progress,
+            );
+            drop(progress);
+
+            // Copy 很快時，容量掃描可能稍晚完成；完成事件前等待它並送出最後一次穩定
+            // 分母，確保 task 百分比不因動態增加的總量而倒退。
+            let total_bytes = total_bytes.unwrap_or_else(|| {
+                size_worker
+                    .join()
+                    .ok()
+                    .and_then(|_| size_receiver.try_recv().ok())
+                    .unwrap_or(completed_bytes)
+            });
+            let _ = sender.send(FileJobEvent::Progress {
+                task_id,
+                completed_bytes,
+                total_bytes,
+            });
+            let _ = sender.send(FileJobEvent::Paste {
+                task_id,
+                clipboard: worker_clipboard,
+                overwrite,
+                result,
+            });
+        });
+        self.file_job_receivers.insert(task_id, receiver);
+        self.status = format!(
+            "pasting {entry_count} item(s) in background to {} [task {task_id}]",
+            target_dir.display()
+        );
         Ok(())
     }
 
@@ -8570,6 +8981,21 @@ impl App {
     /// - 失敗時代表至少有一個 pane 在重新讀取時發生錯誤。
     fn reload_all_panes(&mut self) -> io::Result<()> {
         for pane in self.panes.values_mut() {
+            pane.reload()?;
+        }
+        Ok(())
+    }
+
+    /// 重新載入正在顯示目的目錄或其子目錄的 panel，供背景貼上逐步更新列表。
+    ///
+    /// 參數：`directory: &Path`，背景工作開始寫入的目的根目錄。
+    /// 回傳：`io::Result<()>`；任一位於目的樹內的 panel 載入失敗時回傳原始 I/O 錯誤。
+    fn reload_panes_in_tree(&mut self, directory: &Path) -> io::Result<()> {
+        for pane in self
+            .panes
+            .values_mut()
+            .filter(|pane| pane.cwd == directory || pane.cwd.starts_with(directory))
+        {
             pane.reload()?;
         }
         Ok(())
@@ -9169,6 +9595,7 @@ impl App {
     /// 混入使用者後來啟動的新搜尋。
     pub(crate) fn poll_background_tasks(&mut self) {
         self.poll_network_goto();
+        self.poll_file_jobs();
 
         let Some(receiver) = &self.global_search_rx else {
             return;
@@ -9331,6 +9758,184 @@ impl App {
                 self.finish_task(event.task_id, TaskState::Failed, error.to_string());
                 self.status = format!("path jump failed: {} ({error})", event.target.display());
             }
+        }
+    }
+
+    /// 非阻塞接收大型 paste/compress/extract 工作，並在主執行緒更新 UI 與 Undo。
+    ///
+    /// 參數：無；接收端保存於 `file_job_receivers`。
+    /// 回傳：`()`；每一輪只檢查現有 task，不等待尚未完成的 worker。
+    fn poll_file_jobs(&mut self) {
+        let task_ids = self.file_job_receivers.keys().copied().collect::<Vec<_>>();
+        for task_id in task_ids {
+            let Some(receiver) = self.file_job_receivers.remove(&task_id) else {
+                continue;
+            };
+            let mut completed = false;
+            loop {
+                match receiver.try_recv() {
+                    Ok(FileJobEvent::DestinationVisible { target_dir }) => {
+                        if let Err(error) = self.reload_panes_in_tree(&target_dir) {
+                            self.status = format!(
+                                "background paste started; destination refresh failed: {error}"
+                            );
+                        }
+                        self.full_redraw_requested = true;
+                    }
+                    Ok(FileJobEvent::Progress {
+                        task_id,
+                        completed_bytes,
+                        total_bytes,
+                    }) => {
+                        self.update_task_progress(task_id, completed_bytes, total_bytes);
+                    }
+                    Ok(event) => {
+                        self.apply_file_job_event(event);
+                        completed = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        completed = true;
+                        if self
+                            .task_log
+                            .iter()
+                            .any(|task| task.id == task_id && task.state == TaskState::Running)
+                        {
+                            self.finish_task(
+                                task_id,
+                                TaskState::Failed,
+                                String::from("file worker disconnected"),
+                            );
+                            self.status =
+                                format!("file task {task_id} failed: worker disconnected");
+                        }
+                        break;
+                    }
+                }
+            }
+            if !completed {
+                self.file_job_receivers.insert(task_id, receiver);
+            } else if self
+                .task_log
+                .iter()
+                .any(|task| task.id == task_id && task.state == TaskState::Running)
+            {
+                self.finish_task(
+                    task_id,
+                    TaskState::Failed,
+                    String::from("file worker disconnected"),
+                );
+                self.status = format!("file task {task_id} failed: worker disconnected");
+            }
+        }
+    }
+
+    /// 套用單一背景檔案工作的完成結果。
+    ///
+    /// 參數：`event: FileJobEvent`，worker 回傳的 paste、compress 或 extract 結果。
+    /// 回傳：`()`；I/O 錯誤會完整寫入 task 與狀態列，不會中止主事件迴圈。
+    fn apply_file_job_event(&mut self, event: FileJobEvent) {
+        match event {
+            FileJobEvent::DestinationVisible { .. } => {
+                // 目標可見事件已在 `poll_file_jobs` 即時處理，不屬於完成事件。
+            }
+            FileJobEvent::Progress { .. } => {
+                // Progress 已在 `poll_file_jobs` 合併處理，完成事件才會進入這個函數。
+            }
+            FileJobEvent::Paste {
+                task_id,
+                clipboard,
+                overwrite,
+                result,
+            } => {
+                let operation = clipboard.operation;
+                self.record_file_operation(operation, result.history_items);
+                if let Some(failure) = result.failure {
+                    let status = paste_failure_status(
+                        &failure.display_name,
+                        &failure.planned_target,
+                        &failure.error,
+                    );
+                    self.finish_task(task_id, TaskState::Failed, status.clone());
+                    self.status = status;
+                } else {
+                    if operation == ClipboardOperation::Cut
+                        && self.clipboard.as_ref() == Some(&clipboard)
+                    {
+                        self.clipboard = None;
+                    }
+                    let status = paste_success_status(operation, overwrite, result.pasted_count);
+                    self.finish_task(task_id, TaskState::Done, status.clone());
+                    self.status = status;
+                }
+                if let Err(error) = self.reload_all_panes() {
+                    self.status = format!("{}; refresh failed: {error}", self.status);
+                }
+                self.full_redraw_requested = true;
+            }
+            FileJobEvent::Compress {
+                task_id,
+                pane_id,
+                entry_count,
+                first_name,
+                result,
+            } => match result {
+                Ok(archive_path) => {
+                    if let Err(error) = self.reload_all_panes() {
+                        self.status = format!("compress completed; refresh failed: {error}");
+                        self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                        return;
+                    }
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.select_path(&archive_path);
+                    }
+                    let archive_name = archive_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("archive.zip");
+                    self.status = if entry_count == 1 {
+                        format!("compressed {first_name} -> {archive_name}")
+                    } else {
+                        format!("compressed {entry_count} items -> {archive_name}")
+                    };
+                    self.finish_task(task_id, TaskState::Done, self.status.clone());
+                    self.full_redraw_requested = true;
+                }
+                Err(error) => {
+                    self.status = format!("compress failed: {error}");
+                    self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                }
+            },
+            FileJobEvent::Extract {
+                task_id,
+                pane_id,
+                result,
+            } => match result {
+                Ok((extracted, skipped)) if !extracted.is_empty() => {
+                    if let Err(error) = self.reload_all_panes() {
+                        self.status = format!("extract completed; refresh failed: {error}");
+                        self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                        return;
+                    }
+                    if let Some(first) = extracted.first()
+                        && let Some(pane) = self.panes.get_mut(&pane_id)
+                    {
+                        pane.select_path(&first.output_path);
+                    }
+                    self.status = extraction_status_label(&extracted, skipped);
+                    self.finish_task(task_id, TaskState::Done, self.status.clone());
+                    self.full_redraw_requested = true;
+                }
+                Ok((_, skipped)) => {
+                    self.status = format!("no supported archives selected (skipped {skipped})");
+                    self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                }
+                Err(error) => {
+                    self.status = format!("extract failed: {error}");
+                    self.finish_task(task_id, TaskState::Failed, self.status.clone());
+                }
+            },
         }
     }
 }
@@ -9936,6 +10541,180 @@ fn zoxide_list_status(query: &str, count: usize, selected: usize, editing: bool)
             selected.saturating_add(1).min(count),
             count
         )
+    }
+}
+
+/// 超過此大小的單批檔案工作一律放到背景，避免可感知的 TUI 停頓。
+const BACKGROUND_FILE_JOB_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 判斷 paste 是否應移出主執行緒。
+///
+/// 參數：`clipboard: &ClipboardState` 為來源批次；`target_dir: &Path` 為目的目錄。
+/// 回傳：`bool`；來源包含目錄、目的地為網路磁碟，或來源檔案總大小達門檻時回傳
+/// `true`。目錄一律在背景處理，避免為了判斷大小而在 UI thread 遞迴走訪內容。
+fn paste_should_run_in_background(clipboard: &ClipboardState, target_dir: &Path) -> bool {
+    is_probably_network_or_external_path(target_dir)
+        || clipboard
+            .entries
+            .iter()
+            .any(|entry| entry.source_path.is_dir())
+        || clipboard
+            .entries
+            .iter()
+            .filter_map(|entry| fs::metadata(&entry.source_path).ok())
+            .map(|metadata| metadata.len())
+            .try_fold(0u64, |total, size| total.checked_add(size))
+            .is_none_or(|total| total >= BACKGROUND_FILE_JOB_THRESHOLD_BYTES)
+}
+
+/// 判斷壓縮或解壓項目是否可能長時間占用 CPU／磁碟。
+///
+/// 參數：`entries: &[FileEntry]`，目前選取項目。
+/// 回傳：`bool`；資料夾或總檔案大小達 8 MiB 時使用背景工作。
+fn entries_should_run_in_background(entries: &[super::entry::FileEntry]) -> bool {
+    entries.iter().any(|entry| entry.is_dir)
+        || entries
+            .iter()
+            .map(|entry| entry.size)
+            .try_fold(0u64, |total, size| total.checked_add(size))
+            .is_none_or(|total| total >= BACKGROUND_FILE_JOB_THRESHOLD_BYTES)
+}
+
+/// 以跨平台保守規則辨識可能產生長延遲的網路或外接 volume。
+///
+/// 參數：`path: &Path`，要寫入的目標。
+/// 回傳：`bool`；Windows UNC 與 macOS `/Volumes/...` 回傳 `true`。Windows 映射磁碟
+/// 無法只靠路徑可靠辨識，但大型來源仍會由大小門檻轉入背景。
+fn is_probably_network_or_external_path(path: &Path) -> bool {
+    let display = path.to_string_lossy();
+    is_unc_path(&display)
+        || display == "/Volumes"
+        || display.starts_with("/Volumes/")
+        || display.starts_with("/Volumes\\")
+}
+
+/// 在 worker 執行完整 paste 批次，不接觸 App 或任何可變 UI 狀態。
+///
+/// 參數：`clipboard: &ClipboardState` 為固定來源；`target_dir: &Path` 為目的目錄；
+/// `overwrite: bool` 表示是否覆蓋。
+/// 回傳：`PasteJobResult`，包含成功的 Undo 資料及第一個失敗項目。
+fn perform_paste_job<F>(
+    clipboard: &ClipboardState,
+    target_dir: &Path,
+    overwrite: bool,
+    progress: &mut F,
+) -> PasteJobResult
+where
+    F: FnMut(u64),
+{
+    let mut history_items = Vec::new();
+    let mut pasted_count = 0usize;
+
+    for entry in &clipboard.entries {
+        if entry.source_path.parent() == Some(target_dir)
+            && clipboard.operation == ClipboardOperation::Cut
+        {
+            continue;
+        }
+
+        let planned_target =
+            PaneState::planned_paste_target_in_dir(&entry.source_path, target_dir, overwrite)
+                .unwrap_or_else(|_| target_dir.join(&entry.display_name));
+        let result = match clipboard.operation {
+            ClipboardOperation::Copy => PaneState::copy_path_to_dir_with_history_progress(
+                &entry.source_path,
+                target_dir,
+                overwrite,
+                progress,
+            ),
+            ClipboardOperation::Cut => PaneState::move_path_to_dir_with_history_progress(
+                &entry.source_path,
+                target_dir,
+                overwrite,
+                progress,
+            ),
+        };
+        match result {
+            Ok(outcome) => {
+                pasted_count += 1;
+                history_items.push(OperationItem {
+                    source_path: entry.source_path.clone(),
+                    destination_path: outcome.target_path,
+                    replaced_backup: outcome.backup_path,
+                });
+            }
+            Err(error) => {
+                return PasteJobResult {
+                    history_items,
+                    pasted_count,
+                    failure: Some(PasteJobFailure {
+                        display_name: entry.display_name.clone(),
+                        planned_target,
+                        error,
+                    }),
+                };
+            }
+        }
+    }
+
+    PasteJobResult {
+        history_items,
+        pasted_count,
+        failure: None,
+    }
+}
+
+/// 百分比實際增加時才送出進度事件，避免大型檔案產生數萬筆 channel 訊息。
+///
+/// 參數：`sender` 為 worker event channel；`task_id` 為工作編號；`completed_bytes` 與
+/// `total_bytes` 為累計量；`last_percent` 保存上次已送出的比例。
+/// 回傳：`() `；channel 已關閉時安靜停止回報，不影響檔案工作的錯誤處理。
+fn send_progress_if_changed(
+    sender: &mpsc::Sender<FileJobEvent>,
+    task_id: usize,
+    completed_bytes: u64,
+    total_bytes: u64,
+    last_percent: &mut u8,
+) {
+    if total_bytes == 0 {
+        return;
+    }
+    let percent = completed_bytes
+        .saturating_mul(100)
+        .checked_div(total_bytes)
+        .unwrap_or(0)
+        .min(99) as u8;
+    if percent <= *last_percent {
+        return;
+    }
+    *last_percent = percent;
+    let _ = sender.send(FileJobEvent::Progress {
+        task_id,
+        completed_bytes,
+        total_bytes,
+    });
+}
+
+/// 建立 paste 成功後的狀態文字，讓同步與背景流程使用相同規則。
+///
+/// 參數：`operation` 為 copy/cut；`overwrite` 表示覆蓋；`count` 為成功數量。
+/// 回傳：`String`，可直接顯示於狀態列並寫入 task detail。
+fn paste_success_status(operation: ClipboardOperation, overwrite: bool, count: usize) -> String {
+    match operation {
+        ClipboardOperation::Copy if overwrite && count == 1 => {
+            String::from("pasted copy with overwrite: 1 item")
+        }
+        ClipboardOperation::Copy if overwrite => {
+            format!("pasted copy with overwrite: {count} items")
+        }
+        ClipboardOperation::Copy if count == 1 => String::from("pasted copy: 1 item"),
+        ClipboardOperation::Copy => format!("pasted copy: {count} items"),
+        ClipboardOperation::Cut if overwrite && count == 1 => {
+            String::from("moved with overwrite: 1 item")
+        }
+        ClipboardOperation::Cut if overwrite => format!("moved with overwrite: {count} items"),
+        ClipboardOperation::Cut if count == 1 => String::from("moved: 1 item"),
+        ClipboardOperation::Cut => format!("moved: {count} items"),
     }
 }
 
@@ -11161,11 +11940,26 @@ fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
         .iter()
         .map(|task| TaskPanelLine {
             state: task_state_label(task.state).to_string(),
-            time: format_task_time(task.started_at_unix_ms),
+            started_at: format_task_time(task.started_at_unix_ms),
+            finished_at: task
+                .finished_at_unix_ms
+                .map(format_task_time)
+                .unwrap_or_else(|| String::from("--:--:--")),
+            progress: task_progress_label(task),
             title: task.title.clone(),
             detail: task.detail.clone(),
         })
         .collect()
+}
+
+/// 產生 task 面板的獨立進度欄，讓狀態、時間與完成比例不會互相覆蓋。
+///
+/// 參數：`task: &TaskRecord`，要顯示的 task。
+/// 回傳：`String`；支援進度的工作顯示 `37%`，一般外部工作顯示 `-`。
+fn task_progress_label(task: &TaskRecord) -> String {
+    task.progress_percent
+        .map(|percent| format!("{percent}%"))
+        .unwrap_or_else(|| String::from("-"))
 }
 
 /// 將 task 狀態轉成簡短標籤。
@@ -11175,13 +11969,14 @@ fn task_state_label(state: TaskState) -> &'static str {
         TaskState::Done => "DONE",
         TaskState::Failed => "FAILED",
         TaskState::Cancelled => "CANCELLED",
+        TaskState::Interrupted => "INTERRUPTED",
     }
 }
 
 /// 將 unix 毫秒時間轉成 task 面板使用的簡短時間。
 fn format_task_time(unix_ms: u64) -> String {
     DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_millis(unix_ms))
-        .format("%H:%M")
+        .format("%H:%M:%S")
         .to_string()
 }
 
@@ -11540,17 +12335,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        App, BookmarkListMode, ClipboardOperation, FilterState, GlobalSearchState, ListFindState,
+        App, BACKGROUND_FILE_JOB_THRESHOLD_BYTES, BookmarkListMode, ClipboardEntry,
+        ClipboardOperation, ClipboardState, FilterState, GlobalSearchState, ListFindState,
         PanelSearchState, PendingAction, RegexRenameOutcome, RenameMode, SearchMode, TaskRecord,
         TaskState, TrashConfirmAction, VisualSelectionState, bookmark_panel_lines,
         command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
         ctrl_digit_target_pane_id, filtered_bookmark_entries, filtered_global_search_entries,
-        help_entries, is_windows_drive_path, key_matches_ctrl_letter,
-        key_matches_ctrl_shift_letter, key_matches_letter_any_case, key_matches_plain_letter,
-        key_matches_shifted_letter, looks_like_navigation_path, missing_search_tool_status,
-        plain_digit_target_pane_id, query_zoxide_directories, rename_basename_cursor,
-        rename_next_word_start, rename_previous_word_start, rename_word_end,
-        trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action, typed_char_from_key,
+        help_entries, is_probably_network_or_external_path, is_windows_drive_path,
+        key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
+        key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
+        missing_search_tool_status, paste_should_run_in_background, plain_digit_target_pane_id,
+        query_zoxide_directories, rename_basename_cursor, rename_next_word_start,
+        rename_previous_word_start, rename_word_end, trash_confirm_panel_id,
+        trash_panel_overlay_state_from_pending_action, typed_char_from_key,
     };
     use crate::{
         config::{
@@ -11561,7 +12358,7 @@ mod tests {
             bookmark::{BookmarkEntry, BookmarkTarget},
             layout::{LayoutNode, SplitDirection},
             open::LaunchMode,
-            pane::{LineMode, SortMode},
+            pane::{LineMode, PaneState, SortMode},
             search::{GlobalSearchEntry, GlobalSearchEvent},
         },
         theme::{Theme, ThemePreset},
@@ -11730,6 +12527,21 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("global search did not complete in time");
+    }
+
+    /// 輪詢測試中的大型檔案工作直到全部完成，避免測試直接依賴執行緒排程速度。
+    ///
+    /// 保護目的：paste/compress/extract 已移出主執行緒；測試必須驗證 task 完成事件
+    /// 確實回到 App，而不是以固定 sleep 掩蓋偶發競態。
+    fn wait_for_file_jobs(app: &mut App) {
+        for _ in 0..200 {
+            app.poll_background_tasks();
+            if app.file_job_receivers.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("background file job did not complete in time");
     }
 
     #[test]
@@ -12100,6 +12912,23 @@ mod tests {
         assert!(is_windows_drive_path("D:\\work"));
         assert!(looks_like_navigation_path("R:/repo"));
         assert!(!is_windows_drive_path("docs/readme"));
+    }
+
+    #[test]
+    /// 驗證 Windows UNC 與 macOS `/Volumes` 目的地都會被視為背景傳輸目標。
+    ///
+    /// 保護目的：兩個正式支援平台使用不同網路路徑形式；若任一形式漏判，大檔案貼上
+    /// 就可能退回主執行緒並再次凍結 TUI。
+    fn network_destination_detection_covers_windows_and_macos() {
+        assert!(is_probably_network_or_external_path(std::path::Path::new(
+            "//server/share"
+        )));
+        assert!(is_probably_network_or_external_path(std::path::Path::new(
+            "/Volumes/company/share"
+        )));
+        assert!(!is_probably_network_or_external_path(std::path::Path::new(
+            "/Users/otto/Documents"
+        )));
     }
 
     #[test]
@@ -13823,20 +14652,22 @@ mod tests {
         app.task_log.push(TaskRecord {
             id: 1,
             pane_id: 1,
-            kind: "search",
+            kind: String::from("search"),
             title: String::from("alpha task"),
             detail: String::from("first detail"),
             state: TaskState::Done,
+            progress_percent: None,
             started_at_unix_ms: 0,
             finished_at_unix_ms: Some(1),
         });
         app.task_log.push(TaskRecord {
             id: 2,
             pane_id: 1,
-            kind: "search",
+            kind: String::from("search"),
             title: String::from("beta task"),
             detail: String::from("second detail"),
             state: TaskState::Running,
+            progress_percent: None,
             started_at_unix_ms: 2,
             finished_at_unix_ms: None,
         });
@@ -15039,6 +15870,245 @@ mod tests {
     }
 
     #[test]
+    /// 驗證大型檔案貼上會先建立背景 task，而不是在按下 `p` 時同步完成。
+    ///
+    /// 保護目的：大 ZIP 或 SMB 傳輸可能需要數分鐘；測試以 sparse 8 MiB 檔觸發
+    /// 背景門檻，確認主處理函式先返回、完成事件仍會刷新列表並建立 Undo 歷史。
+    fn app_large_paste_runs_as_background_task_and_records_completion() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source_file = source_dir.join("large.zip");
+        fs::File::create(&source_file)
+            .expect("large source")
+            .set_len(BACKGROUND_FILE_JOB_THRESHOLD_BYTES)
+            .expect("size source");
+
+        let mut app = App::new(source_dir, default_loaded_config()).expect("app");
+        app.copy_selected();
+        app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+        app.current_pane_mut()
+            .expect("pane")
+            .reload()
+            .expect("reload target");
+
+        app.paste_into_focused_pane().expect("queue paste");
+
+        assert!(!app.file_job_receivers.is_empty());
+        assert!(app.status.contains("in background"));
+        wait_for_file_jobs(&mut app);
+
+        assert_eq!(
+            fs::metadata(target_dir.join("large.zip"))
+                .expect("target metadata")
+                .len(),
+            BACKGROUND_FILE_JOB_THRESHOLD_BYTES
+        );
+        assert_eq!(app.status, "pasted copy: 1 item");
+        assert_eq!(app.operation_history.len(), 1);
+        assert!(matches!(
+            app.task_log.last().map(|task| task.state),
+            Some(TaskState::Done)
+        ));
+        assert_eq!(
+            app.task_log.last().and_then(|task| task.progress_percent),
+            Some(100),
+            "背景貼上完成後 task 必須明確顯示 100%，不能停在最後一次中途回報"
+        );
+    }
+
+    #[test]
+    /// 驗證 PaneFM 正常關閉時會把尚未完成的 task 標成 `Interrupted` 並保存到檔案。
+    ///
+    /// 保護目的：大型本機或 SMB copy 可能執行超過半小時；若使用者關閉程式，舊版
+    /// 記憶體 task 會完全消失。此測試確保關閉後仍可追查開始時間、進度與中斷原因，
+    /// 且不會錯誤顯示為仍在執行。
+    fn app_shutdown_persists_running_tasks_as_interrupted() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let task_id = app.push_task(
+            1,
+            "paste",
+            String::from("copy large.zip"),
+            String::from("destination: share"),
+        );
+        app.update_task_progress(task_id, 42, 100);
+
+        app.prepare_for_shutdown().expect("persist shutdown");
+        let tasks = super::load_task_history(&app.task_history_path).expect("load history");
+        let task = tasks.last().expect("persisted task");
+
+        assert_eq!(task.state, TaskState::Interrupted);
+        assert_eq!(task.progress_percent, Some(42));
+        assert!(task.finished_at_unix_ms.is_some());
+        assert!(task.detail.contains("interrupted when PaneFM closed"));
+    }
+
+    #[test]
+    /// 驗證啟動時會載入上次 task 歷史，並修正來不及正常關閉的 `Running` 紀錄。
+    ///
+    /// 保護目的：使用者可能直接關閉 terminal 或系統終止程序，導致關閉 hook 沒機會
+    /// 執行。下次啟動必須把磁碟上最後一次 RUNNING 快照轉為 `Interrupted`，不能讓 task
+    /// 面板永久顯示不存在的工作，也不能自動重複覆寫目的檔案。
+    fn app_startup_recovers_unclean_running_task_history() {
+        let dir = tempdir().expect("tempdir");
+        let history_path = super::task_history_file_path(dir.path(), None);
+        super::save_task_history(
+            &history_path,
+            &[TaskRecord {
+                id: 12,
+                pane_id: 8,
+                kind: String::from("paste"),
+                title: String::from("copy build"),
+                detail: String::from("destination: share"),
+                state: TaskState::Running,
+                progress_percent: Some(37),
+                started_at_unix_ms: 1_700_000_000_000,
+                finished_at_unix_ms: None,
+            }],
+        )
+        .expect("seed history");
+
+        let app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let task = app.task_log.last().expect("recovered task");
+
+        assert_eq!(task.state, TaskState::Interrupted);
+        assert_eq!(
+            task.pane_id, 1,
+            "舊 session 的 task 必須出現在目前可見 panel"
+        );
+        assert_eq!(app.next_task_id, 13);
+        assert!(app.status.contains("recovered 1 interrupted task"));
+    }
+
+    #[test]
+    /// 驗證來源只要是目錄就必須直接判定為背景貼上，不能用目錄本身的 metadata 大小
+    /// 代表內部內容。測試以 sparse file 表示超過 1 GiB 的大型 build 目錄，不實際寫入
+    /// 或複製 1 GiB 資料。
+    ///
+    /// 保護目的：過去 `target/` 雖然包含大量資料，目錄 metadata 卻只有數百 bytes，
+    /// 因而被錯放到 UI thread 同步複製，造成整個 TUI 卡死。
+    fn directory_paste_is_background_even_when_directory_metadata_is_small() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("target");
+        let destination_dir = dir.path().join("destination");
+        fs::create_dir(&source_dir).expect("source directory");
+        fs::create_dir(&destination_dir).expect("destination directory");
+        fs::File::create(source_dir.join("large-build-output.bin"))
+            .expect("sparse source")
+            .set_len(1024 * 1024 * 1024 + 1)
+            .expect("sparse source size");
+        let clipboard = ClipboardState {
+            entries: vec![ClipboardEntry {
+                source_path: source_dir,
+                display_name: String::from("target"),
+            }],
+            operation: ClipboardOperation::Copy,
+        };
+
+        assert!(paste_should_run_in_background(&clipboard, &destination_dir));
+    }
+
+    #[test]
+    /// 驗證背景進度只能向前增加，且 task 面板會分別顯示狀態、時間與百分比。
+    ///
+    /// 保護目的：網路傳輸事件可能因輪詢批次或估算值順序不同而重複抵達；畫面不可從
+    /// `60%` 倒退成 `20%`，否則使用者會誤以為傳輸重新開始。
+    fn task_progress_is_monotonic_and_visible_in_task_panel() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        let task_id = app.push_task(
+            1,
+            "paste",
+            String::from("copy large.zip"),
+            String::from("destination: target"),
+        );
+
+        app.update_task_progress(task_id, 60, 100);
+        app.update_task_progress(task_id, 20, 100);
+        let lines = super::task_panel_lines(&app.task_log);
+
+        assert_eq!(app.task_log[0].progress_percent, Some(60));
+        assert_eq!(lines[0].state, "RUNNING");
+        assert_eq!(lines[0].progress, "60%");
+        assert_eq!(lines[0].finished_at, "--:--:--");
+
+        app.finish_task(task_id, TaskState::Done, String::from("completed"));
+        assert_eq!(app.task_log[0].progress_percent, Some(100));
+        let lines = super::task_panel_lines(&app.task_log);
+        assert_ne!(lines[0].finished_at, "--:--:--");
+    }
+
+    #[test]
+    /// 驗證背景貼上刷新目的根目錄時，也會更新已經進入其子目錄的 panel。
+    ///
+    /// 保護目的：使用者可能在大型 copy 尚未完成時進入新建立的 `target/`；舊流程只
+    /// 刷新目的父目錄，子目錄 panel 會一直保持空白直到整批結束。測試同時確認目的
+    /// 樹以外的 panel 不會被無關進度反覆 reload。
+    fn background_destination_refresh_updates_open_descendant_panels_only() {
+        let dir = tempdir().expect("tempdir");
+        let destination = dir.path().join("destination");
+        let child = destination.join("target");
+        let unrelated = dir.path().join("unrelated");
+        fs::create_dir_all(&child).expect("destination child");
+        fs::create_dir(&unrelated).expect("unrelated dir");
+
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.panes
+            .insert(2, PaneState::new(child.clone()).expect("child panel"));
+        app.panes.insert(
+            3,
+            PaneState::new(unrelated.clone()).expect("unrelated panel"),
+        );
+        fs::write(child.join("copied.txt"), b"visible").expect("copied file");
+        fs::write(unrelated.join("not-reloaded.txt"), b"hidden").expect("unrelated file");
+
+        app.reload_panes_in_tree(&destination)
+            .expect("refresh destination tree");
+
+        assert!(
+            app.panes[&2]
+                .entries
+                .iter()
+                .any(|entry| entry.name == "copied.txt")
+        );
+        assert!(
+            app.panes[&3]
+                .entries
+                .iter()
+                .all(|entry| entry.name != "not-reloaded.txt")
+        );
+    }
+
+    #[test]
+    /// 驗證 worker 只有在整數百分比前進時才送出進度事件。
+    ///
+    /// 保護目的：若每個 1 MiB buffer 都排入 channel，數十 GB 傳輸會讓主執行緒忙於
+    /// 處理重複比例；測試確保同一百分比只產生一次事件。
+    fn progress_events_are_throttled_to_percentage_changes() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut last_percent = 0u8;
+
+        super::send_progress_if_changed(&sender, 7, 10, 1_000, &mut last_percent);
+        super::send_progress_if_changed(&sender, 7, 11, 1_000, &mut last_percent);
+        super::send_progress_if_changed(&sender, 7, 20, 1_000, &mut last_percent);
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(last_percent, 2);
+        assert!(matches!(
+            events.last(),
+            Some(super::FileJobEvent::Progress {
+                task_id: 7,
+                completed_bytes: 20,
+                total_bytes: 1_000,
+            })
+        ));
+    }
+
+    #[test]
     /// 驗證 `x` 剪下後可以用 `p` 移動檔案，且剪貼簿會在成功後清空。
     /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
     fn app_cut_and_paste_moves_file_and_clears_clipboard() {
@@ -15424,7 +16494,8 @@ mod tests {
 
     #[test]
     /// 驗證 `:extract` 會解開目前選取的 zip，並將游標帶到輸出目錄。
-    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
+    /// 保護目的：同時確認資料夾壓縮會先排入背景 task，完成後仍能選中新 ZIP 並接續
+    /// 解壓，避免非阻塞重構破壞原本的完整操作流程。
     fn app_extract_command_unpacks_zip_and_reveals_output() {
         let dir = tempdir().expect("tempdir");
         let folder = dir.path().join("demo");
@@ -15433,6 +16504,11 @@ mod tests {
 
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.execute_command("compress").expect("compress dir");
+        assert!(
+            !app.file_job_receivers.is_empty(),
+            "directory compression must not block the TUI thread"
+        );
+        wait_for_file_jobs(&mut app);
 
         let archive_path = dir.path().join("demo.zip");
         assert!(archive_path.exists());

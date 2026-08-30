@@ -20,6 +20,7 @@ mod platform;
 mod rg;
 mod search;
 mod smb;
+mod task_history;
 mod tools;
 mod trash;
 mod ui;
@@ -159,6 +160,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         }
     }
 
+    app.prepare_for_shutdown()?;
     Ok(())
 }
 

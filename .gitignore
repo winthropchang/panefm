@@ -6,6 +6,7 @@
 /bookmark.toml
 /config.toml
 /plugins.toml
+/task-history.json
 
 # 個人開發接續與 AI 對話交接紀錄；只保留在本機，不放進公開 repository。
 /DEV_NOTES.md

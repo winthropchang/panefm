@@ -159,6 +159,8 @@
 ## 7. 搜尋與效能規則
 
 - 使用者感知到的流暢度很重要，不能只看功能有沒有做出來。
+- 本機已下載的 mature-reference 原始碼位於 `/Users/otto/Documents/mature-reference`；需要比對 mature-reference 行為或
+  效能時，必須優先直接閱讀這份 source，不要只依畫面或記憶推測實作。
 - 大目錄下的操作若可能卡頓，必須優先考慮：
   - lazy loading
   - chunked result
@@ -172,6 +174,22 @@
 - 單目錄/全目錄快速跳轉：可優先考慮 `fzf`
 - 大量檔案搜尋：優先考慮成熟搜尋工具或分批回傳架構
 
+### 7.1 Copy / Move 效能基準
+
+- mature-reference 在 macOS 與 Windows 的本機單檔 copy 使用 `std::fs::copy`，並由預設 3 個
+  file workers 執行；PaneFM 的資料夾 copy 不可退化成單 worker 逐檔等待。
+- Move 必須先嘗試作業系統原生 `rename`；rename 未成功時依 mature-reference 流程退回原生 copy，
+  並且只有 copy 完成且通過大小驗證後才刪除來源。
+- macOS、Windows 本機路徑與已掛載 SMB／UNC 路徑都必須和 mature-reference 一樣，使用
+  `std::fs::copy` 交由平台原生檔案系統處理；不可只因路徑位於 `/Volumes` 或 UNC 就
+  切換成自製串流 copy。失敗時仍必須保留 partial cleanup 與完成後大小驗證。
+- 進度統計不得迫使平台原生 copy 改成較慢的單執行緒手動串流；UI 進度與實際 copy
+  引擎應解耦，改由獨立流程輪詢目標檔案 metadata，計算已完成 byte 數。
+- 大型資料夾的容量掃描不可阻擋 copy 啟動；若百分比需要總量，掃描必須和 copy 並行，
+  避免先完整走訪一次、再從頭複製一次所造成的可感知延遲。
+- 背景 copy 建立第一層目標後，必須立即通知目的 panel 刷新。列表可先顯示正在建立的
+  項目，完成、Undo 與錯誤狀態仍以 worker 最終驗證結果為準。
+
 ## 8. 設定檔規則
 
 - 可調整的行為、步長、主題、UI 尺寸、預設模式，不應寫死在程式中。
@@ -183,6 +201,19 @@
   - 驗證邏輯
   - README 或相關文件
   - 測試
+
+### 8.1 Task 歷史與關閉安全
+
+- task 是使用者狀態，不可只保存在記憶體；狀態或進度改變時必須同步到
+  `task-history.json`。
+- 正常關閉前仍在執行的 task 必須標記為 `INTERRUPTED`，保留開始時間、結束時間、
+  百分比與診斷內容。
+- 強制關閉可能來不及執行 shutdown hook，因此啟動時必須把歷史中的 `RUNNING`
+  修正為 `INTERRUPTED`。
+- 在沒有可靠 checkpoint 前禁止自動續傳。特別是 SMB、壓縮檔與覆蓋操作，不能只靠
+  舊百分比猜測續寫位置，否則可能產生看似完成但內容損壞的檔案。
+- 未來加入 Resume 時，至少要保存來源與目標、檔案大小、mtime、已完成項目及 partial
+  file 規則，並在恢復前重新驗證來源沒有變動。
 
 ## 9. 測試規則
 
