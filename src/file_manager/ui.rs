@@ -1050,7 +1050,7 @@ pub(crate) fn render_global_search_panel(
     )
 }
 
-/// 在畫面底部繪製排序選單，模仿 mature-reference 的快捷鍵提示面板。
+/// 在畫面底部繪製排序選單，使用緊湊且可掃讀的快捷鍵提示面板。
 pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
     render_shortcut_grid_panel(
         frame,

@@ -6,7 +6,7 @@
 
 ## 1. 專案目標
 
-這個專案是以個人高效率使用為核心的 terminal 檔案管理器，操作風格以 Vim / mature-reference 為主要參考。
+這個專案是以個人高效率使用為核心的 terminal 檔案管理器，操作風格以 Vim 與成熟的 terminal 工作流程為主要參考。
 
 目前正式支援的平台是：
 
@@ -159,8 +159,8 @@
 ## 7. 搜尋與效能規則
 
 - 使用者感知到的流暢度很重要，不能只看功能有沒有做出來。
-- 本機已下載的 mature-reference 原始碼位於 `/Users/otto/Documents/mature-reference`；需要比對 mature-reference 行為或
-  效能時，必須優先直接閱讀這份 source，不要只依畫面或記憶推測實作。
+- 需要比對其他成熟實作的行為或效能時，必須優先閱讀對方的原始碼，
+  不要只依畫面或記憶推測實作。
 - 大目錄下的操作若可能卡頓，必須優先考慮：
   - lazy loading
   - chunked result
@@ -176,11 +176,11 @@
 
 ### 7.1 Copy / Move 效能基準
 
-- mature-reference 在 macOS 與 Windows 的本機單檔 copy 使用 `std::fs::copy`，並由預設 3 個
-  file workers 執行；PaneFM 的資料夾 copy 不可退化成單 worker 逐檔等待。
-- Move 必須先嘗試作業系統原生 `rename`；rename 未成功時依 mature-reference 流程退回原生 copy，
+- macOS 與 Windows 的本機單檔 copy 使用 `std::fs::copy`，並由預設 3 個
+  file workers 執行；資料夾 copy 不可退化成單 worker 逐檔等待。
+- Move 必須先嘗試作業系統原生 `rename`；rename 未成功時退回原生 copy，
   並且只有 copy 完成且通過大小驗證後才刪除來源。
-- macOS、Windows 本機路徑與已掛載 SMB／UNC 路徑都必須和 mature-reference 一樣，使用
+- macOS、Windows 本機路徑與已掛載 SMB／UNC 路徑都必須使用
   `std::fs::copy` 交由平台原生檔案系統處理；不可只因路徑位於 `/Volumes` 或 UNC 就
   切換成自製串流 copy。失敗時仍必須保留 partial cleanup 與完成後大小驗證。
 - 進度統計不得迫使平台原生 copy 改成較慢的單執行緒手動串流；UI 進度與實際 copy

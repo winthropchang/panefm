@@ -37,7 +37,7 @@ use super::{
 /// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
 static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// 與 mature-reference 預設值一致的檔案複製 worker 數量。
+/// 經過跨平台 I/O 壓力與小檔案吞吐量取捨的檔案複製 worker 數量。
 ///
 /// 目錄走訪只負責建立資料夾與排入單檔工作，實際 copy 由固定數量 worker 並行處理。
 /// 固定上限可提升大量小檔案的速度，同時避免對 SMB 或較慢磁碟產生無限制 I/O 壓力。
@@ -1323,7 +1323,7 @@ impl PaneState {
     ///
     /// 參數：`source_path`、`target_dir`、`overwrite` 與 `progress` 和公開入口相同；
     /// `rename_source` 型別為 `FnOnce(&Path, &Path) -> io::Result<()>`，只負責把來源移到
-    /// 最終目標。回傳：`io::Result<PasteOutcome>`；rename 失敗時會依 mature-reference 流程改用
+    /// 最終目標。回傳：`io::Result<PasteOutcome>`；rename 失敗時會改用
     /// 原生 copy，驗證成功後才刪除來源。
     fn move_path_to_dir_with_history_progress_using_rename<F, R>(
         source_path: &Path,
@@ -2440,7 +2440,7 @@ where
 
 /// 直接複製到正式目標，失敗時清除本次建立的部分內容。
 ///
-/// 一般貼上採用這條路徑，與 mature-reference 在 macOS/Windows 的本機檔案引擎一致，
+/// 一般貼上採用這條跨平台原生檔案引擎路徑，
 /// 不額外要求 SMB 伺服器允許 rename；目標名稱由上層保證原本不存在。
 ///
 /// 參數：
@@ -2692,7 +2692,7 @@ where
 
 /// 使用平台原生 copy 複製單一檔案，並在完成後確認來源、回報值與目標大小一致。
 ///
-/// 這條路徑刻意與 mature-reference 在 macOS／Windows 的 local engine 保持一致：不依 UNC、
+/// 這條路徑在 macOS／Windows 保持單一的 local engine：不依 UNC、
 /// `/Volumes` 或一般本機路徑切換成另一套手寫串流，而是統一交給 `std::fs::copy`。
 /// 這可讓 Rust 標準函式庫與作業系統處理 SMB redirector、clone 與平台細節。
 ///
@@ -2709,8 +2709,8 @@ fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()
 
 /// 使用平台原生 copy 複製檔案，並在 copy 執行期間輪詢目的檔大小更新背景進度。
 ///
-/// mature-reference 的 progressive copy 會讓原生 copy 在 blocking worker 中執行，另一個非同步
-/// 工作定期讀取目的檔 metadata。PaneFM 使用相同分工；輪詢週期縮短為 200ms，讓大型
+/// 原生 copy 在 blocking worker 中執行，另一個非同步工作定期讀取目的檔
+/// metadata；輪詢週期為 200ms，讓大型
 /// 檔案在 task 面板中有較即時的百分比，但輪詢本身不接管或改寫資料傳輸。
 ///
 /// 參數：`source_path`、`target_path` 為來源與目標；`progress` 在單檔完整完成後收到
@@ -3005,7 +3005,7 @@ enum CopyFileResult {
 
 /// 以有界工作佇列與固定 worker 數並行複製目錄中的檔案。
 ///
-/// 這個流程參考 mature-reference 的 scheduler：走訪器一邊發現檔案，一邊把單檔 copy 排給多個
+/// 這個流程採用成熟的 producer-worker scheduler：走訪器一邊發現檔案，一邊把單檔 copy 排給多個
 /// worker，不會等上一個檔案完成後才處理下一個。`sync_channel` 限制尚未處理的工作量，
 /// 因此即使目錄有數十萬個檔案，也不會一次把全部路徑保留在記憶體。
 ///
@@ -3725,12 +3725,12 @@ mod tests {
     }
 
     #[test]
-    /// 驗證 mature-reference 風格的原生 copy 會完整複製內容，並回報正確 byte 數。
+    /// 驗證跨平台原生 copy 會完整複製內容，並回報正確 byte 數。
     ///
     /// 參數：無。
     /// 回傳：無；若目標內容或進度累計與來源不同，測試失敗。
     /// 保護目的：本機、Windows UNC 與 macOS 掛載路徑統一改用原生 API 後，仍須驗證
-    /// 回報進度與目標內容，避免為了與 mature-reference 對齊而把不完整檔案當成成功。
+    /// 回報進度與目標內容，避免把不完整檔案當成成功。
     fn native_copy_verifies_content_and_reports_progress() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source.bin");
@@ -3754,7 +3754,7 @@ mod tests {
     /// 參數：無。
     /// 回傳：無；若 progress 只能在整個 copy 結束後一次跳到 100%，或累計 byte 不等於
     /// 來源大小，測試就會失敗。
-    /// 保護目的：PaneFM 改用 mature-reference 的原生 copy 後，不能為了顯示百分比退回手寫串流；
+    /// 保護目的：PaneFM 改用平台原生 copy 後，不能為了顯示百分比退回手寫串流；
     /// 此測試保護「copy 引擎與進度 metadata 輪詢互相獨立」的核心設計。
     fn native_copy_polls_destination_metadata_before_completion() {
         let dir = tempdir().expect("tempdir");
@@ -3857,7 +3857,7 @@ mod tests {
     }
 
     #[test]
-    /// 模擬 SMB 不支援 rename，驗證 move 會像 mature-reference 一樣改用原生 copy 後刪除來源。
+    /// 模擬 SMB 不支援 rename，驗證 move 會改用原生 copy 後刪除來源。
     ///
     /// 參數：無。
     /// 回傳：無；若 rename 錯誤直接中止、目標內容不完整、來源提早刪除或進度不正確，
@@ -3896,7 +3896,7 @@ mod tests {
     /// 回傳：無；若目標未先變成可見、最高同時工作數小於 2、內容遺失或進度錯誤，
     /// 測試就會失敗。
     /// 保護目的：PaneFM 過去複製包含大量小檔案的 `target` 目錄時只用一條 worker，
-    /// 比 mature-reference 的三條 file worker 慢很多；此測試防止後續重構再次移除並行 scheduler。
+    /// 小檔案處理會大幅變慢；此測試防止後續重構再次移除並行 scheduler。
     fn directory_copy_uses_multiple_workers_and_preserves_content() {
         let dir = tempdir().expect("tempdir");
         let source = dir.path().join("source");

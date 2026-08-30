@@ -98,7 +98,7 @@ pub struct UiConfig {
 pub struct IconsConfig {
     /// 是否在檔名左側顯示跨平台 Unicode 圖示。
     pub enabled: bool,
-    /// 圖示字元風格；`nerd-font` 接近 mature-reference，`ascii` 不依賴特殊字型。
+    /// 圖示字元風格；`nerd-font` 提供緊湊圖示，`ascii` 不依賴特殊字型。
     pub style: IconStyle,
 }
 

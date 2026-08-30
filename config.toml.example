@@ -5,7 +5,7 @@ poll_rate_ms = 120
 [ui.icons]
 # 是否在檔名左側顯示檔案類型文字圖示。
 enabled = true
-# nerd-font 接近 mature-reference 的圖示樣式，需要 Terminal 使用 Nerd Font。
+# nerd-font 提供緊湊的檔案類型圖示，需要 Terminal 使用 Nerd Font。
 # ascii 不需要特殊字型，會顯示 [D] [F] [S] [I] [A] [X]。
 style = "nerd-font"
 
