@@ -5077,6 +5077,44 @@ impl App {
                             state.search_active = true;
                             self.pending_action = Some(PendingAction::DiffMatrix(state));
                         }
+                        _ if key_matches_plain_letter(&key, 'i') => {
+                            state.git_ignore = !state.git_ignore;
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            let cancelled = Arc::new(AtomicBool::new(false));
+                            self.diff_job_cancelled = Some(cancelled.clone());
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.diff_job_rx = Some(rx);
+                            spawn_background_diff(state.panel_roots.clone(), state.git_ignore, state.include_hidden, cancelled, tx);
+                            state.loading = true;
+                            state.rows.clear();
+                            state.filtered_indices.clear();
+                            self.status = format!(
+                                "diff matrix: .gitignore rules {}",
+                                if state.git_ignore { "enabled" } else { "disabled (scanning target/build dirs)" }
+                            );
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key.code == KeyCode::Char('.') => {
+                            state.include_hidden = !state.include_hidden;
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            let cancelled = Arc::new(AtomicBool::new(false));
+                            self.diff_job_cancelled = Some(cancelled.clone());
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.diff_job_rx = Some(rx);
+                            spawn_background_diff(state.panel_roots.clone(), state.git_ignore, state.include_hidden, cancelled, tx);
+                            state.loading = true;
+                            state.rows.clear();
+                            state.filtered_indices.clear();
+                            self.status = format!(
+                                "diff matrix: hidden files {}",
+                                if state.include_hidden { "included" } else { "excluded" }
+                            );
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
                         _ if key_matches_plain_letter(&key, 'r') => {
                             if let Some(cancelled) = self.diff_job_cancelled.take() {
                                 cancelled.store(true, Ordering::Relaxed);
@@ -5085,7 +5123,7 @@ impl App {
                             self.diff_job_cancelled = Some(cancelled.clone());
                             let (tx, rx) = std::sync::mpsc::channel();
                             self.diff_job_rx = Some(rx);
-                            spawn_background_diff(state.panel_roots.clone(), cancelled, tx);
+                            spawn_background_diff(state.panel_roots.clone(), state.git_ignore, state.include_hidden, cancelled, tx);
                             state.loading = true;
                             state.rows.clear();
                             state.filtered_indices.clear();
@@ -5856,7 +5894,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.diff_job_rx = Some(rx);
 
-        spawn_background_diff(roots.clone(), cancelled, tx);
+        spawn_background_diff(roots.clone(), true, true, cancelled, tx);
 
         let diff_state = DiffMatrixState::new_loading(valid_ids, roots, labels);
         self.pending_action = Some(PendingAction::DiffMatrix(diff_state));
@@ -21709,6 +21747,38 @@ mod tests {
             .expect("filter cycle");
         if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
             assert_eq!(state.filter_mode, crate::file_manager::diff::DiffFilterMode::DiffOnly);
+        }
+
+        // 測試 gitignore 切換 (i)
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("toggle gitignore");
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+            assert!(!state.git_ignore);
+        }
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.poll_background_tasks();
+            if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+                if !state.loading {
+                    break;
+                }
+            }
+        }
+
+        // 測試隱藏檔切換 (.)
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .expect("toggle hidden");
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+            assert!(!state.include_hidden);
+        }
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.poll_background_tasks();
+            if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+                if !state.loading {
+                    break;
+                }
+            }
         }
 
         // 測試搜尋 (/)

@@ -110,6 +110,8 @@ pub(crate) struct DiffMatrixState {
     pub(crate) search_active: bool,
     pub(crate) loading: bool,
     pub(crate) discovered_count: usize,
+    pub(crate) git_ignore: bool,
+    pub(crate) include_hidden: bool,
 }
 
 impl DiffMatrixState {
@@ -132,6 +134,8 @@ impl DiffMatrixState {
             search_active: false,
             loading: true,
             discovered_count: 0,
+            git_ignore: true,
+            include_hidden: true,
         }
     }
 
@@ -156,6 +160,8 @@ impl DiffMatrixState {
             search_active: false,
             loading: false,
             discovered_count: 0,
+            git_ignore: true,
+            include_hidden: true,
         };
         state.refresh_filtered_indices();
         Ok(state)
@@ -291,13 +297,15 @@ fn should_ignore_component(comp: &str) -> bool {
 /// 啟動非阻塞背景比對執行緒。
 pub(crate) fn spawn_background_diff(
     roots: Vec<PathBuf>,
+    git_ignore: bool,
+    include_hidden: bool,
     cancelled: Arc<AtomicBool>,
     sender: Sender<DiffJobEvent>,
 ) {
     thread::spawn(move || {
         let mut relative_paths = BTreeSet::new();
 
-        // 1. 遍歷所有 root，收集相對路徑集合（預設啟用 gitignore 避免掃描巨大編譯暫存檔）
+        // 1. 遍歷所有 root，收集相對路徑集合
         for root in &roots {
             if cancelled.load(Ordering::Relaxed) {
                 return;
@@ -307,11 +315,11 @@ pub(crate) fn spawn_background_diff(
             }
 
             let walker = WalkBuilder::new(root)
-                .hidden(false)
+                .hidden(!include_hidden)
                 .parents(true)
-                .git_ignore(true)
-                .git_global(true)
-                .git_exclude(true)
+                .git_ignore(git_ignore)
+                .git_global(git_ignore)
+                .git_exclude(git_ignore)
                 .build();
 
             for result in walker {
@@ -467,7 +475,7 @@ pub(crate) fn spawn_background_diff(
 pub(crate) fn compute_diff_matrix(roots: &[PathBuf]) -> io::Result<Vec<DiffMatrixRow>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
-    spawn_background_diff(roots.to_vec(), cancelled, tx);
+    spawn_background_diff(roots.to_vec(), true, true, cancelled, tx);
 
     let mut final_rows = Vec::new();
     while let Ok(event) = rx.recv() {

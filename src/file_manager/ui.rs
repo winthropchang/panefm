@@ -3042,9 +3042,22 @@ pub(crate) fn render_diff_matrix(
         String::new()
     };
 
+    let gitignore_label = if state.git_ignore {
+        "啟用"
+    } else {
+        "停用(含target/build)"
+    };
+    let hidden_label = if state.include_hidden {
+        "包含"
+    } else {
+        "排除"
+    };
+
     let filter_text = format!(
-        " 篩選: [{}] (按 f 切換){} | 共 {} 項 (顯示 {} 項) ",
+        " 篩選: [{}] (按 f) | 規則: [.gitignore: {} (按 i)] [隱藏檔: {} (按 .)] [.git: 排除]{} | 共 {} 項 (顯示 {} 項) ",
         state.filter_mode.label(),
+        gitignore_label,
+        hidden_label,
         search_part,
         state.rows.len(),
         state.filtered_indices.len()
@@ -3207,7 +3220,7 @@ pub(crate) fn render_diff_matrix(
     frame.render_widget(list_widget, outer[1]);
 
     // 3. 底部快捷鍵提示列
-    let shortcuts = " [Enter] 查看內容差異  [f] 篩選模式  [/] 搜尋路徑  [r] 重新掃描  [q/Esc] 退出比對 ";
+    let shortcuts = " [Enter] 查看內容差異  [f] 篩選模式  [i] gitignore切換  [.] 隱藏檔切換  [/] 搜尋路徑  [r] 重新掃描  [q/Esc] 退出比對 ";
     let footer_para = Paragraph::new(Line::from(Span::styled(
         shortcuts,
         theme.accent_style().add_modifier(Modifier::BOLD),
