@@ -9698,8 +9698,9 @@ impl App {
     /// - `self: &mut App`，提供目前 panel、輸入模式、狀態文字及 theme 等畫面狀態。
     /// - `frame: &mut ratatui::Frame<'_>`，ratatui 本次更新可使用的繪圖 frame。
     ///
-    /// 回傳：`()`；畫面內容會直接寫入傳入的 `frame`。
-    pub(crate) fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+    /// 回傳：`Option<(u16, u16)>`；畫面需要顯示文字輸入游標時回傳其 cell 座標，
+    /// 否則回傳 `None`。畫面內容會直接寫入傳入的 `frame`。
+    pub(crate) fn render(&mut self, frame: &mut ratatui::Frame<'_>) -> Option<(u16, u16)> {
         let raw_status_text = if self.command_mode {
             format!(":{}", self.command_buffer)
         } else {
@@ -10253,6 +10254,7 @@ impl App {
         if let Some((x, y)) = cursor_position {
             frame.set_cursor_position((x, y));
         }
+        cursor_position
     }
 
     /// 回傳目前畫面應該呈現的 rename 游標模式。
@@ -18525,7 +18527,9 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| app.render(frame))
+            .draw(|frame| {
+                let _ = app.render(frame);
+            })
             .expect("render panel filter");
         let filter_x = terminal
             .backend()
@@ -18541,7 +18545,9 @@ mod tests {
         app.open_preview_focus();
         app.open_preview_search_input();
         terminal
-            .draw(|frame| app.render(frame))
+            .draw(|frame| {
+                let _ = app.render(frame);
+            })
             .expect("render preview search");
         let preview_search_x = terminal
             .backend()

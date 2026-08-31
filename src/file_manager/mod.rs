@@ -47,7 +47,7 @@ use crossterm::{
     },
 };
 use ignore::WalkBuilder;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, buffer::Buffer, layout::Position};
 
 use crate::config::load_config;
 
@@ -118,16 +118,38 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let poll_rate = loaded_config.config.ui.poll_rate;
     let mut app = App::new(cwd, loaded_config)?;
     let mut last_cursor_mode = None;
+    let mut presented_frame: Option<(Buffer, Option<Position>)> = None;
 
     loop {
         // 每輪先吸收有限量背景訊息再繪圖，讓搜尋結果能逐批出現，同時避免 channel
         // 一次灌入太多資料而延後鍵盤事件。full redraw 只用於 Windows/SMB 等可能
         // 留下舊 cell 的情況，平常交給 ratatui diff rendering 降低閃爍。
         app.poll_background_tasks();
-        if app.take_full_redraw_request() {
+        let full_redraw_requested = app.take_full_redraw_request();
+        if full_redraw_requested {
             terminal.clear()?;
         }
-        terminal.draw(|frame| app.render(frame))?;
+        terminal.autoresize()?;
+        terminal.current_buffer_mut().reset();
+        let (buffer, cursor_position) = {
+            let mut frame = terminal.get_frame();
+            let cursor_position = app.render(&mut frame).map(Position::from);
+            (frame.buffer_mut().clone(), cursor_position)
+        };
+        let frame_changed = full_redraw_requested
+            || presented_frame
+                .as_ref()
+                .is_none_or(|(previous_buffer, previous_cursor)| {
+                    previous_buffer != &buffer || *previous_cursor != cursor_position
+                });
+        if frame_changed {
+            terminal.apply_buffer_with_cursor(cursor_position)?;
+            presented_frame = Some((buffer, cursor_position));
+        } else {
+            // Manual rendering leaves the candidate buffer active when it is not presented.
+            // Reset it so the next pass starts from the same clean state as Terminal::draw().
+            terminal.current_buffer_mut().reset();
+        }
         sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
 
         if event::poll(poll_rate)?
@@ -145,6 +167,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 .map_err(|error| io::Error::other(error.to_string()));
             app.finish_launch_task(queued.task_id, result);
             last_cursor_mode = None;
+            presented_frame = None;
         }
 
         // fzf 會接管 alternate screen，必須走專用生命週期完整關閉再重建 TUI。
@@ -159,6 +182,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 }
             }
             last_cursor_mode = None;
+            presented_frame = None;
         }
     }
 
