@@ -5,8 +5,11 @@
 
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
+
+#[cfg(any(test, target_os = "macos"))]
+use std::path::Path;
 
 #[cfg(all(target_os = "macos", not(test)))]
 use std::process::Command;
@@ -26,6 +29,7 @@ pub(crate) struct SmbLocation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedSmbLocation {
     Ready(PathBuf),
+    #[allow(dead_code)]
     NeedsMount { local_path: PathBuf },
 }
 
@@ -125,6 +129,7 @@ fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
 /// - `expected_share: &str`，SMB share 名稱。
 ///
 /// 回傳：`Option<PathBuf>`；找不到完全相符的 SMB 掛載時回傳 `None`。
+#[cfg(any(test, target_os = "macos"))]
 fn find_macos_smb_mount(
     mount_output: &str,
     expected_host: &str,
@@ -148,6 +153,7 @@ fn find_macos_smb_mount(
 ///
 /// 參數：`input: &str`，mount table 中的單一路徑欄位。
 /// 回傳：`String`，可交給 `PathBuf` 使用的本機路徑。
+#[cfg(any(test, target_os = "macos"))]
 fn decode_mount_field(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
@@ -222,7 +228,7 @@ pub(crate) fn build_smb_mount_launch(location: &SmbLocation) -> LaunchSpec {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 /// 把已解析的 SMB share 與其子路徑組成 Windows 可直接存取的 UNC PathBuf。
 ///
 /// 參數：`location: &SmbLocation`，包含 host、share 與可選 subpath。

@@ -5,6 +5,7 @@
 //! 當來源與目的跨越不同磁區、檔案系統（如 FAT32/exFAT/NTFS）或網路芳鄰（SMB）時，
 //! 本模組精確識別錯誤並提供平滑降級（Fallback）判定，由上層無縫切換為串流或平行複製。
 
+#[cfg(any(target_os = "macos", test))]
 use std::fs;
 use std::io;
 use std::path::Path;
