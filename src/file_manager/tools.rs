@@ -45,7 +45,7 @@ pub(crate) fn missing_tool_message(tool: &str) -> String {
 }
 
 /// 在指定 PATH 中找出第一個可執行檔，Windows 會依序嘗試常見副檔名。
-fn find_command_in_path(name: &OsStr, path: Option<&OsStr>) -> Option<OsString> {
+pub(crate) fn find_command_in_path(name: &OsStr, path: Option<&OsStr>) -> Option<OsString> {
     let path = path?;
     for directory in std::env::split_paths(path) {
         let candidate = directory.join(name);
@@ -61,6 +61,12 @@ fn find_command_in_path(name: &OsStr, path: Option<&OsStr>) -> Option<OsString> 
         }
     }
     None
+}
+
+/// 快速檢查系統 PATH 中是否有指定名稱的命令。
+pub(crate) fn is_command_in_path(cmd: &str) -> bool {
+    let path = std::env::var_os("PATH");
+    find_command_in_path(std::ffi::OsStr::new(cmd), path.as_deref()).is_some()
 }
 
 /// 判斷 PATH 候選是否為一般檔案；權限細節交由作業系統在啟動時判斷。

@@ -9,6 +9,7 @@ mod archive;
 mod bookmark;
 mod copy;
 mod cow;
+mod diff;
 mod entry;
 mod fd;
 mod filesystem_watcher;

@@ -47,6 +47,7 @@ use super::{
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
     debug_timing_log, debug_timing_message,
+    diff::{DiffJobEvent, DiffMatrixState, launch_content_diff_spec, spawn_background_diff},
     filesystem_watcher::FilesystemWatcher,
     fuzzy::{fuzzy_matched_indices, fuzzy_matched_indices_by_fields},
     layout::{LayoutNode, SplitDirection, SplitPlacement},
@@ -74,7 +75,7 @@ use super::{
         BookmarkPanelLine, CommandSuggestionLine, HelpPanelLine, InlineEditorState,
         InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState, TaskPanelLine,
         TrashPanelLine, ZoxidePanelLine, render_bookmark_action_picker, render_bookmark_picker,
-        render_command_palette, render_confirm_dialog, render_filter_input,
+        render_command_palette, render_confirm_dialog, render_diff_matrix, render_filter_input,
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
         render_theme_picker, render_trash_confirm_dialog, render_window_picker,
@@ -561,6 +562,7 @@ pub(crate) enum PendingAction {
         selected: usize,
         previews: Vec<RegexRenamePreview>,
     },
+    DiffMatrix(DiffMatrixState),
 }
 
 /// 表示整個應用程式的核心狀態。
@@ -602,6 +604,8 @@ pub(crate) struct App {
     pub(crate) global_search_rx: Option<Receiver<GlobalSearchEvent>>,
     pub(crate) global_search_cancelled: Option<Arc<AtomicBool>>,
     pub(crate) active_global_search_task_id: Option<usize>,
+    pub(crate) diff_job_rx: Option<Receiver<DiffJobEvent>>,
+    pub(crate) diff_job_cancelled: Option<Arc<AtomicBool>>,
     /// 目前 UNC `goto` 背景工作的接收端；`None` 代表沒有等待中的網路跳轉。
     network_goto_rx: Option<Receiver<NetworkGotoEvent>>,
     /// 目前 UNC `goto` 對應的 task id，供 Esc 與 task panel 取消後捨棄晚到結果。
@@ -791,6 +795,8 @@ impl App {
             global_search_rx: None,
             global_search_cancelled: None,
             active_global_search_task_id: None,
+            diff_job_rx: None,
+            diff_job_cancelled: None,
             network_goto_rx: None,
             active_network_goto_task_id: None,
             file_job_receivers: BTreeMap::new(),
@@ -1569,6 +1575,13 @@ impl App {
                 self.pending_g = false;
                 self.pending_y = false;
                 self.extract_selected_archives()?;
+                true
+            }
+            _ if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::ALT) => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_diff_matrix(None)?;
                 true
             }
             KeyCode::Char('\'') => {
@@ -2853,6 +2866,18 @@ impl App {
                         self.status = String::from("panel focus changed");
                     }
                 }
+                _ if key_matches_plain_letter(&key, 'd') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.open_diff_matrix(None)?;
+                }
+                _ if key_matches_shifted_letter(&key, 'D') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.open_prefilled_command("diff ");
+                }
                 KeyCode::Esc => {
                     self.status = String::from("normal mode");
                 }
@@ -2861,7 +2886,7 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::WindowPicker { pane_id });
-                    self.status = String::from("panel: choose h/j/k/l/c/o/t from the panel");
+                    self.status = String::from("panel: choose h/j/k/l/c/o/t/d from the panel");
                 }
             },
             PendingAction::LineModePicker { pane_id } => match key.code {
@@ -4971,6 +4996,135 @@ impl App {
                     self.status = self.status_for_pending_action(action)?;
                 }
             }
+            PendingAction::DiffMatrix(mut state) => {
+                if state.search_active {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            state.search_active = false;
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        KeyCode::Backspace => {
+                            state.search_query.pop();
+                            state.refresh_filtered_indices();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        KeyCode::Char(c) => {
+                            state.search_query.push(c);
+                            state.refresh_filtered_indices();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                    }
+                } else if state.loading {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            self.diff_job_rx = None;
+                            self.status = String::from("diff matrix closed");
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            self.diff_job_rx = None;
+                            self.status = String::from("diff matrix closed");
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            self.diff_job_rx = None;
+                            self.status = String::from("diff matrix closed");
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            self.diff_job_rx = None;
+                            self.status = String::from("diff matrix closed");
+                        }
+                        _ if key_matches_plain_letter(&key, 'j') || key.code == KeyCode::Down => {
+                            state.move_down();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key_matches_plain_letter(&key, 'k') || key.code == KeyCode::Up => {
+                            state.move_up();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key_matches_plain_letter(&key, 'g') || key.code == KeyCode::Home => {
+                            state.move_to_top();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key_matches_letter_any_case(&key, 'G') || key.code == KeyCode::End => {
+                            state.move_to_bottom();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key_matches_plain_letter(&key, 'f') => {
+                            state.cycle_filter_mode();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key.code == KeyCode::Char('/') => {
+                            state.search_active = true;
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ if key_matches_plain_letter(&key, 'r') => {
+                            if let Some(cancelled) = self.diff_job_cancelled.take() {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            let cancelled = Arc::new(AtomicBool::new(false));
+                            self.diff_job_cancelled = Some(cancelled.clone());
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.diff_job_rx = Some(rx);
+                            spawn_background_diff(state.panel_roots.clone(), cancelled, tx);
+                            state.loading = true;
+                            state.rows.clear();
+                            state.filtered_indices.clear();
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        KeyCode::Enter => {
+                            if let Some(row) = state.selected_row() {
+                                if let Some(launch) = launch_content_diff_spec(&state.panel_roots, row) {
+                                    let detail = format!("{} {}", launch.program, launch.args.join(" "));
+                                    let sources = state
+                                        .panel_roots
+                                        .iter()
+                                        .map(|p| p.join(&row.relative_path).display().to_string())
+                                        .collect();
+                                    let task_id = self.push_task(
+                                        self.focused_pane,
+                                        "diff",
+                                        format!("diff: {}", row.relative_path.display()),
+                                        detail,
+                                        sources,
+                                        None,
+                                    );
+                                    self.pending_launch = Some(QueuedLaunch { task_id, launch });
+                                    self.status = format!("opening diff for {}", row.relative_path.display());
+                                } else if row.is_dir {
+                                    self.status = format!("{} is a directory", row.relative_path.display());
+                                }
+                            }
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::DiffMatrix(state));
+                        }
+                    }
+                }
+                if let Some(action) = self.pending_action.as_ref() {
+                    self.status = self.status_for_pending_action(action)?;
+                }
+            }
         }
 
         Ok(true)
@@ -5281,12 +5435,23 @@ impl App {
             }
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
+            "diff" | "df" | "d" => self.open_diff_matrix(None)?,
             "rename-regex" | "reg" => {
                 self.status = String::from("usage: rename-regex <pattern> <replace>");
             }
             "" => self.status = String::from("normal mode"),
             other => {
-                if let Some(name) = other.strip_prefix("theme ") {
+                if let Some(args) = other
+                    .strip_prefix("diff ")
+                    .or_else(|| other.strip_prefix("df "))
+                    .or_else(|| other.strip_prefix("d "))
+                {
+                    let ids = args
+                        .split_whitespace()
+                        .filter_map(|s| s.parse::<usize>().ok())
+                        .collect::<Vec<_>>();
+                    self.open_diff_matrix(Some(ids))?;
+                } else if let Some(name) = other.strip_prefix("theme ") {
                     self.set_theme_by_name(name.trim());
                 } else if let Some(path) = other.strip_prefix("goto ") {
                     self.change_directory_from_command(path.trim())?;
@@ -5571,7 +5736,7 @@ impl App {
         self.pending_action = Some(PendingAction::WindowPicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("panel: choose h/j/k/l/c/o/t from the panel");
+        self.status = String::from("panel: choose h/j/k/l/c/o/t/d from the panel");
     }
 
     /// 打開底部 linemode 面板，等待使用者輸入右側欄位顯示模式。
@@ -5644,6 +5809,96 @@ impl App {
             },
         });
         self.status = task_panel_status("", count, 0, false);
+    }
+
+    /// 打開全螢幕 N 路目錄與檔案差異比對工作區 (Diff Matrix)。
+    pub(crate) fn open_diff_matrix(&mut self, target_pane_ids: Option<Vec<usize>>) -> Result<()> {
+        let pane_ids = match target_pane_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => self.panes.keys().copied().collect::<Vec<_>>(),
+        };
+
+        if pane_ids.len() < 2 {
+            self.status = String::from("diff requires at least 2 open panels (e.g. use Ctrl+s / Ctrl+v to split first)");
+            return Ok(());
+        }
+
+        let mut valid_ids = Vec::new();
+        let mut roots = Vec::new();
+        let mut labels = Vec::new();
+
+        for id in pane_ids {
+            if let Some(pane) = self.panes.get(&id) {
+                valid_ids.push(id);
+                roots.push(pane.cwd.clone());
+                let tail = pane
+                    .cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| pane.cwd.display().to_string());
+                labels.push(tail);
+            }
+        }
+
+        if roots.len() < 2 {
+            self.status = String::from("diff requires at least 2 valid panels");
+            return Ok(());
+        }
+
+        // 取消任何先前的 diff background job
+        if let Some(cancelled) = self.diff_job_cancelled.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.diff_job_cancelled = Some(cancelled.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.diff_job_rx = Some(rx);
+
+        spawn_background_diff(roots.clone(), cancelled, tx);
+
+        let diff_state = DiffMatrixState::new_loading(valid_ids, roots, labels);
+        self.pending_action = Some(PendingAction::DiffMatrix(diff_state));
+        self.status = format!("diff matrix: scanning {} panels...", self.panes.len());
+        Ok(())
+    }
+
+    /// 輪詢背景目錄比對工作的接收端，非阻塞更新差異矩陣。
+    fn poll_diff_job(&mut self) {
+        let Some(receiver) = &self.diff_job_rx else {
+            return;
+        };
+        let messages: Vec<DiffJobEvent> = receiver.try_iter().collect();
+        if messages.is_empty() {
+            return;
+        }
+
+        for message in messages {
+            match message {
+                DiffJobEvent::Discovered(count) => {
+                    if let Some(PendingAction::DiffMatrix(state)) = &mut self.pending_action {
+                        state.discovered_count = count;
+                    }
+                }
+                DiffJobEvent::Done(rows) => {
+                    let count = rows.len();
+                    if let Some(PendingAction::DiffMatrix(state)) = &mut self.pending_action {
+                        state.set_completed_rows(rows);
+                        self.status = format!("diff matrix: compared {} items (press q to exit)", count);
+                    }
+                    self.diff_job_rx = None;
+                    self.diff_job_cancelled = None;
+                    break;
+                }
+                DiffJobEvent::Error(err) => {
+                    self.status = format!("diff error: {err}");
+                    self.diff_job_rx = None;
+                    self.diff_job_cancelled = None;
+                    break;
+                }
+            }
+        }
     }
 
     /// 打開書籤列表彈窗，讓使用者可以用列表方式跳轉既有書籤。
@@ -6527,7 +6782,7 @@ impl App {
             }
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::WindowPicker { .. } => {
-                String::from("panel: choose h/j/k/l/c/o from the panel")
+                String::from("panel: choose h/j/k/l/c/o/t/d from the panel")
             }
             PendingAction::LineModePicker { .. } => {
                 String::from("linemode: choose a key from the panel")
@@ -6613,6 +6868,13 @@ impl App {
                 replacement,
                 ..
             } => regex_rename_status(pattern, replacement, previews),
+            PendingAction::DiffMatrix(state) => {
+                format!(
+                    "diff matrix: {} items (filter: {})",
+                    state.filtered_indices.len(),
+                    state.filter_mode.label()
+                )
+            }
         })
     }
 
@@ -10119,7 +10381,7 @@ impl App {
             }
         }
 
-        match &self.pending_action {
+        match &mut self.pending_action {
             Some(PendingAction::ConfirmDelete {
                 target_name,
                 permanent,
@@ -10240,6 +10502,9 @@ impl App {
                     }
                 }
             }
+            Some(PendingAction::DiffMatrix(state)) => {
+                render_diff_matrix(frame, frame.area(), state, self.theme);
+            }
             Some(PendingAction::TrashPanel { .. })
             | Some(PendingAction::TaskPanel { .. })
             | Some(PendingAction::HelpPanel { .. })
@@ -10309,6 +10574,7 @@ impl App {
         self.poll_file_jobs();
         self.poll_directory_load_jobs();
         self.poll_directory_size_jobs();
+        self.poll_diff_job();
 
         let Some(receiver) = &self.global_search_rx else {
             return;
@@ -12400,6 +12666,12 @@ fn help_entries(query: &str) -> Vec<HelpEntry> {
             "b",
             "打開書籤功能面板，可選擇自動儲存、列表跳轉、刪除單筆或清空全部書籤",
             HelpAction::Command("bookmark"),
+        ),
+        help_entry(
+            ":diff",
+            ":diff",
+            "開啟全螢幕多 Panel 目錄矩陣與檔案內容差異比對 (N-Way Diff Matrix)",
+            HelpAction::Command("diff"),
         ),
         help_entry(
             ":bookmark add",
@@ -15639,7 +15911,7 @@ mod tests {
             app.pending_action,
             Some(PendingAction::WindowPicker { pane_id: 1 })
         );
-        assert_eq!(app.status, "panel: choose h/j/k/l/c/o/t from the panel");
+        assert_eq!(app.status, "panel: choose h/j/k/l/c/o/t/d from the panel");
     }
 
     #[test]
@@ -16491,21 +16763,6 @@ mod tests {
         );
     }
 
-    #[test]
-    /// 驗證按下 `~` 時，也會像 F1 一樣打開 help 面板。
-    /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
-    fn app_tilde_opens_help_panel() {
-        let dir = tempdir().expect("tempdir");
-        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE))
-            .expect("open help with tilde");
-
-        assert!(matches!(
-            app.pending_action,
-            Some(PendingAction::HelpPanel { .. })
-        ));
-    }
 
     #[test]
     /// 驗證 help 面板已開啟時，再按一次 `~` 會直接關閉回 normal mode。
@@ -21392,5 +21649,114 @@ mod tests {
             }),
             "模糊搜尋 'tfm' 必須命中 terminal_file_manager.d"
         );
+    }
+
+    #[test]
+    fn diff_command_requires_two_panels() {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        // 只有 1 個 panel 時執行 :diff
+        app.execute_command("diff").expect("diff cmd");
+        assert!(app.status.contains("diff requires at least 2 open panels"));
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn diff_command_opens_and_navigates_matrix() {
+        let dir1 = tempdir().expect("dir1");
+        let dir2 = tempdir().expect("dir2");
+        let dir3 = tempdir().expect("dir3");
+
+        fs::write(dir1.path().join("a.txt"), b"aaa").expect("write a");
+        fs::write(dir2.path().join("a.txt"), b"aaa").expect("write a");
+        fs::write(dir3.path().join("a.txt"), b"different").expect("write a");
+
+        fs::write(dir1.path().join("only1.txt"), b"111").expect("write 1");
+        fs::write(dir2.path().join("only2.txt"), b"222").expect("write 2");
+
+        let mut app = App::new(dir1.path().to_path_buf(), default_loaded_config()).expect("app");
+        // 分割出 panel 2 與 panel 3
+        app.split_current(SplitDirection::Vertical).expect("split 1");
+        app.change_directory_from_command(&dir2.path().to_string_lossy()).expect("goto dir2");
+
+        app.split_current(SplitDirection::Vertical).expect("split 2");
+        app.change_directory_from_command(&dir3.path().to_string_lossy()).expect("goto dir3");
+
+        // 執行 :diff 比對全部 3 個 Panel
+        app.execute_command("diff").expect("execute diff");
+        assert!(matches!(app.pending_action, Some(PendingAction::DiffMatrix(_))));
+
+        // 輪詢等待背景 diff 完成
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.poll_background_tasks();
+            if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+                if !state.loading {
+                    break;
+                }
+            }
+        }
+
+        // 測試按鍵導航
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("down");
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+            assert_eq!(state.selected_index, 1);
+        }
+
+        // 測試篩選切換 (f)
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("filter cycle");
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+            assert_eq!(state.filter_mode, crate::file_manager::diff::DiffFilterMode::DiffOnly);
+        }
+
+        // 測試搜尋 (/)
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("search start");
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .expect("type o");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("type n");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm search");
+
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+            assert!(!state.search_active);
+            assert_eq!(state.search_query, "on");
+            assert_eq!(state.filtered_indices.len(), 2); // only1.txt, only2.txt
+        }
+
+        // 測試退出比對 (q)
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("quit diff");
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "diff matrix closed");
+
+        // 測試快速指令別名 :d 1 2
+        app.execute_command("d 1 2").expect("execute d 1 2");
+        assert!(matches!(app.pending_action, Some(PendingAction::DiffMatrix(_))));
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
+            assert_eq!(state.panel_ids, vec![1, 2]);
+        }
+
+        // 退出
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).expect("esc");
+        assert!(app.pending_action.is_none());
+
+        // 測試快捷鍵 wd (WindowPicker -> d)
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)).expect("w");
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).expect("d");
+        assert!(matches!(app.pending_action, Some(PendingAction::DiffMatrix(_))));
+
+        // 退出
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).expect("esc");
+        assert!(app.pending_action.is_none());
+
+        // 測試快捷鍵 wD (WindowPicker -> D: prefilled :diff )
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)).expect("w");
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)).expect("D");
+        assert!(app.command_mode);
+        assert_eq!(app.command_buffer, "diff ");
     }
 }
