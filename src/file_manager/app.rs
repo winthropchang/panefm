@@ -12161,7 +12161,7 @@ fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
     ]
 }
 
-/// 依 terminal 寬度建立底部快捷鍵列，只放入能完整顯示的提示。
+/// 依 terminal 寬度建立底部快捷鍵列，並把版本固定在最右側。
 ///
 /// 參數：
 /// - `width: u16`，目前快捷鍵列可使用的 terminal cell 寬度。
@@ -12170,13 +12170,20 @@ fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
 /// 回傳：`Line<'static>`，可直接交給 ratatui `Paragraph` 繪製的單行內容。
 fn status_shortcut_line(width: u16, theme: Theme) -> Line<'static> {
     let available_width = usize::from(width);
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version_width = version.len();
+    let version_gap = 2usize;
     let mut used_width = 0usize;
     let mut spans = Vec::new();
 
     for (index, hint) in status_shortcut_hints().iter().enumerate() {
         let separator = if index == 0 { "" } else { "  " };
         let item_width = separator.len() + hint.key.len() + 1 + hint.label.len();
-        if index > 0 && used_width.saturating_add(item_width) > available_width {
+        let required_width = used_width
+            .saturating_add(item_width)
+            .saturating_add(version_gap)
+            .saturating_add(version_width);
+        if required_width > available_width {
             break;
         }
 
@@ -12188,6 +12195,12 @@ fn status_shortcut_line(width: u16, theme: Theme) -> Line<'static> {
         spans.push(Span::raw(hint.label));
         used_width = used_width.saturating_add(item_width);
     }
+
+    let padding_width = available_width.saturating_sub(used_width.saturating_add(version_width));
+    if padding_width > 0 {
+        spans.push(Span::raw(" ".repeat(padding_width)));
+    }
+    spans.push(Span::styled(version, theme.accent_style()));
 
     Line::from(spans)
 }
@@ -13786,11 +13799,12 @@ mod tests {
     }
 
     #[test]
-    /// 驗證窄 terminal 只保留能完整放下的高優先快捷鍵，不會把下一筆裁成半截。
+    /// 驗證窄 terminal 只保留能完整放下的高優先快捷鍵，並固定保留右側版本號。
     /// 保護目的：多 panel 或小視窗會縮短 status bar；此測試避免重新出現只看得到半個
     /// 快捷鍵名稱，並確認寬畫面使用的是目前正確的 Tab preview 與 P 覆蓋貼上提示。
     fn status_shortcut_line_drops_low_priority_items_instead_of_clipping() {
         let theme = Theme::default_theme();
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
         let narrow = super::status_shortcut_line(31, theme);
         let narrow_text = narrow
             .spans
@@ -13804,10 +13818,21 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(narrow_text, "~/F1 help  hjkl move");
+        assert_eq!(narrow_text.len(), 31);
+        assert!(narrow_text.starts_with("~/F1 help"));
+        assert!(narrow_text.ends_with(&version));
         assert!(wide_text.contains("Tab preview"));
         assert!(wide_text.contains("p/P paste/overwrite"));
         assert!(!wide_text.contains("P preview"));
+        assert!(wide_text.ends_with(&version));
+
+        let version_only = super::status_shortcut_line(version.len() as u16, theme);
+        let version_only_text = version_only
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(version_only_text, version);
     }
 
     #[test]
