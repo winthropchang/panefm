@@ -84,8 +84,24 @@ cargo build --release
 panefm
 ```
 
-未來建立正式 GitHub Release 後，預計提供 Homebrew 與 Windows 套件管理器安裝；
-目前尚未發布，因此 README 不會提供無法使用的 `brew install panefm` 或 WinGet 命令。
+正式版本會在 GitHub Releases 提供 Windows x64、macOS Apple Silicon 與 macOS Intel
+執行檔。未來預計再提供 Homebrew 與 Windows 套件管理器安裝；目前 README 不會提供
+尚未設定完成的 `brew install panefm` 或 WinGet 命令。
+
+下載 macOS 執行檔後，第一次執行前需要加上執行權限：
+
+```bash
+chmod +x panefm-macos-arm64 # Apple Silicon
+# 或
+chmod +x panefm-macos-x64   # Intel
+```
+
+查看目前版本：
+
+```bash
+panefm --version
+# panefm 0.1.0
+```
 
 ## 快速開始
 
@@ -187,6 +203,27 @@ cargo fmt --all
 cargo test
 cargo run
 ```
+
+### 自動建置與發布
+
+每次 push 到任意 branch 時，GitHub Actions 會編譯以下三個測試用 artifact，保留 14 天：
+
+- `panefm-windows-x64.exe`
+- `panefm-macos-arm64`
+- `panefm-macos-x64`
+
+可從 GitHub 的 **Actions** 頁面開啟該次 workflow，在 **Artifacts** 區塊下載。一般 push
+只會產生 CI artifact，不會建立 GitHub Release。
+
+準備正式發布時，先把 `Cargo.toml` 的 `version` 更新並提交；再建立相同版本的 tag：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+tag 必須符合 `vX.Y.Z`，且版本必須和 `Cargo.toml` 完全一致。檢查通過後，GitHub Actions
+才會建立正式 Release、自動產生 release notes，並上傳三個平台執行檔。
 
 開發前請閱讀 [DEVELOPMENT_GUIDELINES.md](DEVELOPMENT_GUIDELINES.md)。需要接續目前進度時，
 請先閱讀 [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md) 與 [DEV_NOTES.md](DEV_NOTES.md)。

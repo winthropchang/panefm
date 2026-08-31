@@ -1,0 +1,113 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Match tag to Cargo version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use the vX.Y.Z format (for example, v0.1.0)."
+            exit 1
+          fi
+
+          cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "v$cargo_version" != "$GITHUB_REF_NAME" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            source: target/x86_64-pc-windows-msvc/release/panefm.exe
+            asset: panefm-windows-x64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            source: target/aarch64-apple-darwin/release/panefm
+            asset: panefm-macos-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            source: target/x86_64-apple-darwin/release/panefm
+            asset: panefm-macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Name binary for download
+        shell: bash
+        run: cp "${{ matrix.source }}" "${{ matrix.asset }}"
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: panefm-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "PaneFM $GITHUB_REF_NAME" \
+            --generate-notes
