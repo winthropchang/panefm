@@ -72,6 +72,31 @@ impl TrashStore {
         })
     }
 
+    /// 檢查來源路徑是否與 trash store 位於不同磁碟機或掛載點。
+    pub(crate) fn is_cross_device(&self, path: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            use std::path::Component;
+            let s_prefix = path.components().next();
+            let t_prefix = self.items_dir.components().next();
+            match (s_prefix, t_prefix) {
+                (Some(Component::Prefix(p1)), Some(Component::Prefix(p2))) => {
+                    p1.as_os_str().to_ascii_lowercase() != p2.as_os_str().to_ascii_lowercase()
+                }
+                _ => false,
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(m1), Ok(m2)) = (std::fs::metadata(path), std::fs::metadata(&self.items_dir)) {
+                m1.dev() != m2.dev()
+            } else {
+                false
+            }
+        }
+    }
+
     /// 將指定項目移到 internal trash。
     ///
     /// 參數：
@@ -429,13 +454,64 @@ fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 依路徑型別刪除檔案或整個資料夾樹。
-fn remove_path(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
+fn ensure_path_writable(path: &Path) {
+    if let Ok(mut perms) = fs::symlink_metadata(path).map(|m| m.permissions()) {
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
     }
+}
+
+/// 依路徑型別安全刪除檔案、符號連結或整個資料夾樹，避免 Windows 重新分析點 (reparse point / symlink) 的 4395 錯誤。
+fn remove_path(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        #[cfg(windows)]
+        {
+            if file_type.is_dir() {
+                let _ = fs::remove_dir(path);
+                return Ok(());
+            }
+        }
+        let _ = fs::remove_file(path);
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        ensure_path_writable(path);
+        if let Ok(read_dir) = fs::read_dir(path) {
+            for entry in read_dir.flatten() {
+                let entry_path = entry.path();
+                let _ = remove_path(&entry_path);
+            }
+        }
+        ensure_path_writable(path);
+        let _ = fs::remove_dir(path);
+    } else {
+        ensure_path_writable(path);
+        if let Err(err) = fs::remove_file(path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                ensure_path_writable(path);
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    if path.exists() {
+        ensure_path_writable(path);
+        let _ = fs::remove_dir(path);
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
 }
 
 /// 根據目標資料夾現況，產生一個不與既有項目衝突的新路徑。

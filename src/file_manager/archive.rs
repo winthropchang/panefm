@@ -4,6 +4,7 @@
 //! 路徑都必須經過 collision 與 path traversal 防護，不能直接信任 archive 內的名稱。
 
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
@@ -291,6 +292,21 @@ where
     Ok(())
 }
 
+/// 確保指定目錄及其所有祖先目錄已建立，並將其快取在記憶體中以避免重複的檔案系統系統呼叫。
+fn ensure_dir_created(dir: &Path, created_dirs: &mut HashSet<PathBuf>) -> io::Result<()> {
+    if !created_dirs.contains(dir) {
+        fs::create_dir_all(dir)?;
+        let mut curr = Some(dir);
+        while let Some(p) = curr {
+            if !created_dirs.insert(p.to_path_buf()) {
+                break;
+            }
+            curr = p.parent();
+        }
+    }
+    Ok(())
+}
+
 /// 解開 zip 壓縮檔到指定輸出目錄。
 fn extract_zip_archive<F>(
     archive_path: &Path,
@@ -301,9 +317,11 @@ where
     F: FnMut(u64),
 {
     fs::create_dir_all(output_dir)?;
-    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
+    let file = BufReader::with_capacity(1024 * 1024, File::open(archive_path)?);
     let mut archive = ZipArchive::new(file)?;
     let mut buffer = vec![0u8; 256 * 1024];
+    let mut created_dirs = HashSet::new();
+    ensure_dir_created(output_dir, &mut created_dirs)?;
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
@@ -313,17 +331,15 @@ where
         let target_path = output_dir.join(safe_name);
 
         if entry.is_dir() {
-            fs::create_dir_all(&target_path)?;
+            ensure_dir_created(&target_path, &mut created_dirs)?;
             continue;
         }
 
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
+            ensure_dir_created(parent, &mut created_dirs)?;
         }
-        let mut output_file =
-            BufWriter::with_capacity(256 * 1024, File::create(&target_path)?);
+        let mut output_file = File::create(&target_path)?;
         copy_with_progress(&mut entry, &mut output_file, &mut buffer, progress)?;
-        output_file.flush()?;
     }
 
     Ok(())
@@ -339,7 +355,7 @@ where
     F: FnMut(u64),
 {
     fs::create_dir_all(output_dir)?;
-    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
+    let file = BufReader::with_capacity(1024 * 1024, File::open(archive_path)?);
     let decoder = GzDecoder::new(file);
     let mut archive = TarArchive::new(decoder);
     unpack_tar_archive(&mut archive, output_dir, progress)
@@ -355,7 +371,7 @@ where
     F: FnMut(u64),
 {
     fs::create_dir_all(output_dir)?;
-    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
+    let file = BufReader::with_capacity(1024 * 1024, File::open(archive_path)?);
     let mut archive = TarArchive::new(file);
     unpack_tar_archive(&mut archive, output_dir, progress)
 }
@@ -365,15 +381,14 @@ fn extract_gz_file<F>(archive_path: &Path, output_file: &Path, progress: &mut F)
 where
     F: FnMut(u64),
 {
-    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
+    let file = BufReader::with_capacity(1024 * 1024, File::open(archive_path)?);
     let mut decoder = GzDecoder::new(file);
     if let Some(parent) = output_file.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut buffer = vec![0u8; 256 * 1024];
-    let mut output = BufWriter::with_capacity(256 * 1024, File::create(output_file)?);
+    let mut output = File::create(output_file)?;
     copy_with_progress(&mut decoder, &mut output, &mut buffer, progress)?;
-    output.flush()?;
     Ok(())
 }
 
@@ -388,6 +403,9 @@ where
     F: FnMut(u64),
 {
     let mut buffer = vec![0u8; 256 * 1024];
+    let mut created_dirs = HashSet::new();
+    ensure_dir_created(output_dir, &mut created_dirs)?;
+
     for entry in archive.entries()? {
         let mut entry = entry?;
         let Some(path) = sanitize_archive_member_path(&entry.path()?) else {
@@ -395,16 +413,14 @@ where
         };
         let target_path = output_dir.join(path);
 
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         if entry.header().entry_type().is_dir() {
-            fs::create_dir_all(&target_path)?;
+            ensure_dir_created(&target_path, &mut created_dirs)?;
         } else {
-            let mut output =
-                BufWriter::with_capacity(256 * 1024, File::create(&target_path)?);
+            if let Some(parent) = target_path.parent() {
+                ensure_dir_created(parent, &mut created_dirs)?;
+            }
+            let mut output = File::create(&target_path)?;
             copy_with_progress(&mut entry, &mut output, &mut buffer, progress)?;
-            output.flush()?;
         }
     }
     Ok(())

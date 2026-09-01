@@ -42,7 +42,8 @@ use crate::{
 use super::{
     archive::{
         ExtractedArchive, compress_entries_to_zip, compress_entries_to_zip_with_progress,
-        extract_entries, extract_entries_with_progress,
+        default_extract_output_path, detect_archive_format, extract_entries,
+        extract_entries_with_progress,
     },
     bookmark::{BookmarkEntry, BookmarkStore, BookmarkTarget, bookmark_file_path},
     copy::{CopyAction, build_copy_text, copy_action_status_label, copy_picker_options},
@@ -462,6 +463,7 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         target_name: String,
         permanent: bool,
+        warning_message: Option<String>,
     },
     ConfirmPasteOverwrite {
         pane_id: usize,
@@ -2572,7 +2574,11 @@ impl App {
                 pane_id,
                 target_name,
                 permanent,
+                ref warning_message,
             } => match key.code {
+                _ if key_matches_shifted_letter(&key, 'D') => {
+                    self.confirm_delete(pane_id, &target_name, true)?;
+                }
                 _ if key_matches_plain_letter(&key, 'd') => {
                     self.status = if permanent {
                         format!("delete cancelled: {target_name}")
@@ -2598,10 +2604,12 @@ impl App {
                     };
                 }
                 _ => {
+                    let warning_message = warning_message.clone();
                     self.pending_action = Some(PendingAction::ConfirmDelete {
                         pane_id,
                         target_name: target_name.clone(),
                         permanent,
+                        warning_message,
                     });
                     self.status = if permanent {
                         format!("confirm delete {target_name}: y/n")
@@ -8056,7 +8064,12 @@ impl App {
                 .collect(),
             Some(target_dir.display().to_string()),
         );
-        let busy_paths = vec![target_dir.clone()];
+        let mut busy_paths = entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
+        for entry in &entries {
+            if let Some(format) = detect_archive_format(&entry.path) {
+                busy_paths.push(default_extract_output_path(&target_dir, &entry.path, format));
+            }
+        }
         self.active_file_job_busy_paths.insert(task_id, busy_paths);
         let (sender, receiver) = mpsc::channel();
         // 解壓後資料通常比壓縮檔大，因此這是估算分母；完成事件會校正成最終 byte。
@@ -8122,10 +8135,46 @@ impl App {
             format!("{} items", entries.len())
         };
 
+        let total_bytes = entries
+            .iter()
+            .map(|e| e.directory_size.unwrap_or(e.size))
+            .fold(0u64, u64::saturating_add);
+
+        let warning_message = if permanent {
+            None
+        } else {
+            let is_cross = entries
+                .iter()
+                .any(|e| self.trash_store.is_cross_device(&e.path));
+            let is_large = total_bytes > 10 * 1024 * 1024
+                || entries.iter().any(|e| e.size > 10 * 1024 * 1024 || (e.is_dir && is_cross));
+
+            if is_cross {
+                if total_bytes > 0 {
+                    Some(format!(
+                        "[!] Cross-device move ({}) will copy data and take time.",
+                        format_task_bytes(total_bytes)
+                    ))
+                } else {
+                    Some(String::from(
+                        "[!] Cross-device move will copy data and take time.",
+                    ))
+                }
+            } else if is_large {
+                Some(format!(
+                    "[!] Large item ({}) detected.",
+                    format_task_bytes(total_bytes)
+                ))
+            } else {
+                None
+            }
+        };
+
         self.pending_action = Some(PendingAction::ConfirmDelete {
             pane_id: self.focused_pane,
             target_name: target_name.clone(),
             permanent,
+            warning_message,
         });
         self.status = if permanent {
             format!("confirm delete {target_name}: y/n")
@@ -8156,30 +8205,15 @@ impl App {
         let mut busy_paths = Vec::new();
         let mut delete_targets = Vec::new();
         let deleted_names = entries.iter().map(|e| e.display_name()).collect::<Vec<_>>();
-        let pid = std::process::id();
-        let now_ms = unix_time_ms_now();
 
-        for (idx, entry) in entries.iter().enumerate() {
+        for entry in &entries {
             busy_paths.push(entry.path.clone());
-            if entry.is_dir {
-                if let Some(parent) = entry.path.parent() {
-                    let staging_path =
-                        parent.join(format!(".panefm-del-{pid}-{task_id}-{idx}-{now_ms}"));
-                    if fs::rename(&entry.path, &staging_path).is_ok() {
-                        busy_paths.push(staging_path.clone());
-                        delete_targets.push((staging_path, entry.path.clone(), true));
-                        continue;
-                    }
-                }
-            }
-            delete_targets.push((entry.path.clone(), entry.path.clone(), entry.is_dir));
+            delete_targets.push((entry.path.clone(), entry.is_dir));
         }
         self.active_file_job_busy_paths.insert(task_id, busy_paths);
 
-        // 資料夾移入暫存刪除路徑後，立即重載面板讓使用者看到目錄已瞬間移除
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.marked_paths.clear();
-            let _ = pane.reload();
         }
 
         let total_bytes = entries
@@ -8208,7 +8242,7 @@ impl App {
             };
 
             let mut failed_error = None;
-            for (path, original_path, is_dir) in delete_targets {
+            for (path, is_dir) in delete_targets {
                 let res = if is_dir {
                     remove_dir_all_parallel_with_progress(&path, &mut progress)
                 } else {
@@ -8221,10 +8255,6 @@ impl App {
                     }
                 };
                 if let Err(error) = res {
-                    // 若失敗且曾改名為暫存檔，且原路徑目前不存在，嘗試改名還原讓使用者在目錄看見
-                    if path != original_path && path.exists() && !original_path.exists() {
-                        let _ = fs::rename(&path, &original_path);
-                    }
                     failed_error = Some(error);
                     break;
                 }
@@ -8371,18 +8401,25 @@ impl App {
             return Ok(());
         }
 
-        let results = self.trash_store.restore_many_by_ids(target_ids)?;
-        self.reload_all_panes()?;
-        if let Some(first) = results.first() {
-            let _ = self.reveal_path_and_track(pane_id, &first.restored_path);
-        }
-        self.reopen_trash_panel_after_mutation(pane_id, search, selected)?;
-        if results.is_empty() {
-            self.status = format!("trash item no longer exists: {target_name}");
-        } else if entry_count <= 1 {
-            self.status = format!("restored {target_name}");
-        } else {
-            self.status = format!("restored {} items", results.len());
+        match self.trash_store.restore_many_by_ids(target_ids) {
+            Ok(results) => {
+                let _ = self.reload_all_panes();
+                if let Some(first) = results.first() {
+                    let _ = self.reveal_path_and_track(pane_id, &first.restored_path);
+                }
+                let _ = self.reopen_trash_panel_after_mutation(pane_id, search, selected);
+                if results.is_empty() {
+                    self.status = format!("trash item no longer exists: {target_name}");
+                } else if entry_count <= 1 {
+                    self.status = format!("restored {target_name}");
+                } else {
+                    self.status = format!("restored {} items", results.len());
+                }
+            }
+            Err(error) => {
+                let _ = self.reopen_trash_panel_after_mutation(pane_id, search, selected);
+                self.status = format!("failed to restore from trash: {error}");
+            }
         }
         Ok(())
     }
@@ -8402,14 +8439,21 @@ impl App {
             return Ok(());
         }
 
-        let deleted_names = self.trash_store.delete_many_by_ids(target_ids)?;
-        self.reopen_trash_panel_after_mutation(pane_id, search, selected)?;
-        if deleted_names.is_empty() {
-            self.status = format!("trash item no longer exists: {target_name}");
-        } else if entry_count <= 1 {
-            self.status = format!("deleted permanently {target_name}");
-        } else {
-            self.status = format!("deleted permanently {} items", deleted_names.len());
+        match self.trash_store.delete_many_by_ids(target_ids) {
+            Ok(deleted_names) => {
+                let _ = self.reopen_trash_panel_after_mutation(pane_id, search, selected);
+                if deleted_names.is_empty() {
+                    self.status = format!("trash item no longer exists: {target_name}");
+                } else if entry_count <= 1 {
+                    self.status = format!("deleted permanently {target_name}");
+                } else {
+                    self.status = format!("deleted permanently {} items", deleted_names.len());
+                }
+            }
+            Err(error) => {
+                let _ = self.reopen_trash_panel_after_mutation(pane_id, search, selected);
+                self.status = format!("failed to delete from trash: {error}");
+            }
         }
         Ok(())
     }
@@ -10426,6 +10470,7 @@ impl App {
             Some(PendingAction::ConfirmDelete {
                 target_name,
                 permanent,
+                warning_message,
                 ..
             }) => {
                 render_confirm_dialog(
@@ -10433,6 +10478,7 @@ impl App {
                     frame.area(),
                     target_name,
                     *permanent,
+                    warning_message.as_deref(),
                     self.theme,
                     &self.config,
                 );

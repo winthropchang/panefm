@@ -2805,15 +2805,10 @@ pub(crate) fn render_confirm_dialog(
     area: Rect,
     target_name: &str,
     permanent: bool,
+    warning: Option<&str>,
     theme: Theme,
-    config: &AppConfig,
+    _config: &AppConfig,
 ) {
-    let dialog_area = centered_rect(
-        area,
-        config.ui.dialogs.confirm.width_percent,
-        config.ui.dialogs.confirm.height,
-    );
-    frame.render_widget(Clear, dialog_area);
     let (title, question) = if permanent {
         (
             " Confirm Delete ",
@@ -2822,12 +2817,32 @@ pub(crate) fn render_confirm_dialog(
     } else {
         (" Confirm Trash ", format!("Move {target_name} to trash?"))
     };
+    let mut lines = vec![Line::from(question)];
+    if let Some(warn) = warning {
+        lines.push(Line::from(Span::styled(
+            warn.to_string(),
+            theme.danger_title_style(),
+        )));
+        lines.push(Line::from("Press D for instant background delete, y to trash, Esc."));
+    } else {
+        lines.push(Line::from("Press y to confirm, n or Esc to cancel."));
+    }
+
+    let max_line_len = lines.iter().map(|l| l.width()).max().unwrap_or(40);
+    let required_width = ((max_line_len as u16) + 4)
+        .max(56)
+        .min(area.width.saturating_sub(2));
+    let required_height = ((lines.len() as u16) + 2)
+        .max(5)
+        .min(area.height.saturating_sub(2));
+
+    let x = area.x + (area.width.saturating_sub(required_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(required_height)) / 2;
+    let dialog_area = Rect::new(x, y, required_width, required_height);
+
+    frame.render_widget(Clear, dialog_area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(question),
-            Line::from("Press y to confirm, n or Esc to cancel."),
-        ])
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
                 .title(Line::from(Span::styled(title, theme.danger_title_style())))
                 .borders(Borders::ALL),
