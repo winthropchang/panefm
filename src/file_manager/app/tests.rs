@@ -8252,3 +8252,190 @@ fn cheatsheet_covers_all_context_kinds() {
         }
     }
 }
+
+#[test]
+/// 驗證在 Rename 與 CreateEntry 的 Normal 模式下，按 `q` 可以直接取消並離開。
+fn q_cancels_rename_and_create_in_normal_mode() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("alpha.txt"), "demo").expect("file");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // 1. Rename: 輸入文字後按 Esc 進入 Normal 模式，再按 q 取消
+    app.pending_action = Some(PendingAction::Rename {
+        pane_id: 1,
+        original_name: String::from("alpha.txt"),
+        buffer: String::from("new_alpha.txt"),
+        cursor: 4,
+        mode: RenameMode::Normal,
+    });
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q cancels rename in normal mode");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "rename cancelled: alpha.txt");
+
+    // 2. CreateEntry: 輸入文字後按 Esc 進入 Normal 模式，再按 q 取消
+    app.pending_action = Some(PendingAction::CreateEntry {
+        pane_id: 1,
+        buffer: String::from("some_dir/"),
+        cursor: 4,
+        mode: RenameMode::Normal,
+    });
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q cancels create in normal mode");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "create cancelled");
+}
+
+#[test]
+/// 驗證在全域搜尋結果瀏覽清單中，按 `q` 可以直接關閉全域搜尋回到一般模式。
+fn q_exits_global_search_results_and_preview() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // 1. 搜尋結果瀏覽清單中按 q
+    app.global_search = Some(GlobalSearchState {
+        pane_id: 1,
+        root_dir: dir.path().to_path_buf(),
+        task_id: None,
+        mode: SearchMode::Path,
+        buffer: String::from("test"),
+        results: vec![GlobalSearchEntry {
+            path: dir.path().join("test.txt"),
+            relative_path: String::from("test.txt"),
+            is_dir: false,
+            match_line_number: None,
+            match_column: None,
+            match_preview: None,
+        }],
+        selected: 0,
+        editing: false,
+        searched: true,
+        loading: false,
+        filter: PanelSearchState::default(),
+        preview_scroll: None,
+        preview_current_match: None,
+    });
+
+    app.handle_global_search_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q cancels global search");
+    assert!(app.global_search.is_none());
+    assert_eq!(app.status, "normal mode");
+
+    // 2. 在內容搜尋預覽模式下按 q
+    app.global_search = Some(GlobalSearchState {
+        pane_id: 1,
+        root_dir: dir.path().to_path_buf(),
+        task_id: None,
+        mode: SearchMode::Content,
+        buffer: String::from("demo"),
+        results: vec![GlobalSearchEntry {
+            path: dir.path().join("test.txt"),
+            relative_path: String::from("test.txt"),
+            is_dir: false,
+            match_line_number: None,
+            match_column: None,
+            match_preview: None,
+        }],
+        selected: 0,
+        editing: false,
+        searched: true,
+        loading: false,
+        filter: PanelSearchState::default(),
+        preview_scroll: None,
+        preview_current_match: None,
+    });
+    if let Some(pane) = app.panes.get_mut(&1) {
+        pane.set_preview_active(true);
+    }
+
+    app.handle_global_search_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q exits preview in content search");
+    assert!(app.global_search.is_some());
+    assert!(!app.panes.get(&1).expect("pane").is_preview_active());
+}
+
+#[test]
+/// 驗證檔案預覽模式 (Tab preview) 按 `q` 或 `h` 關閉預覽回到檔案列表。
+fn q_exits_file_preview_mode() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("alpha.txt"), "hello world").expect("file");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.open_preview_focus();
+    assert!(app.panes.get(&1).expect("pane").is_preview_active());
+
+    app.handle_preview_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q exits preview");
+    assert!(!app.panes.get(&1).expect("pane").is_preview_active());
+    assert_eq!(app.status, "normal mode");
+}
+
+#[test]
+/// 驗證視覺選取模式 (Visual Selection) 按 `q` 可以直接取消。
+fn q_cancels_visual_selection() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("alpha.txt"), "hello").expect("file");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+        .expect("start visual selection");
+    assert!(app.visual_selection.is_some());
+
+    app.handle_visual_selection_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q cancels visual selection");
+    assert!(app.visual_selection.is_none());
+    assert_eq!(app.status, "normal mode");
+}
+
+#[test]
+/// 驗證確認刪除與確認覆蓋對話框按 `q` 可以直接取消。
+fn q_cancels_confirmation_dialogs() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // 1. ConfirmDelete
+    app.pending_action = Some(PendingAction::ConfirmDelete {
+        pane_id: 1,
+        target_name: String::from("important.txt"),
+        permanent: true,
+        warning_message: None,
+    });
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q cancels delete");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "delete cancelled: important.txt");
+
+    // 2. ConfirmPasteOverwrite
+    app.pending_action = Some(PendingAction::ConfirmPasteOverwrite {
+        pane_id: 1,
+        target_name: String::from("target.txt"),
+        entry_count: 1,
+        operation: ClipboardOperation::Copy,
+    });
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q cancels overwrite");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "paste cancelled: target.txt");
+}
+
+#[test]
+/// 驗證 CommandMode 在 Normal 模式下按 `q` 可以直接退出。
+fn q_cancels_command_mode_in_normal_mode() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.open_prefilled_command("rename new_name");
+    assert!(app.command_mode);
+
+    // 按 Esc 切換到 Normal 模式
+    app.handle_command_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc enters normal mode");
+    assert_eq!(app.text_input_mode, RenameMode::Normal);
+    assert!(app.command_mode);
+
+    // Normal 模式下按 q 關閉 command mode
+    app.handle_command_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q closes command mode");
+    assert!(!app.command_mode);
+    assert_eq!(app.status, "normal mode");
+}

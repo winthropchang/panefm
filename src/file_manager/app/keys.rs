@@ -195,6 +195,9 @@ impl App {
                     KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
                         return TextEditResult::PassThrough;
                     }
+                    _ if key_matches_plain_letter(key, 'q') => {
+                        return TextEditResult::PassThrough;
+                    }
                     _ => {}
                 }
                 TextEditResult::Consumed
@@ -860,6 +863,16 @@ impl App {
                 self.reset_pending_motion_state();
                 self.status = String::from("normal mode");
             }
+            _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                if self.clear_preview_search_if_active() {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    return Ok(true);
+                }
+                self.current_pane_mut()?.set_preview_active(false);
+                self.reset_pending_motion_state();
+                self.status = String::from("normal mode");
+            }
             KeyCode::Char('/') => {
                 self.clear_pending_count();
                 self.open_preview_search_input();
@@ -981,6 +994,11 @@ impl App {
             KeyCode::Esc => {
                 self.clear_pending_count();
                 self.commit_visual_selection()?;
+            }
+            _ if key_matches_plain_letter(&key, 'q') => {
+                self.clear_pending_count();
+                self.visual_selection = None;
+                self.status = String::from("normal mode");
             }
             KeyCode::Down => {
                 let count = self.take_count_or_one();
@@ -1160,10 +1178,13 @@ impl App {
                 KeyCode::Esc => {
                     self.cancel_global_search();
                 }
+                _ if key_matches_plain_letter(&key, 'q') => {
+                    self.cancel_global_search();
+                }
                 _ => {}
             }
 
-            if !matches!(key.code, KeyCode::Esc) {
+            if !matches!(key.code, KeyCode::Esc) && !key_matches_plain_letter(&key, 'q') {
                 self.status = global_search_status(
                     search.mode,
                     &search.buffer,
@@ -1194,6 +1215,9 @@ impl App {
             }
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
+                    search.filter.editing = false;
+                }
+                _ if key_matches_plain_letter(&key, 'q') => {
                     search.filter.editing = false;
                 }
                 _ => {}
@@ -1248,7 +1272,7 @@ impl App {
                     self.global_search = Some(search);
                     return Ok(true);
                 }
-                _ if key_matches_plain_letter(&key, 'h') => {
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
                     self.clear_pending_count();
                     self.pending_g = false;
                     if let Some(pane) = self.panes.get_mut(&search.pane_id) {
@@ -1262,6 +1286,8 @@ impl App {
                         search.searched,
                         search.loading,
                     );
+                    search.preview_scroll = None;
+                    search.preview_current_match = None;
                     self.global_search = Some(search);
                     return Ok(true);
                 }
@@ -1566,7 +1592,7 @@ impl App {
                     self.global_search = Some(search);
                 }
             }
-            _ if key_matches_plain_letter(&key, 'h') => {
+            _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
                 self.clear_pending_count();
                 self.pending_g = false;
                 self.cancel_global_search();
@@ -1673,6 +1699,12 @@ impl App {
                 filter.editing = false;
                 self.status = format_filter_status(&filter);
                 self.filter = Some(filter);
+            }
+            _ if key_matches_plain_letter(&key, 'q') => {
+                if let Some(pane) = self.panes.get_mut(&filter.pane_id) {
+                    pane.clear_filter();
+                }
+                self.status = String::from("normal mode");
             }
             _ => {
                 self.filter = Some(filter);
@@ -1781,7 +1813,7 @@ impl App {
                         format!("trash cancelled: {target_name}")
                     };
                 }
-                _ if key_matches_letter_any_case(&key, 'n') => {
+                _ if key_matches_letter_any_case(&key, 'n') || key_matches_plain_letter(&key, 'q') => {
                     self.status = if permanent {
                         format!("delete cancelled: {target_name}")
                     } else {
@@ -1815,7 +1847,7 @@ impl App {
                 KeyCode::Esc => {
                     self.status = paste_overwrite_cancelled_status(&target_name, entry_count);
                 }
-                _ if key_matches_letter_any_case(&key, 'n') => {
+                _ if key_matches_letter_any_case(&key, 'n') || key_matches_plain_letter(&key, 'q') => {
                     self.status = paste_overwrite_cancelled_status(&target_name, entry_count);
                 }
                 _ => {
@@ -1858,7 +1890,7 @@ impl App {
                     self.status =
                         trash_confirm_cancelled_status(&action, &target_name, entry_count);
                 }
-                _ if key_matches_letter_any_case(&key, 'n') => {
+                _ if key_matches_letter_any_case(&key, 'n') || key_matches_plain_letter(&key, 'q') => {
                     self.pending_action = Some(trash_panel_pending_action_from_confirm_action(
                         &action,
                         marked_ids,
@@ -4009,6 +4041,9 @@ impl App {
                     KeyCode::Esc => {
                         self.status = format!("rename cancelled: {original_name}");
                     }
+                    _ if key_matches_plain_letter(&key, 'q') => {
+                        self.status = format!("rename cancelled: {original_name}");
+                    }
                     _ => {
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -4211,6 +4246,9 @@ impl App {
                         self.confirm_create_entry(pane_id, &buffer)?;
                     }
                     KeyCode::Esc => {
+                        self.status = String::from("create cancelled");
+                    }
+                    _ if key_matches_plain_letter(&key, 'q') => {
                         self.status = String::from("create cancelled");
                     }
                     _ => {
@@ -4630,6 +4668,9 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
+                self.status = String::from("normal mode");
+            }
+            _ if key_matches_plain_letter(&key, 'q') => {
                 self.status = String::from("normal mode");
             }
             KeyCode::Char(bookmark) => match prompt {

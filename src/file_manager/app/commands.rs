@@ -65,6 +65,13 @@ impl App {
                 self.command_completion_cycle = None;
                 self.status = String::from("normal mode");
             }
+            _ if key_matches_plain_letter(&key, 'q') => {
+                self.command_mode = false;
+                self.command_buffer.clear();
+                self.command_suggestion_selected = 0;
+                self.command_completion_cycle = None;
+                self.status = String::from("normal mode");
+            }
             KeyCode::Enter => {
                 let selected_suggestion = suggestions
                     .get(

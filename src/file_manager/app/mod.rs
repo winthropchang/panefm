@@ -4391,7 +4391,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("preview", "Tab", "（內容搜尋模式）切換進入 / 離開右側檔案內容預覽", HelpAction::QuitHint),
                 help_entry("preview-match", "n / p / N", "在預覽中跳至下一個 / 上一個內容比對匹配行", HelpAction::QuitHint),
                 help_entry("preview-scroll", "j / k", "在預覽中上下捲動檔案內容", HelpAction::QuitHint),
-                help_entry("exit", "Esc / h", "退出搜尋結果面板，返回檔案列表", HelpAction::QuitHint),
+                help_entry("exit", "Esc / q / h", "退出搜尋結果面板，返回檔案列表", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::ListFind => (
@@ -4400,7 +4400,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("type", "Characters", "輸入要尋找的檔名關鍵字", HelpAction::QuitHint),
                 help_entry("confirm", "Enter", "確認尋找並鎖定目標項目", HelpAction::QuitHint),
                 help_entry("next/prev", "n / N", "在檔案列表中跳至下一個 / 上一個匹配項目", HelpAction::QuitHint),
-                help_entry("cancel", "Esc", "取消檔名尋找並退出", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消檔名尋找並退出", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::TaskPanel => (
@@ -4467,7 +4467,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("rename-regex", "r / R", "對目前選取範圍開啟 Regex 批次改名預覽", HelpAction::QuitHint),
                 help_entry("compress", "C", "將選取範圍內所有項目壓縮為 ZIP", HelpAction::QuitHint),
                 help_entry("commit", "v", "將選取範圍提交為常規標記並退出視覺模式", HelpAction::QuitHint),
-                help_entry("cancel", "Esc", "取消視覺選取模式", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消視覺選取模式", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::WindowPicker => (
@@ -4481,7 +4481,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("diff", "d", "開啟多 Panel 目錄 Diff 矩陣比對", HelpAction::QuitHint),
                 help_entry("terminal", "t", "在目前目錄開啟外部終端機 (Terminal)", HelpAction::QuitHint),
                 help_entry("select-pane", "1..9", "直接切換焦點至指定編號視窗", HelpAction::QuitHint),
-                help_entry("cancel", "Esc / w", "取消退出視窗管理選單", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / w", "取消退出視窗管理選單", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::BookmarkPicker => (
@@ -4566,7 +4566,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("history", "Up / Down", "瀏覽歷史輸入指令", HelpAction::QuitHint),
                 help_entry("start", "Ctrl+a / Home", "移動游標至指令開頭", HelpAction::QuitHint),
                 help_entry("end", "Ctrl+e / End", "移動游標至指令結尾", HelpAction::QuitHint),
-                help_entry("cancel", "Esc", "取消並退出命令模式", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消並退出命令模式", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::Filter => (
@@ -4574,7 +4574,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
             vec![
                 help_entry("confirm", "Enter", "確認鎖定目前過濾條件", HelpAction::QuitHint),
                 help_entry("toggle-fuzzy", "Tab", "切換模糊過濾 (Fuzzy) 與精確過濾 (Exact)", HelpAction::QuitHint),
-                help_entry("cancel", "Esc", "清除過濾條件並返回完整清單", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "清除過濾條件並返回完整清單", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::Preview => (
@@ -4584,7 +4584,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻滾預覽", HelpAction::QuitHint),
                 help_entry("search", "/", "在預覽內容中搜尋關鍵字", HelpAction::QuitHint),
                 help_entry("match", "n / N", "跳至下一個 / 上一個搜尋匹配項目", HelpAction::QuitHint),
-                help_entry("exit", "Tab / Esc / h / q", "退出預覽捲動，返回檔案列表", HelpAction::QuitHint),
+                help_entry("exit", "Tab / Esc / q / h", "退出預覽捲動，返回檔案列表", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::Rename => (
@@ -4592,7 +4592,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
             vec![
                 help_entry("edit", "Characters", "編輯新檔案或資料夾名稱", HelpAction::QuitHint),
                 help_entry("apply", "Enter", "確認套用重新命名", HelpAction::QuitHint),
-                help_entry("cancel", "Esc", "取消重新命名並返回檔案列表", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消重新命名並返回檔案列表 (Normal 模式)", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::CreateEntry => (
@@ -4600,7 +4600,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
             vec![
                 help_entry("name", "Characters", "輸入名稱（以 / 結尾為資料夾，否則為檔案）", HelpAction::QuitHint),
                 help_entry("create", "Enter", "確認建立新檔案或目錄", HelpAction::QuitHint),
-                help_entry("cancel", "Esc", "取消建立並返回檔案列表", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消建立並返回檔案列表 (Normal 模式)", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::ConfirmAction => (
