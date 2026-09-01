@@ -104,7 +104,10 @@ pub(crate) fn build_terminal_launch_spec(
     let ancestor_processes = super::platform::detect_ancestor_process_names();
     for plugin in plugins {
         let env_match = !plugin.match_env.is_empty()
-            && plugin.match_env.iter().any(|var| std::env::var_os(var).is_some());
+            && plugin
+                .match_env
+                .iter()
+                .any(|var| std::env::var_os(var).is_some());
         let process_match = !plugin.match_process.is_empty()
             && plugin.match_process.iter().any(|proc_name| {
                 let proc_lower = proc_name.to_lowercase();
@@ -595,23 +598,16 @@ mod tests {
         };
 
         // 未設置環境變數時不匹配
-        let spec_without_env = build_terminal_launch_spec(
-            &PathBuf::from("/tmp/foo"),
-            None,
-            &[plugin.clone()],
-        )
-        .expect("spec");
+        let spec_without_env =
+            build_terminal_launch_spec(&PathBuf::from("/tmp/foo"), None, &[plugin.clone()])
+                .expect("spec");
 
         // 設置環境變數後匹配
         unsafe {
             std::env::set_var("CUSTOM_TERM_ENV_FOR_TEST", "1");
         }
-        let spec_with_env = build_terminal_launch_spec(
-            &PathBuf::from("/tmp/foo"),
-            None,
-            &[plugin],
-        )
-        .expect("spec");
+        let spec_with_env =
+            build_terminal_launch_spec(&PathBuf::from("/tmp/foo"), None, &[plugin]).expect("spec");
         unsafe {
             std::env::remove_var("CUSTOM_TERM_ENV_FOR_TEST");
         }

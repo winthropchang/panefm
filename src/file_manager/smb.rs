@@ -3,10 +3,7 @@
 //! `smb://host/share/path` 是書籤與 command 使用的穩定表示；macOS 會解析已掛載
 //! volume，Windows 則轉成 UNC path。此層只解析或產生掛載請求，不應執行檔案複製。
 
-use std::{
-    io,
-    path::PathBuf,
-};
+use std::{io, path::PathBuf};
 
 #[cfg(any(test, target_os = "macos"))]
 use std::path::Path;
@@ -30,7 +27,9 @@ pub(crate) struct SmbLocation {
 pub(crate) enum ResolvedSmbLocation {
     Ready(PathBuf),
     #[allow(dead_code)]
-    NeedsMount { local_path: PathBuf },
+    NeedsMount {
+        local_path: PathBuf,
+    },
 }
 
 /// 解析 `smb://host/share/path` 這類字串，整理出 host、share 與子路徑。

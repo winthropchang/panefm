@@ -25,11 +25,7 @@ use super::open::{LaunchMode, LaunchSpec};
 /// 描述單一項目在某個 Panel 中的存在與內容特徵。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DiffEntryState {
-    Present {
-        size: u64,
-        hash: u64,
-        is_dir: bool,
-    },
+    Present { size: u64, hash: u64, is_dir: bool },
     Missing,
 }
 
@@ -221,7 +217,9 @@ impl DiffMatrixState {
 
     /// 向下移動游標。
     pub(crate) fn move_down(&mut self) {
-        if !self.filtered_indices.is_empty() && self.selected_index + 1 < self.filtered_indices.len() {
+        if !self.filtered_indices.is_empty()
+            && self.selected_index + 1 < self.filtered_indices.len()
+        {
             self.selected_index += 1;
         }
     }
@@ -337,9 +335,10 @@ pub(crate) fn spawn_background_diff(
                         continue;
                     }
                     // 忽略 .git 內部物件
-                    if rel.components().any(|c| {
-                        should_ignore_component(&c.as_os_str().to_string_lossy())
-                    }) {
+                    if rel
+                        .components()
+                        .any(|c| should_ignore_component(&c.as_os_str().to_string_lossy()))
+                    {
                         continue;
                     }
 
@@ -659,16 +658,28 @@ mod tests {
         let rows = compute_diff_matrix(&roots).expect("matrix");
         assert_eq!(rows.len(), 4);
 
-        let same_row = rows.iter().find(|r| r.relative_path == Path::new("same.txt")).unwrap();
+        let same_row = rows
+            .iter()
+            .find(|r| r.relative_path == Path::new("same.txt"))
+            .unwrap();
         assert_eq!(same_row.status, DiffStatus::Identical);
 
-        let diff_row = rows.iter().find(|r| r.relative_path == Path::new("diff.txt")).unwrap();
+        let diff_row = rows
+            .iter()
+            .find(|r| r.relative_path == Path::new("diff.txt"))
+            .unwrap();
         assert_eq!(diff_row.status, DiffStatus::Modified);
 
-        let only3_row = rows.iter().find(|r| r.relative_path == Path::new("only3.txt")).unwrap();
+        let only3_row = rows
+            .iter()
+            .find(|r| r.relative_path == Path::new("only3.txt"))
+            .unwrap();
         assert_eq!(only3_row.status, DiffStatus::Exclusive { panel_index: 2 });
 
-        let subset_row = rows.iter().find(|r| r.relative_path == Path::new("subset.txt")).unwrap();
+        let subset_row = rows
+            .iter()
+            .find(|r| r.relative_path == Path::new("subset.txt"))
+            .unwrap();
         assert_eq!(subset_row.status, DiffStatus::Subset);
     }
 
@@ -710,14 +721,30 @@ mod tests {
 
     #[test]
     fn launch_content_diff_spec_builds_valid_spec() {
-        let roots = vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
+        let roots = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
         let row = DiffMatrixRow {
             relative_path: PathBuf::from("src/main.rs"),
             is_dir: false,
             panel_states: vec![
-                DiffEntryState::Present { size: 10, hash: 1, is_dir: false },
-                DiffEntryState::Present { size: 12, hash: 2, is_dir: false },
-                DiffEntryState::Present { size: 10, hash: 1, is_dir: false },
+                DiffEntryState::Present {
+                    size: 10,
+                    hash: 1,
+                    is_dir: false,
+                },
+                DiffEntryState::Present {
+                    size: 12,
+                    hash: 2,
+                    is_dir: false,
+                },
+                DiffEntryState::Present {
+                    size: 10,
+                    hash: 1,
+                    is_dir: false,
+                },
             ],
             status: DiffStatus::Modified,
             display_size: 12,

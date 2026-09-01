@@ -52,7 +52,10 @@ pub(crate) fn new_terminal_spec_for_platform(
     let alacritty_active = std::env::var_os("ALACRITTY_WINDOW_ID").is_some()
         || std::env::var_os("ALACRITTY_LOG").is_some()
         || std::env::var_os("ALACRITTY_SOCKET").is_some()
-        || std::env::var("TERM").map(|t| t.to_ascii_lowercase()).as_deref() == Ok("alacritty")
+        || std::env::var("TERM")
+            .map(|t| t.to_ascii_lowercase())
+            .as_deref()
+            == Ok("alacritty")
         || matches!(
             ancestor_info.as_ref().map(|i| i.kind),
             Some(AncestorTerminalKind::Alacritty)
@@ -103,7 +106,8 @@ fn new_terminal_spec_for_platform_with_env(
 ) -> io::Result<LaunchSpec> {
     let alacritty_active = matches!(term_program, Some(p) if p.eq_ignore_ascii_case("alacritty"));
     let wezterm_active = matches!(term_program, Some(p) if p.eq_ignore_ascii_case("wezterm"));
-    let wt_session_active = matches!(term_program, Some(p) if p.eq_ignore_ascii_case("windowsterminal"));
+    let wt_session_active =
+        matches!(term_program, Some(p) if p.eq_ignore_ascii_case("windowsterminal"));
 
     new_terminal_spec_for_platform_with_env_flags(
         path,
@@ -134,7 +138,9 @@ fn new_terminal_spec_for_platform_with_env_flags(
 ) -> io::Result<LaunchSpec> {
     let launch = match platform {
         PlatformKind::Windows => {
-            if wezterm_active || matches!(term_program, Some(p) if p.eq_ignore_ascii_case("wezterm")) {
+            if wezterm_active
+                || matches!(term_program, Some(p) if p.eq_ignore_ascii_case("wezterm"))
+            {
                 LaunchSpec {
                     program: resolve_wezterm_program(wezterm_exe),
                     args: vec![
@@ -145,7 +151,9 @@ fn new_terminal_spec_for_platform_with_env_flags(
                     ],
                     mode: LaunchMode::Detached,
                 }
-            } else if alacritty_active || matches!(term_program, Some(p) if p.eq_ignore_ascii_case("alacritty")) {
+            } else if alacritty_active
+                || matches!(term_program, Some(p) if p.eq_ignore_ascii_case("alacritty"))
+            {
                 LaunchSpec {
                     program: resolve_alacritty_program(alacritty_exe),
                     args: vec![
@@ -219,17 +227,16 @@ fn resolve_alacritty_program(hint_exe: Option<&str>) -> String {
 /// 若祖先程序或環境變數提供的是 GUI 主程式 `wezterm-gui.exe`，自動換成同目錄下的 CLI 程式 `wezterm.exe`。
 fn resolve_wezterm_program(hint_exe: Option<&str>) -> String {
     let env_exe = std::env::var("WEZTERM_EXECUTABLE").ok();
-    let candidates = [
-        hint_exe,
-        env_exe.as_deref(),
-    ];
+    let candidates = [hint_exe, env_exe.as_deref()];
     for candidate in candidates.into_iter().flatten() {
         let path = Path::new(candidate);
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.to_ascii_lowercase());
-        if file_name.as_deref() == Some("wezterm-gui.exe") || file_name.as_deref() == Some("wezterm-gui") {
+        if file_name.as_deref() == Some("wezterm-gui.exe")
+            || file_name.as_deref() == Some("wezterm-gui")
+        {
             if let Some(parent) = path.parent() {
                 let cli = parent.join("wezterm.exe");
                 if cli.exists() {
@@ -351,7 +358,8 @@ fn detect_ancestor_terminal_info() -> Option<AncestorTerminalInfo> {
                     if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
                         let mut buffer = [0u16; 1024];
                         let mut size = buffer.len() as u32;
-                        if QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) != 0
+                        if QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size)
+                            != 0
                             && size > 0
                         {
                             exe_path = Some(String::from_utf16_lossy(&buffer[..size as usize]));
@@ -650,13 +658,9 @@ mod tests {
     /// 保護目的：避免改用特定 broker 時讓 TrustView 等父程序權杖意外遺失。
     fn windows_terminal_inherits_context_and_active_directory() {
         let path = PathBuf::from(r"C:\project\foo");
-        let spec = new_terminal_spec_for_platform_with_env(
-            &path,
-            PlatformKind::Windows,
-            None,
-            None,
-        )
-        .expect("spec");
+        let spec =
+            new_terminal_spec_for_platform_with_env(&path, PlatformKind::Windows, None, None)
+                .expect("spec");
 
         assert_eq!(spec.program, default_windows_shell());
         assert_eq!(spec.mode, LaunchMode::NewTerminal { current_dir: path });
@@ -680,7 +684,9 @@ mod tests {
         )
         .expect("spec");
 
-        assert!(spec.program.to_lowercase().ends_with("alacritty.exe") || spec.program == "alacritty");
+        assert!(
+            spec.program.to_lowercase().ends_with("alacritty.exe") || spec.program == "alacritty"
+        );
         assert_eq!(spec.args, vec!["--working-directory", r"C:\project\foo"]);
         assert_eq!(spec.mode, LaunchMode::Detached);
     }

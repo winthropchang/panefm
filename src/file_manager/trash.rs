@@ -89,7 +89,8 @@ impl TrashStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if let (Ok(m1), Ok(m2)) = (std::fs::metadata(path), std::fs::metadata(&self.items_dir)) {
+            if let (Ok(m1), Ok(m2)) = (std::fs::metadata(path), std::fs::metadata(&self.items_dir))
+            {
                 m1.dev() != m2.dev()
             } else {
                 false

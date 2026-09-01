@@ -367,13 +367,21 @@ pub(crate) fn render_pane(
                     .map(|line| {
                         let cmd_str = truncate_text(&line.command, cmd_w);
                         let shortcut_str = truncate_text(&line.shortcut, shortcut_w);
-                        let prefix = format!("{:<cmd_w$}  {:<shortcut_w$}  ", cmd_str, shortcut_str);
+                        let prefix =
+                            format!("{:<cmd_w$}  {:<shortcut_w$}  ", cmd_str, shortcut_str);
                         let prefix_w = UnicodeWidthStr::width(prefix.as_str());
                         let desc_max_w = content_width.saturating_sub(prefix_w);
-                        let desc_str = truncate_text_to_display_width(&line.description, desc_max_w);
+                        let desc_str =
+                            truncate_text_to_display_width(&line.description, desc_max_w);
                         ListItem::new(Line::from(vec![
-                            Span::styled(format!("{:<cmd_w$}  ", cmd_str), theme.accent_style().add_modifier(Modifier::BOLD)),
-                            Span::styled(format!("{:<shortcut_w$}  ", shortcut_str), theme.muted_style()),
+                            Span::styled(
+                                format!("{:<cmd_w$}  ", cmd_str),
+                                theme.accent_style().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{:<shortcut_w$}  ", shortcut_str),
+                                theme.muted_style(),
+                            ),
                             Span::raw(desc_str),
                         ]))
                     })
@@ -2781,7 +2789,8 @@ mod tests {
         assert_eq!(UnicodeWidthStr::width(formatted.as_str()), 20);
         assert!(formatted.starts_with("src/main.rs"));
 
-        let long = ".creator/asset-template/typescript/Custom Script Template Help Documentation.url";
+        let long =
+            ".creator/asset-template/typescript/Custom Script Template Help Documentation.url";
         let formatted_long = format_diff_path_column(long, 35);
         assert_eq!(UnicodeWidthStr::width(formatted_long.as_str()), 35);
         assert!(formatted_long.contains('…'));
@@ -2823,7 +2832,9 @@ pub(crate) fn render_confirm_dialog(
             warn.to_string(),
             theme.danger_title_style(),
         )));
-        lines.push(Line::from("Press D for instant background delete, y to trash, Esc."));
+        lines.push(Line::from(
+            "Press D for instant background delete, y to trash, Esc.",
+        ));
     } else {
         lines.push(Line::from("Press y to confirm, n or Esc to cancel."));
     }
@@ -3007,7 +3018,10 @@ pub(crate) fn format_diff_path_column(path: &str, target_width: usize) -> String
     let keep_tail = target_width.saturating_sub(keep_head + 1);
 
     let head: String = chars.iter().take(keep_head).collect();
-    let tail: String = chars.iter().skip(chars.len().saturating_sub(keep_tail)).collect();
+    let tail: String = chars
+        .iter()
+        .skip(chars.len().saturating_sub(keep_tail))
+        .collect();
     let mut combined = format!("{}…{}", head, tail);
 
     let mut actual_w = UnicodeWidthStr::width(combined.as_str());
@@ -3086,22 +3100,25 @@ pub(crate) fn render_diff_matrix(
         .borders(Borders::ALL)
         .border_style(theme.focused_border_style());
 
-    let header_para = Paragraph::new(Line::from(Span::styled(
-        filter_text,
-        theme.accent_style(),
-    )))
-    .block(header_block);
+    let header_para = Paragraph::new(Line::from(Span::styled(filter_text, theme.accent_style())))
+        .block(header_block);
     frame.render_widget(header_para, outer[0]);
 
     // 2. 中央矩陣表格 / 載入中狀態
     if state.loading {
         let loading_msg = if state.discovered_count > 0 {
-            format!(" 正在非阻塞掃描目錄... 已發現 {} 個項目 (按 Esc/q 可隨時退出) ", state.discovered_count)
+            format!(
+                " 正在非阻塞掃描目錄... 已發現 {} 個項目 (按 Esc/q 可隨時退出) ",
+                state.discovered_count
+            )
         } else {
             String::from(" 正在非阻塞掃描目錄中... (按 Esc/q 可隨時退出) ")
         };
         let loading_block = Block::default()
-            .title(Line::from(Span::styled(" [掃描中] ", theme.accent_style().add_modifier(Modifier::BOLD))))
+            .title(Line::from(Span::styled(
+                " [掃描中] ",
+                theme.accent_style().add_modifier(Modifier::BOLD),
+            )))
             .borders(Borders::ALL)
             .border_style(theme.focused_border_style());
         let loading_para = Paragraph::new(Line::from(vec![
@@ -3167,27 +3184,37 @@ pub(crate) fn render_diff_matrix(
                 for (p_idx, p_state) in row.panel_states.iter().enumerate() {
                     let badge = match p_state {
                         DiffEntryState::Present { .. } => match row.status {
-                            DiffStatus::Identical => Span::styled(" [ ✔ ]  ", theme.success_style()),
-                            DiffStatus::Modified => Span::styled(" [ ≠ ]  ", theme.danger_style().add_modifier(Modifier::BOLD)),
+                            DiffStatus::Identical => {
+                                Span::styled(" [ ✔ ]  ", theme.success_style())
+                            }
+                            DiffStatus::Modified => Span::styled(
+                                " [ ≠ ]  ",
+                                theme.danger_style().add_modifier(Modifier::BOLD),
+                            ),
                             DiffStatus::Subset => Span::styled(" [ ✔ ]  ", theme.accent_style()),
                             DiffStatus::Exclusive { panel_index } if panel_index == p_idx => {
-                                Span::styled(" [ + ]  ", theme.accent_style().add_modifier(Modifier::BOLD))
+                                Span::styled(
+                                    " [ + ]  ",
+                                    theme.accent_style().add_modifier(Modifier::BOLD),
+                                )
                             }
                             _ => Span::styled(" [ ✔ ]  ", theme.success_style()),
                         },
-                        DiffEntryState::Missing => {
-                            Span::styled(" [ -- ] ", theme.muted_style())
-                        }
+                        DiffEntryState::Missing => Span::styled(" [ -- ] ", theme.muted_style()),
                     };
                     panel_spans.push(badge);
                 }
 
                 let status_span = match row.status {
                     DiffStatus::Identical => Span::styled("  完全一致", theme.success_style()),
-                    DiffStatus::Modified => Span::styled("  內容不同", theme.danger_style().add_modifier(Modifier::BOLD)),
-                    DiffStatus::Exclusive { panel_index } => {
-                        Span::styled(format!("  僅 #{} 獨有", panel_index + 1), theme.accent_style())
-                    }
+                    DiffStatus::Modified => Span::styled(
+                        "  內容不同",
+                        theme.danger_style().add_modifier(Modifier::BOLD),
+                    ),
+                    DiffStatus::Exclusive { panel_index } => Span::styled(
+                        format!("  僅 #{} 獨有", panel_index + 1),
+                        theme.accent_style(),
+                    ),
                     DiffStatus::Subset => Span::styled("  子集一致", theme.accent_style()),
                 };
 
@@ -3195,9 +3222,23 @@ pub(crate) fn render_diff_matrix(
                 let size_formatted = format!("{:>8}  ", size_str);
 
                 let mut line_spans = vec![
-                    Span::styled(cursor_str, if is_selected { theme.accent_style() } else { Style::default() }),
+                    Span::styled(
+                        cursor_str,
+                        if is_selected {
+                            theme.accent_style()
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(icon, Style::default()),
-                    Span::styled(path_formatted, if is_selected { theme.selected_item_style() } else { Style::default() }),
+                    Span::styled(
+                        path_formatted,
+                        if is_selected {
+                            theme.selected_item_style()
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(size_formatted, theme.muted_style()),
                 ];
                 line_spans.extend(panel_spans);
@@ -3215,7 +3256,10 @@ pub(crate) fn render_diff_matrix(
     };
 
     let mut table_title_spans = vec![
-        Span::styled(format!("  {:<w$}", "Path", w = path_col_width + 2), theme.accent_style()),
+        Span::styled(
+            format!("  {:<w$}", "Path", w = path_col_width + 2),
+            theme.accent_style(),
+        ),
         Span::styled(format!("{:>8}  ", "Size"), theme.accent_style()),
     ];
     for idx in 0..panel_count {
@@ -3242,4 +3286,3 @@ pub(crate) fn render_diff_matrix(
     )));
     frame.render_widget(footer_para, outer[2]);
 }
-

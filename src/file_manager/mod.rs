@@ -4,31 +4,31 @@
 //! 時可靠還原終端。`App` 保存可測試的業務狀態；`ui` 只繪圖；fzf 等會接管終端的
 //! 程式則必須經由這裡暫停 TUI，避免 keyboard enhancement flags 或殘留畫面外洩。
 
-mod app;
-mod archive;
-mod bookmark;
-mod copy;
-mod cow;
-mod diff;
-mod entry;
-mod fd;
-mod filesystem_watcher;
-mod fuzzy;
-mod fzf;
-mod layout;
-mod open;
-mod operation_history;
-mod osc7;
-mod pane;
-mod platform;
-mod rg;
-mod search;
-mod smb;
-mod task_history;
-mod tools;
-mod trash;
-mod ui;
-mod zoxide;
+pub(crate) mod app;
+pub(crate) mod archive;
+pub(crate) mod bookmark;
+pub(crate) mod copy;
+pub(crate) mod cow;
+pub(crate) mod diff;
+pub(crate) mod entry;
+pub(crate) mod fd;
+pub(crate) mod filesystem_watcher;
+pub(crate) mod fuzzy;
+pub(crate) mod fzf;
+pub(crate) mod layout;
+pub(crate) mod open;
+pub(crate) mod operation_history;
+pub(crate) mod osc7;
+pub(crate) mod pane;
+pub(crate) mod platform;
+pub(crate) mod rg;
+pub(crate) mod search;
+pub(crate) mod smb;
+pub(crate) mod task_history;
+pub(crate) mod tools;
+pub(crate) mod trash;
+pub(crate) mod ui;
+pub(crate) mod zoxide;
 
 use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::path::PathBuf;
@@ -611,9 +611,7 @@ fn spawn_new_terminal_process(
     current_dir: &std::path::Path,
 ) -> Result<()> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(current_dir);
+    command.args(args).current_dir(current_dir);
 
     #[cfg(target_os = "windows")]
     {

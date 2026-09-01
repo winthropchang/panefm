@@ -1004,7 +1004,12 @@ fn apply_terminal_plugins_config(
             .filter(|value| !value.is_empty())
     };
     for item in terminals {
-        let name = match item.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let name = match item
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(name) => name.to_string(),
             None => bail!("terminal plugin must define a non-empty name"),
         };
@@ -1027,7 +1032,10 @@ fn apply_terminal_plugins_config(
         let windows_command = normalize(item.windows_command);
 
         if command.is_none() && mac_command.is_none() && windows_command.is_none() {
-            bail!("terminal plugin '{}' must define at least one of command / mac_command / windows_command", name);
+            bail!(
+                "terminal plugin '{}' must define at least one of command / mac_command / windows_command",
+                name
+            );
         }
 
         config.actions.terminals.push(TerminalPluginConfig {

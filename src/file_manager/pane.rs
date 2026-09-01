@@ -3216,7 +3216,12 @@ where
         target_path,
         expected_size,
         progress,
-        |_, _| Err(io::Error::new(io::ErrorKind::Unsupported, "test simulated fallback")),
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test simulated fallback",
+            ))
+        },
         native_copy,
     )
 }

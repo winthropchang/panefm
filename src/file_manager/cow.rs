@@ -95,7 +95,10 @@ pub(crate) fn clone_dir_cow(source: &Path, target: &Path) -> io::Result<()> {
     if target.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("clone target directory already exists: {}", target.display()),
+            format!(
+                "clone target directory already exists: {}",
+                target.display()
+            ),
         ));
     }
 
