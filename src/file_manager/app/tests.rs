@@ -8018,7 +8018,7 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     assert!(task_keys.contains(&"x/c"));
 
     // 4. Trash panel mode
-    app.open_trash_panel();
+    let _ = app.open_trash_panel();
     let trash_hints = app.active_status_shortcut_hints();
     assert_eq!(trash_hints[0].key, "~/F1");
     assert_eq!(trash_hints[0].label, "help");
@@ -8287,6 +8287,38 @@ fn q_cancels_rename_and_create_in_normal_mode() {
 }
 
 #[test]
+/// 驗證在全域搜尋輸入框中輸入文字後，按 Esc 進入 Normal 模式，再按 q 可以直接退出全域搜尋。
+fn q_cancels_global_search_input_in_normal_mode() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.open_global_search().expect("open global search");
+    assert!(app.global_search.is_some());
+    assert!(app.global_search.as_ref().unwrap().editing);
+
+    // 輸入 'k' 與 'j'
+    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+        .expect("type k");
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+        .expect("type j");
+    assert_eq!(app.global_search.as_ref().unwrap().buffer, "kj");
+    assert_eq!(app.text_input_mode, RenameMode::Insert);
+
+    // 按 Esc 進入 Normal 模式
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("press esc");
+    assert_eq!(app.text_input_mode, RenameMode::Normal);
+    assert!(app.global_search.is_some());
+    assert!(app.global_search.as_ref().unwrap().editing);
+
+    // 在 Normal 模式下按 q 退出全域搜尋
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("press q");
+    assert!(app.global_search.is_none());
+    assert_eq!(app.status, "normal mode");
+}
+
+#[test]
 /// 驗證在全域搜尋結果瀏覽清單中，按 `q` 可以直接關閉全域搜尋回到一般模式。
 fn q_exits_global_search_results_and_preview() {
     let dir = tempdir().expect("tempdir");
@@ -8438,4 +8470,89 @@ fn q_cancels_command_mode_in_normal_mode() {
         .expect("q closes command mode");
     assert!(!app.command_mode);
     assert_eq!(app.status, "normal mode");
+}
+
+#[test]
+/// 驗證 ListFind 在 Normal 模式下按 `q` 可以直接取消。
+fn q_cancels_list_find_in_normal_mode() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("alpha.txt"), "demo").expect("file");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.open_list_find_input();
+    assert!(app.list_find.is_some());
+
+    // 輸入 'a'
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .expect("type a");
+    assert_eq!(app.list_find.as_ref().unwrap().buffer, "a");
+
+    // 按 Esc 進入 Normal 模式
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc enters normal mode");
+    assert_eq!(app.text_input_mode, RenameMode::Normal);
+    assert!(app.list_find.is_some());
+
+    // Normal 模式下按 q 關閉 list find
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q closes list find");
+    assert!(app.list_find.is_none());
+    assert_eq!(app.status, "normal mode");
+}
+
+#[test]
+/// 驗證各面板內部搜尋框（TaskPanel, TrashPanel, BookmarkList, ZoxideList）在 Normal 模式下按 `q` 關閉搜尋框。
+fn q_cancels_panel_search_in_normal_mode() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // 1. TaskPanel 內部搜尋
+    app.text_input_mode = RenameMode::Insert;
+    app.pending_action = Some(PendingAction::TaskPanel {
+        pane_id: 1,
+        selected: 0,
+        search: PanelSearchState {
+            buffer: String::from("copy"),
+            editing: true,
+        },
+        marked_ids: Vec::new(),
+        visual_anchor: None,
+    });
+    // Esc -> Normal
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(app.text_input_mode, RenameMode::Normal);
+    // q -> 關閉 search.editing
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q closes task panel search");
+    if let Some(PendingAction::TaskPanel { search, .. }) = &app.pending_action {
+        assert!(!search.editing);
+    } else {
+        panic!("expected TaskPanel");
+    }
+
+    // 2. TrashPanel 內部搜尋
+    app.text_input_mode = RenameMode::Insert;
+    app.pending_action = Some(PendingAction::TrashPanel {
+        pane_id: 1,
+        selected: 0,
+        search: PanelSearchState {
+            buffer: String::from("del"),
+            editing: true,
+        },
+        marked_ids: Vec::new(),
+        visual_anchor: None,
+    });
+    // Esc -> Normal
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(app.text_input_mode, RenameMode::Normal);
+    // q -> 關閉 search.editing
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("q closes trash panel search");
+    if let Some(PendingAction::TrashPanel { search, .. }) = &app.pending_action {
+        assert!(!search.editing);
+    } else {
+        panic!("expected TrashPanel");
+    }
 }

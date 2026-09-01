@@ -1648,6 +1648,12 @@ impl App {
                 }
                 self.status = String::from("normal mode");
             }
+            _ if key_matches_plain_letter(&key, 'q') => {
+                if let Some(pane) = self.panes.get_mut(&search.pane_id) {
+                    pane.clear_list_find();
+                }
+                self.status = String::from("normal mode");
+            }
             _ => {
                 self.list_find = Some(search);
             }
@@ -2218,6 +2224,9 @@ impl App {
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            search.editing = false;
+                        }
                         _ => {}
                     }
                     let next_len = trash_panel_entries(&self.trash_store, &search.buffer)?.len();
@@ -2521,6 +2530,9 @@ impl App {
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            search.editing = false;
+                        }
                         _ => {}
                     }
                     let next_len = if let Some(custom) = &custom_entries {
@@ -2712,6 +2724,9 @@ impl App {
                 if search.editing {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
                             search.editing = false;
                         }
                         _ => {}
@@ -3160,6 +3175,9 @@ impl App {
                         KeyCode::Esc | KeyCode::Enter => {
                             search.editing = false;
                         }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            search.editing = false;
+                        }
                         _ => {}
                     }
                     let next_len =
@@ -3363,6 +3381,9 @@ impl App {
                 if search.editing {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => {
+                            search.editing = false;
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
                             search.editing = false;
                         }
                         _ => {}
