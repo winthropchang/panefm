@@ -258,12 +258,14 @@ fn resolve_wezterm_program(hint_exe: Option<&str>) -> String {
     "wezterm.exe".to_string()
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AncestorTerminalInfo {
     kind: AncestorTerminalKind,
     exe_path: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AncestorTerminalKind {
     Alacritty,
