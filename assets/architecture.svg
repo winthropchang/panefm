@@ -1,0 +1,209 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 640" width="100%" height="100%">
+  <defs>
+    <style>
+      .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", Roboto, sans-serif; font-weight: 700; font-size: 16px; fill: #ffffff; text-anchor: middle; }
+      .box-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", Roboto, sans-serif; font-weight: 600; font-size: 15px; fill: #ffffff; text-anchor: middle; }
+      .item-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", Roboto, sans-serif; font-weight: 400; font-size: 13px; fill: #c9d1d9; }
+      .item-code { font-family: "SF Mono", "Consolas", "Liberation Mono", monospace; font-weight: 600; font-size: 12px; fill: #79c0ff; }
+      .bus-line { stroke: #58a6ff; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; fill: none; }
+      .link-line { stroke: #388bfd; stroke-width: 2; stroke-dasharray: 4 4; fill: none; }
+      .card-bg { fill: #161b22; stroke-width: 1.5; rx: 8px; ry: 8px; }
+      .header-bg { fill: #21262d; rx: 8px; ry: 8px; }
+    </style>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.4" />
+    </filter>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="1200" height="640" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5" />
+
+  <!-- Top Core Architecture Box -->
+  <g filter="url(#shadow)">
+    <rect x="370" y="24" width="460" height="52" rx="8" fill="#1f242d" stroke="#58a6ff" stroke-width="2" />
+    <text x="600" y="56" class="title">⚡ PaneFM 核心系統架構 (Core Architecture)</text>
+  </g>
+
+  <!-- Connection Lines -->
+  <!-- Main vertical stem -->
+  <path d="M 600 76 L 600 110" class="bus-line" />
+  
+  <!-- Horizontal Bus Bar -->
+  <path d="M 160 110 L 1040 110" class="bus-line" />
+  
+  <!-- Row 1 Vertical Drops -->
+  <path d="M 160 110 L 160 135" class="bus-line" />
+  <path d="M 453 110 L 453 135" class="bus-line" />
+  <path d="M 746 110 L 746 135" class="bus-line" />
+  <path d="M 1040 110 L 1040 135" class="bus-line" />
+
+  <!-- Row 1 to Row 2 Vertical Links -->
+  <path d="M 160 345 L 160 380" class="bus-line" />
+  <path d="M 453 345 L 453 380" class="bus-line" />
+  <path d="M 746 345 L 746 380" class="bus-line" />
+  <path d="M 1040 345 L 1040 380" class="bus-line" />
+
+  <!-- ==================== ROW 1 CARDS ==================== -->
+
+  <!-- Box 1: Multi-Pane Layout -->
+  <g filter="url(#shadow)">
+    <rect x="28" y="135" width="265" height="210" class="card-bg" stroke="#388bfd" />
+    <path d="M 28 135 Q 28 135 28 135 L 293 135 Q 293 135 293 135 L 293 178 L 28 178 Z" fill="#1b2533" />
+    <line x1="28" y1="178" x2="293" y2="178" stroke="#388bfd" stroke-width="1.5" />
+    <text x="160" y="162" class="box-title">🪟 多視窗佈局管理</text>
+    
+    <circle cx="48" cy="202" r="3.5" fill="#388bfd" />
+    <text x="60" y="206" class="item-text">自由水平 / 垂直分割視窗</text>
+    
+    <circle cx="48" cy="236" r="3.5" fill="#388bfd" />
+    <text x="60" y="240" class="item-text"><tspan class="item-code">1~9</tspan> 號工作視窗極速切換</text>
+    
+    <circle cx="48" cy="270" r="3.5" fill="#388bfd" />
+    <text x="60" y="274" class="item-text"><tspan class="item-code">OSC 7</tspan> 終端分頁原生目錄同步</text>
+    
+    <circle cx="48" cy="304" r="3.5" fill="#388bfd" />
+    <text x="60" y="308" class="item-text"><tspan class="item-code">wt</tspan> / <tspan class="item-code">:terminal</tspan> 一鍵秒開終端</text>
+  </g>
+
+  <!-- Box 2: Vim Motion & Navigation -->
+  <g filter="url(#shadow)">
+    <rect x="321" y="135" width="265" height="210" class="card-bg" stroke="#e3b341" />
+    <path d="M 321 135 Q 321 135 321 135 L 586 135 Q 586 135 586 135 L 586 178 L 321 178 Z" fill="#2d2618" />
+    <line x1="321" y1="178" x2="586" y2="178" stroke="#e3b341" stroke-width="1.5" />
+    <text x="453" y="162" class="box-title">⚡ 極速導航與跳轉</text>
+    
+    <circle cx="341" cy="202" r="3.5" fill="#e3b341" />
+    <text x="353" y="206" class="item-text"><tspan class="item-code">h/j/k/l</tspan> 與數字計數前綴 (<tspan class="item-code">5j</tspan>)</text>
+    
+    <circle cx="341" cy="236" r="3.5" fill="#e3b341" />
+    <text x="353" y="240" class="item-text"><tspan class="item-code">g</tspan> 快速跳轉目錄選單 (<tspan class="item-code">gd/gh</tspan>)</text>
+    
+    <circle cx="341" cy="270" r="3.5" fill="#e3b341" />
+    <text x="353" y="274" class="item-text"><tspan class="item-code">fzf</tspan> 與 <tspan class="item-code">zoxide</tspan> 模糊歷史目錄跳</text>
+    
+    <circle cx="341" cy="304" r="3.5" fill="#e3b341" />
+    <text x="353" y="308" class="item-text"><tspan class="item-code">/</tspan> 當前清單即時檔名跳轉搜尋</text>
+  </g>
+
+  <!-- Box 3: Safe File Operations -->
+  <g filter="url(#shadow)">
+    <rect x="614" y="135" width="265" height="210" class="card-bg" stroke="#3fb950" />
+    <path d="M 614 135 Q 614 135 614 135 L 879 135 Q 879 135 879 135 L 879 178 L 614 178 Z" fill="#18271e" />
+    <line x1="614" y1="178" x2="879" y2="178" stroke="#3fb950" stroke-width="1.5" />
+    <text x="746" y="162" class="box-title">📦 安全檔案操作復原</text>
+    
+    <circle cx="634" cy="202" r="3.5" fill="#3fb950" />
+    <text x="646" y="206" class="item-text"><tspan class="item-code">Visual (v)</tspan> 連續多選標記</text>
+    
+    <circle cx="634" cy="236" r="3.5" fill="#3fb950" />
+    <text x="646" y="240" class="item-text"><tspan class="item-code">CoW</tspan> 零空間瞬間複製 (APFS)</text>
+    
+    <circle cx="634" cy="270" r="3.5" fill="#3fb950" />
+    <text x="646" y="274" class="item-text">交易式多線程傳輸與 <tspan class="item-code">Undo (u)</tspan></text>
+    
+    <circle cx="634" cy="304" r="3.5" fill="#3fb950" />
+    <text x="646" y="308" class="item-text">防呆垃圾桶與原生 <tspan class="item-code">ZIP</tspan> 壓縮解壓</text>
+  </g>
+
+  <!-- Box 4: Global Search & Preview -->
+  <g filter="url(#shadow)">
+    <rect x="907" y="135" width="265" height="210" class="card-bg" stroke="#a371f7" />
+    <path d="M 907 135 Q 907 135 907 135 L 1172 135 Q 1172 135 1172 135 L 1172 178 L 907 178 Z" fill="#261e33" />
+    <line x1="907" y1="178" x2="1172" y2="178" stroke="#a371f7" stroke-width="1.5" />
+    <text x="1040" y="162" class="box-title">🔍 全域即時搜尋預覽</text>
+    
+    <circle cx="927" cy="202" r="3.5" fill="#a371f7" />
+    <text x="939" y="206" class="item-text"><tspan class="item-code">fd</tspan> 全域檔名串流即時搜尋 (<tspan class="item-code">s</tspan>)</text>
+    
+    <circle cx="927" cy="236" r="3.5" fill="#a371f7" />
+    <text x="939" y="240" class="item-text"><tspan class="item-code">ripgrep</tspan> 內容全文高亮檢索 (<tspan class="item-code">S</tspan>)</text>
+    
+    <circle cx="927" cy="270" r="3.5" fill="#a371f7" />
+    <text x="939" y="274" class="item-text"><tspan class="item-code">Tab</tspan> 檔案語法高亮即時預覽</text>
+    
+    <circle cx="927" cy="304" r="3.5" fill="#a371f7" />
+    <text x="939" y="308" class="item-text">預覽視窗內關鍵字快速檢索</text>
+  </g>
+
+  <!-- ==================== ROW 2 CARDS ==================== -->
+
+  <!-- Box 5: Diff Matrix -->
+  <g filter="url(#shadow)">
+    <rect x="28" y="380" width="265" height="210" class="card-bg" stroke="#f0883e" />
+    <path d="M 28 380 Q 28 380 28 380 L 293 380 Q 293 380 293 380 L 293 423 L 28 423 Z" fill="#2e2017" />
+    <line x1="28" y1="423" x2="293" y2="423" stroke="#f0883e" stroke-width="1.5" />
+    <text x="160" y="407" class="box-title">⚖️ 目錄差異比對矩陣</text>
+    
+    <circle cx="48" cy="447" r="3.5" fill="#f0883e" />
+    <text x="60" y="451" class="item-text"><tspan class="item-code">2~N</tspan> 個目錄樹內容同步對齊</text>
+    
+    <circle cx="48" cy="481" r="3.5" fill="#f0883e" />
+    <text x="60" y="485" class="item-text"><tspan class="item-code">4</tspan> 種狀態過濾 (差異/獨有/相同)</text>
+    
+    <circle cx="48" cy="515" r="3.5" fill="#f0883e" />
+    <text x="60" y="519" class="item-text">支援 <tspan class="item-code">.gitignore</tspan> 自動排除過濾</text>
+    
+    <circle cx="48" cy="549" r="3.5" fill="#f0883e" />
+    <text x="60" y="553" class="item-text">自動呼叫 <tspan class="item-code">delta</tspan> / <tspan class="item-code">diff</tspan> 雙欄比對</text>
+  </g>
+
+  <!-- Box 6: Bookmarks & History -->
+  <g filter="url(#shadow)">
+    <rect x="321" y="380" width="265" height="210" class="card-bg" stroke="#56b6c2" />
+    <path d="M 321 380 Q 321 380 321 380 L 586 380 Q 586 380 586 380 L 586 423 L 321 423 Z" fill="#18282b" />
+    <line x1="321" y1="423" x2="586" y2="423" stroke="#56b6c2" stroke-width="1.5" />
+    <text x="453" y="407" class="box-title">🔖 智慧書籤歷史管理</text>
+    
+    <circle cx="341" cy="447" r="3.5" fill="#56b6c2" />
+    <text x="353" y="451" class="item-text"><tspan class="item-code">ba</tspan> / <tspan class="item-code">b{key}</tspan> 單鍵快捷秒跳書籤</text>
+    
+    <circle cx="341" cy="481" r="3.5" fill="#56b6c2" />
+    <text x="353" y="485" class="item-text">檔案系統底層變更自動監聽</text>
+    
+    <circle cx="341" cy="515" r="3.5" fill="#56b6c2" />
+    <text x="353" y="519" class="item-text">網路磁碟 (<tspan class="item-code">SMB</tspan>) 防卡死安全取消</text>
+    
+    <circle cx="341" cy="549" r="3.5" fill="#56b6c2" />
+    <text x="353" y="553" class="item-text">歷史造訪目錄自動權重學習</text>
+  </g>
+
+  <!-- Box 7: Themes & View Settings -->
+  <g filter="url(#shadow)">
+    <rect x="614" y="380" width="265" height="210" class="card-bg" stroke="#ec407a" />
+    <path d="M 614 380 Q 614 380 614 380 L 879 380 Q 879 380 879 380 L 879 423 L 614 423 Z" fill="#2d1922" />
+    <line x1="614" y1="423" x2="879" y2="423" stroke="#ec407a" stroke-width="1.5" />
+    <text x="746" y="407" class="box-title">🎨 主題外觀自訂視圖</text>
+    
+    <circle cx="634" cy="447" r="3.5" fill="#ec407a" />
+    <text x="646" y="451" class="item-text"><tspan class="item-code">10+</tspan> 款精美主題選單即時預覽</text>
+    
+    <circle cx="634" cy="481" r="3.5" fill="#ec407a" />
+    <text x="646" y="485" class="item-text"><tspan class="item-code">5</tspan> 種檔案欄位模式 (<tspan class="item-code">m</tspan>)</text>
+    
+    <circle cx="634" cy="515" r="3.5" fill="#ec407a" />
+    <text x="646" y="519" class="item-text">多維度自訂排序 (<tspan class="item-code">,</tspan>) (大小/時間)</text>
+    
+    <circle cx="634" cy="549" r="3.5" fill="#ec407a" />
+    <text x="646" y="553" class="item-text">隱藏檔切換 (<tspan class="item-code">H</tspan>) 與自訂介面尺寸</text>
+  </g>
+
+  <!-- Box 8: Tasks & Diagnostics -->
+  <g filter="url(#shadow)">
+    <rect x="907" y="380" width="265" height="210" class="card-bg" stroke="#20c997" />
+    <path d="M 907 380 Q 907 380 907 380 L 1172 380 Q 1172 380 1172 380 L 1172 423 L 907 423 Z" fill="#152823" />
+    <line x1="907" y1="423" x2="1172" y2="423" stroke="#20c997" stroke-width="1.5" />
+    <text x="1040" y="407" class="box-title">📊 背景任務智慧說明</text>
+    
+    <circle cx="927" cy="447" r="3.5" fill="#20c997" />
+    <text x="939" y="451" class="item-text">非同步背景 <tspan class="item-code">Worker</tspan> 傳輸不卡 <tspan class="item-code">UI</tspan></text>
+    
+    <circle cx="927" cy="481" r="3.5" fill="#20c997" />
+    <text x="939" y="485" class="item-text"><tspan class="item-code">?</tspan> 當前面板情境感知速查手冊</text>
+    
+    <circle cx="927" cy="515" r="3.5" fill="#20c997" />
+    <text x="939" y="519" class="item-text"><tspan class="item-code">~/F1</tspan> 全局完整功能說明字典</text>
+    
+    <circle cx="927" cy="549" r="3.5" fill="#20c997" />
+    <text x="939" y="553" class="item-text">統一 <tspan class="item-code">q</tspan> / <tspan class="item-code">Esc</tspan> 各面板極速退出</text>
+  </g>
+</svg>
