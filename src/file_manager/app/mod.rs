@@ -2755,6 +2755,50 @@ impl App {
             return hints;
         }
 
+        if let Some(search) = &self.global_search {
+            if search.editing {
+                hints.extend_from_slice(&[
+                    StatusShortcutHint {
+                        key: "Enter",
+                        label: "start search",
+                    },
+                    StatusShortcutHint {
+                        key: "Esc",
+                        label: "cancel",
+                    },
+                ]);
+            } else if search.filter.editing {
+                hints.extend_from_slice(&[StatusShortcutHint {
+                    key: "Enter/Esc",
+                    label: "done filter",
+                }]);
+            } else {
+                hints.extend_from_slice(&[
+                    StatusShortcutHint {
+                        key: "j/k",
+                        label: "move",
+                    },
+                    StatusShortcutHint {
+                        key: "Enter/l",
+                        label: "jump",
+                    },
+                    StatusShortcutHint {
+                        key: "f",
+                        label: "filter",
+                    },
+                    StatusShortcutHint {
+                        key: "i/s",
+                        label: "edit query",
+                    },
+                    StatusShortcutHint {
+                        key: "q/Esc",
+                        label: "exit",
+                    },
+                ]);
+            }
+            return hints;
+        }
+
         if let Some(action) = &self.pending_action {
             match action {
                 PendingAction::TaskPanel {
@@ -4201,12 +4245,15 @@ pub(crate) fn filter_custom_help_entries(entries: &[HelpEntry], query: &str) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextHelpKind {
     Normal,
+    GlobalSearch,
+    ListFind,
     TaskPanel,
     TrashPanel,
     DiffMatrix,
     VisualSelection,
     BookmarkPicker,
     BookmarkList,
+    ZoxideList,
     WindowPicker,
     SortPicker,
     GoPicker,
@@ -4217,6 +4264,11 @@ pub(crate) enum ContextHelpKind {
     Preview,
     ToolPanel,
     RegexRename,
+    Rename,
+    CreateEntry,
+    ConfirmAction,
+    CopyPicker,
+    OpenPicker,
 }
 
 impl App {
@@ -4235,8 +4287,11 @@ impl App {
         {
             return ContextHelpKind::Preview;
         }
-        if let Some(_find) = &self.list_find {
-            return ContextHelpKind::Normal;
+        if self.global_search.is_some() {
+            return ContextHelpKind::GlobalSearch;
+        }
+        if self.list_find.is_some() {
+            return ContextHelpKind::ListFind;
         }
         if self.visual_selection.is_some() {
             return ContextHelpKind::VisualSelection;
@@ -4244,12 +4299,14 @@ impl App {
         if let Some(action) = &self.pending_action {
             match action {
                 PendingAction::TaskPanel { .. } => ContextHelpKind::TaskPanel,
-                PendingAction::TrashPanel { .. } | PendingAction::ConfirmTrashAction { .. } => {
-                    ContextHelpKind::TrashPanel
-                }
+                PendingAction::TrashPanel { .. } => ContextHelpKind::TrashPanel,
+                PendingAction::ConfirmTrashAction { .. }
+                | PendingAction::ConfirmDelete { .. }
+                | PendingAction::ConfirmPasteOverwrite { .. } => ContextHelpKind::ConfirmAction,
                 PendingAction::DiffMatrix { .. } => ContextHelpKind::DiffMatrix,
                 PendingAction::BookmarkPicker { .. } => ContextHelpKind::BookmarkPicker,
                 PendingAction::BookmarkList { .. } => ContextHelpKind::BookmarkList,
+                PendingAction::ZoxideList { .. } => ContextHelpKind::ZoxideList,
                 PendingAction::WindowPicker { .. } => ContextHelpKind::WindowPicker,
                 PendingAction::SortPicker { .. } => ContextHelpKind::SortPicker,
                 PendingAction::GoPicker { .. } => ContextHelpKind::GoPicker,
@@ -4259,6 +4316,10 @@ impl App {
                 }
                 PendingAction::ToolPanel { .. } => ContextHelpKind::ToolPanel,
                 PendingAction::RegexRename { .. } => ContextHelpKind::RegexRename,
+                PendingAction::Rename { .. } => ContextHelpKind::Rename,
+                PendingAction::CreateEntry { .. } => ContextHelpKind::CreateEntry,
+                PendingAction::CopyPicker { .. } => ContextHelpKind::CopyPicker,
+                PendingAction::OpenPicker { .. } => ContextHelpKind::OpenPicker,
                 _ => ContextHelpKind::Normal,
             }
         } else if let Some(pane) = self.panes.get(&self.focused_pane)
@@ -4279,9 +4340,9 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
             vec![
                 help_entry("move", "j / k", "向下 / 向上移動檔案游標", HelpAction::QuitHint),
                 help_entry("navigate", "h / l", "返回上一層目錄 / 進入資料夾或開啟檔案", HelpAction::QuitHint),
-                help_entry("open", "Enter", "開啟所選檔案或進入資料夾", HelpAction::QuitHint),
-                help_entry("copy", "y", "複製目前檔案或所有標記項目 (Yank)", HelpAction::Command("copy")),
-                help_entry("cut", "x", "剪下目前檔案或所有標記項目 (Cut)", HelpAction::Command("cut")),
+                help_entry("open", "Enter / o", "開啟所選檔案或進入資料夾", HelpAction::QuitHint),
+                help_entry("copy", "y / Y", "複製目前檔案或所有標記項目 / 清除剪貼簿", HelpAction::Command("copy")),
+                help_entry("cut", "x / X", "剪下目前檔案或所有標記項目 / 清除剪貼簿", HelpAction::Command("cut")),
                 help_entry("paste", "p / P", "貼上檔案 / 強制覆蓋貼上", HelpAction::Command("paste")),
                 help_entry("rename", "r", "重新命名目前選取的檔案或資料夾", HelpAction::Command("rename")),
                 help_entry("regex-rename", "R / :reg", "開啟 Regex 批次改名預覽面板", HelpAction::Command("rename-regex")),
@@ -4292,27 +4353,60 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("visual", "v / V", "開啟視覺連續多選模式 (Visual Selection)", HelpAction::Visual),
                 help_entry("mark", "Space", "單檔切換標記 / 取消標記", HelpAction::QuitHint),
                 help_entry("mark-all", "Ctrl+a", "全選目前目錄所有檔案與資料夾", HelpAction::QuitHint),
+                help_entry("unmark-all", "Ctrl+Shift+a", "清除目前目錄所有標記", HelpAction::QuitHint),
+                help_entry("invert-marks", "Ctrl+r", "反向切換目前目錄標記狀態", HelpAction::QuitHint),
                 help_entry("preview", "Tab", "切換右側檔案預覽 / 進入預覽模式", HelpAction::Command("preview")),
-                help_entry("sort", "s", "打開排序選單 (Name, Size, MTime, Ext, Reverse)", HelpAction::Command("sort ")),
+                help_entry("hidden", ".", "切換顯示 / 隱藏以點開頭之隱藏檔", HelpAction::Hidden),
+                help_entry("compress", "C", "將所選項目壓縮為 ZIP 壓縮檔", HelpAction::QuitHint),
+                help_entry("extract", "E", "解壓縮所選壓縮檔（支援 zip, tar.gz, tar 等）", HelpAction::QuitHint),
+                help_entry("sort", ",", "打開排序選單 (Name, Size, MTime, Ext, Reverse)", HelpAction::Sort),
+                help_entry("search-name", "s", "啟動 fd 檔名全域即時搜尋", HelpAction::Command("search")),
+                help_entry("search-content", "S", "啟動 rg 檔案內容全文即時搜尋", HelpAction::Command("search")),
+                help_entry("jump", "z", "啟動 fzf 目錄樹模糊搜尋跳轉", HelpAction::Command("jump")),
+                help_entry("zoxide", "Z", "打開 zoxide 常用歷史目錄跳轉清單", HelpAction::Command("zoxide")),
+                help_entry("list-find", "/", "快速檔名跳轉搜尋 (List Find)", HelpAction::QuitHint),
+                help_entry("filter", "f / F", "即時過濾目前目錄檔案 (Normal / Fuzzy Filter)", HelpAction::Filter),
                 help_entry("linemode", "m", "打開 Linemode 選單 (Size, Perms, BTime, MTime, None)", HelpAction::Command("linemode ")),
                 help_entry("bookmark", "b", "打開書籤快捷選單 (ba 新增, bg 跳轉, bd 刪除, bD 清空)", HelpAction::Command("bookmark")),
                 help_entry("window", "w", "打開視窗分割與焦點選單 (wv 垂直, ws 水平, wh/j/k/l 切換, wc 關閉)", HelpAction::Command("window")),
+                help_entry("theme", "t", "打開佈景主題快速切換選單", HelpAction::Command("theme list")),
                 help_entry("tasks", "T", "打開任務管理面板 (檢視背景傳輸與執行進度)", HelpAction::Command("tasks")),
                 help_entry("trash-panel", "gt", "打開垃圾桶面板 (檢視與還原已刪除項目)", HelpAction::Command("trash")),
-                help_entry("diff", ":diff", "開啟全螢幕多 Panel 目錄矩陣與檔案內容比對", HelpAction::Command("diff")),
-                help_entry("jump", "z", "快速模糊跳轉檔案或目錄 (fzf jump)", HelpAction::Command("jump")),
-                help_entry("zoxide", "Z", "打開 zoxide 常用歷史目錄跳轉清單", HelpAction::Command("zoxide")),
-                help_entry("search", "/", "快速檔名搜尋", HelpAction::Command("search")),
-                help_entry("filter", "f / F", "即時過濾目前目錄檔案 (Normal / Fuzzy Filter)", HelpAction::Command("filter")),
+                help_entry("diff", "Alt+d / :diff", "開啟全螢幕多 Panel 目錄矩陣與檔案內容比對", HelpAction::Command("diff")),
                 help_entry("command", ":", "開啟底端命令列模式 (Command Mode)", HelpAction::Command("")),
                 help_entry("help", "~/F1", "打開全局完整說明手冊 (Help Dictionary)", HelpAction::Command("help")),
                 help_entry("cheatsheet", "?", "開啟當前面板快捷鍵指南 (Cheatsheet)", HelpAction::Command("cheatsheet")),
             ],
         ),
+        ContextHelpKind::GlobalSearch => (
+            String::from("Cheatsheet: Global Search (全域搜尋)"),
+            vec![
+                help_entry("move", "j / k / Down / Up", "在搜尋結果清單中上下移動", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
+                help_entry("jump-large", "J / K", "大步快速移動游標", HelpAction::QuitHint),
+                help_entry("top/bottom", "gg / G", "跳至搜尋結果頂部 / 底部", HelpAction::QuitHint),
+                help_entry("open", "Enter / l / Right", "跳轉並定位至所選檔案位置", HelpAction::QuitHint),
+                help_entry("filter", "f", "在目前搜尋結果中進行即時模糊過濾", HelpAction::QuitHint),
+                help_entry("re-edit", "i / s", "重新回到搜尋關鍵字輸入框重新搜尋", HelpAction::QuitHint),
+                help_entry("preview", "Tab", "（內容搜尋模式）切換進入 / 離開右側檔案內容預覽", HelpAction::QuitHint),
+                help_entry("preview-match", "n / p / N", "在預覽中跳至下一個 / 上一個內容比對匹配行", HelpAction::QuitHint),
+                help_entry("preview-scroll", "j / k", "在預覽中上下捲動檔案內容", HelpAction::QuitHint),
+                help_entry("exit", "Esc / h", "退出搜尋結果面板，返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::ListFind => (
+            String::from("Cheatsheet: List Find (檔名尋找)"),
+            vec![
+                help_entry("type", "Characters", "輸入要尋找的檔名關鍵字", HelpAction::QuitHint),
+                help_entry("confirm", "Enter", "確認尋找並鎖定目標項目", HelpAction::QuitHint),
+                help_entry("next/prev", "n / N", "在檔案列表中跳至下一個 / 上一個匹配項目", HelpAction::QuitHint),
+                help_entry("cancel", "Esc", "取消檔名尋找並退出", HelpAction::QuitHint),
+            ],
+        ),
         ContextHelpKind::TaskPanel => (
             String::from("Cheatsheet: Task Panel (任務管理)"),
             vec![
-                help_entry("move", "j / k", "上下移動選取任務", HelpAction::QuitHint),
+                help_entry("move", "j / k / Down / Up", "上下移動選取任務", HelpAction::QuitHint),
                 help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
                 help_entry("top/bottom", "gg / G", "跳至任務清單頂部 / 底部", HelpAction::QuitHint),
                 help_entry("visual", "v / V", "開啟視覺連續多選模式（連續標記多個任務）", HelpAction::QuitHint),
@@ -4323,14 +4417,14 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("cancel", "x / c", "取消目前正在執行的背景任務", HelpAction::QuitHint),
                 help_entry("cancel-all", "X / C", "取消所有正在執行的背景任務", HelpAction::QuitHint),
                 help_entry("search", "f", "開啟搜尋列，即時過濾任務名稱或路徑", HelpAction::QuitHint),
-                help_entry("detail", "Enter / l", "檢視該任務完整執行細節、路徑與錯誤訊息", HelpAction::QuitHint),
+                help_entry("detail", "Enter / l / Right", "檢視該任務完整執行細節、路徑與錯誤訊息", HelpAction::QuitHint),
                 help_entry("close", "Esc / q / t / h", "關閉任務面板，返回檔案列表", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::TrashPanel => (
             String::from("Cheatsheet: Trash Panel (垃圾桶)"),
             vec![
-                help_entry("move", "j / k", "上下移動選取垃圾桶項目", HelpAction::QuitHint),
+                help_entry("move", "j / k / Down / Up", "上下移動選取垃圾桶項目", HelpAction::QuitHint),
                 help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
                 help_entry("top/bottom", "gg / G", "跳至清單頂部 / 底部", HelpAction::QuitHint),
                 help_entry("visual", "v / V", "開啟視覺多選模式（連續標記多個項目）", HelpAction::QuitHint),
@@ -4353,6 +4447,11 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("toggle", "Space", "勾選 / 切換選取要同步的差異項目", HelpAction::QuitHint),
                 help_entry("all", "a", "全選 / 取消全選所有差異項目", HelpAction::QuitHint),
                 help_entry("diff-detail", "d", "開啟雙欄檔案內容詳細 Diff 比對檢視視窗", HelpAction::QuitHint),
+                help_entry("filter-cycle", "f", "循環切換篩選（全部 ➔ 僅差異 ➔ 僅獨有 ➔ 相同）", HelpAction::QuitHint),
+                help_entry("gitignore", "i", "切換 .gitignore 規則（包含/排除 build 與忽略檔）", HelpAction::QuitHint),
+                help_entry("hidden", ".", "切換顯示 / 隱藏以點開頭之隱藏檔", HelpAction::QuitHint),
+                help_entry("search", "/", "檔名關鍵字搜尋比對", HelpAction::QuitHint),
+                help_entry("rescan", "r", "重新掃描所有比對 Panel 目錄", HelpAction::QuitHint),
                 help_entry("apply", "Enter", "套用同步動作（將選取項目從來源複製至目標）", HelpAction::QuitHint),
                 help_entry("exit", "Esc / q", "退出差異比對矩陣，返回多面板模式", HelpAction::QuitHint),
             ],
@@ -4360,12 +4459,13 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
         ContextHelpKind::VisualSelection => (
             String::from("Cheatsheet: Visual Selection (視覺連續選取)"),
             vec![
-                help_entry("expand", "j / k", "延伸 / 縮小視覺連續選取範圍", HelpAction::QuitHint),
+                help_entry("expand", "j / k / Down / Up", "延伸 / 縮小視覺連續選取範圍", HelpAction::QuitHint),
                 help_entry("top/bottom", "gg / G", "連續選取至檔案清單頂部 / 底部", HelpAction::QuitHint),
                 help_entry("copy", "y", "複製選取範圍內的所有檔案/資料夾 (Yank)", HelpAction::QuitHint),
                 help_entry("cut", "x", "剪下選取範圍內的所有檔案/資料夾 (Cut)", HelpAction::QuitHint),
                 help_entry("delete", "d", "批次刪除選取範圍內的所有檔案/資料夾", HelpAction::QuitHint),
                 help_entry("rename-regex", "r / R", "對目前選取範圍開啟 Regex 批次改名預覽", HelpAction::QuitHint),
+                help_entry("compress", "C", "將選取範圍內所有項目壓縮為 ZIP", HelpAction::QuitHint),
                 help_entry("commit", "v", "將選取範圍提交為常規標記並退出視覺模式", HelpAction::QuitHint),
                 help_entry("cancel", "Esc", "取消視覺選取模式", HelpAction::QuitHint),
             ],
@@ -4376,9 +4476,12 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("split-v", "v", "垂直新增分割視窗 (Vertical Split)", HelpAction::QuitHint),
                 help_entry("split-s", "s", "水平新增分割視窗 (Horizontal Split)", HelpAction::QuitHint),
                 help_entry("focus", "h / j / k / l", "切換焦點至 左 / 下 / 上 / 右 視窗", HelpAction::QuitHint),
-                help_entry("close", "c", "關閉目前焦點視窗 (Close Pane)", HelpAction::QuitHint),
+                help_entry("close", "c / q", "關閉目前焦點視窗 (Close Pane)", HelpAction::QuitHint),
                 help_entry("only", "o", "僅保留目前視窗，關閉其他所有視窗 (Only)", HelpAction::QuitHint),
-                help_entry("cancel", "Esc / q / w", "取消退出視窗管理選單", HelpAction::QuitHint),
+                help_entry("diff", "d", "開啟多 Panel 目錄 Diff 矩陣比對", HelpAction::QuitHint),
+                help_entry("terminal", "t", "在目前目錄開啟外部終端機 (Terminal)", HelpAction::QuitHint),
+                help_entry("select-pane", "1..9", "直接切換焦點至指定編號視窗", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / w", "取消退出視窗管理選單", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::BookmarkPicker => (
@@ -4395,10 +4498,23 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
         ContextHelpKind::BookmarkList => (
             String::from("Cheatsheet: Bookmark List (書籤清單)"),
             vec![
-                help_entry("move", "j / k", "上下移動選擇書籤", HelpAction::QuitHint),
-                help_entry("jump", "Enter / l", "跳轉至所選書籤目錄", HelpAction::QuitHint),
-                help_entry("delete", "d", "刪除目前所選書籤", HelpAction::QuitHint),
-                help_entry("cancel", "Esc / q", "取消退出書籤清單", HelpAction::QuitHint),
+                help_entry("move", "j / k / Down / Up", "上下移動選擇書籤", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
+                help_entry("search", "f", "即時過濾書籤名稱或路徑", HelpAction::QuitHint),
+                help_entry("jump", "Enter / l", "跳轉至所選書籤目錄（刪除模式下為刪除）", HelpAction::QuitHint),
+                help_entry("delete", "d / {key}", "刪除對應代號書籤（在刪除模式下）", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / h", "取消退出書籤清單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::ZoxideList => (
+            String::from("Cheatsheet: Zoxide (歷史目錄跳轉)"),
+            vec![
+                help_entry("move", "j / k / Down / Up", "上下移動選擇常用目錄", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
+                help_entry("top/bottom", "gg / G", "跳至清單頂部 / 底部", HelpAction::QuitHint),
+                help_entry("filter", "f", "即時過濾歷史目錄路徑關鍵字", HelpAction::QuitHint),
+                help_entry("jump", "Enter / l", "跳轉進入所選常用目錄", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / h", "取消並返回檔案列表", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::SortPicker => (
@@ -4409,7 +4525,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("by-mtime", "m", "依修改時間排序 (Modified Time)", HelpAction::QuitHint),
                 help_entry("by-ext", "e", "依副檔名排序 (Extension)", HelpAction::QuitHint),
                 help_entry("reverse", "r", "反轉目前排序順序 (Reverse)", HelpAction::QuitHint),
-                help_entry("cancel", "Esc / q / s", "取消退出排序選單", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / ,", "取消退出排序選單", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::LineModePicker => (
@@ -4418,7 +4534,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry("size", "s", "右側欄位顯示檔案容量 (Size)", HelpAction::QuitHint),
                 help_entry("perms", "p", "右側欄位顯示檔案權限 (Permissions)", HelpAction::QuitHint),
                 help_entry("btime", "b", "右側欄位顯示建立時間 (Birth Time)", HelpAction::QuitHint),
-                help_entry("mtime", "m", "右側欄位顯示修改時間 (Modified Time)", HelpAction::QuitHint),
+                help_entry("mtime", "t / m", "右側欄位顯示修改時間 (Modified Time)", HelpAction::QuitHint),
                 help_entry("none", "n", "簡潔模式，不顯示右側額外欄位 (None)", HelpAction::QuitHint),
                 help_entry("cancel", "Esc / q / m", "取消退出欄位選單", HelpAction::QuitHint),
             ],
@@ -4428,6 +4544,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
             vec![
                 help_entry("documents", "d", "快速跳轉至 ~/Documents 目錄", HelpAction::QuitHint),
                 help_entry("desktop", "k", "快速跳轉至 ~/Desktop 目錄", HelpAction::QuitHint),
+                help_entry("home", "h", "快速跳轉至使用者家目錄 ~", HelpAction::QuitHint),
                 help_entry("goto-path", "t", "開啟路徑跳轉輸入框 (Goto path)", HelpAction::QuitHint),
                 help_entry("cancel", "Esc / q / g", "取消退出跳轉選單", HelpAction::QuitHint),
             ],
@@ -4435,9 +4552,10 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
         ContextHelpKind::ThemePicker => (
             String::from("Cheatsheet: Theme (佈景主題)"),
             vec![
-                help_entry("move", "j / k", "上下移動即時預覽佈景主題", HelpAction::QuitHint),
-                help_entry("apply", "Enter", "套用所選主題並儲存為預設", HelpAction::QuitHint),
-                help_entry("cancel", "Esc / q", "取消並恢復原主題", HelpAction::QuitHint),
+                help_entry("move", "j / k / Down / Up", "上下移動即時預覽佈景主題", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
+                help_entry("apply", "Enter / l", "套用所選主題並儲存為預設", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / h", "取消並恢復原主題", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::CommandMode => (
@@ -4462,24 +4580,64 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
         ContextHelpKind::Preview => (
             String::from("Cheatsheet: Preview (檔案預覽)"),
             vec![
-                help_entry("scroll", "j / k", "向下 / 向上捲動預覽文字內容", HelpAction::QuitHint),
+                help_entry("scroll", "j / k / Down / Up", "向下 / 向上捲動預覽文字內容", HelpAction::QuitHint),
                 help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻滾預覽", HelpAction::QuitHint),
                 help_entry("search", "/", "在預覽內容中搜尋關鍵字", HelpAction::QuitHint),
                 help_entry("match", "n / N", "跳至下一個 / 上一個搜尋匹配項目", HelpAction::QuitHint),
                 help_entry("exit", "Tab / Esc / h / q", "退出預覽捲動，返回檔案列表", HelpAction::QuitHint),
             ],
         ),
+        ContextHelpKind::Rename => (
+            String::from("Cheatsheet: Rename (重新命名)"),
+            vec![
+                help_entry("edit", "Characters", "編輯新檔案或資料夾名稱", HelpAction::QuitHint),
+                help_entry("apply", "Enter", "確認套用重新命名", HelpAction::QuitHint),
+                help_entry("cancel", "Esc", "取消重新命名並返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::CreateEntry => (
+            String::from("Cheatsheet: Create Entry (新增檔案/目錄)"),
+            vec![
+                help_entry("name", "Characters", "輸入名稱（以 / 結尾為資料夾，否則為檔案）", HelpAction::QuitHint),
+                help_entry("create", "Enter", "確認建立新檔案或目錄", HelpAction::QuitHint),
+                help_entry("cancel", "Esc", "取消建立並返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::ConfirmAction => (
+            String::from("Cheatsheet: Confirm Action (確認操作)"),
+            vec![
+                help_entry("confirm", "y / Enter", "確認執行此操作", HelpAction::QuitHint),
+                help_entry("cancel", "n / Esc / q", "取消操作並返回", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::CopyPicker => (
+            String::from("Cheatsheet: Copy Path (複製路徑)"),
+            vec![
+                help_entry("full-path", "1", "複製完整絕對路徑到剪貼簿", HelpAction::QuitHint),
+                help_entry("filename", "2", "僅複製檔案名稱到剪貼簿", HelpAction::QuitHint),
+                help_entry("parent-dir", "3", "複製所在目錄路徑到剪貼簿", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / c", "取消複製選單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::OpenPicker => (
+            String::from("Cheatsheet: Open With (開啟應用程式)"),
+            vec![
+                help_entry("move", "j / k / Down / Up", "上下移動選擇應用程式", HelpAction::QuitHint),
+                help_entry("open", "Enter", "使用所選應用程式開啟檔案", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消並返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
         ContextHelpKind::ToolPanel => (
             String::from("Cheatsheet: Tool Dependencies (相依工具)"),
             vec![
-                help_entry("move", "j / k", "上下移動檢視相依工具狀態", HelpAction::QuitHint),
+                help_entry("move", "j / k / Down / Up", "上下移動檢視相依工具狀態", HelpAction::QuitHint),
                 help_entry("close", "Esc / q", "關閉相依工具面板", HelpAction::QuitHint),
             ],
         ),
         ContextHelpKind::RegexRename => (
             String::from("Cheatsheet: Regex Batch Rename (批次改名)"),
             vec![
-                help_entry("move", "j / k", "上下移動檢視改名預覽項目", HelpAction::QuitHint),
+                help_entry("move", "j / k / Down / Up", "上下移動檢視改名預覽項目", HelpAction::QuitHint),
                 help_entry("apply", "Enter", "確認套用批次改名", HelpAction::QuitHint),
                 help_entry("cancel", "Esc / q", "取消並退出批次改名", HelpAction::QuitHint),
             ],
