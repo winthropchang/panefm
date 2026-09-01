@@ -513,6 +513,8 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         selected: usize,
         search: PanelSearchState,
+        marked_ids: Vec<usize>,
+        visual_anchor: Option<usize>,
     },
     BookmarkPicker {
         pane_id: usize,
@@ -920,15 +922,29 @@ impl App {
                 Some(PendingAction::TaskPanel {
                     pane_id: action_pane_id,
                     search,
-                    ..
+                    marked_ids,
+                    visual_anchor,
+                    selected,
                 }),
             ) = (task_records.as_ref(), self.pending_action.as_ref())
             {
                 if *action_pane_id == pane_id {
-                    Some(task_panel_lines(&filtered_task_entries(
-                        records,
-                        &search.buffer,
-                    )))
+                    let filtered = filtered_task_entries(records, &search.buffer);
+                    let mut effective_marked = marked_ids.clone();
+                    if let Some(anchor) = visual_anchor {
+                        let start = (*anchor).min(*selected);
+                        let end = (*anchor).max(*selected);
+                        for task in filtered
+                            .iter()
+                            .skip(start)
+                            .take(end.saturating_sub(start) + 1)
+                        {
+                            if !effective_marked.contains(&task.id) {
+                                effective_marked.push(task.id);
+                            }
+                        }
+                    }
+                    Some(task_panel_lines(&filtered, &effective_marked))
                 } else {
                     None
                 }
@@ -1088,6 +1104,7 @@ impl App {
                     pane_id: action_pane_id,
                     selected,
                     search,
+                    ..
                 }) = &self.pending_action
                 {
                     if *action_pane_id == pane_id {
@@ -3183,7 +3200,7 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":tasks",
             "T",
-            "打開目前 panel 的任務面板；x 取消選取任務，X 取消所有可取消任務",
+            "打開目前 panel 的任務面板；支援 v 範圍選取、Space 標記、d/D 刪除與清空、x/X 取消任務",
             HelpAction::Command("tasks"),
         ),
         help_entry(
@@ -3695,6 +3712,7 @@ pub(crate) fn task_panel_status(
     count: usize,
     selected: usize,
     editing: bool,
+    marked_count: usize,
 ) -> String {
     if editing {
         format!(
@@ -3707,9 +3725,16 @@ pub(crate) fn task_panel_status(
         } else {
             format!("tasks: {} (0)", query)
         }
+    } else if marked_count > 0 {
+        format!(
+            "tasks: {}/{} ({} marked) (d delete marked, v visual, a all, x/c cancel, f search)",
+            selected + 1,
+            count,
+            marked_count
+        )
     } else {
         format!(
-            "tasks: {}/{} (j/k move, x cancel, X cancel all, f search, h close)",
+            "tasks: {}/{} (d delete, D clear all, v visual, Space mark, x/c cancel, f search)",
             selected + 1,
             count
         )
@@ -3852,7 +3877,7 @@ pub(crate) fn trash_panel_overlay_state_from_pending_action(
 }
 
 /// 將目前 task log 轉成面板可直接渲染的資料列。
-pub(crate) fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
+pub(crate) fn task_panel_lines(tasks: &[TaskRecord], marked_ids: &[usize]) -> Vec<TaskPanelLine> {
     tasks
         .iter()
         .map(|task| TaskPanelLine {
@@ -3867,6 +3892,7 @@ pub(crate) fn task_panel_lines(tasks: &[TaskRecord]) -> Vec<TaskPanelLine> {
             source_locations: task.source_locations.clone(),
             destination_location: task.destination_location.clone(),
             detail: task.detail.clone(),
+            marked: marked_ids.contains(&task.id),
         })
         .collect()
 }

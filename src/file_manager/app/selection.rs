@@ -80,6 +80,43 @@ impl App {
         added
     }
 
+    /// 將目前 task 視覺選取範圍加入已標記清單。
+    pub(crate) fn commit_task_visual_selection(
+        &self,
+        tasks: &[TaskRecord],
+        marked_ids: &mut Vec<usize>,
+        anchor: usize,
+        current: usize,
+    ) -> usize {
+        let start = anchor.min(current);
+        let end = anchor.max(current);
+        let mut added = 0usize;
+
+        for task in tasks.iter().skip(start).take(end.saturating_sub(start) + 1) {
+            if !marked_ids.iter().any(|id| *id == task.id) {
+                marked_ids.push(task.id);
+                added += 1;
+            }
+        }
+
+        added
+    }
+
+    /// 回傳 task 面板 visual mode 的狀態列文字。
+    pub(crate) fn task_visual_status_label(
+        &self,
+        anchor: usize,
+        current: usize,
+        marked_count: usize,
+    ) -> String {
+        let selecting = anchor.abs_diff(current) + 1;
+        if marked_count > 0 {
+            format!("task visual: selecting {selecting} tasks ({marked_count} marked)")
+        } else {
+            format!("task visual: selecting {selecting} tasks")
+        }
+    }
+
     /// 清除目前焦點 pane 中所有標記。
     pub(crate) fn clear_marks_in_focused_pane(&mut self) -> io::Result<()> {
         let pane = self.current_pane_mut()?;

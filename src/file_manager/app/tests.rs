@@ -2474,7 +2474,7 @@ fn app_task_panel_supports_filtering() {
     }
     assert_eq!(
         app.status,
-        "tasks: 1/1 (j/k move, x cancel, X cancel all, f search, h close)"
+        "tasks: 1/1 (d delete, D clear all, v visual, Space mark, x/c cancel, f search)"
     );
 
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
@@ -3817,7 +3817,7 @@ fn task_progress_uses_latest_dynamic_estimate_and_is_visible_in_panel() {
 
     app.update_task_progress(task_id, 60, 100);
     app.update_task_progress(task_id, 20, 100);
-    let lines = super::task_panel_lines(&app.task_log);
+    let lines = super::task_panel_lines(&app.task_log, &[]);
 
     assert_eq!(app.task_log[0].progress_percent, Some(20));
     assert_eq!(lines[0].state, "RUNNING");
@@ -3829,7 +3829,7 @@ fn task_progress_uses_latest_dynamic_estimate_and_is_visible_in_panel() {
     app.finish_task(task_id, TaskState::Done, String::from("completed"));
     assert_eq!(app.task_log[0].progress_percent, Some(100));
     assert_eq!(app.task_log[0].completed_bytes, Some(100));
-    let lines = super::task_panel_lines(&app.task_log);
+    let lines = super::task_panel_lines(&app.task_log, &[]);
     assert_ne!(lines[0].finished_at, "--:--:--");
 }
 
@@ -7823,4 +7823,151 @@ fn diff_command_opens_and_navigates_matrix() {
         .expect("D");
     assert!(app.command_mode);
     assert_eq!(app.command_buffer, "diff ");
+}
+
+#[test]
+/// 驗證任務面板可以使用 v 進行 visual 選取並使用 d 批次刪除任務。
+fn task_panel_supports_visual_selection_and_batch_delete_with_v_and_d() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    let t1 = app.push_task(
+        1,
+        "copy",
+        "copy a.txt".into(),
+        "running".into(),
+        vec!["/a.txt".into()],
+        None,
+    );
+    let t2 = app.push_task(
+        1,
+        "move",
+        "move b.txt".into(),
+        "running".into(),
+        vec!["/b.txt".into()],
+        None,
+    );
+    let t3 = app.push_task(
+        1,
+        "delete",
+        "delete c.txt".into(),
+        "running".into(),
+        vec!["/c.txt".into()],
+        None,
+    );
+
+    // 打開任務面板
+    app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
+        .expect("open task panel");
+
+    // 目前有 3 筆任務，最新排在最上面 (t3, t2, t1)
+    assert_eq!(app.tasks_for_pane(1).len(), 3);
+
+    // 按下 v 開啟 visual 選取模式
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+        .expect("v start");
+
+    // 向下移動一格 (j)
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+        .expect("j down");
+
+    // 再次按下 v 提交 visual 選取 (選取了 t3 與 t2)
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+        .expect("v commit");
+
+    match app.pending_action.as_ref() {
+        Some(PendingAction::TaskPanel { marked_ids, .. }) => {
+            assert_eq!(marked_ids.len(), 2);
+            assert!(marked_ids.contains(&t3));
+            assert!(marked_ids.contains(&t2));
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+
+    // 按下 d 批次刪除已選取的任務
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .expect("d delete marked");
+
+    assert_eq!(app.tasks_for_pane(1).len(), 1);
+    assert_eq!(app.tasks_for_pane(1)[0].id, t1);
+    assert_eq!(app.status, "tasks: deleted 2 tasks");
+}
+
+#[test]
+/// 驗證任務面板可以使用 Space 標記個別任務、使用 a 全選、使用 d/D 刪除與清空。
+fn task_panel_supports_space_mark_all_and_clear_all_with_shifted_d() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    let t1 = app.push_task(
+        1,
+        "copy",
+        "copy a.txt".into(),
+        "running".into(),
+        vec!["/a.txt".into()],
+        None,
+    );
+    let t2 = app.push_task(
+        1,
+        "move",
+        "move b.txt".into(),
+        "running".into(),
+        vec!["/b.txt".into()],
+        None,
+    );
+
+    // 打開任務面板
+    app.open_task_panel();
+
+    // 按 Space 標記第一筆任務 (t2)
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .expect("space mark");
+
+    match app.pending_action.as_ref() {
+        Some(PendingAction::TaskPanel { marked_ids, .. }) => {
+            assert_eq!(marked_ids, &vec![t2]);
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+
+    // 按 d 刪除被標記的 t2
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .expect("d delete");
+    assert_eq!(app.tasks_for_pane(1).len(), 1);
+    assert_eq!(app.tasks_for_pane(1)[0].id, t1);
+
+    // 按 a 標記全部剩餘任務
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .expect("a mark all");
+    match app.pending_action.as_ref() {
+        Some(PendingAction::TaskPanel { marked_ids, .. }) => {
+            assert_eq!(marked_ids, &vec![t1]);
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+
+    // 按 a 取消全部標記
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .expect("a clear all marks");
+    match app.pending_action.as_ref() {
+        Some(PendingAction::TaskPanel { marked_ids, .. }) => {
+            assert!(marked_ids.is_empty());
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+
+    // 在沒有標記狀態下按 d，直接刪除游標所在任務
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .expect("d delete single");
+    assert_eq!(app.tasks_for_pane(1).len(), 0);
+
+    // 重新新增任務並測試 Shift+D (清空所有任務)
+    app.push_task(1, "copy", "task 1".into(), "running".into(), vec![], None);
+    app.push_task(1, "copy", "task 2".into(), "running".into(), vec![], None);
+    assert_eq!(app.tasks_for_pane(1).len(), 2);
+
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+        .expect("D clear all");
+    assert_eq!(app.tasks_for_pane(1).len(), 0);
+    assert_eq!(app.status, "tasks: cleared 2 tasks");
 }

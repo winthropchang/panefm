@@ -130,6 +130,7 @@ pub(crate) struct TaskPanelLine {
     /// 任務目的位置；刪除等沒有目的地的工作使用 `None`。
     pub(crate) destination_location: Option<String>,
     pub(crate) detail: String,
+    pub(crate) marked: bool,
 }
 
 /// 描述書籤列表彈窗中單一列要顯示的內容。
@@ -1718,8 +1719,10 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 ///
 /// 回傳：`Vec<Line<'static>>`，可直接交給單一 [`ListItem`] 顯示的多行文字。
 fn task_panel_display_lines(task: &TaskPanelLine, max_width: usize) -> Vec<Line<'static>> {
+    let mark = if task.marked { "* " } else { "  " };
     let summary = format!(
-        "{:<11} start {}  end {}  {}",
+        "{}{:<11} start {}  end {}  {}",
+        mark,
         truncate_text(&task.state, 11),
         truncate_text(&task.started_at, 8),
         truncate_text(&task.finished_at, 8),
@@ -2472,6 +2475,7 @@ mod tests {
                 "/Users/otto/Documents/AB_Demo/very-long-target-directory",
             )),
             detail: String::from("pasted copy: 1 item"),
+            marked: false,
         };
 
         let rendered = task_panel_display_lines(&task, 32);
@@ -2524,6 +2528,7 @@ mod tests {
                 .collect(),
             destination_location: Some(String::from("/destination")),
             detail: String::from("running"),
+            marked: false,
         };
 
         let rendered = task_panel_display_lines(&task, 80)

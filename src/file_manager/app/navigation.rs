@@ -631,8 +631,10 @@ impl App {
                 buffer: String::new(),
                 editing: false,
             },
+            marked_ids: Vec::new(),
+            visual_anchor: None,
         });
-        self.status = task_panel_status("", count, 0, false);
+        self.status = task_panel_status("", count, 0, false, 0);
     }
 
     /// 打開全螢幕 N 路目錄與檔案差異比對工作區 (Diff Matrix)。
@@ -1177,10 +1179,22 @@ impl App {
                 pane_id,
                 selected,
                 search,
+                marked_ids,
+                visual_anchor,
             } => {
                 let filtered =
                     filtered_task_entries(&self.tasks_for_pane(*pane_id), &search.buffer);
-                task_panel_status(&search.buffer, filtered.len(), *selected, search.editing)
+                if let Some(anchor) = visual_anchor {
+                    self.task_visual_status_label(*anchor, *selected, marked_ids.len())
+                } else {
+                    task_panel_status(
+                        &search.buffer,
+                        filtered.len(),
+                        *selected,
+                        search.editing,
+                        marked_ids.len(),
+                    )
+                }
             }
             PendingAction::BookmarkPicker { .. } => {
                 String::from("bookmark: choose a/g/d/D from the panel")

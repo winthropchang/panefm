@@ -216,6 +216,29 @@ impl App {
             .collect()
     }
 
+    /// 刪除指定的 task 清單（如果正在執行則先取消，並從 task_log 中移除）。
+    pub(crate) fn delete_tasks_by_ids(&mut self, task_ids: &[usize]) -> usize {
+        for id in task_ids {
+            self.cancel_task_by_id(*id);
+        }
+        let initial_len = self.task_log.len();
+        self.task_log.retain(|task| !task_ids.contains(&task.id));
+        let removed = initial_len.saturating_sub(self.task_log.len());
+        self.persist_task_history_best_effort();
+        removed
+    }
+
+    /// 清空指定 pane 的所有任務（如果正在執行則先取消）。
+    pub(crate) fn delete_all_tasks_for_pane(&mut self, pane_id: usize) -> usize {
+        let pane_task_ids: Vec<usize> = self
+            .task_log
+            .iter()
+            .filter(|t| t.pane_id == pane_id)
+            .map(|t| t.id)
+            .collect();
+        self.delete_tasks_by_ids(&pane_task_ids)
+    }
+
     /// 執行 help 面板中選到的功能，直接跳到對應模式或命令。
     pub(crate) fn execute_help_entry(
         &mut self,
