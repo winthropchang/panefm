@@ -1198,8 +1198,13 @@ impl App {
             }
         }
 
-        let help = Paragraph::new(status_shortcut_line(outer[1].width, self.theme))
-            .block(Block::default().borders(Borders::TOP));
+        let shortcut_hints = self.active_status_shortcut_hints();
+        let help = Paragraph::new(status_shortcut_line(
+            outer[1].width,
+            self.theme,
+            &shortcut_hints,
+        ))
+        .block(Block::default().borders(Borders::TOP));
         frame.render_widget(help, outer[1]);
 
         frame.render_widget(Paragraph::new(status_text).style(status_style), outer[2]);
@@ -2642,15 +2647,752 @@ pub(crate) fn paste_failure_status(
 /// `~/F1 help` 等重要入口裁掉，或顯示只剩一半的快捷鍵說明。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusShortcutHint {
-    key: &'static str,
-    label: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
 }
 
-/// 回傳底部 status bar 允許顯示的高頻快捷鍵，並依實際使用優先度排序。
-///
-/// 參數：無。
-/// 回傳：`&'static [StatusShortcutHint]`，第一筆固定為 Help；低頻功能應留在 F1
-/// 完整說明，不要加入這份清單讓 status bar 重新變得難以閱讀。
+impl App {
+    /// 依目前開啟的畫面、面板或互動模式，動態產出最相關且有用的快捷鍵清單。
+    /// 第一個項目永遠固定為 Help。
+    pub(crate) fn active_status_shortcut_hints(&self) -> Vec<StatusShortcutHint> {
+        let mut hints = Vec::new();
+        // 第一個項目永遠固定為 Help
+        hints.push(StatusShortcutHint {
+            key: "~/F1",
+            label: "help",
+        });
+
+        if self.command_mode {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "Enter",
+                    label: "execute",
+                },
+                StatusShortcutHint {
+                    key: "Tab",
+                    label: "complete",
+                },
+                StatusShortcutHint {
+                    key: "Esc",
+                    label: "cancel",
+                },
+            ]);
+            return hints;
+        }
+
+        if let Some(filter) = &self.filter
+            && filter.editing
+        {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "Enter",
+                    label: "confirm",
+                },
+                StatusShortcutHint {
+                    key: "Tab",
+                    label: "fuzzy/normal",
+                },
+                StatusShortcutHint {
+                    key: "Esc",
+                    label: "cancel",
+                },
+            ]);
+            return hints;
+        }
+
+        if let Some(search) = &self.preview_search
+            && search.editing
+        {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "Enter",
+                    label: "confirm",
+                },
+                StatusShortcutHint {
+                    key: "n/N",
+                    label: "match",
+                },
+                StatusShortcutHint {
+                    key: "Esc",
+                    label: "cancel",
+                },
+            ]);
+            return hints;
+        }
+
+        if let Some(_find) = &self.list_find {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "Enter",
+                    label: "confirm",
+                },
+                StatusShortcutHint {
+                    key: "n/N",
+                    label: "match",
+                },
+                StatusShortcutHint {
+                    key: "Esc",
+                    label: "cancel",
+                },
+            ]);
+            return hints;
+        }
+
+        if let Some(action) = &self.pending_action {
+            match action {
+                PendingAction::TaskPanel {
+                    search,
+                    marked_ids,
+                    visual_anchor,
+                    ..
+                } => {
+                    if search.editing {
+                        hints.extend_from_slice(&[StatusShortcutHint {
+                            key: "Enter/Esc",
+                            label: "done search",
+                        }]);
+                    } else if visual_anchor.is_some() {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "select range",
+                            },
+                            StatusShortcutHint {
+                                key: "v",
+                                label: "commit visual",
+                            },
+                            StatusShortcutHint {
+                                key: "Esc",
+                                label: "cancel visual",
+                            },
+                        ]);
+                    } else if !marked_ids.is_empty() {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "d",
+                                label: "delete marked",
+                            },
+                            StatusShortcutHint {
+                                key: "Space",
+                                label: "unmark",
+                            },
+                            StatusShortcutHint {
+                                key: "a",
+                                label: "clear marks",
+                            },
+                            StatusShortcutHint {
+                                key: "v",
+                                label: "visual",
+                            },
+                            StatusShortcutHint {
+                                key: "x/c",
+                                label: "cancel task",
+                            },
+                            StatusShortcutHint {
+                                key: "Esc",
+                                label: "clear marks",
+                            },
+                        ]);
+                    } else {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "move",
+                            },
+                            StatusShortcutHint {
+                                key: "v",
+                                label: "visual",
+                            },
+                            StatusShortcutHint {
+                                key: "Space",
+                                label: "mark",
+                            },
+                            StatusShortcutHint {
+                                key: "a",
+                                label: "mark all",
+                            },
+                            StatusShortcutHint {
+                                key: "d",
+                                label: "delete",
+                            },
+                            StatusShortcutHint {
+                                key: "D",
+                                label: "clear all",
+                            },
+                            StatusShortcutHint {
+                                key: "x/c",
+                                label: "cancel task",
+                            },
+                            StatusShortcutHint {
+                                key: "X",
+                                label: "cancel all",
+                            },
+                            StatusShortcutHint {
+                                key: "f",
+                                label: "search",
+                            },
+                            StatusShortcutHint {
+                                key: "q/Esc",
+                                label: "close",
+                            },
+                        ]);
+                    }
+                }
+                PendingAction::TrashPanel {
+                    search,
+                    marked_ids,
+                    visual_anchor,
+                    ..
+                } => {
+                    if search.editing {
+                        hints.extend_from_slice(&[StatusShortcutHint {
+                            key: "Enter/Esc",
+                            label: "done search",
+                        }]);
+                    } else if visual_anchor.is_some() {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "select range",
+                            },
+                            StatusShortcutHint {
+                                key: "v",
+                                label: "commit visual",
+                            },
+                            StatusShortcutHint {
+                                key: "Esc",
+                                label: "cancel visual",
+                            },
+                        ]);
+                    } else if !marked_ids.is_empty() {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "u",
+                                label: "restore marked",
+                            },
+                            StatusShortcutHint {
+                                key: "d",
+                                label: "delete marked",
+                            },
+                            StatusShortcutHint {
+                                key: "Space",
+                                label: "unmark",
+                            },
+                            StatusShortcutHint {
+                                key: "a",
+                                label: "clear marks",
+                            },
+                            StatusShortcutHint {
+                                key: "Esc",
+                                label: "clear marks",
+                            },
+                        ]);
+                    } else {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "move",
+                            },
+                            StatusShortcutHint {
+                                key: "v",
+                                label: "visual",
+                            },
+                            StatusShortcutHint {
+                                key: "Space",
+                                label: "mark",
+                            },
+                            StatusShortcutHint {
+                                key: "a",
+                                label: "mark all",
+                            },
+                            StatusShortcutHint {
+                                key: "u",
+                                label: "restore",
+                            },
+                            StatusShortcutHint {
+                                key: "U",
+                                label: "restore all",
+                            },
+                            StatusShortcutHint {
+                                key: "d",
+                                label: "delete",
+                            },
+                            StatusShortcutHint {
+                                key: "D",
+                                label: "clear all",
+                            },
+                            StatusShortcutHint {
+                                key: "f",
+                                label: "search",
+                            },
+                            StatusShortcutHint {
+                                key: "q/Esc",
+                                label: "close",
+                            },
+                        ]);
+                    }
+                }
+                PendingAction::DiffMatrix(diff_state) => {
+                    if diff_state.search_active {
+                        hints.extend_from_slice(&[StatusShortcutHint {
+                            key: "Enter/Esc",
+                            label: "done search",
+                        }]);
+                    } else {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "move",
+                            },
+                            StatusShortcutHint {
+                                key: "Enter",
+                                label: "diff file",
+                            },
+                            StatusShortcutHint {
+                                key: "i",
+                                label: "gitignore",
+                            },
+                            StatusShortcutHint {
+                                key: ".",
+                                label: "hidden",
+                            },
+                            StatusShortcutHint {
+                                key: "r",
+                                label: "rescan",
+                            },
+                            StatusShortcutHint {
+                                key: "f",
+                                label: "search",
+                            },
+                            StatusShortcutHint {
+                                key: "q/Esc",
+                                label: "close",
+                            },
+                        ]);
+                    }
+                }
+                PendingAction::HelpPanel { search, .. } => {
+                    if search.editing {
+                        hints.extend_from_slice(&[StatusShortcutHint {
+                            key: "Enter/Esc",
+                            label: "done search",
+                        }]);
+                    } else {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "move",
+                            },
+                            StatusShortcutHint {
+                                key: "Enter",
+                                label: "execute",
+                            },
+                            StatusShortcutHint {
+                                key: "f",
+                                label: "search",
+                            },
+                            StatusShortcutHint {
+                                key: "q/Esc",
+                                label: "close",
+                            },
+                        ]);
+                    }
+                }
+                PendingAction::BookmarkList { search, mode, .. } => {
+                    if search.editing {
+                        hints.extend_from_slice(&[StatusShortcutHint {
+                            key: "Enter/Esc",
+                            label: "done search",
+                        }]);
+                    } else {
+                        match mode {
+                            BookmarkListMode::Jump => {
+                                hints.extend_from_slice(&[
+                                    StatusShortcutHint {
+                                        key: "j/k",
+                                        label: "move",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "Enter",
+                                        label: "jump",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "f",
+                                        label: "search",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "q/Esc",
+                                        label: "close",
+                                    },
+                                ]);
+                            }
+                            BookmarkListMode::Delete => {
+                                hints.extend_from_slice(&[
+                                    StatusShortcutHint {
+                                        key: "j/k",
+                                        label: "move",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "d/Enter",
+                                        label: "delete",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "D",
+                                        label: "clear all",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "f",
+                                        label: "search",
+                                    },
+                                    StatusShortcutHint {
+                                        key: "q/Esc",
+                                        label: "close",
+                                    },
+                                ]);
+                            }
+                        }
+                    }
+                }
+                PendingAction::ZoxideList { search, .. } => {
+                    if search.editing {
+                        hints.extend_from_slice(&[StatusShortcutHint {
+                            key: "Enter/Esc",
+                            label: "done search",
+                        }]);
+                    } else {
+                        hints.extend_from_slice(&[
+                            StatusShortcutHint {
+                                key: "j/k",
+                                label: "move",
+                            },
+                            StatusShortcutHint {
+                                key: "Enter",
+                                label: "jump",
+                            },
+                            StatusShortcutHint {
+                                key: "f",
+                                label: "search",
+                            },
+                            StatusShortcutHint {
+                                key: "q/Esc",
+                                label: "close",
+                            },
+                        ]);
+                    }
+                }
+                PendingAction::BookmarkPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "a",
+                            label: "add",
+                        },
+                        StatusShortcutHint {
+                            key: "g",
+                            label: "jump list",
+                        },
+                        StatusShortcutHint {
+                            key: "d",
+                            label: "delete list",
+                        },
+                        StatusShortcutHint {
+                            key: "D",
+                            label: "clear all",
+                        },
+                        StatusShortcutHint {
+                            key: "b/Esc",
+                            label: "close",
+                        },
+                    ]);
+                }
+                PendingAction::WindowPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "s/v",
+                            label: "split h/v",
+                        },
+                        StatusShortcutHint {
+                            key: "q",
+                            label: "close",
+                        },
+                        StatusShortcutHint {
+                            key: "o",
+                            label: "only",
+                        },
+                        StatusShortcutHint {
+                            key: "d",
+                            label: "diff",
+                        },
+                        StatusShortcutHint {
+                            key: "t",
+                            label: "terminal",
+                        },
+                        StatusShortcutHint {
+                            key: "1..9",
+                            label: "focus",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "close",
+                        },
+                    ]);
+                }
+                PendingAction::SortPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "n",
+                            label: "name",
+                        },
+                        StatusShortcutHint {
+                            key: "s",
+                            label: "size",
+                        },
+                        StatusShortcutHint {
+                            key: "m",
+                            label: "mtime",
+                        },
+                        StatusShortcutHint {
+                            key: "e",
+                            label: "ext",
+                        },
+                        StatusShortcutHint {
+                            key: "r",
+                            label: "reverse",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::GoPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "g",
+                            label: "top",
+                        },
+                        StatusShortcutHint {
+                            key: "d",
+                            label: "documents",
+                        },
+                        StatusShortcutHint {
+                            key: "k",
+                            label: "desktop",
+                        },
+                        StatusShortcutHint {
+                            key: "h",
+                            label: "home",
+                        },
+                        StatusShortcutHint {
+                            key: "t",
+                            label: "goto path",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::LineModePicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "s",
+                            label: "size",
+                        },
+                        StatusShortcutHint {
+                            key: "m",
+                            label: "mtime",
+                        },
+                        StatusShortcutHint {
+                            key: "p",
+                            label: "perms",
+                        },
+                        StatusShortcutHint {
+                            key: "n",
+                            label: "none",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::ThemePicker { .. } | PendingAction::ThemeCommandPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "j/k",
+                            label: "preview",
+                        },
+                        StatusShortcutHint {
+                            key: "Enter",
+                            label: "apply",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::OpenPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "j/k",
+                            label: "move",
+                        },
+                        StatusShortcutHint {
+                            key: "Enter",
+                            label: "open with",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::CopyPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "j/k",
+                            label: "move",
+                        },
+                        StatusShortcutHint {
+                            key: "Enter",
+                            label: "copy text",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::Rename { .. } | PendingAction::CreateEntry { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "Enter",
+                            label: "confirm",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::RegexRename { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "j/k",
+                            label: "move",
+                        },
+                        StatusShortcutHint {
+                            key: "Enter",
+                            label: "apply",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+                PendingAction::ToolPanel { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "j/k",
+                            label: "move",
+                        },
+                        StatusShortcutHint {
+                            key: "q/Esc",
+                            label: "close",
+                        },
+                    ]);
+                }
+                PendingAction::ConfirmDelete { .. }
+                | PendingAction::ConfirmPasteOverwrite { .. }
+                | PendingAction::ConfirmTrashAction { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "y",
+                            label: "confirm",
+                        },
+                        StatusShortcutHint {
+                            key: "n/Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
+            }
+            return hints;
+        }
+
+        if self.visual_selection.is_some() {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "j/k",
+                    label: "select range",
+                },
+                StatusShortcutHint {
+                    key: "y",
+                    label: "copy",
+                },
+                StatusShortcutHint {
+                    key: "x",
+                    label: "cut",
+                },
+                StatusShortcutHint {
+                    key: "d",
+                    label: "trash",
+                },
+                StatusShortcutHint {
+                    key: "D",
+                    label: "delete",
+                },
+                StatusShortcutHint {
+                    key: "C",
+                    label: "compress",
+                },
+                StatusShortcutHint {
+                    key: "Space",
+                    label: "mark",
+                },
+                StatusShortcutHint {
+                    key: "v/Esc",
+                    label: "exit visual",
+                },
+            ]);
+            return hints;
+        }
+
+        if let Some(pane) = self.panes.get(&self.focused_pane)
+            && pane.is_preview_active()
+        {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "j/k",
+                    label: "scroll",
+                },
+                StatusShortcutHint {
+                    key: "Ctrl+d/u",
+                    label: "page scroll",
+                },
+                StatusShortcutHint {
+                    key: "Tab",
+                    label: "close preview",
+                },
+                StatusShortcutHint {
+                    key: "q",
+                    label: "close preview",
+                },
+            ]);
+            return hints;
+        }
+
+        // 預設（一般列表瀏覽模式）
+        hints.extend_from_slice(status_shortcut_hints());
+        // 移除重複的 help (因為 status_shortcut_hints() 本身第一項也是 help)
+        hints.dedup();
+        hints
+    }
+}
+
+/// 回傳底部 status bar 允許顯示的標準預設快捷鍵。第一筆固定為 Help。
 pub(crate) fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
     &[
         StatusShortcutHint {
@@ -2706,6 +3448,10 @@ pub(crate) fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
             label: "create",
         },
         StatusShortcutHint {
+            key: "d/D",
+            label: "delete",
+        },
+        StatusShortcutHint {
             key: "u",
             label: "undo",
         },
@@ -2713,17 +3459,26 @@ pub(crate) fn status_shortcut_hints() -> &'static [StatusShortcutHint] {
             key: "w",
             label: "panel",
         },
+        StatusShortcutHint {
+            key: "T",
+            label: "tasks",
+        },
     ]
 }
 
-/// 依 terminal 寬度建立底部快捷鍵列，並把版本固定在最右側。
+/// 依 terminal 寬度與目前情境快捷鍵清單建立底部快捷鍵列，並把版本固定在最右側。
 ///
 /// 參數：
 /// - `width: u16`，目前快捷鍵列可使用的 terminal cell 寬度。
 /// - `theme: Theme`，用來替按鍵套用目前主題的 accent 顏色。
+/// - `hints: &[StatusShortcutHint]`，依照目前畫面或模式產生的快捷鍵清單。
 ///
 /// 回傳：`Line<'static>`，可直接交給 ratatui `Paragraph` 繪製的單行內容。
-pub(crate) fn status_shortcut_line(width: u16, theme: Theme) -> Line<'static> {
+pub(crate) fn status_shortcut_line(
+    width: u16,
+    theme: Theme,
+    hints: &[StatusShortcutHint],
+) -> Line<'static> {
     let available_width = usize::from(width);
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let version_width = version.len();
@@ -2731,7 +3486,7 @@ pub(crate) fn status_shortcut_line(width: u16, theme: Theme) -> Line<'static> {
     let mut used_width = 0usize;
     let mut spans = Vec::new();
 
-    for (index, hint) in status_shortcut_hints().iter().enumerate() {
+    for (index, hint) in hints.iter().enumerate() {
         let separator = if index == 0 { "" } else { "  " };
         let item_width = separator.len() + hint.key.len() + 1 + hint.label.len();
         let required_width = used_width

@@ -74,13 +74,13 @@ fn status_shortcut_hints_keep_help_first_and_follow_usage_priority() {
 fn status_shortcut_line_drops_low_priority_items_instead_of_clipping() {
     let theme = Theme::default_theme();
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let narrow = super::status_shortcut_line(31, theme);
+    let narrow = super::status_shortcut_line(31, theme, super::status_shortcut_hints());
     let narrow_text = narrow
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    let wide = super::status_shortcut_line(u16::MAX, theme);
+    let wide = super::status_shortcut_line(u16::MAX, theme, super::status_shortcut_hints());
     let wide_text = wide
         .spans
         .iter()
@@ -95,7 +95,8 @@ fn status_shortcut_line_drops_low_priority_items_instead_of_clipping() {
     assert!(!wide_text.contains("P preview"));
     assert!(wide_text.ends_with(&version));
 
-    let version_only = super::status_shortcut_line(version.len() as u16, theme);
+    let version_only =
+        super::status_shortcut_line(version.len() as u16, theme, super::status_shortcut_hints());
     let version_only_text = version_only
         .spans
         .iter()
@@ -7970,4 +7971,97 @@ fn task_panel_supports_space_mark_all_and_clear_all_with_shifted_d() {
         .expect("D clear all");
     assert_eq!(app.tasks_for_pane(1).len(), 0);
     assert_eq!(app.status, "tasks: cleared 2 tasks");
+}
+
+#[test]
+/// 驗證底部快捷鍵列會依據目前畫面／模式動態調整，且第一個提示一律固定為 Help。
+fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_help() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // 1. Normal mode
+    let hints = app.active_status_shortcut_hints();
+    assert_eq!(hints[0].key, "~/F1");
+    assert_eq!(hints[0].label, "help");
+    let keys: Vec<&str> = hints.iter().map(|h| h.key).collect();
+    assert!(keys.contains(&"hjkl"));
+    assert!(keys.contains(&"Enter"));
+    assert!(keys.contains(&"y"));
+    assert!(keys.contains(&"v"));
+
+    // 2. Command mode (:)
+    app.execute_command("").unwrap();
+    app.command_mode = true;
+    let cmd_hints = app.active_status_shortcut_hints();
+    assert_eq!(cmd_hints[0].key, "~/F1");
+    assert_eq!(cmd_hints[0].label, "help");
+    let cmd_keys: Vec<&str> = cmd_hints.iter().map(|h| h.key).collect();
+    assert_eq!(cmd_keys, vec!["~/F1", "Enter", "Tab", "Esc"]);
+    app.command_mode = false;
+
+    // 3. Task panel mode
+    app.open_task_panel();
+    let task_hints = app.active_status_shortcut_hints();
+    assert_eq!(task_hints[0].key, "~/F1");
+    assert_eq!(task_hints[0].label, "help");
+    let task_keys: Vec<&str> = task_hints.iter().map(|h| h.key).collect();
+    assert!(task_keys.contains(&"v"));
+    assert!(task_keys.contains(&"Space"));
+    assert!(task_keys.contains(&"d"));
+    assert!(task_keys.contains(&"D"));
+    assert!(task_keys.contains(&"x/c"));
+
+    // 4. Trash panel mode
+    app.open_trash_panel();
+    let trash_hints = app.active_status_shortcut_hints();
+    assert_eq!(trash_hints[0].key, "~/F1");
+    assert_eq!(trash_hints[0].label, "help");
+    let trash_keys: Vec<&str> = trash_hints.iter().map(|h| h.key).collect();
+    assert!(trash_keys.contains(&"u"));
+    assert!(trash_keys.contains(&"U"));
+    assert!(trash_keys.contains(&"d"));
+    assert!(trash_keys.contains(&"D"));
+
+    // 5. Diff Matrix mode
+    app.pending_action = Some(PendingAction::DiffMatrix(
+        crate::file_manager::diff::DiffMatrixState::new_loading(
+            vec![1, 2],
+            vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            vec!["1".into(), "2".into()],
+        ),
+    ));
+    let diff_hints = app.active_status_shortcut_hints();
+    assert_eq!(diff_hints[0].key, "~/F1");
+    assert_eq!(diff_hints[0].label, "help");
+    let diff_keys: Vec<&str> = diff_hints.iter().map(|h| h.key).collect();
+    assert!(diff_keys.contains(&"Enter"));
+    assert!(diff_keys.contains(&"i"));
+    assert!(diff_keys.contains(&"."));
+    assert!(diff_keys.contains(&"r"));
+
+    // 6. Window picker (w)
+    app.pending_action = Some(PendingAction::WindowPicker { pane_id: 1 });
+    let win_hints = app.active_status_shortcut_hints();
+    assert_eq!(win_hints[0].key, "~/F1");
+    assert_eq!(win_hints[0].label, "help");
+    let win_keys: Vec<&str> = win_hints.iter().map(|h| h.key).collect();
+    assert!(win_keys.contains(&"s/v"));
+    assert!(win_keys.contains(&"d"));
+    assert!(win_keys.contains(&"t"));
+
+    // 7. Visual selection mode
+    app.pending_action = None;
+    app.visual_selection = Some(super::VisualSelectionState {
+        pane_id: 1,
+        anchor: 0,
+        current: 1,
+    });
+    let visual_hints = app.active_status_shortcut_hints();
+    assert_eq!(visual_hints[0].key, "~/F1");
+    assert_eq!(visual_hints[0].label, "help");
+    let visual_keys: Vec<&str> = visual_hints.iter().map(|h| h.key).collect();
+    assert!(visual_keys.contains(&"j/k"));
+    assert!(visual_keys.contains(&"y"));
+    assert!(visual_keys.contains(&"x"));
+    assert!(visual_keys.contains(&"d"));
 }
