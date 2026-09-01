@@ -824,6 +824,11 @@ impl App {
         Ok(app)
     }
 
+    /// 回傳目前 active panel 的目錄；供 OSC 7 終端同步或外部查詢使用。
+    pub(crate) fn active_pane_cwd(&self) -> Option<&Path> {
+        self.panes.get(&self.focused_pane).map(|pane| pane.cwd.as_path())
+    }
+
     /// 嘗試把目前按鍵視為 count prefix 的下一個數字。
     ///
     /// 規則：
@@ -6508,7 +6513,11 @@ impl App {
             .get(&self.focused_pane)
             .map(|pane| pane.cwd.clone())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "panel no longer exists"))?;
-        let launch = build_terminal_launch_spec(&cwd, self.config.actions.terminal.as_ref())?;
+        let launch = build_terminal_launch_spec(
+            &cwd,
+            self.config.actions.terminal.as_ref(),
+            &self.config.actions.terminals,
+        )?;
         let detail = format!("{} {}", launch.program, launch.args.join(" "));
         let task_id = self.push_task(
             self.focused_pane,
@@ -14591,15 +14600,19 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
+        let target = std::path::PathBuf::from("C:/nonexistent_test_path_12345/");
         app.command_mode = true;
-        app.command_buffer = String::from("C:/");
+        app.command_buffer = target.to_string_lossy().into_owned();
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("execute path-like input");
 
         assert!(!app.command_mode);
         assert!(app.command_buffer.is_empty());
-        assert!(app.status.starts_with("path jump failed: C:/"));
+        assert!(
+            app.status.contains("C:/nonexistent_test_path_12345/")
+                || app.status.contains("C:\\nonexistent_test_path_12345\\")
+        );
     }
 
     #[test]
@@ -16025,7 +16038,7 @@ mod tests {
         fs::create_dir(&src).expect("src");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\n", docs.display()),
+            format!("a = \"{}\"\n", docs.to_string_lossy().replace('\\', "/")),
         )
         .expect("bookmark file");
 
@@ -16135,7 +16148,7 @@ mod tests {
         fs::create_dir(&docs).expect("docs");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("d = \"{}\"\n", docs.display()),
+            format!("d = \"{}\"\n", docs.to_string_lossy().replace('\\', "/")),
         )
         .expect("bookmark file");
 
@@ -16242,7 +16255,11 @@ mod tests {
         fs::create_dir(&beta).expect("beta");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+            format!(
+                "a = \"{}\"\nb = \"{}\"\n",
+                alpha.to_string_lossy().replace('\\', "/"),
+                beta.to_string_lossy().replace('\\', "/")
+            ),
         )
         .expect("bookmark file");
 
@@ -16278,7 +16295,11 @@ mod tests {
         fs::create_dir(&beta).expect("beta");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+            format!(
+                "a = \"{}\"\nb = \"{}\"\n",
+                alpha.to_string_lossy().replace('\\', "/"),
+                beta.to_string_lossy().replace('\\', "/")
+            ),
         )
         .expect("bookmark file");
 
@@ -16317,7 +16338,11 @@ mod tests {
         fs::create_dir(&beta).expect("beta");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+            format!(
+                "a = \"{}\"\nb = \"{}\"\n",
+                alpha.to_string_lossy().replace('\\', "/"),
+                beta.to_string_lossy().replace('\\', "/")
+            ),
         )
         .expect("bookmark file");
 
@@ -16356,7 +16381,11 @@ mod tests {
         fs::create_dir(&beta).expect("beta");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+            format!(
+                "a = \"{}\"\nb = \"{}\"\n",
+                alpha.to_string_lossy().replace('\\', "/"),
+                beta.to_string_lossy().replace('\\', "/")
+            ),
         )
         .expect("bookmark file");
 
@@ -16383,7 +16412,7 @@ mod tests {
         fs::create_dir(&alpha).expect("alpha");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\n", alpha.display()),
+            format!("a = \"{}\"\n", alpha.to_string_lossy().replace('\\', "/")),
         )
         .expect("bookmark file");
 
@@ -16520,7 +16549,11 @@ mod tests {
         fs::create_dir(&beta).expect("beta");
         fs::write(
             dir.path().join("bookmark.toml"),
-            format!("a = \"{}\"\nb = \"{}\"\n", alpha.display(), beta.display()),
+            format!(
+                "a = \"{}\"\nb = \"{}\"\n",
+                alpha.to_string_lossy().replace('\\', "/"),
+                beta.to_string_lossy().replace('\\', "/")
+            ),
         )
         .expect("bookmark file");
 

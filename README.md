@@ -23,11 +23,16 @@ PaneFM 是一個以 **Vibe Coding** 方式開發的軟體，也是我嘗試使�
 - **快速搜尋**：使用 `fd` 搜尋檔名、`rg` 搜尋內容、`fzf` 模糊跳轉。
 - **多檔案操作**：支援範圍選取、全選、複製、剪下、貼上、刪除及 Trash 還原。
 - **跨平台**：以 macOS 與 Windows 為主要支援平台，包含 Windows 磁碟路徑與 SMB 位置。
-- **可自訂**：可切換成熟配色主題，並透過 `plugins.toml` 加入 VS Code、Xcode、Git、SVN 等外部動作。
+- **可自訂擴充**：可切換成熟配色主題，透過 `plugins.toml` 自訂終端適配器（`[[terminals]]`）與 `Open with` 外部工具（VS Code、Xcode、Git 等）。
 
 ## 功能
 
 - 多 Panel 分割、關閉與快速切換
+- **智慧終端整合與外掛系統（`wt` / `:terminal` / `[[terminals]]`）**：
+  - 支援 `[[terminals]]` 自訂外掛清單，透過環境變數或程序樹自動識別宿主終端
+  - 內建 WezTerm、Alacritty、Windows Terminal、iTerm2、Kitty、Ghostty 適配
+  - 內建 **OSC 7 目錄廣播**，終端原生快捷鍵（`Ctrl+Shift+T` / `Cmd+T`）秒開目前目錄 Tab
+  - 100% 獨立程序群組（`CREATE_NEW_PROCESS_GROUP`）與 **TrustView 企業安全保護環境繼承**
 - **N-Way 多 Panel 目錄與檔案矩陣比對（Diff Matrix）**：
   - 支援 2 ~ N 個 Panel 之間的目錄結構與檔案內容同時比對
   - 背景非阻塞掃描、`.gitignore` 過濾支援、Zero-I/O 智慧分類與首尾採樣 Hash
@@ -193,10 +198,51 @@ Terminal、WezTerm、Ghostty 或 Warp，無法辨識時才使用 Terminal.app。
 設定檔可調整主題、隱藏檔、預設排序、搜尋上限、移動步長與 UI 尺寸。
 字體和字體大小由 Windows Terminal、iTerm2 或其他 Terminal 控制，不由 PaneFM 設定。
 
-## 自訂動作
+## 外掛擴充與自訂動作 (`plugins.toml`)
 
-PaneFM 可透過 [plugins.toml.example](plugins.toml.example) 加入公司或個人環境專用的動作，
-不需要把 VS Code、Xcode、Git、SVN 或其他工具寫死在程式裡：
+PaneFM 支援透過 `plugins.toml` 自由擴充**終端適配器**與 **`Open with` 外部動作**，無需修改原始碼或重新編譯。
+
+詳細設定與範例請參考 [plugins.toml.example](plugins.toml.example)。
+
+### 1. 自訂終端適配器 (`[[terminals]]`)
+
+當在 PaneFM 中按下 **`wt`** 或輸入 **`:terminal`** 時，系統會依序檢查 `[[terminals]]` 列表：
+只要符合當前環境變數（`match_env`）或父程序名稱（`match_process`），就會自動以當前目錄 `{path}` 喚起該終端：
+
+```toml
+# 範例 1：macOS Kitty 終端（在現有視窗直接開新 Tab）
+[[terminals]]
+name = "kitty"
+match_env = ["KITTY_WINDOW_ID", "KITTY_PID"]
+match_process = ["kitty"]
+mac_command = "kitty @ launch --type=tab --cwd={path}"
+
+# 範例 2：跨平台 Ghostty 終端（開新視窗並定位至當前目錄）
+[[terminals]]
+name = "ghostty"
+match_env = ["GHOSTTY_RESOURCES_DIR"]
+match_process = ["ghostty.exe", "ghostty"]
+mac_command = "open -a Ghostty {path}"
+windows_command = "ghostty.exe --working-directory {path}"
+
+# 範例 3：公司 TrustView 加密保護終端
+[[terminals]]
+name = "trustview-safe-terminal"
+match_env = ["TRUSTVIEW_SESSION"]
+windows_command = "TrustViewLauncher.exe --cwd {path}"
+```
+
+> 💡 **小撇步**：
+> - **如何查詢終端的環境變數？** 在該終端執行 `Get-ChildItem env:`（PowerShell）或 `env`（macOS/Linux），即可看見該終端注入的專屬環境變數。
+> - **不想查環境變數？** 直接寫 `match_process = ["軟體名稱"]`（如 `["kitty"]`、`["ghostty.exe"]`）即可，PaneFM 會自動追蹤祖先程序樹！
+> - **開新 Tab（分頁）**：PaneFM 內建標準 **OSC 7 目錄廣播**。在支援的終端（WezTerm、Kitty、iTerm2 等）直接按終端原生快捷鍵（`Ctrl+Shift+T` / `Cmd+T`），也會直接在當前目錄開新 Tab！
+> - **TrustView 安全性保證**：若 PaneFM 是在 TrustView 保護下啟動，不論是開新分頁還是開新視窗，都會 100% 繼承安全權杖，可正常讀取保護區檔案。
+
+---
+
+### 2. 自訂 `Open with` 動作 (`[[actions.open_with]]`)
+
+按下 `O` 或 `Shift-Enter` 可開啟 Open With 彈出面板，自訂任何日常開發指令：
 
 ```toml
 [[actions.open_with]]
@@ -205,10 +251,15 @@ scope = "dir"
 mode = "detached"
 mac_command = "open -a 'Visual Studio Code' {path}"
 windows_command = "code {path}"
+
+[[actions.open_with]]
+name = "Git log"
+scope = "both"
+mode = "terminal"
+command = "git -C {parent} log --oneline"
 ```
 
-把 `plugins.toml` 放在 `config.toml` 旁邊，使用 `O` 或 `Shift-Enter` 開啟
-Open With 面板即可選擇自訂動作。
+把 `plugins.toml` 放在 `config.toml` 同級目錄即可自動生效。
 
 ## 外觀與圖示
 

@@ -11,6 +11,7 @@ use std::{
 
 use crate::config::{
     ActionLaunchMode, ActionTargetScope, CustomOpenActionConfig, TerminalLauncherConfig,
+    TerminalPluginConfig,
 };
 
 use super::platform::PlatformKind;
@@ -74,14 +75,14 @@ pub(crate) enum LaunchMode {
 
 /// 建立「在指定目錄開新終端」的跨平台命令。
 ///
-/// 有 `[terminal]` 設定時使用自訂命令，並以 `{path}` 展開 active panel 目錄；否則
-/// 使用平台預設。自訂入口可用來明確呼叫 TrustView 等公司保護軟體。
-///
-/// 參數：`path: &Path`，active panel cwd；`launcher: Option<&TerminalLauncherConfig>`，覆寫設定。
-/// 回傳：`io::Result<LaunchSpec>`，只建立規格，不會在此啟動程序。
+/// 優先順序：
+/// 1. `[terminal]` 全域覆寫命令。
+/// 2. `[[terminals]]` 自訂外掛清單（依環境變數與程序特徵匹配）。
+/// 3. 系統內建預設終端適配（WezTerm, Alacritty, Windows Terminal 等）。
 pub(crate) fn build_terminal_launch_spec(
     path: &Path,
     launcher: Option<&TerminalLauncherConfig>,
+    plugins: &[TerminalPluginConfig],
 ) -> io::Result<LaunchSpec> {
     if let Some(launcher) = launcher {
         let action = CustomOpenActionConfig {
@@ -99,6 +100,35 @@ pub(crate) fn build_terminal_launch_spec(
         };
         return build_custom_launch_spec(&target, &action);
     }
+
+    let ancestor_processes = super::platform::detect_ancestor_process_names();
+    for plugin in plugins {
+        let env_match = !plugin.match_env.is_empty()
+            && plugin.match_env.iter().any(|var| std::env::var_os(var).is_some());
+        let process_match = !plugin.match_process.is_empty()
+            && plugin.match_process.iter().any(|proc_name| {
+                let proc_lower = proc_name.to_lowercase();
+                ancestor_processes.iter().any(|p| p.contains(&proc_lower))
+            });
+
+        if env_match || process_match {
+            let action = CustomOpenActionConfig {
+                name: plugin.name.clone(),
+                scope: ActionTargetScope::Directory,
+                mode: ActionLaunchMode::Detached,
+                command: plugin.command.clone(),
+                mac_command: plugin.mac_command.clone(),
+                windows_command: plugin.windows_command.clone(),
+            };
+            let target = OpenTarget {
+                path: path.to_path_buf(),
+                display_name: path.display().to_string(),
+                is_dir: true,
+            };
+            return build_custom_launch_spec(&target, &action);
+        }
+    }
+
     super::platform::new_terminal_spec_for_platform(path, super::platform::current_platform())
 }
 
@@ -439,12 +469,14 @@ pub(crate) fn custom_action_applies_to_target(
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config::{ActionLaunchMode, ActionTargetScope, CustomOpenActionConfig};
+    use crate::config::{
+        ActionLaunchMode, ActionTargetScope, CustomOpenActionConfig, TerminalPluginConfig,
+    };
 
     use super::{
         LaunchMode, OpenAction, OpenPickerAction, OpenTarget,
-        build_custom_launch_spec_for_platform, build_launch_spec, is_text_like_path,
-        open_picker_options, parse_command_line,
+        build_custom_launch_spec_for_platform, build_launch_spec, build_terminal_launch_spec,
+        is_text_like_path, open_picker_options, parse_command_line,
     };
     use crate::file_manager::platform::PlatformKind;
 
@@ -548,5 +580,42 @@ mod tests {
         assert_eq!(spec.args[0], "-lc");
         assert!(spec.args[1].contains("open -a Xcode '/tmp/My Project'"));
         assert_eq!(spec.mode, LaunchMode::Detached);
+    }
+
+    #[test]
+    /// 驗證 build_terminal_launch_spec 能優先匹配自訂的 terminal plugin。
+    fn build_terminal_launch_spec_matches_terminal_plugin() {
+        let plugin = TerminalPluginConfig {
+            name: "custom-term".to_string(),
+            match_env: vec!["CUSTOM_TERM_ENV_FOR_TEST".to_string()],
+            match_process: Vec::new(),
+            command: Some("custom-term {path}".to_string()),
+            mac_command: None,
+            windows_command: None,
+        };
+
+        // 未設置環境變數時不匹配
+        let spec_without_env = build_terminal_launch_spec(
+            &PathBuf::from("/tmp/foo"),
+            None,
+            &[plugin.clone()],
+        )
+        .expect("spec");
+
+        // 設置環境變數後匹配
+        unsafe {
+            std::env::set_var("CUSTOM_TERM_ENV_FOR_TEST", "1");
+        }
+        let spec_with_env = build_terminal_launch_spec(
+            &PathBuf::from("/tmp/foo"),
+            None,
+            &[plugin],
+        )
+        .expect("spec");
+        unsafe {
+            std::env::remove_var("CUSTOM_TERM_ENV_FOR_TEST");
+        }
+
+        assert_ne!(spec_without_env.program, spec_with_env.program);
     }
 }

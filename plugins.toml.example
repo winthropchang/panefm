@@ -1,28 +1,91 @@
-# `plugins.toml` 可以寫註解。
-# TOML 使用 `#` 當作註解開頭，整行註解或行尾註解都可以。
+# ==============================================================================
+# `plugins.toml` 設定範例
+# ==============================================================================
+# 本設定檔提供兩大自訂擴充能力：
+# 1. `[[terminals]]`：自訂終端適配器（讓 `wt` / `:terminal` 自動對接特定終端或開新分頁）
+# 2. `[[actions.open_with]]`：自訂 `Open with` 外部動作（用自選工具開啟檔案/目錄）
 #
-# 這個檔案目前用來定義 `Open with` 面板中的自訂動作。
-# 你可以把常用的外部工具寫進來，例如：
-# - 用 VS Code / Xcode 開啟目錄
-# - 執行 git / svn 指令
-# - 呼叫系統工具 reveal 目前檔案
+# ==============================================================================
+# 第一部分：自訂終端適配器 (`[[terminals]]`)
+# ==============================================================================
+# 當你在 PaneFM 中按下 `wt` 或輸入 `:terminal` 時：
+# 系統會優先比對 `[[terminals]]` 列表中的特徵，命中時自動以當前目錄 `{path}` 啟動對應指令。
 #
-# 基本結構：
-# 1. `[actions]` 是動作設定群組。
-# 2. `[[actions.open_with]]` 代表一個可出現在 `Open with` 面板中的選項。
-# 3. 你可以寫很多個 `[[actions.open_with]]`，每一個都是獨立功能。
+# 🔍 欄位詳細說明：
+# - `name`（必填）：終端適配器的識別名稱，例如 `"kitty"`、`"ghostty"`、`"trustview-term"`。
+# - `match_env`（選填）：終端軟體自動注入的專屬環境變數清單。只要環境中有其中一個就命中。
+#   - WezTerm: `["WEZTERM_PANE", "WEZTERM_EXECUTABLE"]`
+#   - Alacritty: `["ALACRITTY_WINDOW_ID", "ALACRITTY_SOCKET"]`
+#   - Windows Terminal: `["WT_SESSION", "WT_PROFILE_ID"]`
+#   - Kitty: `["KITTY_WINDOW_ID", "KITTY_PID"]`
+#   - Ghostty: `["GHOSTTY_RESOURCES_DIR"]`
+#   - Warp: `["WARP_IS_LOCAL_SHELL_SESSION"]`
+#
+# 💡 如何自己查詢當前終端的專屬環境變數（match_env）？
+#   在你想測試的終端視窗中直接輸入以下指令，即可看到所有環境變數：
+#   - PowerShell（Windows / macOS / Linux）：
+#     Get-ChildItem env:
+#     （或過濾關鍵字：Get-ChildItem env: | Where-Object { $_.Name -match "TERM|WINDOW|SESSION|PANE" }）
+#   - CMD（Windows）：
+#     set
+#   - Bash / Zsh / Fish（macOS / Linux）：
+#     env
+#     （或過濾關鍵字：env | grep -iE "term|window|session|pane"）
+#
+# - `match_process`（選填）：宿主終端軟體的執行檔名稱（不分大小寫）。
+#   - 例如：`["ghostty.exe", "ghostty"]`、`["kitty"]`、`["wezterm-gui.exe"]`。
+#   - 只要父程序樹符合其中一個名稱就命中（如果你不想查環境變數，直接寫軟體名稱最簡單！）。
+# - `command`（選填）：全平台通用的啟動指令範本。
+# - `mac_command`（選填）：僅在 macOS 上執行的啟動指令（優先於 `command`）。
+# - `windows_command`（選填）：僅在 Windows 上執行的啟動指令（優先於 `command`）。
+#
+# 📌 佔位符說明：
+# - `{path}`：會自動替換為 PaneFM 當前活躍 panel 的完整絕對目錄路徑。
+#
+# 🛡️ TrustView / 企業安全環境說明：
+# 只要 PaneFM 是在 TrustView 保護下啟動，透過 `wt` 喚起的新終端或分頁都會 100% 繼承安全權杖，
+# 正常存取保護區檔案。
 
-# 可選：覆寫 `wt` / `:terminal` 使用的新終端啟動器。
-# 預設不需要設定；Windows 會直接建立繼承 PaneFM 權杖的新 console，macOS 會依
-# `TERM_PROGRAM` / `LC_TERMINAL` 延續 iTerm2、Terminal、WezTerm、Ghostty 或 Warp，
-# 無法辨識才回退到 Terminal.app。公司若要求終端必須經由 TrustView 等保護軟體啟動，
-# 可取消下列註解並改成公司提供的正式命令。`{path}` 會替換成 active panel 的完整目錄。
-#
+# 範例 A：macOS Kitty 終端（直接在現有 Kitty 視窗開新 Tab）
+# [[terminals]]
+# name = "kitty"
+# match_env = ["KITTY_WINDOW_ID", "KITTY_PID"]
+# match_process = ["kitty"]
+# mac_command = "kitty @ launch --type=tab --cwd={path}"
+
+# 範例 B：跨平台 Ghostty 終端（開新視窗並定位到當前目錄）
+# [[terminals]]
+# name = "ghostty"
+# match_env = ["GHOSTTY_RESOURCES_DIR"]
+# match_process = ["ghostty.exe", "ghostty"]
+# mac_command = "open -a Ghostty {path}"
+# windows_command = "ghostty.exe --working-directory {path}"
+
+# 範例 C：跨平台 Warp 終端
+# [[terminals]]
+# name = "warp"
+# match_env = ["WARP_IS_LOCAL_SHELL_SESSION"]
+# match_process = ["warp.exe", "warp"]
+# mac_command = "open -a Warp {path}"
+# windows_command = "warp.exe {path}"
+
+# 範例 D：公司專屬的 TrustView 加密保護終端包裝器
+# [[terminals]]
+# name = "trustview-launcher"
+# match_env = ["TRUSTVIEW_SESSION"]
+# windows_command = "TrustViewLauncher.exe --cwd {path}"
+
+# ------------------------------------------------------------------------------
+# 單一全域終端覆寫（選用）：
+# 如果你不想用自動識別，希望不論在哪裡按 `wt` 都一律強制執行固定指令，可直接設定 `[terminal]`：
 # [terminal]
 # mac_command = "open -a 'Company Terminal Launcher' {path}"
 # windows_command = "CompanyTerminalLauncher.exe {path}"
+# ------------------------------------------------------------------------------
 
-[actions]
+# ==============================================================================
+# 第二部分：自訂 Open with 動作 (`[actions]`)
+# ==============================================================================
 
 # 範例 1：
 # 在選到「資料夾」時，顯示一個 `VSCode` 選項。

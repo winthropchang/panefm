@@ -173,11 +173,24 @@ pub struct ActionsConfig {
     pub open_with: Vec<CustomOpenActionConfig>,
     /// 可選的新終端啟動器；公司保護環境可在 plugins.toml 指定 TrustView 等入口。
     pub terminal: Option<TerminalLauncherConfig>,
+    /// 自訂或擴充的終端適配器清單。
+    pub terminals: Vec<TerminalPluginConfig>,
 }
 
 /// 表示 `plugins.toml` 中可覆寫的平台終端啟動命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalLauncherConfig {
+    pub command: Option<String>,
+    pub mac_command: Option<String>,
+    pub windows_command: Option<String>,
+}
+
+/// 表示 `plugins.toml` 中自訂的終端適配器（Terminal Plugin）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalPluginConfig {
+    pub name: String,
+    pub match_env: Vec<String>,
+    pub match_process: Vec<String>,
     pub command: Option<String>,
     pub mac_command: Option<String>,
     pub windows_command: Option<String>,
@@ -285,6 +298,7 @@ impl Default for AppConfig {
             actions: ActionsConfig {
                 open_with: Vec::new(),
                 terminal: None,
+                terminals: Vec::new(),
             },
         }
     }
@@ -455,11 +469,23 @@ struct BehaviorConfigFile {
 struct PluginsConfigFile {
     actions: Option<ActionsConfigFile>,
     terminal: Option<TerminalLauncherFile>,
+    terminals: Option<Vec<TerminalPluginFile>>,
 }
 
 /// 表示 plugins.toml `[terminal]` 區塊尚未驗證的原始欄位。
 #[derive(Debug, Default, Deserialize)]
 struct TerminalLauncherFile {
+    command: Option<String>,
+    mac_command: Option<String>,
+    windows_command: Option<String>,
+}
+
+/// 表示 plugins.toml `[[terminals]]` 區塊尚未驗證的原始欄位。
+#[derive(Debug, Default, Deserialize)]
+struct TerminalPluginFile {
+    name: Option<String>,
+    match_env: Option<Vec<String>>,
+    match_process: Option<Vec<String>>,
     command: Option<String>,
     mac_command: Option<String>,
     windows_command: Option<String>,
@@ -547,6 +573,9 @@ pub fn load_config(base_dir: &Path) -> Result<LoadedConfig> {
         }
         if let Some(terminal) = plugins.terminal {
             apply_terminal_launcher_config(&mut config, terminal)?;
+        }
+        if let Some(terminals) = plugins.terminals {
+            apply_terminal_plugins_config(&mut config, terminals)?;
         }
     }
 
@@ -961,6 +990,55 @@ fn apply_terminal_launcher_config(
         bail!("terminal must define at least one of command / mac_command / windows_command");
     }
     config.actions.terminal = Some(launcher);
+    Ok(())
+}
+
+/// 套用並驗證 `terminals` 自訂終端外掛清單設定。
+fn apply_terminal_plugins_config(
+    config: &mut AppConfig,
+    terminals: Vec<TerminalPluginFile>,
+) -> Result<()> {
+    let normalize = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    for item in terminals {
+        let name = match item.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => name.to_string(),
+            None => bail!("terminal plugin must define a non-empty name"),
+        };
+        let match_env = item
+            .match_env
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let match_process = item
+            .match_process
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let command = normalize(item.command);
+        let mac_command = normalize(item.mac_command);
+        let windows_command = normalize(item.windows_command);
+
+        if command.is_none() && mac_command.is_none() && windows_command.is_none() {
+            bail!("terminal plugin '{}' must define at least one of command / mac_command / windows_command", name);
+        }
+
+        config.actions.terminals.push(TerminalPluginConfig {
+            name,
+            match_env,
+            match_process,
+            command,
+            mac_command,
+            windows_command,
+        });
+    }
     Ok(())
 }
 
@@ -1390,5 +1468,43 @@ size = 42
 
         let loaded = load_config(dir.path()).expect("config should remain compatible");
         assert_eq!(loaded.config, AppConfig::default());
+    }
+
+    #[test]
+    /// 驗證 `plugins.toml` 的 `[[terminals]]` 自訂適配器清單可以正確載入。
+    fn load_config_reads_terminal_plugins() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("plugins.toml"),
+            r#"
+[[terminals]]
+name = "kitty"
+match_env = ["KITTY_WINDOW_ID", "KITTY_PID"]
+mac_command = "kitty @ launch --type=tab --cwd={path}"
+
+[[terminals]]
+name = "ghostty"
+match_process = ["ghostty.exe", "ghostty"]
+windows_command = "ghostty.exe --working-directory {path}"
+"#,
+        )
+        .expect("write plugins");
+
+        let loaded = load_config(dir.path()).expect("config");
+        assert_eq!(loaded.config.actions.terminals.len(), 2);
+        assert_eq!(loaded.config.actions.terminals[0].name, "kitty");
+        assert_eq!(
+            loaded.config.actions.terminals[0].match_env,
+            vec!["KITTY_WINDOW_ID", "KITTY_PID"]
+        );
+        assert_eq!(
+            loaded.config.actions.terminals[0].mac_command.as_deref(),
+            Some("kitty @ launch --type=tab --cwd={path}")
+        );
+        assert_eq!(loaded.config.actions.terminals[1].name, "ghostty");
+        assert_eq!(
+            loaded.config.actions.terminals[1].match_process,
+            vec!["ghostty.exe", "ghostty"]
+        );
     }
 }

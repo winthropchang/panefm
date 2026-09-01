@@ -18,6 +18,7 @@ mod fzf;
 mod layout;
 mod open;
 mod operation_history;
+mod osc7;
 mod pane;
 mod platform;
 mod rg;
@@ -30,6 +31,7 @@ mod ui;
 mod zoxide;
 
 use std::io::{self, BufRead, BufReader, Stdout, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -55,6 +57,7 @@ use crate::config::load_config;
 use self::app::{App, FzfJumpRequest, RenameMode};
 use self::fzf::fzf_command;
 use self::open::{LaunchMode, LaunchSpec};
+use self::osc7::sync_terminal_working_directory;
 
 /// 啟動檔案管理器模組的完整執行流程。
 ///
@@ -120,6 +123,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new(cwd, loaded_config)?;
     let mut last_cursor_mode = None;
     let mut presented_frame: Option<(Buffer, Option<Position>)> = None;
+    let mut last_synced_cwd: Option<PathBuf> = None;
 
     loop {
         // 每輪先吸收有限量背景訊息再繪圖，讓搜尋結果能逐批出現，同時避免 channel
@@ -152,6 +156,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             terminal.current_buffer_mut().reset();
         }
         sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
+
+        // 向外層終端（WezTerm, Windows Terminal, Alacritty 等）同步目前 active panel 目錄 (OSC 7)
+        if let Some(active_cwd) = app.active_pane_cwd() {
+            if last_synced_cwd.as_deref() != Some(active_cwd) {
+                let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
+                last_synced_cwd = Some(active_cwd.to_path_buf());
+            }
+        }
 
         if event::poll(poll_rate)?
             && let Event::Key(key) = event::read()?
@@ -538,12 +550,25 @@ fn run_launch_spec(
 ) -> Result<()> {
     match launch.mode {
         LaunchMode::Detached => {
-            Command::new(&launch.program)
-                .args(&launch.args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
+            let mut command = Command::new(&launch.program);
+            command.args(&launch.args);
+
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+            }
+
+            command.spawn()?;
         }
         LaunchMode::TerminalBlocking => {
             disable_raw_mode()?;
@@ -574,8 +599,9 @@ fn run_launch_spec(
 
 /// 直接建立具有獨立 console 的 shell 子程序，並把 cwd 設成 active panel 目錄。
 ///
-/// Windows 的 `CREATE_NEW_CONSOLE` 不經過 Windows Terminal broker，因此 child 會繼承
-/// PaneFM 當下的安全權杖與環境。其他平台保留一般 detached fallback，方便未來擴充。
+/// Windows 的 `CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP` 不經過 Windows Terminal broker，
+/// 且擁有獨立程序群組，因此關閉新視窗不會連帶關閉父程序，同時 child 會繼承 PaneFM 當下的安全權杖與環境。
+/// 其他平台保留一般 detached fallback，方便未來擴充。
 ///
 /// 參數：`program: &str`，shell；`args: &[String]`，參數；`current_dir: &Path`，cwd。
 /// 回傳：`Result<()>`；程序無法建立時回傳完整 OS 錯誤。
@@ -587,19 +613,31 @@ fn spawn_new_terminal_process(
     let mut command = Command::new(program);
     command
         .args(args)
-        .current_dir(current_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .current_dir(current_dir);
 
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        command.creation_flags(CREATE_NEW_CONSOLE);
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
     }
 
-    command.spawn()?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+
+    command.spawn().with_context(|| {
+        format!(
+            "failed to launch terminal process: {} in {}",
+            program,
+            current_dir.display()
+        )
+    })?;
     Ok(())
 }
 
