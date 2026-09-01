@@ -3106,9 +3106,16 @@ fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()
     match clone_file_cow(source_path, staged_path) {
         Ok(()) => Ok(()),
         Err(error) if is_cow_unsupported_error(&error) => {
-            copy_file_and_verify_with(source_path, staged_path, |source, target| {
+            match copy_file_and_verify_with(source_path, staged_path, |source, target| {
                 fs::copy(source, target)
-            })
+            }) {
+                Ok(()) => Ok(()),
+                Err(err) if native_copy_supports_stream_fallback(&err) => {
+                    remove_partial_file_for_fallback(staged_path, &err)?;
+                    copy_file_streaming_with_progress(source_path, staged_path, &mut |_| {})
+                }
+                Err(err) => Err(err),
+            }
         }
         Err(error) => Err(error),
     }
@@ -3313,9 +3320,13 @@ fn native_copy_supports_stream_fallback(error: &io::Error) -> bool {
 
     match error.raw_os_error() {
         #[cfg(unix)]
-        Some(45) | Some(95) => true,
+        // EXDEV = 18, EINVAL = 22, ENOTSUP = 45 (macOS) / 95 (Linux), ENOSYS = 78 (macOS) / 38 (Linux), EOPNOTSUPP = 102 (macOS), EPERM = 1
+        Some(1) | Some(18) | Some(22) | Some(38) | Some(45) | Some(78) | Some(95) | Some(102) => {
+            true
+        }
         #[cfg(windows)]
-        Some(1) | Some(50) => true,
+        // ERROR_INVALID_FUNCTION = 1, ERROR_NOT_SAME_DEVICE = 17, ERROR_NOT_SUPPORTED = 50
+        Some(1) | Some(17) | Some(50) => true,
         _ => false,
     }
 }
@@ -4805,6 +4816,32 @@ mod tests {
 
         assert_eq!(reported, payload.len() as u64);
         assert_eq!(fs::read(&target).expect("target bytes"), payload);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// 驗證 macOS 上的 os error 102 (EOPNOTSUPP, Operation not supported on socket)
+    /// 能正確觸發串流 fallback。
+    fn native_copy_macos_os_error_102_triggers_stream_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.txt");
+        let target = dir.path().join("target.txt");
+        fs::write(&source, b"test content").expect("source");
+        let mut reported = 0u64;
+
+        copy_file_with_native_fallback(
+            &source,
+            &target,
+            &mut |increment| reported = reported.saturating_add(increment),
+            |_, target| {
+                File::create(target).expect("simulated partial target");
+                Err(io::Error::from_raw_os_error(102))
+            },
+        )
+        .expect("stream fallback for os error 102");
+
+        assert_eq!(reported, 12);
+        assert_eq!(fs::read(&target).expect("target bytes"), b"test content");
     }
 
     #[test]
