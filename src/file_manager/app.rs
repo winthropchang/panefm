@@ -61,7 +61,7 @@ use super::{
     },
     pane::{
         DirectoryLoadProgress, FilterMode, LineMode, PaneState, SortDetailKind, SortMode,
-        TransferProgress, path_content_size,
+        TransferProgress,
     },
     platform::write_text_to_system_clipboard,
     search::{
@@ -7995,18 +7995,12 @@ impl App {
         let busy_paths = entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
         self.active_file_job_busy_paths.insert(task_id, busy_paths);
         let (sender, receiver) = std::sync::mpsc::channel();
+        let total_bytes = entries
+            .iter()
+            .map(|entry| entry.size)
+            .fold(0u64, u64::saturating_add);
+        self.update_task_progress(task_id, 0, total_bytes);
         thread::spawn(move || {
-            // 計算大型目錄的內容總量也會遞迴碰觸檔案系統，必須跟壓縮本體一起留在
-            // worker，否則「已使用背景壓縮」仍會在按下 C 時先凍結 TUI。
-            let total_bytes = entries
-                .iter()
-                .filter_map(|entry| path_content_size(&entry.path).ok())
-                .fold(0u64, u64::saturating_add);
-            let _ = sender.send(FileJobEvent::Progress {
-                task_id,
-                completed_bytes: 0,
-                total_bytes,
-            });
             let progress_sender = sender.clone();
             let mut completed_bytes = 0u64;
             let mut last_progress = None;

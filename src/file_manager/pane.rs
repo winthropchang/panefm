@@ -3893,6 +3893,7 @@ fn send_copy_job(
 ///
 /// 參數：`path: &Path`，要統計的來源。
 /// 回傳：`io::Result<u64>`；資料夾會遞迴加總，無法讀取時回傳原始 I/O 錯誤。
+#[allow(dead_code)]
 pub(crate) fn path_content_size(path: &Path) -> io::Result<u64> {
     let metadata = fs::metadata(path)?;
     if metadata.is_file() {
@@ -3902,10 +3903,24 @@ pub(crate) fn path_content_size(path: &Path) -> io::Result<u64> {
         return Ok(0);
     }
     let mut total = 0u64;
-    for entry in fs::read_dir(path)? {
-        total = total.saturating_add(path_content_size(&entry?.path())?);
-    }
+    dir_content_size(path, &mut total)?;
     Ok(total)
+}
+
+fn dir_content_size(dir: &Path, total: &mut u64) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                let _ = dir_content_size(&entry.path(), total);
+            } else if ft.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    *total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 根據目標資料夾現況，產生一個不與既有項目衝突的新路徑。

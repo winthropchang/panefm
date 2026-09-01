@@ -5,7 +5,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, Read},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -67,9 +67,13 @@ where
     let archive_name = default_archive_name(entries);
     let archive_path = unique_path_in_dir(cwd, &archive_name, false);
     let file = File::create(&archive_path)?;
-    let mut zip = ZipWriter::new(file);
-    let file_options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let buffered = BufWriter::with_capacity(1024 * 1024, file);
+    let mut zip = ZipWriter::new(buffered);
+    let file_options = FileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(1));
     let dir_options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut buffer = vec![0u8; 256 * 1024];
 
     for entry in entries {
         let relative_path = PathBuf::from(&entry.name);
@@ -77,13 +81,16 @@ where
             &mut zip,
             &entry.path,
             &relative_path,
+            entry.is_dir,
             file_options,
             dir_options,
+            &mut buffer,
             progress,
         )?;
     }
 
-    zip.finish()?;
+    let mut buffered = zip.finish()?;
+    buffered.flush()?;
     Ok(archive_path)
 }
 
@@ -193,20 +200,63 @@ fn default_archive_name(entries: &[FileEntry]) -> String {
     }
 }
 
+/// 檢查副檔名是否為已壓縮格式，此類檔案使用 Stored 模式避免無效的 CPU 運算。
+fn is_already_compressed_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "zip"
+            | "gz"
+            | "tgz"
+            | "7z"
+            | "rar"
+            | "xz"
+            | "zst"
+            | "bz2"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+            | "mp4"
+            | "mkv"
+            | "mov"
+            | "avi"
+            | "mp3"
+            | "flac"
+            | "ogg"
+            | "aac"
+            | "pdf"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+            | "apk"
+            | "jar"
+            | "war"
+            | "wasm"
+    )
+}
+
 /// 將指定路徑遞迴寫入 zip，保留目前 pane 目錄下看到的相對名稱。
-fn add_path_to_zip<F>(
-    zip: &mut ZipWriter<File>,
+fn add_path_to_zip<W, F>(
+    zip: &mut ZipWriter<W>,
     source_path: &Path,
     relative_path: &Path,
+    is_dir: bool,
     file_options: FileOptions,
     dir_options: FileOptions,
+    buffer: &mut [u8],
     progress: &mut F,
 ) -> io::Result<()>
 where
+    W: io::Write + io::Seek,
     F: FnMut(u64),
 {
     let archive_name = normalize_archive_path(relative_path);
-    if source_path.is_dir() {
+    if is_dir {
         let dir_name = if archive_name.ends_with('/') {
             archive_name.clone()
         } else {
@@ -215,20 +265,28 @@ where
         zip.add_directory(dir_name, dir_options)?;
         for item in fs::read_dir(source_path)? {
             let item = item?;
+            let item_is_dir = item.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
             let next_relative = relative_path.join(item.file_name());
             add_path_to_zip(
                 zip,
                 &item.path(),
                 &next_relative,
+                item_is_dir,
                 file_options,
                 dir_options,
+                buffer,
                 progress,
             )?;
         }
     } else {
-        zip.start_file(archive_name, file_options)?;
+        let options = if is_already_compressed_file(source_path) {
+            dir_options
+        } else {
+            file_options
+        };
+        zip.start_file(archive_name, options)?;
         let mut file = File::open(source_path)?;
-        copy_with_progress(&mut file, zip, progress)?;
+        copy_with_progress(&mut file, zip, buffer, progress)?;
     }
     Ok(())
 }
@@ -243,8 +301,9 @@ where
     F: FnMut(u64),
 {
     fs::create_dir_all(output_dir)?;
-    let file = File::open(archive_path)?;
+    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
     let mut archive = ZipArchive::new(file)?;
+    let mut buffer = vec![0u8; 256 * 1024];
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
@@ -261,8 +320,10 @@ where
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut output_file = File::create(&target_path)?;
-        copy_with_progress(&mut entry, &mut output_file, progress)?;
+        let mut output_file =
+            BufWriter::with_capacity(256 * 1024, File::create(&target_path)?);
+        copy_with_progress(&mut entry, &mut output_file, &mut buffer, progress)?;
+        output_file.flush()?;
     }
 
     Ok(())
@@ -278,7 +339,7 @@ where
     F: FnMut(u64),
 {
     fs::create_dir_all(output_dir)?;
-    let file = File::open(archive_path)?;
+    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
     let decoder = GzDecoder::new(file);
     let mut archive = TarArchive::new(decoder);
     unpack_tar_archive(&mut archive, output_dir, progress)
@@ -294,7 +355,7 @@ where
     F: FnMut(u64),
 {
     fs::create_dir_all(output_dir)?;
-    let file = File::open(archive_path)?;
+    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
     let mut archive = TarArchive::new(file);
     unpack_tar_archive(&mut archive, output_dir, progress)
 }
@@ -304,13 +365,15 @@ fn extract_gz_file<F>(archive_path: &Path, output_file: &Path, progress: &mut F)
 where
     F: FnMut(u64),
 {
-    let file = File::open(archive_path)?;
+    let file = BufReader::with_capacity(512 * 1024, File::open(archive_path)?);
     let mut decoder = GzDecoder::new(file);
     if let Some(parent) = output_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut output = File::create(output_file)?;
-    copy_with_progress(&mut decoder, &mut output, progress)?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut output = BufWriter::with_capacity(256 * 1024, File::create(output_file)?);
+    copy_with_progress(&mut decoder, &mut output, &mut buffer, progress)?;
+    output.flush()?;
     Ok(())
 }
 
@@ -324,6 +387,7 @@ where
     R: Read,
     F: FnMut(u64),
 {
+    let mut buffer = vec![0u8; 256 * 1024];
     for entry in archive.entries()? {
         let mut entry = entry?;
         let Some(path) = sanitize_archive_member_path(&entry.path()?) else {
@@ -337,8 +401,10 @@ where
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(&target_path)?;
         } else {
-            let mut output = File::create(&target_path)?;
-            copy_with_progress(&mut entry, &mut output, progress)?;
+            let mut output =
+                BufWriter::with_capacity(256 * 1024, File::create(&target_path)?);
+            copy_with_progress(&mut entry, &mut output, &mut buffer, progress)?;
+            output.flush()?;
         }
     }
     Ok(())
@@ -348,16 +414,20 @@ where
 ///
 /// 參數：`reader`、`writer` 為來源與輸出；`progress` 接收每輪寫入 byte 數。
 /// 回傳：`io::Result<u64>`，代表總寫入量。
-fn copy_with_progress<R, W, F>(reader: &mut R, writer: &mut W, progress: &mut F) -> io::Result<u64>
+fn copy_with_progress<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    buffer: &mut [u8],
+    progress: &mut F,
+) -> io::Result<u64>
 where
     R: Read,
     W: io::Write,
     F: FnMut(u64),
 {
-    let mut buffer = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }
