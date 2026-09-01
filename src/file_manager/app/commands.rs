@@ -263,6 +263,7 @@ impl App {
             "tasks" => self.open_task_panel(),
             "status" => self.open_tool_panel(),
             "help" => self.open_help_panel(),
+            "cheatsheet" | "cheat" | "keys" => self.open_cheatsheet_from_current(),
             "bookmark list" => self.open_bookmark_list(),
             "zoxide" => self.open_zoxide_list(),
             "trash undo" => self.restore_latest_from_trash()?,

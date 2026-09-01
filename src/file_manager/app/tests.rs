@@ -7974,7 +7974,7 @@ fn task_panel_supports_space_mark_all_and_clear_all_with_shifted_d() {
 }
 
 #[test]
-/// 驗證底部快捷鍵列會依據目前畫面／模式動態調整，且第一個提示一律固定為 Help。
+/// 驗證底部快捷鍵列會依據目前畫面／模式動態調整，且前兩個提示一律固定為 Help 與 Cheatsheet。
 fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_help() {
     let dir = tempdir().expect("tempdir");
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -7983,6 +7983,8 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let hints = app.active_status_shortcut_hints();
     assert_eq!(hints[0].key, "~/F1");
     assert_eq!(hints[0].label, "help");
+    assert_eq!(hints[1].key, "?");
+    assert_eq!(hints[1].label, "cheat");
     let keys: Vec<&str> = hints.iter().map(|h| h.key).collect();
     assert!(keys.contains(&"hjkl"));
     assert!(keys.contains(&"Enter"));
@@ -7995,8 +7997,10 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let cmd_hints = app.active_status_shortcut_hints();
     assert_eq!(cmd_hints[0].key, "~/F1");
     assert_eq!(cmd_hints[0].label, "help");
+    assert_eq!(cmd_hints[1].key, "?");
+    assert_eq!(cmd_hints[1].label, "cheat");
     let cmd_keys: Vec<&str> = cmd_hints.iter().map(|h| h.key).collect();
-    assert_eq!(cmd_keys, vec!["~/F1", "Enter", "Tab", "Esc"]);
+    assert_eq!(cmd_keys, vec!["~/F1", "?", "Enter", "Tab", "Esc"]);
     app.command_mode = false;
 
     // 3. Task panel mode
@@ -8004,6 +8008,8 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let task_hints = app.active_status_shortcut_hints();
     assert_eq!(task_hints[0].key, "~/F1");
     assert_eq!(task_hints[0].label, "help");
+    assert_eq!(task_hints[1].key, "?");
+    assert_eq!(task_hints[1].label, "cheat");
     let task_keys: Vec<&str> = task_hints.iter().map(|h| h.key).collect();
     assert!(task_keys.contains(&"v"));
     assert!(task_keys.contains(&"Space"));
@@ -8016,6 +8022,8 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let trash_hints = app.active_status_shortcut_hints();
     assert_eq!(trash_hints[0].key, "~/F1");
     assert_eq!(trash_hints[0].label, "help");
+    assert_eq!(trash_hints[1].key, "?");
+    assert_eq!(trash_hints[1].label, "cheat");
     let trash_keys: Vec<&str> = trash_hints.iter().map(|h| h.key).collect();
     assert!(trash_keys.contains(&"u"));
     assert!(trash_keys.contains(&"U"));
@@ -8033,6 +8041,8 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let diff_hints = app.active_status_shortcut_hints();
     assert_eq!(diff_hints[0].key, "~/F1");
     assert_eq!(diff_hints[0].label, "help");
+    assert_eq!(diff_hints[1].key, "?");
+    assert_eq!(diff_hints[1].label, "cheat");
     let diff_keys: Vec<&str> = diff_hints.iter().map(|h| h.key).collect();
     assert!(diff_keys.contains(&"Enter"));
     assert!(diff_keys.contains(&"i"));
@@ -8044,6 +8054,8 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let win_hints = app.active_status_shortcut_hints();
     assert_eq!(win_hints[0].key, "~/F1");
     assert_eq!(win_hints[0].label, "help");
+    assert_eq!(win_hints[1].key, "?");
+    assert_eq!(win_hints[1].label, "cheat");
     let win_keys: Vec<&str> = win_hints.iter().map(|h| h.key).collect();
     assert!(win_keys.contains(&"s/v"));
     assert!(win_keys.contains(&"d"));
@@ -8059,9 +8071,97 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     let visual_hints = app.active_status_shortcut_hints();
     assert_eq!(visual_hints[0].key, "~/F1");
     assert_eq!(visual_hints[0].label, "help");
+    assert_eq!(visual_hints[1].key, "?");
+    assert_eq!(visual_hints[1].label, "cheat");
     let visual_keys: Vec<&str> = visual_hints.iter().map(|h| h.key).collect();
     assert!(visual_keys.contains(&"j/k"));
     assert!(visual_keys.contains(&"y"));
     assert!(visual_keys.contains(&"x"));
     assert!(visual_keys.contains(&"d"));
+}
+
+#[test]
+/// 驗證按下 ? 鍵在 Normal 模式與 Task 面板能分別開啟對應情境的 Cheatsheet，且 Esc 能無縫返回。
+fn cheatsheet_opens_context_specific_help_and_restores_state() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // 1. 在 Normal 模式按 ? 鍵
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+        .expect("press ? in normal mode");
+    match &app.pending_action {
+        Some(PendingAction::HelpPanel { custom_title, custom_entries, .. }) => {
+            assert!(custom_title.as_ref().unwrap().contains("Normal Mode"));
+            let entries = custom_entries.as_ref().unwrap();
+            assert!(entries.iter().any(|e| e.line.shortcut.contains("j / k")));
+            assert!(entries.iter().any(|e| e.line.command == "rename"));
+        }
+        other => panic!("expected Cheatsheet HelpPanel, got {other:?}"),
+    }
+
+    // 按 Esc 退出 Cheatsheet 返回 Normal 模式
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("press Esc to exit cheatsheet");
+    assert!(app.pending_action.is_none());
+
+    // 2. 開啟 TaskPanel 後按 ? 鍵
+    app.open_task_panel();
+    assert!(matches!(app.pending_action, Some(PendingAction::TaskPanel { .. })));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+        .expect("press ? in task panel");
+    match &app.pending_action {
+        Some(PendingAction::HelpPanel { custom_title, custom_entries, .. }) => {
+            assert!(custom_title.as_ref().unwrap().contains("Task Panel"));
+            let entries = custom_entries.as_ref().unwrap();
+            assert!(entries.iter().any(|e| e.line.shortcut.contains("d")));
+            assert!(entries.iter().any(|e| e.line.shortcut.contains("x / c")));
+            assert!(entries.iter().any(|e| e.line.shortcut.contains("v / V")));
+        }
+        other => panic!("expected Cheatsheet HelpPanel, got {other:?}"),
+    }
+
+    // 按 ? 鍵再次關閉 Cheatsheet，必須精準返回 TaskPanel
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+        .expect("press ? to exit cheatsheet");
+    assert!(matches!(app.pending_action, Some(PendingAction::TaskPanel { .. })));
+
+    // 3. 驗證 :cheatsheet 與 :cheat 指令
+    app.pending_action = None;
+    app.execute_command("cheatsheet").expect("exec :cheatsheet");
+    assert!(matches!(app.pending_action, Some(PendingAction::HelpPanel { custom_title: Some(_), .. })));
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
+    app.execute_command("cheat").expect("exec :cheat");
+    assert!(matches!(app.pending_action, Some(PendingAction::HelpPanel { custom_title: Some(_), .. })));
+}
+
+#[test]
+/// 驗證 Cheatsheet 支援以 f 鍵開啟搜尋並在情境清單內進行模糊過濾。
+fn cheatsheet_search_filters_within_context_entries() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.open_task_panel();
+    app.open_cheatsheet_from_current();
+
+    // 在 Task Cheatsheet 內按 f 搜尋 "cancel"
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+        .expect("open search");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+        .expect("type c");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .expect("type a");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+        .expect("type n");
+
+    match &app.pending_action {
+        Some(PendingAction::HelpPanel { search, custom_entries, .. }) => {
+            assert_eq!(search.buffer, "can");
+            let filtered = filter_custom_help_entries(custom_entries.as_ref().unwrap(), &search.buffer);
+            assert!(filtered.len() >= 1);
+            assert!(filtered.iter().any(|e| e.line.description.contains("取消")));
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
 }

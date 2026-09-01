@@ -617,6 +617,8 @@ impl App {
                 buffer: String::new(),
                 editing: false,
             },
+            custom_title: None,
+            custom_entries: None,
         });
         self.status = help_panel_status("", help_entries("").len(), false);
     }
@@ -1004,7 +1006,7 @@ impl App {
         Ok(())
     }
 
-    /// 以目前正在操作的上下文為返回點，打開 help 面板。
+    /// 以目前正在操作的上下文為返回點，打開全局 help 字典。
     pub(crate) fn open_help_from_current(&mut self) {
         self.help_return = self.capture_help_return_state();
         self.pending_action = Some(PendingAction::HelpPanel {
@@ -1014,8 +1016,29 @@ impl App {
                 buffer: String::new(),
                 editing: false,
             },
+            custom_title: None,
+            custom_entries: None,
         });
         self.status = help_panel_status("", help_entries("").len(), false);
+    }
+
+    /// 以目前正在操作的上下文為基礎，打開專屬的快捷鍵 Cheatsheet。
+    pub(crate) fn open_cheatsheet_from_current(&mut self) {
+        let kind = self.active_context_help_kind();
+        let (title, entries) = context_cheatsheet_entries(kind);
+        let count = entries.len();
+        self.help_return = self.capture_help_return_state();
+        self.pending_action = Some(PendingAction::HelpPanel {
+            pane_id: self.focused_pane,
+            selected: 0,
+            search: PanelSearchState {
+                buffer: String::new(),
+                editing: false,
+            },
+            custom_title: Some(title.clone()),
+            custom_entries: Some(entries),
+        });
+        self.status = format!("{title} ({count} keys) (?/Esc/q to return)");
     }
 
     /// 擷取目前互動狀態，供 help 面板關閉後回復。

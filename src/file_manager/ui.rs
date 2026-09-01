@@ -89,6 +89,7 @@ pub(crate) enum PaneListState<'a> {
         search: &'a str,
         editing: bool,
         cursor: usize,
+        custom_title: Option<&'a str>,
     },
     Tools {
         statuses: &'a [ToolStatus],
@@ -217,7 +218,11 @@ pub(crate) fn render_pane(
         Some(PaneListState::Search(_)) => "  [search]",
         Some(PaneListState::Tasks { .. }) => "  [tasks]",
         Some(PaneListState::Trash { .. }) => "  [trash d/D u/U]",
-        Some(PaneListState::Help { .. }) => "  [help]",
+        Some(PaneListState::Help {
+            custom_title: Some(_),
+            ..
+        }) => "  [cheatsheet ?]",
+        Some(PaneListState::Help { .. }) => "  [help ~/F1]",
         Some(PaneListState::Tools { .. }) => "  [dependencies Esc]",
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
@@ -541,12 +546,17 @@ pub(crate) fn render_pane(
             search,
             editing: true,
             cursor,
+            custom_title,
             ..
         }) => Some(render_top_right_input(
             frame,
             area,
             theme,
-            "Help Search",
+            if custom_title.is_some() {
+                "Cheatsheet Search"
+            } else {
+                "Help Search"
+            },
             search,
             cursor,
         )),

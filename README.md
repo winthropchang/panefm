@@ -140,9 +140,9 @@ panefm --version
 | `wD` | 預填 `:diff ` 指定比對 Panel（例如 `:d 1 2`） |
 | `wt` | 在 active Panel 目前目錄開啟新終端 |
 | `1..9` / `0` | 直接切換到指定 Panel |
-| `:` | 開啟命令輸入介面 |
 | `T` | 開啟任務管理面板（支援 `v` 範圍選取、`Space` 標記、`d`/`D` 刪除與清空、`x` 取消任務） |
-| `~` / `F1` | 顯示完整 Help，可搜尋並直接執行命令 |
+| `~` / `F1` | 顯示全局完整說明字典（Global Help Dictionary），可搜尋並直接執行命令 |
+| `?` | 顯示當前畫面／面板專屬快捷鍵指南（Context Cheatsheet，支援 `:cheatsheet` / `:cheat`） |
 | `q` | 離開 PaneFM |
 
 多按鍵操作在按下第一個按鍵後會顯示提示面板，不需要事先背下全部命令。

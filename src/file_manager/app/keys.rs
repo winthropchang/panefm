@@ -223,6 +223,15 @@ impl App {
             self.pending_y = false;
             return Ok(true);
         }
+        if key_matches_plain_letter(&key, '?') && !self.is_text_input_active() {
+            if matches!(self.pending_action, Some(PendingAction::HelpPanel { .. })) {
+                return self.handle_pending_action_key(key);
+            }
+            self.open_cheatsheet_from_current();
+            self.pending_g = false;
+            self.pending_y = false;
+            return Ok(true);
+        }
         if self.pending_action.is_some() {
             return self.handle_pending_action_key(key);
         }
@@ -2466,8 +2475,14 @@ impl App {
                 pane_id,
                 mut selected,
                 mut search,
+                custom_title,
+                custom_entries,
             } => {
-                let filtered_entries = help_entries(&search.buffer);
+                let filtered_entries = if let Some(custom) = &custom_entries {
+                    filter_custom_help_entries(custom, &search.buffer)
+                } else {
+                    help_entries(&search.buffer)
+                };
                 let filtered_len = filtered_entries.len();
                 if search.editing {
                     match key.code {
@@ -2476,12 +2491,22 @@ impl App {
                         }
                         _ => {}
                     }
-                    let next_len = help_entries(&search.buffer).len();
-                    let status = help_panel_status(&search.buffer, next_len, search.editing);
+                    let next_len = if let Some(custom) = &custom_entries {
+                        filter_custom_help_entries(custom, &search.buffer).len()
+                    } else {
+                        help_entries(&search.buffer).len()
+                    };
+                    let status = if custom_title.is_some() {
+                        format!("cheatsheet search: {} ({next_len})", search.buffer)
+                    } else {
+                        help_panel_status(&search.buffer, next_len, search.editing)
+                    };
                     self.pending_action = Some(PendingAction::HelpPanel {
                         pane_id,
                         selected,
                         search,
+                        custom_title,
+                        custom_entries,
                     });
                     self.status = status;
                 } else {
@@ -2490,6 +2515,8 @@ impl App {
                             pane_id,
                             selected,
                             search,
+                            custom_title,
+                            custom_entries,
                         });
                         return Ok(true);
                     }
@@ -2503,11 +2530,17 @@ impl App {
                             selected = filtered_len - 1;
                         }
                         self.pending_g = false;
-                        let status = help_panel_status(&search.buffer, filtered_len, false);
+                        let status = if let Some(title) = &custom_title {
+                            format!("{title} ({filtered_len} keys) (?/Esc/q to return)")
+                        } else {
+                            help_panel_status(&search.buffer, filtered_len, false)
+                        };
                         self.pending_action = Some(PendingAction::HelpPanel {
                             pane_id,
                             selected,
                             search,
+                            custom_title,
+                            custom_entries,
                         });
                         self.status = status;
                         return Ok(true);
@@ -2591,7 +2624,7 @@ impl App {
                             self.restore_help_return_state(false)?;
                             return Ok(true);
                         }
-                        _ if key_matches_tilde(&key) => {
+                        _ if key_matches_tilde(&key) || key_matches_plain_letter(&key, '?') => {
                             self.clear_pending_count();
                             self.pending_g = false;
                             self.restore_help_return_state(false)?;
@@ -2610,12 +2643,26 @@ impl App {
                             self.pending_g = false;
                         }
                     }
-                    let next_count = help_entries(&search.buffer).len();
-                    let status = help_panel_status(&search.buffer, next_count, false);
+                    let next_count = if let Some(custom) = &custom_entries {
+                        filter_custom_help_entries(custom, &search.buffer).len()
+                    } else {
+                        help_entries(&search.buffer).len()
+                    };
+                    let status = if let Some(title) = &custom_title {
+                        if search.buffer.is_empty() {
+                            format!("{title} ({next_count} keys) (?/Esc/q to return)")
+                        } else {
+                            format!("cheatsheet search: {} ({next_count})", search.buffer)
+                        }
+                    } else {
+                        help_panel_status(&search.buffer, next_count, false)
+                    };
                     self.pending_action = Some(PendingAction::HelpPanel {
                         pane_id,
                         selected,
                         search,
+                        custom_title,
+                        custom_entries,
                     });
                     self.status = status;
                 }

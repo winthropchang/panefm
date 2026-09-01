@@ -508,6 +508,8 @@ pub(crate) enum PendingAction {
         pane_id: usize,
         selected: usize,
         search: PanelSearchState,
+        custom_title: Option<String>,
+        custom_entries: Option<Vec<HelpEntry>>,
     },
     TaskPanel {
         pane_id: usize,
@@ -954,11 +956,19 @@ impl App {
             let help_lines = if let Some(PendingAction::HelpPanel {
                 pane_id: action_pane_id,
                 search,
+                custom_entries,
                 ..
             }) = &self.pending_action
             {
                 if *action_pane_id == pane_id {
-                    Some(help_panel_lines(&search.buffer))
+                    Some(if let Some(custom) = custom_entries {
+                        filter_custom_help_entries(custom, &search.buffer)
+                            .into_iter()
+                            .map(|e| e.line)
+                            .collect()
+                    } else {
+                        help_panel_lines(&search.buffer)
+                    })
                 } else {
                     None
                 }
@@ -1122,6 +1132,8 @@ impl App {
                     pane_id: action_pane_id,
                     selected,
                     search,
+                    custom_title,
+                    ..
                 }) = &self.pending_action
                 {
                     if *action_pane_id == pane_id {
@@ -1131,6 +1143,7 @@ impl App {
                             search: &search.buffer,
                             editing: search.editing,
                             cursor: self.text_input_cursor,
+                            custom_title: custom_title.as_deref(),
                         })
                     } else {
                         None
@@ -2656,10 +2669,14 @@ impl App {
     /// 第一個項目永遠固定為 Help。
     pub(crate) fn active_status_shortcut_hints(&self) -> Vec<StatusShortcutHint> {
         let mut hints = Vec::new();
-        // 第一個項目永遠固定為 Help
+        // 第一個項目永遠固定為 Help，第二個固定為當前面板的 Cheatsheet
         hints.push(StatusShortcutHint {
             key: "~/F1",
             label: "help",
+        });
+        hints.push(StatusShortcutHint {
+            key: "?",
+            label: "cheat",
         });
 
         if self.command_mode {
@@ -3591,7 +3608,7 @@ pub(crate) fn status_is_error(status: &str) -> bool {
 }
 
 /// 描述 help 面板中某一列按下 Enter 後要執行的行為。
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelpAction {
     Command(&'static str),
     Delete,
@@ -3604,7 +3621,7 @@ pub(crate) enum HelpAction {
 }
 
 /// 描述 help 面板中完整的一筆資料。
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HelpEntry {
     line: HelpPanelLine,
     action: HelpAction,
@@ -4163,6 +4180,313 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
     .collect()
 }
 
+/// 依照關鍵字過濾自訂的 HelpEntry 清單（如 Cheatsheet）。
+pub(crate) fn filter_custom_help_entries(entries: &[HelpEntry], query: &str) -> Vec<HelpEntry> {
+    if query.trim().is_empty() {
+        return entries.to_vec();
+    }
+    fuzzy_matched_indices_by_fields(entries, query, |entry| {
+        vec![
+            entry.line.command.clone(),
+            entry.line.shortcut.clone(),
+            entry.line.description.clone(),
+        ]
+    })
+    .into_iter()
+    .map(|index| entries[index].clone())
+    .collect()
+}
+
+/// 定義不同畫面或面板對應的情境種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextHelpKind {
+    Normal,
+    TaskPanel,
+    TrashPanel,
+    DiffMatrix,
+    VisualSelection,
+    BookmarkPicker,
+    BookmarkList,
+    WindowPicker,
+    SortPicker,
+    GoPicker,
+    LineModePicker,
+    ThemePicker,
+    CommandMode,
+    Filter,
+    Preview,
+    ToolPanel,
+    RegexRename,
+}
+
+impl App {
+    /// 偵測目前焦點所在的互動情境或子面板種類。
+    pub(crate) fn active_context_help_kind(&self) -> ContextHelpKind {
+        if self.command_mode {
+            return ContextHelpKind::CommandMode;
+        }
+        if let Some(filter) = &self.filter
+            && filter.editing
+        {
+            return ContextHelpKind::Filter;
+        }
+        if let Some(search) = &self.preview_search
+            && search.editing
+        {
+            return ContextHelpKind::Preview;
+        }
+        if let Some(_find) = &self.list_find {
+            return ContextHelpKind::Normal;
+        }
+        if self.visual_selection.is_some() {
+            return ContextHelpKind::VisualSelection;
+        }
+        if let Some(action) = &self.pending_action {
+            match action {
+                PendingAction::TaskPanel { .. } => ContextHelpKind::TaskPanel,
+                PendingAction::TrashPanel { .. } | PendingAction::ConfirmTrashAction { .. } => {
+                    ContextHelpKind::TrashPanel
+                }
+                PendingAction::DiffMatrix { .. } => ContextHelpKind::DiffMatrix,
+                PendingAction::BookmarkPicker { .. } => ContextHelpKind::BookmarkPicker,
+                PendingAction::BookmarkList { .. } => ContextHelpKind::BookmarkList,
+                PendingAction::WindowPicker { .. } => ContextHelpKind::WindowPicker,
+                PendingAction::SortPicker { .. } => ContextHelpKind::SortPicker,
+                PendingAction::GoPicker { .. } => ContextHelpKind::GoPicker,
+                PendingAction::LineModePicker { .. } => ContextHelpKind::LineModePicker,
+                PendingAction::ThemePicker { .. } | PendingAction::ThemeCommandPicker { .. } => {
+                    ContextHelpKind::ThemePicker
+                }
+                PendingAction::ToolPanel { .. } => ContextHelpKind::ToolPanel,
+                PendingAction::RegexRename { .. } => ContextHelpKind::RegexRename,
+                _ => ContextHelpKind::Normal,
+            }
+        } else if let Some(pane) = self.panes.get(&self.focused_pane)
+            && pane.is_preview_active()
+        {
+            ContextHelpKind::Preview
+        } else {
+            ContextHelpKind::Normal
+        }
+    }
+}
+
+/// 依情境種類產出對應的 Cheatsheet 標題與專屬功能快捷鍵清單。
+pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<HelpEntry>) {
+    match kind {
+        ContextHelpKind::Normal => (
+            String::from("Cheatsheet: Normal Mode (檔案列表)"),
+            vec![
+                help_entry("move", "j / k", "向下 / 向上移動檔案游標", HelpAction::QuitHint),
+                help_entry("navigate", "h / l", "返回上一層目錄 / 進入資料夾或開啟檔案", HelpAction::QuitHint),
+                help_entry("open", "Enter", "開啟所選檔案或進入資料夾", HelpAction::QuitHint),
+                help_entry("copy", "y", "複製目前檔案或所有標記項目 (Yank)", HelpAction::Command("copy")),
+                help_entry("cut", "x", "剪下目前檔案或所有標記項目 (Cut)", HelpAction::Command("cut")),
+                help_entry("paste", "p / P", "貼上檔案 / 強制覆蓋貼上", HelpAction::Command("paste")),
+                help_entry("rename", "r", "重新命名目前選取的檔案或資料夾", HelpAction::Command("rename")),
+                help_entry("regex-rename", "R / :reg", "開啟 Regex 批次改名預覽面板", HelpAction::Command("rename-regex")),
+                help_entry("create", "a", "建立新檔案或目錄（以 / 結尾為資料夾）", HelpAction::Command("create")),
+                help_entry("trash", "d", "將檔案移至垃圾桶 (需確認)", HelpAction::Command("trash")),
+                help_entry("delete!", "D", "永久直接刪除檔案或資料夾 (不進垃圾桶)", HelpAction::Command("delete!")),
+                help_entry("undo", "u", "復原上一步貼上或搬移操作 (Undo)", HelpAction::Command("undo")),
+                help_entry("visual", "v / V", "開啟視覺連續多選模式 (Visual Selection)", HelpAction::Visual),
+                help_entry("mark", "Space", "單檔切換標記 / 取消標記", HelpAction::QuitHint),
+                help_entry("mark-all", "Ctrl+a", "全選目前目錄所有檔案與資料夾", HelpAction::QuitHint),
+                help_entry("preview", "Tab", "切換右側檔案預覽 / 進入預覽模式", HelpAction::Command("preview")),
+                help_entry("sort", "s", "打開排序選單 (Name, Size, MTime, Ext, Reverse)", HelpAction::Command("sort ")),
+                help_entry("linemode", "m", "打開 Linemode 選單 (Size, Perms, BTime, MTime, None)", HelpAction::Command("linemode ")),
+                help_entry("bookmark", "b", "打開書籤快捷選單 (ba 新增, bg 跳轉, bd 刪除, bD 清空)", HelpAction::Command("bookmark")),
+                help_entry("window", "w", "打開視窗分割與焦點選單 (wv 垂直, ws 水平, wh/j/k/l 切換, wc 關閉)", HelpAction::Command("window")),
+                help_entry("tasks", "T", "打開任務管理面板 (檢視背景傳輸與執行進度)", HelpAction::Command("tasks")),
+                help_entry("trash-panel", "gt", "打開垃圾桶面板 (檢視與還原已刪除項目)", HelpAction::Command("trash")),
+                help_entry("diff", ":diff", "開啟全螢幕多 Panel 目錄矩陣與檔案內容比對", HelpAction::Command("diff")),
+                help_entry("jump", "z", "快速模糊跳轉檔案或目錄 (fzf jump)", HelpAction::Command("jump")),
+                help_entry("zoxide", "Z", "打開 zoxide 常用歷史目錄跳轉清單", HelpAction::Command("zoxide")),
+                help_entry("search", "/", "快速檔名搜尋", HelpAction::Command("search")),
+                help_entry("filter", "f / F", "即時過濾目前目錄檔案 (Normal / Fuzzy Filter)", HelpAction::Command("filter")),
+                help_entry("command", ":", "開啟底端命令列模式 (Command Mode)", HelpAction::Command("")),
+                help_entry("help", "~/F1", "打開全局完整說明手冊 (Help Dictionary)", HelpAction::Command("help")),
+                help_entry("cheatsheet", "?", "開啟當前面板快捷鍵指南 (Cheatsheet)", HelpAction::Command("cheatsheet")),
+            ],
+        ),
+        ContextHelpKind::TaskPanel => (
+            String::from("Cheatsheet: Task Panel (任務管理)"),
+            vec![
+                help_entry("move", "j / k", "上下移動選取任務", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
+                help_entry("top/bottom", "gg / G", "跳至任務清單頂部 / 底部", HelpAction::QuitHint),
+                help_entry("visual", "v / V", "開啟視覺連續多選模式（連續標記多個任務）", HelpAction::QuitHint),
+                help_entry("mark", "Space", "標記 / 取消標記目前任務", HelpAction::QuitHint),
+                help_entry("mark-all", "a", "全選所有任務 / 清除所有標記", HelpAction::QuitHint),
+                help_entry("delete", "d", "直接刪除所選或所有已標記的任務記錄（不彈窗）", HelpAction::QuitHint),
+                help_entry("clear-all", "D", "直接清空面板中所有任務記錄", HelpAction::QuitHint),
+                help_entry("cancel", "x / c", "取消目前正在執行的背景任務", HelpAction::QuitHint),
+                help_entry("cancel-all", "X / C", "取消所有正在執行的背景任務", HelpAction::QuitHint),
+                help_entry("search", "f", "開啟搜尋列，即時過濾任務名稱或路徑", HelpAction::QuitHint),
+                help_entry("detail", "Enter / l", "檢視該任務完整執行細節、路徑與錯誤訊息", HelpAction::QuitHint),
+                help_entry("close", "Esc / q / t / h", "關閉任務面板，返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::TrashPanel => (
+            String::from("Cheatsheet: Trash Panel (垃圾桶)"),
+            vec![
+                help_entry("move", "j / k", "上下移動選取垃圾桶項目", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻頁", HelpAction::QuitHint),
+                help_entry("top/bottom", "gg / G", "跳至清單頂部 / 底部", HelpAction::QuitHint),
+                help_entry("visual", "v / V", "開啟視覺多選模式（連續標記多個項目）", HelpAction::QuitHint),
+                help_entry("mark", "Space", "標記 / 取消標記目前項目", HelpAction::QuitHint),
+                help_entry("mark-all", "a", "全選所有項目 / 清除所有標記", HelpAction::QuitHint),
+                help_entry("restore", "u", "還原所選或已標記項目回原本目錄（需確認）", HelpAction::QuitHint),
+                help_entry("restore-all", "U", "還原垃圾桶內所有項目（需確認）", HelpAction::QuitHint),
+                help_entry("delete", "d", "永久刪除所選或已標記項目（需確認）", HelpAction::QuitHint),
+                help_entry("empty-trash", "D", "清空整個垃圾桶（永久刪除所有檔案，需確認）", HelpAction::QuitHint),
+                help_entry("search", "f", "開啟搜尋列，即時過濾垃圾桶項目名稱", HelpAction::QuitHint),
+                help_entry("detail", "Enter / l", "檢視原始路徑與刪除時間", HelpAction::QuitHint),
+                help_entry("close", "Esc / q / h", "關閉垃圾桶面板，返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::DiffMatrix => (
+            String::from("Cheatsheet: Diff Matrix (檔案差異比對)"),
+            vec![
+                help_entry("move", "j / k", "在差異項目清單中上下移動", HelpAction::QuitHint),
+                help_entry("switch-col", "h / l", "在左 / 中 / 右各 Panel 欄位間切換焦點", HelpAction::QuitHint),
+                help_entry("toggle", "Space", "勾選 / 切換選取要同步的差異項目", HelpAction::QuitHint),
+                help_entry("all", "a", "全選 / 取消全選所有差異項目", HelpAction::QuitHint),
+                help_entry("diff-detail", "d", "開啟雙欄檔案內容詳細 Diff 比對檢視視窗", HelpAction::QuitHint),
+                help_entry("apply", "Enter", "套用同步動作（將選取項目從來源複製至目標）", HelpAction::QuitHint),
+                help_entry("exit", "Esc / q", "退出差異比對矩陣，返回多面板模式", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::VisualSelection => (
+            String::from("Cheatsheet: Visual Selection (視覺連續選取)"),
+            vec![
+                help_entry("expand", "j / k", "延伸 / 縮小視覺連續選取範圍", HelpAction::QuitHint),
+                help_entry("top/bottom", "gg / G", "連續選取至檔案清單頂部 / 底部", HelpAction::QuitHint),
+                help_entry("copy", "y", "複製選取範圍內的所有檔案/資料夾 (Yank)", HelpAction::QuitHint),
+                help_entry("cut", "x", "剪下選取範圍內的所有檔案/資料夾 (Cut)", HelpAction::QuitHint),
+                help_entry("delete", "d", "批次刪除選取範圍內的所有檔案/資料夾", HelpAction::QuitHint),
+                help_entry("rename-regex", "r / R", "對目前選取範圍開啟 Regex 批次改名預覽", HelpAction::QuitHint),
+                help_entry("commit", "v", "將選取範圍提交為常規標記並退出視覺模式", HelpAction::QuitHint),
+                help_entry("cancel", "Esc", "取消視覺選取模式", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::WindowPicker => (
+            String::from("Cheatsheet: Window Layout (視窗分割與管理)"),
+            vec![
+                help_entry("split-v", "v", "垂直新增分割視窗 (Vertical Split)", HelpAction::QuitHint),
+                help_entry("split-s", "s", "水平新增分割視窗 (Horizontal Split)", HelpAction::QuitHint),
+                help_entry("focus", "h / j / k / l", "切換焦點至 左 / 下 / 上 / 右 視窗", HelpAction::QuitHint),
+                help_entry("close", "c", "關閉目前焦點視窗 (Close Pane)", HelpAction::QuitHint),
+                help_entry("only", "o", "僅保留目前視窗，關閉其他所有視窗 (Only)", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / w", "取消退出視窗管理選單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::BookmarkPicker => (
+            String::from("Cheatsheet: Bookmark (書籤管理)"),
+            vec![
+                help_entry("add", "a", "自動挑選下一個可用代號，將目前目錄存入書籤", HelpAction::QuitHint),
+                help_entry("jump-list", "g", "打開書籤清單進行跳轉", HelpAction::QuitHint),
+                help_entry("delete-list", "d", "打開書籤清單進行刪除", HelpAction::QuitHint),
+                help_entry("clear-all", "D", "直接清空所有已儲存書籤", HelpAction::QuitHint),
+                help_entry("quick-jump", "'{key}", "按單一按鍵直接跳轉至對應代號書籤", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / b", "取消退出書籤選單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::BookmarkList => (
+            String::from("Cheatsheet: Bookmark List (書籤清單)"),
+            vec![
+                help_entry("move", "j / k", "上下移動選擇書籤", HelpAction::QuitHint),
+                help_entry("jump", "Enter / l", "跳轉至所選書籤目錄", HelpAction::QuitHint),
+                help_entry("delete", "d", "刪除目前所選書籤", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消退出書籤清單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::SortPicker => (
+            String::from("Cheatsheet: Sort (檔案排序)"),
+            vec![
+                help_entry("by-name", "n", "依檔案名稱排序 (Name)", HelpAction::QuitHint),
+                help_entry("by-size", "s", "依檔案大小排序 (Size)", HelpAction::QuitHint),
+                help_entry("by-mtime", "m", "依修改時間排序 (Modified Time)", HelpAction::QuitHint),
+                help_entry("by-ext", "e", "依副檔名排序 (Extension)", HelpAction::QuitHint),
+                help_entry("reverse", "r", "反轉目前排序順序 (Reverse)", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / s", "取消退出排序選單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::LineModePicker => (
+            String::from("Cheatsheet: Linemode (欄位顯示)"),
+            vec![
+                help_entry("size", "s", "右側欄位顯示檔案容量 (Size)", HelpAction::QuitHint),
+                help_entry("perms", "p", "右側欄位顯示檔案權限 (Permissions)", HelpAction::QuitHint),
+                help_entry("btime", "b", "右側欄位顯示建立時間 (Birth Time)", HelpAction::QuitHint),
+                help_entry("mtime", "m", "右側欄位顯示修改時間 (Modified Time)", HelpAction::QuitHint),
+                help_entry("none", "n", "簡潔模式，不顯示右側額外欄位 (None)", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / m", "取消退出欄位選單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::GoPicker => (
+            String::from("Cheatsheet: Quick Jump (快速跳轉)"),
+            vec![
+                help_entry("documents", "d", "快速跳轉至 ~/Documents 目錄", HelpAction::QuitHint),
+                help_entry("desktop", "k", "快速跳轉至 ~/Desktop 目錄", HelpAction::QuitHint),
+                help_entry("goto-path", "t", "開啟路徑跳轉輸入框 (Goto path)", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q / g", "取消退出跳轉選單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::ThemePicker => (
+            String::from("Cheatsheet: Theme (佈景主題)"),
+            vec![
+                help_entry("move", "j / k", "上下移動即時預覽佈景主題", HelpAction::QuitHint),
+                help_entry("apply", "Enter", "套用所選主題並儲存為預設", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消並恢復原主題", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::CommandMode => (
+            String::from("Cheatsheet: Command Mode (命令列模式)"),
+            vec![
+                help_entry("execute", "Enter", "執行目前輸入之指令", HelpAction::QuitHint),
+                help_entry("complete", "Tab", "自動補全指令名稱或檔案路徑", HelpAction::QuitHint),
+                help_entry("history", "Up / Down", "瀏覽歷史輸入指令", HelpAction::QuitHint),
+                help_entry("start", "Ctrl+a / Home", "移動游標至指令開頭", HelpAction::QuitHint),
+                help_entry("end", "Ctrl+e / End", "移動游標至指令結尾", HelpAction::QuitHint),
+                help_entry("cancel", "Esc", "取消並退出命令模式", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::Filter => (
+            String::from("Cheatsheet: Filter (檔案即時過濾)"),
+            vec![
+                help_entry("confirm", "Enter", "確認鎖定目前過濾條件", HelpAction::QuitHint),
+                help_entry("toggle-fuzzy", "Tab", "切換模糊過濾 (Fuzzy) 與精確過濾 (Exact)", HelpAction::QuitHint),
+                help_entry("cancel", "Esc", "清除過濾條件並返回完整清單", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::Preview => (
+            String::from("Cheatsheet: Preview (檔案預覽)"),
+            vec![
+                help_entry("scroll", "j / k", "向下 / 向上捲動預覽文字內容", HelpAction::QuitHint),
+                help_entry("page", "Ctrl+d / Ctrl+u", "快速半頁向下 / 向上翻滾預覽", HelpAction::QuitHint),
+                help_entry("search", "/", "在預覽內容中搜尋關鍵字", HelpAction::QuitHint),
+                help_entry("match", "n / N", "跳至下一個 / 上一個搜尋匹配項目", HelpAction::QuitHint),
+                help_entry("exit", "Tab / Esc / h / q", "退出預覽捲動，返回檔案列表", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::ToolPanel => (
+            String::from("Cheatsheet: Tool Dependencies (相依工具)"),
+            vec![
+                help_entry("move", "j / k", "上下移動檢視相依工具狀態", HelpAction::QuitHint),
+                help_entry("close", "Esc / q", "關閉相依工具面板", HelpAction::QuitHint),
+            ],
+        ),
+        ContextHelpKind::RegexRename => (
+            String::from("Cheatsheet: Regex Batch Rename (批次改名)"),
+            vec![
+                help_entry("move", "j / k", "上下移動檢視改名預覽項目", HelpAction::QuitHint),
+                help_entry("apply", "Enter", "確認套用批次改名", HelpAction::QuitHint),
+                help_entry("cancel", "Esc / q", "取消並退出批次改名", HelpAction::QuitHint),
+            ],
+        ),
+    }
+}
+
 /// 只取出 help 面板渲染需要的列內容。
 pub(crate) fn help_panel_lines(query: &str) -> Vec<HelpPanelLine> {
     help_entries(query)
@@ -4170,6 +4494,7 @@ pub(crate) fn help_panel_lines(query: &str) -> Vec<HelpPanelLine> {
         .map(|entry| entry.line)
         .collect()
 }
+
 
 /// 根據解壓結果數量與略過項目數，整理出適合顯示在狀態列的訊息。
 pub(crate) fn extraction_status_label(extracted: &[ExtractedArchive], skipped: usize) -> String {
