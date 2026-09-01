@@ -3617,10 +3617,29 @@ fn remove_transfer_path(path: &Path) -> io::Result<()> {
 /// - 成功時代表既有目標已被安全移除。
 /// - 失敗時代表沒有權限、目標正被使用或刪除過程出錯。
 fn remove_existing_target(target_path: &Path) -> io::Result<()> {
-    if target_path.is_dir() {
-        fs::remove_dir_all(target_path)
+    if !target_path.exists() {
+        return Ok(());
+    }
+    let mut last_err = None;
+    for _ in 0..10 {
+        let res = if target_path.is_dir() {
+            fs::remove_dir_all(target_path)
+        } else {
+            fs::remove_file(target_path)
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        Err(err)
     } else {
-        fs::remove_file(target_path)
+        Ok(())
     }
 }
 
@@ -4902,7 +4921,13 @@ mod tests {
         let source = source_parent.join("build-output");
         fs::create_dir_all(&source).expect("source directory");
         fs::create_dir(&target_parent).expect("target parent");
-        fs::write(source.join("artifact.bin"), b"artifact").expect("source file");
+        let bin_path = source.join("artifact.bin");
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&bin_path).expect("source file");
+            file.write_all(b"artifact").expect("write artifact");
+            file.sync_all().expect("sync artifact");
+        }
         let mut progress_calls = Vec::new();
 
         let outcome = PaneState::move_path_to_dir_with_history_progress(
