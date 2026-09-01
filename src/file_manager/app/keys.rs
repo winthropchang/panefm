@@ -2805,6 +2805,16 @@ impl App {
                                 visual_anchor,
                             });
                             return Ok(true);
+                        } else {
+                            self.status = String::from("tasks: empty");
+                            self.pending_action = Some(PendingAction::TaskPanel {
+                                pane_id,
+                                selected: 0,
+                                search,
+                                marked_ids,
+                                visual_anchor: None,
+                            });
+                            return Ok(true);
                         }
                     }
                     if key_matches_shifted_letter(&key, 'D') {
@@ -2814,7 +2824,11 @@ impl App {
                         visual_anchor = None;
                         let deleted = self.delete_all_tasks_for_pane(pane_id);
                         selected = 0;
-                        self.status = format!("tasks: cleared {deleted} tasks");
+                        self.status = if deleted == 0 {
+                            String::from("tasks: empty")
+                        } else {
+                            format!("tasks: cleared {deleted} tasks")
+                        };
                         self.pending_action = Some(PendingAction::TaskPanel {
                             pane_id,
                             selected,
