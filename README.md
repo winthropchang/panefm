@@ -161,7 +161,36 @@ winget install sharkdp.fd BurntSushi.ripgrep.MSVC junegunn.fzf ajeetdsouza.zoxid
 
 ---
 
-### 2. 從原始碼編譯安裝
+### 2. 下載預先編譯版本（GitHub Releases）
+
+至 [Releases 頁面](https://github.com/winthropchang/panefm/releases) 下載對應作業系統的預先編譯執行檔：
+
+* **macOS (Apple Silicon / M 系列)**：`panefm-macos-arm64`
+* **macOS (Intel)**：`panefm-macos-x86_64`
+* **Windows (x64)**：`panefm-windows-x86_64.exe`
+
+#### 🍎 macOS 使用者注意事項（Gatekeeper 隔離解除）
+
+由於 GitHub Releases 的二進位檔案未經 Apple 開發者付費簽名，macOS 下載後會自動加上隔離標記，初次執行可能會跳出 `Apple could not verify "panefm..."` 的阻擋警告。
+
+請在 Terminal 執行以下指令移除隔離標記並加入系統路徑：
+
+```bash
+# 1. 移除 macOS 下載隔離標記（請替換為您下載的檔名）
+xattr -d com.apple.quarantine ./panefm-macos-arm64
+
+# 2. 賦予執行權限
+chmod +x ./panefm-macos-arm64
+
+# 3. 移至系統 PATH（即可隨時輸入 panefm 啟動）
+sudo mv ./panefm-macos-arm64 /usr/local/bin/panefm
+```
+
+> 💡 **圖形介面解法**：亦可前往 macOS **「系統設定」➔「隱私權與安全性」**，在安全性區塊點擊 **「強制打開（Open Anyway）」**。
+
+---
+
+### 3. 從原始碼編譯安裝
 
 ```bash
 git clone https://github.com/winthropchang/panefm.git

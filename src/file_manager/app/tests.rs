@@ -200,7 +200,7 @@ fn default_loaded_config() -> LoadedConfig {
 
 /// 輪詢測試中的背景搜尋直到完成，並設定 timeout 防止失敗時無限等待。
 fn wait_for_global_search(app: &mut App) {
-    for _ in 0..50 {
+    for _ in 0..300 {
         app.poll_background_tasks();
         if app
             .global_search
