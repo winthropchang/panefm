@@ -312,6 +312,7 @@ impl Default for AppConfig {
 pub struct LoadedConfig {
     pub config: AppConfig,
     pub source: Option<PathBuf>,
+    pub base_dir: PathBuf,
 }
 
 /// 將目前選取的主題名稱同步寫入設定檔。
@@ -582,13 +583,14 @@ pub fn load_config(base_dir: &Path) -> Result<LoadedConfig> {
     Ok(LoadedConfig {
         config,
         source: config_source,
+        base_dir: base_dir.to_path_buf(),
     })
 }
 
 /// 建立設定檔搜尋路徑清單。
 ///
 /// 參數：
-/// - `base_dir: &Path`，目前專案目錄。
+/// - `base_dir: &Path`，目前應用程式/可執行檔目錄。
 ///
 /// 回傳：`Vec<PathBuf>`，依照優先順序排列的候選設定檔路徑。
 fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
@@ -602,7 +604,9 @@ fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
         paths.push(PathBuf::from(path));
     }
 
-    paths.push(base_dir.join("config.toml"));
+    if !base_dir.as_os_str().is_empty() {
+        paths.push(base_dir.join("config.toml"));
+    }
 
     if let Some(xdg_home) = env::var_os("XDG_CONFIG_HOME") {
         let xdg_home = PathBuf::from(xdg_home);
@@ -640,7 +644,7 @@ fn config_search_paths(base_dir: &Path) -> Vec<PathBuf> {
 /// 建立 `plugins.toml` 的搜尋路徑清單。
 ///
 /// 參數：
-/// - `base_dir: &Path`，目前專案目錄。
+/// - `base_dir: &Path`，目前應用程式/可執行檔目錄。
 /// - `config_source: Option<&Path>`，已找到的 `config.toml` 路徑，用來推導同層的 `plugins.toml`。
 ///
 /// 回傳：`Vec<PathBuf>`，依照優先順序排列的候選 plugins 檔案路徑。
@@ -659,7 +663,7 @@ fn plugins_search_paths(base_dir: &Path, config_source: Option<&Path>) -> Vec<Pa
         if let Some(parent) = config_path.parent() {
             paths.push(parent.join("plugins.toml"));
         }
-    } else {
+    } else if !base_dir.as_os_str().is_empty() {
         paths.push(base_dir.join("plugins.toml"));
     }
 

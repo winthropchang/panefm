@@ -1819,7 +1819,9 @@ impl App {
                         format!("trash cancelled: {target_name}")
                     };
                 }
-                _ if key_matches_letter_any_case(&key, 'n') || key_matches_plain_letter(&key, 'q') => {
+                _ if key_matches_letter_any_case(&key, 'n')
+                    || key_matches_plain_letter(&key, 'q') =>
+                {
                     self.status = if permanent {
                         format!("delete cancelled: {target_name}")
                     } else {
@@ -1853,7 +1855,9 @@ impl App {
                 KeyCode::Esc => {
                     self.status = paste_overwrite_cancelled_status(&target_name, entry_count);
                 }
-                _ if key_matches_letter_any_case(&key, 'n') || key_matches_plain_letter(&key, 'q') => {
+                _ if key_matches_letter_any_case(&key, 'n')
+                    || key_matches_plain_letter(&key, 'q') =>
+                {
                     self.status = paste_overwrite_cancelled_status(&target_name, entry_count);
                 }
                 _ => {
@@ -1896,7 +1900,9 @@ impl App {
                     self.status =
                         trash_confirm_cancelled_status(&action, &target_name, entry_count);
                 }
-                _ if key_matches_letter_any_case(&key, 'n') || key_matches_plain_letter(&key, 'q') => {
+                _ if key_matches_letter_any_case(&key, 'n')
+                    || key_matches_plain_letter(&key, 'q') =>
+                {
                     self.pending_action = Some(trash_panel_pending_action_from_confirm_action(
                         &action,
                         marked_ids,

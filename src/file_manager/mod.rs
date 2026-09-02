@@ -118,7 +118,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 /// - 失敗時代表設定檔載入、事件讀取或畫面更新過程出錯。
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let loaded_config = load_config(&cwd)?;
+    let app_dir = platform::executable_dir().unwrap_or_else(|| cwd.clone());
+    let loaded_config = load_config(&app_dir)?;
     let poll_rate = loaded_config.config.ui.poll_rate;
     let mut app = App::new(cwd, loaded_config)?;
     let mut last_cursor_mode = None;

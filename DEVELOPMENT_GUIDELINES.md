@@ -232,6 +232,7 @@
 - 可調整的行為、步長、主題、UI 尺寸、預設模式，不應寫死在程式中。
 - `config.toml` 只放設定。
 - 與使用者資料有關的內容，應放在獨立檔案，例如 `bookmark.toml`。
+- `config.toml`、`bookmark.toml`、`plugins.toml` 等應用程式設定與持久化檔案，預設應與執行檔同目錄或放置於使用者資料目錄（如 `%APPDATA%` / `XDG`），嚴禁寫入啟動時開啟的瀏覽目錄 (`cwd`)。
 - 新增設定時必須同步更新：
   - `config.toml.example`
   - 設定解析程式

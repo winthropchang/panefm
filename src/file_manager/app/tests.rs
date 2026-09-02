@@ -195,6 +195,7 @@ fn default_loaded_config() -> LoadedConfig {
     LoadedConfig {
         config: AppConfig::default(),
         source: None,
+        base_dir: PathBuf::new(),
     }
 }
 
@@ -1067,6 +1068,7 @@ fn app_new_applies_startup_pane_preferences() {
             ..AppConfig::default()
         },
         source: None,
+        base_dir: PathBuf::new(),
     };
 
     let app = App::new(dir.path().to_path_buf(), loaded).expect("app");
@@ -2517,6 +2519,50 @@ fn app_bookmark_list_supports_filtering() {
 
     assert_eq!(app.panes.get(&1).expect("pane").cwd, beta);
     assert_eq!(app.status, "jumped to bookmark [b]");
+}
+
+#[test]
+/// 驗證在不同工作目錄開啟 PaneFM 時，書籤與設定檔會寫入執行檔/基礎目錄，而不是寫入瀏覽目錄。
+/// 保護目的：避免在無寫入權限目錄（例如 System32）或隨機目錄啟動時，將程式資料寫入工作目錄造成錯誤或檔案污染。
+fn app_writes_bookmarks_and_configs_to_base_dir_not_cwd() {
+    let app_dir = tempdir().expect("app tempdir");
+    let browse_dir = tempdir().expect("browse tempdir");
+
+    let loaded = crate::config::load_config(app_dir.path()).expect("load config");
+    assert_eq!(loaded.base_dir, app_dir.path());
+
+    let mut app = App::new(browse_dir.path().to_path_buf(), loaded).expect("app");
+    assert_eq!(app.panes.get(&1).expect("pane").cwd, browse_dir.path());
+
+    // 新增書籤
+    app.add_bookmark_with_auto_key(1).expect("add bookmark");
+
+    // 驗證書籤檔案寫入到 app_dir，且 browse_dir 中沒有產生 bookmark.toml
+    let app_bookmark_path = app_dir.path().join("bookmark.toml");
+    let browse_bookmark_path = browse_dir.path().join("bookmark.toml");
+    assert!(
+        app_bookmark_path.exists(),
+        "bookmark.toml should be written in app_dir"
+    );
+    assert!(
+        !browse_bookmark_path.exists(),
+        "bookmark.toml should NOT be written in browse_dir"
+    );
+
+    // 切換主題並持久化
+    app.set_theme_by_name("nord");
+
+    // 驗證設定檔寫入到 app_dir，且 browse_dir 中沒有產生 config.toml
+    let app_config_path = app_dir.path().join("config.toml");
+    let browse_config_path = browse_dir.path().join("config.toml");
+    assert!(
+        app_config_path.exists(),
+        "config.toml should be written in app_dir"
+    );
+    assert!(
+        !browse_config_path.exists(),
+        "config.toml should NOT be written in browse_dir"
+    );
 }
 
 #[test]
@@ -8090,7 +8136,11 @@ fn cheatsheet_opens_context_specific_help_and_restores_state() {
     app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
         .expect("press ? in normal mode");
     match &app.pending_action {
-        Some(PendingAction::HelpPanel { custom_title, custom_entries, .. }) => {
+        Some(PendingAction::HelpPanel {
+            custom_title,
+            custom_entries,
+            ..
+        }) => {
             assert!(custom_title.as_ref().unwrap().contains("Normal Mode"));
             let entries = custom_entries.as_ref().unwrap();
             assert!(entries.iter().any(|e| e.line.shortcut.contains("j / k")));
@@ -8106,12 +8156,19 @@ fn cheatsheet_opens_context_specific_help_and_restores_state() {
 
     // 2. 開啟 TaskPanel 後按 ? 鍵
     app.open_task_panel();
-    assert!(matches!(app.pending_action, Some(PendingAction::TaskPanel { .. })));
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::TaskPanel { .. })
+    ));
 
     app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
         .expect("press ? in task panel");
     match &app.pending_action {
-        Some(PendingAction::HelpPanel { custom_title, custom_entries, .. }) => {
+        Some(PendingAction::HelpPanel {
+            custom_title,
+            custom_entries,
+            ..
+        }) => {
             assert!(custom_title.as_ref().unwrap().contains("Task Panel"));
             let entries = custom_entries.as_ref().unwrap();
             assert!(entries.iter().any(|e| e.line.shortcut.contains("d")));
@@ -8124,16 +8181,32 @@ fn cheatsheet_opens_context_specific_help_and_restores_state() {
     // 按 ? 鍵再次關閉 Cheatsheet，必須精準返回 TaskPanel
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
         .expect("press ? to exit cheatsheet");
-    assert!(matches!(app.pending_action, Some(PendingAction::TaskPanel { .. })));
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::TaskPanel { .. })
+    ));
 
     // 3. 驗證 :cheatsheet 與 :cheat 指令
     app.pending_action = None;
     app.execute_command("cheatsheet").expect("exec :cheatsheet");
-    assert!(matches!(app.pending_action, Some(PendingAction::HelpPanel { custom_title: Some(_), .. })));
-    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::HelpPanel {
+            custom_title: Some(_),
+            ..
+        })
+    ));
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
 
     app.execute_command("cheat").expect("exec :cheat");
-    assert!(matches!(app.pending_action, Some(PendingAction::HelpPanel { custom_title: Some(_), .. })));
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::HelpPanel {
+            custom_title: Some(_),
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -8156,9 +8229,14 @@ fn cheatsheet_search_filters_within_context_entries() {
         .expect("type n");
 
     match &app.pending_action {
-        Some(PendingAction::HelpPanel { search, custom_entries, .. }) => {
+        Some(PendingAction::HelpPanel {
+            search,
+            custom_entries,
+            ..
+        }) => {
             assert_eq!(search.buffer, "can");
-            let filtered = filter_custom_help_entries(custom_entries.as_ref().unwrap(), &search.buffer);
+            let filtered =
+                filter_custom_help_entries(custom_entries.as_ref().unwrap(), &search.buffer);
             assert!(filtered.len() >= 1);
             assert!(filtered.iter().any(|e| e.line.description.contains("取消")));
         }
@@ -8180,9 +8258,16 @@ fn cheatsheet_in_global_search_shows_only_search_navigation_keys() {
     app.open_cheatsheet_from_current();
 
     match &app.pending_action {
-        Some(PendingAction::HelpPanel { custom_title, custom_entries, .. }) => {
+        Some(PendingAction::HelpPanel {
+            custom_title,
+            custom_entries,
+            ..
+        }) => {
             let title = custom_title.as_ref().unwrap();
-            assert!(title.contains("Global Search"), "title should be Global Search, got: {title}");
+            assert!(
+                title.contains("Global Search"),
+                "title should be Global Search, got: {title}"
+            );
             let entries = custom_entries.as_ref().unwrap();
             let commands: Vec<&str> = entries.iter().map(|e| e.line.command.as_str()).collect();
 
@@ -8194,12 +8279,30 @@ fn cheatsheet_in_global_search_shows_only_search_navigation_keys() {
             assert!(commands.contains(&"exit"));
 
             // 確保「絕對不包含」無法在搜尋面板執行的 normal 模式指令
-            assert!(!commands.contains(&"create"), "cheatsheet should NOT contain create");
-            assert!(!commands.contains(&"trash"), "cheatsheet should NOT contain trash");
-            assert!(!commands.contains(&"delete!"), "cheatsheet should NOT contain delete!");
-            assert!(!commands.contains(&"rename"), "cheatsheet should NOT contain rename");
-            assert!(!commands.contains(&"paste"), "cheatsheet should NOT contain paste");
-            assert!(!commands.contains(&"undo"), "cheatsheet should NOT contain undo");
+            assert!(
+                !commands.contains(&"create"),
+                "cheatsheet should NOT contain create"
+            );
+            assert!(
+                !commands.contains(&"trash"),
+                "cheatsheet should NOT contain trash"
+            );
+            assert!(
+                !commands.contains(&"delete!"),
+                "cheatsheet should NOT contain delete!"
+            );
+            assert!(
+                !commands.contains(&"rename"),
+                "cheatsheet should NOT contain rename"
+            );
+            assert!(
+                !commands.contains(&"paste"),
+                "cheatsheet should NOT contain paste"
+            );
+            assert!(
+                !commands.contains(&"undo"),
+                "cheatsheet should NOT contain undo"
+            );
         }
         other => panic!("expected Cheatsheet HelpPanel, got {other:?}"),
     }
@@ -8207,7 +8310,10 @@ fn cheatsheet_in_global_search_shows_only_search_navigation_keys() {
     // 按 Esc 退出 Cheatsheet，必須精準回復 global_search
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .expect("press Esc to exit cheatsheet");
-    assert!(app.global_search.is_some(), "global_search state should be restored");
+    assert!(
+        app.global_search.is_some(),
+        "global_search state should be restored"
+    );
 }
 
 #[test]
@@ -8244,11 +8350,23 @@ fn cheatsheet_covers_all_context_kinds() {
     for kind in all_kinds {
         let (title, entries) = context_cheatsheet_entries(kind);
         assert!(!title.is_empty(), "title for {kind:?} must not be empty");
-        assert!(!entries.is_empty(), "entries for {kind:?} must not be empty");
+        assert!(
+            !entries.is_empty(),
+            "entries for {kind:?} must not be empty"
+        );
         for entry in &entries {
-            assert!(!entry.line.command.is_empty(), "command in {kind:?} must not be empty");
-            assert!(!entry.line.shortcut.is_empty(), "shortcut in {kind:?} must not be empty");
-            assert!(!entry.line.description.is_empty(), "description in {kind:?} must not be empty");
+            assert!(
+                !entry.line.command.is_empty(),
+                "command in {kind:?} must not be empty"
+            );
+            assert!(
+                !entry.line.shortcut.is_empty(),
+                "shortcut in {kind:?} must not be empty"
+            );
+            assert!(
+                !entry.line.description.is_empty(),
+                "description in {kind:?} must not be empty"
+            );
         }
     }
 }

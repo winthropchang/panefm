@@ -41,6 +41,15 @@ pub(crate) fn current_platform() -> PlatformKind {
     }
 }
 
+/// 取得目前執行檔所在的目錄路徑。
+///
+/// 若無法取得執行檔路徑或其父目錄，回傳 `None`。
+pub(crate) fn executable_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
 pub(crate) fn new_terminal_spec_for_platform(
     path: &Path,
     platform: PlatformKind,
@@ -810,5 +819,15 @@ mod tests {
         .expect("spec");
 
         assert_eq!(spec.args, vec!["-a", "iTerm", "/Users/otto/project/foo"]);
+    }
+
+    #[test]
+    /// 驗證可正確取得當前執行檔所在的目錄路徑。
+    /// 保護目的：避免應用程式狀態（如 bookmark、config）錯誤寫入工作目錄而非執行檔目錄。
+    fn executable_dir_returns_valid_path_in_test_environment() {
+        let dir = super::executable_dir();
+        assert!(dir.is_some());
+        let dir = dir.unwrap();
+        assert!(dir.exists());
     }
 }
