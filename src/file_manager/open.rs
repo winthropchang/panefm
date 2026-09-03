@@ -421,12 +421,11 @@ fn expand_custom_action_template(
     );
     let name = shell_quote_for_platform(&target.display_name, platform);
     let stem = shell_quote_for_platform(
-        &target
+        target
             .path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_string(),
+            .unwrap_or_default(),
         platform,
     );
 
@@ -595,9 +594,12 @@ mod tests {
         };
 
         // 未設置環境變數時不匹配
-        let spec_without_env =
-            build_terminal_launch_spec(&PathBuf::from("/tmp/foo"), None, &[plugin.clone()])
-                .expect("spec");
+        let spec_without_env = build_terminal_launch_spec(
+            &PathBuf::from("/tmp/foo"),
+            None,
+            std::slice::from_ref(&plugin),
+        )
+        .expect("spec");
 
         // 設置環境變數後匹配
         unsafe {

@@ -357,12 +357,12 @@ impl App {
     pub(crate) fn apply_list_find_buffer(&mut self, search: &ListFindState) {
         if let Some(pane) = self.panes.get_mut(&search.pane_id) {
             pane.set_list_find_query(&search.buffer);
-            if pane.has_list_find() {
-                if let Some(target) = pane.list_find_match_indices().first().copied() {
-                    pane.selected = target;
-                    pane.list_state.select(Some(target));
-                    pane.preview_scroll = 0;
-                }
+            if pane.has_list_find()
+                && let Some(target) = pane.list_find_match_indices().first().copied()
+            {
+                pane.selected = target;
+                pane.list_state.select(Some(target));
+                pane.preview_scroll = 0;
             }
         }
     }

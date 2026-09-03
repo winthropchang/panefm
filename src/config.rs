@@ -749,10 +749,12 @@ fn apply_new_file(config: &mut AppConfig, file: AppConfigFile) -> Result<()> {
 ///
 /// 回傳：`Result<()>`。
 fn apply_legacy_file(config: &mut AppConfig, file: LegacyAppConfigFile) -> Result<()> {
-    let mut ui = UiConfigFile::default();
-    ui.theme = file.theme;
-    ui.poll_rate_ms = file.poll_rate_ms;
-    ui.preview = file.preview;
+    let mut ui = UiConfigFile {
+        theme: file.theme,
+        poll_rate_ms: file.poll_rate_ms,
+        preview: file.preview,
+        ..Default::default()
+    };
     if file.confirm_dialog.is_some() || file.theme_picker.is_some() {
         ui.dialog = Some(DialogsConfigFile {
             confirm: file.confirm_dialog,

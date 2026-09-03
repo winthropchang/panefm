@@ -242,6 +242,7 @@ fn is_already_compressed_file(path: &Path) -> bool {
 }
 
 /// 將指定路徑遞迴寫入 zip，保留目前 pane 目錄下看到的相對名稱。
+#[allow(clippy::too_many_arguments)]
 fn add_path_to_zip<W, F>(
     zip: &mut ZipWriter<W>,
     source_path: &Path,

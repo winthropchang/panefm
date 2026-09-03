@@ -39,12 +39,12 @@ pub fn resolve_undo_backup_dir() -> PathBuf {
             }
         }
 
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let candidate = exe_dir.join("undoBackup");
-                if fs::create_dir_all(&candidate).is_ok() {
-                    return candidate;
-                }
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(exe_dir) = exe_path.parent()
+        {
+            let candidate = exe_dir.join("undoBackup");
+            if fs::create_dir_all(&candidate).is_ok() {
+                return candidate;
             }
         }
 

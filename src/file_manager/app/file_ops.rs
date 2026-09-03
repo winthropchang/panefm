@@ -160,15 +160,15 @@ impl App {
         target: OpenTarget,
         action: OpenAction,
     ) -> io::Result<()> {
-        if target.is_dir {
-            if let Some((task_id, title, progress)) = self.active_file_job_for_path(&target.path) {
-                let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
-                self.status = format!(
-                    "cannot open '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
-                    target.display_name
-                );
-                return Ok(());
-            }
+        if target.is_dir
+            && let Some((task_id, title, progress)) = self.active_file_job_for_path(&target.path)
+        {
+            let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
+            self.status = format!(
+                "cannot open '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
+                target.display_name
+            );
+            return Ok(());
         }
         let launch = build_launch_spec(&target, action)?;
         let title = match action {
@@ -1810,7 +1810,6 @@ impl App {
                 overwrite,
                 &mut progress,
             );
-            drop(progress);
 
             let _ = sender.send(FileJobEvent::Progress {
                 task_id,

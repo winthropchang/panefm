@@ -460,21 +460,19 @@ impl App {
             _ if key_matches_plain_letter(&key, 'l') => {
                 self.clear_pending_count();
                 let pane_id = self.focused_pane;
-                if let Some(entry) = self.panes.get(&pane_id).and_then(|p| p.selected_entry()) {
-                    if entry.is_dir {
-                        if let Some((task_id, title, progress)) =
-                            self.active_file_job_for_path(&entry.path)
-                        {
-                            let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
-                            self.status = format!(
-                                "cannot enter '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
-                                entry.display_name()
-                            );
-                            self.pending_g = false;
-                            self.pending_y = false;
-                            return Ok(true);
-                        }
-                    }
+                if let Some(entry) = self.panes.get(&pane_id).and_then(|p| p.selected_entry())
+                    && entry.is_dir
+                    && let Some((task_id, title, progress)) =
+                        self.active_file_job_for_path(&entry.path)
+                {
+                    let pct_str = progress.map(|p| format!(" ({p}%)")).unwrap_or_default();
+                    self.status = format!(
+                        "cannot enter '{}': transfer in progress [task #{task_id}: {title}{pct_str}]",
+                        entry.display_name()
+                    );
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    return Ok(true);
                 }
                 let is_loading = self.directory_load_jobs.contains_key(&pane_id);
                 let previous_cwd = self.current_pane_mut()?.cwd.clone();
@@ -3082,7 +3080,7 @@ impl App {
                         KeyCode::Esc => {
                             self.clear_pending_count();
                             self.pending_g = false;
-                            if let Some(_) = visual_anchor.take() {
+                            if visual_anchor.take().is_some() {
                                 self.status = String::from("task visual: cancelled");
                             } else if !marked_ids.is_empty() {
                                 let cleared = marked_ids.len();

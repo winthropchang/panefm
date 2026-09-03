@@ -146,6 +146,7 @@ impl Theme {
     /// - `danger: Color`，危險操作或刪除提示使用的顏色。
     ///
     /// 回傳：`Theme`，可直接套用於 UI 渲染。
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         accent: Color,
         focus_border: Color,

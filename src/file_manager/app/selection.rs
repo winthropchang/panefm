@@ -93,7 +93,7 @@ impl App {
         let mut added = 0usize;
 
         for task in tasks.iter().skip(start).take(end.saturating_sub(start) + 1) {
-            if !marked_ids.iter().any(|id| *id == task.id) {
+            if !marked_ids.contains(&task.id) {
                 marked_ids.push(task.id);
                 added += 1;
             }

@@ -109,6 +109,7 @@ pub(crate) enum GlobalSearchEvent {
 /// - `sender: Sender<GlobalSearchEvent>`，用來回傳搜尋進度的 channel。
 ///
 /// 回傳：`()`
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_search_entries(
     pane_id: usize,
     root: &Path,
@@ -287,6 +288,7 @@ fn path_buf_from_fd_output(bytes: Vec<u8>) -> PathBuf {
 /// - 只搜尋檔案，不回傳資料夾。
 /// - 以不分大小寫方式比對內容。
 /// - 不提供內建搜尋 fallback；缺少或無法啟動 `rg` 時，通知主程式顯示依賴狀態。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_content_search_entries(
     pane_id: usize,
     root: &Path,
@@ -327,6 +329,7 @@ pub(crate) fn stream_content_search_entries(
 /// 啟動 ripgrep 並串流解析內容搜尋結果。
 ///
 /// 回傳：`bool`，成功完成或被使用者取消時為 `true`；無法使用 `rg` 時為 `false`。
+#[allow(clippy::too_many_arguments)]
 fn stream_content_search_entries_with_rg(
     pane_id: usize,
     root: &Path,

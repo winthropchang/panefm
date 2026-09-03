@@ -81,7 +81,7 @@ impl TrashStore {
             let t_prefix = self.items_dir.components().next();
             match (s_prefix, t_prefix) {
                 (Some(Component::Prefix(p1)), Some(Component::Prefix(p2))) => {
-                    p1.as_os_str().to_ascii_lowercase() != p2.as_os_str().to_ascii_lowercase()
+                    !p1.as_os_str().eq_ignore_ascii_case(p2.as_os_str())
                 }
                 _ => false,
             }
@@ -456,12 +456,12 @@ fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
 }
 
 fn ensure_path_writable(path: &Path) {
-    if let Ok(mut perms) = fs::symlink_metadata(path).map(|m| m.permissions()) {
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
+    if let Ok(mut perms) = fs::symlink_metadata(path).map(|m| m.permissions())
+        && perms.readonly()
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(path, perms);
     }
 }
 
@@ -499,11 +499,11 @@ fn remove_path(path: &Path) -> io::Result<()> {
         let _ = fs::remove_dir(path);
     } else {
         ensure_path_writable(path);
-        if let Err(err) = fs::remove_file(path) {
-            if err.kind() != io::ErrorKind::NotFound {
-                ensure_path_writable(path);
-                let _ = fs::remove_file(path);
-            }
+        if let Err(err) = fs::remove_file(path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            ensure_path_writable(path);
+            let _ = fs::remove_file(path);
         }
     }
 

@@ -2473,12 +2473,12 @@ pub(crate) fn send_progress_if_changed(
 }
 
 pub(crate) fn ensure_path_writable(path: &Path) {
-    if let Ok(mut perms) = fs::metadata(path).map(|m| m.permissions()) {
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
+    if let Ok(mut perms) = fs::metadata(path).map(|m| m.permissions())
+        && perms.readonly()
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(path, perms);
     }
 }
 
@@ -2529,7 +2529,7 @@ where
         }
     }
     ensure_path_writable(path);
-    if let Err(_) = fs::remove_dir(path) {
+    if fs::remove_dir(path).is_err() {
         let _ = fs::remove_dir_all(path);
     }
     Ok(())
@@ -2565,7 +2565,7 @@ where
             }
         }
     } else {
-        let chunk_size = (entries.len() + DELETE_WORKERS - 1) / DELETE_WORKERS;
+        let chunk_size = entries.len().div_ceil(DELETE_WORKERS);
         let progress_mutex = std::sync::Mutex::new(on_progress);
         thread::scope(|scope| {
             for chunk in entries.chunks(chunk_size) {
@@ -2590,10 +2590,10 @@ where
                             local_progress(size);
                         }
                     }
-                    if local_bytes > 0 {
-                        if let Ok(mut guard) = p_mutex.lock() {
-                            guard(local_bytes);
-                        }
+                    if local_bytes > 0
+                        && let Ok(mut guard) = p_mutex.lock()
+                    {
+                        guard(local_bytes);
                     }
                 });
             }
@@ -2601,7 +2601,7 @@ where
     }
 
     ensure_path_writable(path);
-    if let Err(_) = fs::remove_dir(path) {
+    if fs::remove_dir(path).is_err() {
         // 若仍有殘留項目（例如 macOS Finder 動態寫入的 .DS_Store 或特殊屬性），
         // 執行最終保底清理，確保 100% 清空
         let _ = fs::remove_dir_all(path);
@@ -6236,8 +6236,8 @@ pub(crate) fn missing_search_tool_status(mode: SearchMode, tool: &str) -> String
 }
 
 /// 把 `fzf` 回傳的相對路徑文字轉回實際檔案系統路徑。
-pub(crate) fn jump_selection_to_path(root_dir: &PathBuf, selection: &str) -> PathBuf {
-    let mut target = root_dir.clone();
+pub(crate) fn jump_selection_to_path(root_dir: &Path, selection: &str) -> PathBuf {
+    let mut target = root_dir.to_path_buf();
     let trimmed = selection.trim_end_matches('/');
     for segment in trimmed.split('/').filter(|segment| !segment.is_empty()) {
         target.push(segment);

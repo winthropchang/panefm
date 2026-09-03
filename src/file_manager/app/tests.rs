@@ -473,14 +473,14 @@ fn app_gd_jumps_to_documents_directory() {
         std::env::set_var("USERPROFILE", &home);
     }
 
-    let result = (|| {
+    {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
             .expect("open go picker");
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
             .expect("jump documents");
         assert_eq!(app.panes.get(&1).expect("pane").cwd, documents);
-    })();
+    }
 
     unsafe {
         match original_home {
@@ -492,8 +492,6 @@ fn app_gd_jumps_to_documents_directory() {
             None => std::env::remove_var("USERPROFILE"),
         }
     }
-
-    result
 }
 
 #[test]
@@ -516,14 +514,14 @@ fn app_gk_jumps_to_desktop_directory() {
         std::env::set_var("USERPROFILE", &home);
     }
 
-    let result = (|| {
+    {
         let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
             .expect("open go picker");
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
             .expect("jump desktop");
         assert_eq!(app.panes.get(&1).expect("pane").cwd, desktop);
-    })();
+    }
 
     unsafe {
         match original_home {
@@ -535,8 +533,6 @@ fn app_gk_jumps_to_desktop_directory() {
             None => std::env::remove_var("USERPROFILE"),
         }
     }
-
-    result
 }
 
 #[test]
@@ -8047,10 +8043,10 @@ fn diff_command_opens_and_navigates_matrix() {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(10));
         app.poll_background_tasks();
-        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
-            if !state.loading {
-                break;
-            }
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action
+            && !state.loading
+        {
+            break;
         }
     }
 
@@ -8080,10 +8076,10 @@ fn diff_command_opens_and_navigates_matrix() {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(10));
         app.poll_background_tasks();
-        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
-            if !state.loading {
-                break;
-            }
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action
+            && !state.loading
+        {
+            break;
         }
     }
 
@@ -8096,10 +8092,10 @@ fn diff_command_opens_and_navigates_matrix() {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(10));
         app.poll_background_tasks();
-        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action {
-            if !state.loading {
-                break;
-            }
+        if let Some(PendingAction::DiffMatrix(state)) = &app.pending_action
+            && !state.loading
+        {
+            break;
         }
     }
 
@@ -8529,7 +8525,7 @@ fn cheatsheet_search_filters_within_context_entries() {
             assert_eq!(search.buffer, "can");
             let filtered =
                 filter_custom_help_entries(custom_entries.as_ref().unwrap(), &search.buffer);
-            assert!(filtered.len() >= 1);
+            assert!(!filtered.is_empty());
             assert!(filtered.iter().any(|e| e.line.description.contains("取消")));
         }
         other => panic!("unexpected action: {other:?}"),

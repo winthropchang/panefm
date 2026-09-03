@@ -8,7 +8,7 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::Duration,
 };
@@ -165,14 +165,14 @@ impl FilesystemWatcher {
 
 /// 判斷路徑是否很可能位於網路 share，這類位置需要輪詢補足不可靠的原生事件。
 ///
-/// 參數：`path: &PathBuf`，目前 panel 的實際本機或掛載路徑。
+/// 參數：`path: &Path`，目前 panel 的實際本機或掛載路徑。
 /// 回傳：`bool`；Windows UNC 與 macOS `/Volumes` 掛載位置回傳 `true`。其他平台暫時
 /// 回傳 `false`，未來支援 Linux 時可只在此擴充 mount 判斷，不必修改 watcher 主流程。
-fn is_likely_network_path(path: &PathBuf) -> bool {
+fn is_likely_network_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let text = path.to_string_lossy();
-        return text.starts_with(r"\\") || text.starts_with("//");
+        text.starts_with(r"\\") || text.starts_with("//")
     }
     #[cfg(target_os = "macos")]
     {
@@ -254,6 +254,6 @@ mod tests {
     /// 使用者仍會感覺 TUI 卡住；本測試固定一般本機路徑只能使用原生 watcher。
     fn local_directory_does_not_require_polling_fallback() {
         let directory = tempdir().expect("tempdir");
-        assert!(!is_likely_network_path(&directory.path().to_path_buf()));
+        assert!(!is_likely_network_path(directory.path()));
     }
 }

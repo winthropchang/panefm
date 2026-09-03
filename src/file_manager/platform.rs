@@ -133,6 +133,7 @@ fn new_terminal_spec_for_platform_with_env(
 }
 
 /// 依平台、終端識別變數及各終端旗標建立新終端規格。
+#[allow(clippy::too_many_arguments)]
 fn new_terminal_spec_for_platform_with_env_flags(
     path: &Path,
     platform: PlatformKind,
@@ -220,10 +221,10 @@ fn new_terminal_spec_for_platform_with_env_flags(
 
 /// 尋找系統上可用的 Alacritty 執行檔名稱或路徑。
 fn resolve_alacritty_program(hint_exe: Option<&str>) -> String {
-    if let Some(hint) = hint_exe {
-        if Path::new(hint).exists() {
-            return hint.to_string();
-        }
+    if let Some(hint) = hint_exe
+        && Path::new(hint).exists()
+    {
+        return hint.to_string();
     }
     if let Some(cmd) = crate::file_manager::tools::find_system_command("alacritty") {
         return cmd.to_string_lossy().into_owned();
@@ -243,18 +244,17 @@ fn resolve_wezterm_program(hint_exe: Option<&str>) -> String {
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.to_ascii_lowercase());
-        if file_name.as_deref() == Some("wezterm-gui.exe")
-            || file_name.as_deref() == Some("wezterm-gui")
+        if (file_name.as_deref() == Some("wezterm-gui.exe")
+            || file_name.as_deref() == Some("wezterm-gui"))
+            && let Some(parent) = path.parent()
         {
-            if let Some(parent) = path.parent() {
-                let cli = parent.join("wezterm.exe");
-                if cli.exists() {
-                    return cli.to_string_lossy().into_owned();
-                }
-                let cli_no_ext = parent.join("wezterm");
-                if cli_no_ext.exists() {
-                    return cli_no_ext.to_string_lossy().into_owned();
-                }
+            let cli = parent.join("wezterm.exe");
+            if cli.exists() {
+                return cli.to_string_lossy().into_owned();
+            }
+            let cli_no_ext = parent.join("wezterm");
+            if cli_no_ext.exists() {
+                return cli_no_ext.to_string_lossy().into_owned();
             }
         }
         if path.exists() {

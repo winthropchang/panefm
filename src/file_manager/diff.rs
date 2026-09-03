@@ -517,7 +517,7 @@ pub fn compute_diff_matrix(roots: &[PathBuf]) -> io::Result<Vec<DiffMatrixRow>> 
                 break;
             }
             DiffJobEvent::Error(err) => {
-                return Err(io::Error::new(io::ErrorKind::Other, err));
+                return Err(io::Error::other(err));
             }
             DiffJobEvent::Discovered(_) => {}
         }

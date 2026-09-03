@@ -36,21 +36,21 @@ impl ZoxideTracker {
         #[cfg(test)]
         {
             // App 測試需要立即查詢剛加入的資料；正式版本仍使用下方背景 worker。
-            return Self { sender: None };
+            Self { sender: None }
         }
 
         #[cfg(not(test))]
-        let (sender, receiver) = mpsc::sync_channel::<PathBuf>(64);
-        #[cfg(not(test))]
-        thread::spawn(move || {
-            while let Ok(path) = receiver.recv() {
-                let _ = add_directory_to_zoxide(&path);
+        {
+            let (sender, receiver) = mpsc::sync_channel::<PathBuf>(64);
+            thread::spawn(move || {
+                while let Ok(path) = receiver.recv() {
+                    let _ = add_directory_to_zoxide(&path);
+                }
+            });
+            Self {
+                sender: Some(sender),
             }
-        });
-        #[cfg(not(test))]
-        return Self {
-            sender: Some(sender),
-        };
+        }
     }
 
     /// 非阻塞地排入一個瀏覽過的目錄。
@@ -87,10 +87,10 @@ pub(crate) fn zoxide_data_dir() -> Result<PathBuf> {
         let thread_id = format!("{:?}", std::thread::current().id())
             .replace("ThreadId(", "")
             .replace(')', "");
-        return Ok(std::env::temp_dir()
+        Ok(std::env::temp_dir()
             .join("panefm-tests")
             .join("zoxide")
-            .join(thread_id));
+            .join(thread_id))
     }
 
     #[cfg(not(test))]
@@ -144,10 +144,10 @@ fn add_directory_to_zoxide_with_data_dir(path: &Path, data_dir: &Path) -> Result
     }
 
     let command = zoxide_command()?;
-    fs::create_dir_all(&data_dir).context("create zoxide data directory")?;
+    fs::create_dir_all(data_dir).context("create zoxide data directory")?;
 
     let status = Command::new(command)
-        .env("_ZO_DATA_DIR", &data_dir)
+        .env("_ZO_DATA_DIR", data_dir)
         .arg("add")
         .arg(path)
         .stdout(Stdio::null())
@@ -177,10 +177,10 @@ pub(crate) fn query_zoxide_directories() -> Result<Vec<PathBuf>> {
 /// 用指定資料目錄查詢 zoxide 資料庫，供正式流程與測試共用。
 fn query_zoxide_directories_with_data_dir(data_dir: &Path) -> Result<Vec<PathBuf>> {
     let command = zoxide_command()?;
-    fs::create_dir_all(&data_dir).context("create zoxide data directory")?;
+    fs::create_dir_all(data_dir).context("create zoxide data directory")?;
 
     let output = Command::new(command)
-        .env("_ZO_DATA_DIR", &data_dir)
+        .env("_ZO_DATA_DIR", data_dir)
         .arg("query")
         .arg("--list")
         .output()

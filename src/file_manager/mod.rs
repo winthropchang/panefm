@@ -160,11 +160,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
 
         // 向外層終端（WezTerm, Windows Terminal, Alacritty 等）同步目前 active panel 目錄 (OSC 7)
-        if let Some(active_cwd) = app.active_pane_cwd() {
-            if last_synced_cwd.as_deref() != Some(active_cwd) {
-                let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
-                last_synced_cwd = Some(active_cwd.to_path_buf());
-            }
+        if let Some(active_cwd) = app.active_pane_cwd()
+            && last_synced_cwd.as_deref() != Some(active_cwd)
+        {
+            let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
+            last_synced_cwd = Some(active_cwd.to_path_buf());
         }
 
         if event::poll(poll_rate)?
@@ -374,7 +374,7 @@ fn shell_join_os_args(args: &[std::ffi::OsString]) -> String {
     #[cfg(windows)]
     {
         args.iter()
-            .map(|arg| quote_windows_cmd_arg(arg))
+            .map(quote_windows_cmd_arg)
             .collect::<Vec<_>>()
             .join(" ")
     }

@@ -2273,12 +2273,10 @@ fn preview_directory(entry: &FileEntry, max_lines: usize) -> Vec<Line<'static>> 
     match fs::read_dir(&entry.path) {
         Ok(read_dir) => {
             let mut child_names = Vec::new();
-            for child in read_dir {
-                if let Ok(child) = child {
-                    child_names.push(child.file_name().to_string_lossy().to_string());
-                    if child_names.len() >= remaining {
-                        break;
-                    }
+            for child in read_dir.flatten() {
+                child_names.push(child.file_name().to_string_lossy().to_string());
+                if child_names.len() >= remaining {
+                    break;
                 }
             }
 
@@ -2577,10 +2575,10 @@ fn highlight_preview_line(
         let start = cursor + found;
         let end = start.saturating_add(lower_query.len());
 
-        if let Some(head) = text.get(cursor..start) {
-            if !head.is_empty() {
-                spans.push(Span::styled(head.to_string(), line_style));
-            }
+        if let Some(head) = text.get(cursor..start)
+            && !head.is_empty()
+        {
+            spans.push(Span::styled(head.to_string(), line_style));
         }
 
         if let Some(body) = text.get(start..end) {
@@ -2595,10 +2593,10 @@ fn highlight_preview_line(
         cursor = end;
     }
 
-    if let Some(tail) = text.get(cursor..) {
-        if !tail.is_empty() {
-            spans.push(Span::styled(tail.to_string(), line_style));
-        }
+    if let Some(tail) = text.get(cursor..)
+        && !tail.is_empty()
+    {
+        spans.push(Span::styled(tail.to_string(), line_style));
     }
 
     Line::from(spans)
@@ -4008,10 +4006,10 @@ fn dir_content_size(dir: &Path, total: &mut u64) -> io::Result<()> {
         if let Ok(ft) = entry.file_type() {
             if ft.is_dir() {
                 let _ = dir_content_size(&entry.path(), total);
-            } else if ft.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    *total = total.saturating_add(meta.len());
-                }
+            } else if ft.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                *total = total.saturating_add(meta.len());
             }
         }
     }
@@ -5155,6 +5153,7 @@ mod tests {
                 let running = active_for_copy.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum_for_copy.fetch_max(running, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(15));
+                #[allow(clippy::redundant_closure)]
                 let result = fs::copy(from, to).map(|copied| progress(copied));
                 active_for_copy.fetch_sub(1, Ordering::SeqCst);
                 result
