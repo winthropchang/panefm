@@ -1560,6 +1560,19 @@ impl PaneState {
         move_path_into_dir(source_path, target_dir, false, true)
     }
 
+    #[cfg(test)]
+    /// 以可替換的 rename 函數測試同步 move 在跨裝置時的 copy 降級。
+    pub(crate) fn move_path_to_dir_with_history_using_rename<R>(
+        source_path: &Path,
+        target_dir: &Path,
+        rename_source: R,
+    ) -> io::Result<PasteOutcome>
+    where
+        R: FnOnce(&Path, &Path) -> io::Result<()>,
+    {
+        move_path_into_dir_using_rename(source_path, target_dir, false, true, rename_source)
+    }
+
     /// 依照輸入路徑建立新項目。
     ///
     /// 規則：
@@ -2887,20 +2900,53 @@ where
 /// - `source_path: &Path`，來源檔案或資料夾。
 /// - `target_dir: &Path`，貼上目標資料夾。
 ///
-/// 回傳：`io::Result<String>`，成功時回傳可顯示的名稱。
+/// 將單一路徑移動到目標資料夾，優先嘗試快速的原生 rename；若失敗（例如跨磁碟／跨裝置 EXDEV）
+/// 則自動降級為 copy_path_into_dir 加上刪除來源項目。
 fn move_path_into_dir(
     source_path: &Path,
     target_dir: &Path,
     overwrite: bool,
     retain_backup: bool,
 ) -> io::Result<PasteOutcome> {
-    move_path_into_dir_with_source_rename(
+    move_path_into_dir_using_rename(
         source_path,
         target_dir,
         overwrite,
         retain_backup,
         |source, target| fs::rename(source, target),
     )
+}
+
+/// 使用可替換的 rename 函數實作 move，支援失敗時降級為 copy + delete。
+fn move_path_into_dir_using_rename<R>(
+    source_path: &Path,
+    target_dir: &Path,
+    overwrite: bool,
+    retain_backup: bool,
+    rename_source: R,
+) -> io::Result<PasteOutcome>
+where
+    R: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    match move_path_into_dir_with_source_rename(
+        source_path,
+        target_dir,
+        overwrite,
+        retain_backup,
+        rename_source,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(_rename_error) => {
+            let outcome = copy_path_into_dir(
+                source_path,
+                target_dir,
+                overwrite,
+                retain_backup,
+            )?;
+            remove_existing_target(source_path)?;
+            Ok(outcome)
+        }
+    }
 }
 
 /// 使用可替換的來源 rename 實作 move 的原生快速路徑。
@@ -5023,6 +5069,29 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(fs::read(&outcome.target_path).expect("target"), bytes);
         assert_eq!(completed, bytes.len() as u64);
+    }
+
+    #[test]
+    /// 驗證同步 move 遇到跨裝置錯誤 (os error 18 EXDEV) 時，會降級為 copy 後刪除來源。
+    fn move_path_into_dir_falls_back_to_copy_on_cross_device_error() {
+        let dir = tempdir().expect("tempdir");
+        let source_dir = dir.path().join("source");
+        let target_dir = dir.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source = source_dir.join("payload.zip");
+        let bytes = b"payload bytes for cross device move";
+        fs::write(&source, bytes).expect("source file");
+
+        let outcome = PaneState::move_path_to_dir_with_history_using_rename(
+            &source,
+            &target_dir,
+            |_, _| Err(std::io::Error::from_raw_os_error(18)),
+        )
+        .expect("cross device fallback");
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&outcome.target_path).expect("target"), bytes);
     }
 
     #[test]

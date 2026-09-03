@@ -4,7 +4,10 @@
 //! 歷史目前不寫入磁碟，避免重開程式後對已變動的檔案系統套用過期操作；覆蓋前內容則
 //! 暫存在目標旁的隱藏備份，直到該筆歷史被復原、淘汰或程式正常關閉。
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use super::{pane::remove_undo_backup, trash::TrashStore};
 
@@ -160,7 +163,7 @@ fn undo_copy_item(item: &OperationItem, trash_store: &TrashStore) -> io::Result<
     if let Some(backup) = &item.replaced_backup
         && backup.exists()
     {
-        fs::rename(backup, &item.destination_path)?;
+        move_path_with_fallback(backup, &item.destination_path)?;
     }
     Ok(())
 }
@@ -183,13 +186,43 @@ fn undo_move_item(item: &OperationItem) -> io::Result<()> {
         ));
     }
 
-    fs::rename(&item.destination_path, &item.source_path)?;
+    move_path_with_fallback(&item.destination_path, &item.source_path)?;
     if let Some(backup) = &item.replaced_backup
         && backup.exists()
-        && let Err(error) = fs::rename(backup, &item.destination_path)
+        && let Err(error) = move_path_with_fallback(backup, &item.destination_path)
     {
-        let _ = fs::rename(&item.source_path, &item.destination_path);
+        let _ = move_path_with_fallback(&item.source_path, &item.destination_path);
         return Err(error);
+    }
+    Ok(())
+}
+
+/// 將來源路徑移動到目標路徑，若跨裝置導致 rename 失敗，則退回 copy+delete。
+fn move_path_with_fallback(source: &Path, destination: &Path) -> io::Result<()> {
+    if fs::rename(source, destination).is_ok() {
+        return Ok(());
+    }
+    if source.is_dir() {
+        copy_dir_recursive(source, destination)?;
+        fs::remove_dir_all(source)?;
+    } else {
+        fs::copy(source, destination)?;
+        fs::remove_file(source)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target_item = destination.join(entry.file_name());
+        let item_path = entry.path();
+        if item_path.is_dir() {
+            copy_dir_recursive(&item_path, &target_item)?;
+        } else {
+            fs::copy(&item_path, &target_item)?;
+        }
     }
     Ok(())
 }
@@ -338,6 +371,29 @@ mod tests {
             destination_path: destination.to_path_buf(),
             replaced_backup: None,
         }
+    }
+
+    #[test]
+    /// 驗證 move_path_with_fallback 能正確移動檔案與目錄。
+    fn move_path_with_fallback_moves_files_and_directories() {
+        let dir = tempdir().expect("tempdir");
+        let source_file = dir.path().join("a.txt");
+        let target_file = dir.path().join("b.txt");
+        fs::write(&source_file, "content").expect("write");
+        super::move_path_with_fallback(&source_file, &target_file).expect("move file");
+        assert!(!source_file.exists());
+        assert_eq!(fs::read_to_string(&target_file).expect("read"), "content");
+
+        let source_dir = dir.path().join("folder");
+        let target_dir = dir.path().join("folder2");
+        fs::create_dir(&source_dir).expect("mkdir");
+        fs::write(source_dir.join("sub.txt"), "sub").expect("write sub");
+        super::move_path_with_fallback(&source_dir, &target_dir).expect("move dir");
+        assert!(!source_dir.exists());
+        assert_eq!(
+            fs::read_to_string(target_dir.join("sub.txt")).expect("read sub"),
+            "sub"
+        );
     }
 
     use std::path::PathBuf;

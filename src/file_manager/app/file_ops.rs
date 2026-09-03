@@ -2010,6 +2010,26 @@ impl App {
             return Ok(());
         }
 
+        let clipboard = ClipboardState {
+            operation: ClipboardOperation::Cut,
+            entries: entries
+                .iter()
+                .map(|entry| ClipboardEntry {
+                    source_path: entry.path.clone(),
+                    display_name: entry.display_name(),
+                })
+                .collect(),
+        };
+
+        if paste_should_run_in_background(&clipboard, target_dir) {
+            return self.start_background_paste(
+                self.focused_pane,
+                target_dir.to_path_buf(),
+                clipboard,
+                false,
+            );
+        }
+
         let mut moved_count = 0usize;
         let mut history_items = Vec::new();
         for entry in &entries {

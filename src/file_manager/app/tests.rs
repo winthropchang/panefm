@@ -4602,6 +4602,33 @@ fn app_move_panel_command_moves_selected_entry_to_target_pane_dir() {
 }
 
 #[test]
+/// 驗證 `:move-panel` 移動大檔案或目錄時，會自動交給背景工作處理以避免卡住 TUI。
+fn app_move_panel_command_runs_in_background_when_target_is_external() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("large.zip");
+    fs::File::create(&source_file)
+        .expect("create file")
+        .set_len(BACKGROUND_FILE_JOB_THRESHOLD_BYTES)
+        .expect("set len");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.focus_pane_by_id(1);
+    app.current_pane_mut().expect("pane").reload().expect("reload");
+
+    app.execute_command("move-panel 2").expect("move panel");
+
+    assert!(!app.file_job_receivers.is_empty());
+    assert!(app.task_log.iter().any(|t| t.title.starts_with("move")));
+}
+
+#[test]
 /// 驗證 `:compress` 會把目前選取項目壓成 zip，並把游標帶到新壓縮檔。
 /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
 fn app_compress_command_creates_zip_and_reveals_result() {
