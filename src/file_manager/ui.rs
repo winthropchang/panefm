@@ -1252,20 +1252,32 @@ pub(crate) fn render_sort_picker(frame: &mut ratatui::Frame<'_>, area: Rect, the
     );
 }
 
-/// 在畫面底部繪製 linemode 快捷鍵面板，供 `m` 使用。
+/// 在畫面底部繪製 Move 與 LineMode 快捷鍵面板，供 `m` 使用。
 pub(crate) fn render_linemode_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
     render_shortcut_grid_panel(
         frame,
         area,
         theme,
-        " LineMode ",
+        " Move / LineMode ",
         &[
+            ShortcutPanelItem {
+                shortcut: "m",
+                label: "move to path",
+            },
+            ShortcutPanelItem {
+                shortcut: "p",
+                label: "move to panel",
+            },
+            ShortcutPanelItem {
+                shortcut: "1..9",
+                label: "move to pane <id>",
+            },
             ShortcutPanelItem {
                 shortcut: "s",
                 label: "linemode size",
             },
             ShortcutPanelItem {
-                shortcut: "p",
+                shortcut: "r",
                 label: "linemode permissions",
             },
             ShortcutPanelItem {

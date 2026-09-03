@@ -36,6 +36,7 @@ use super::{
     fuzzy::fuzzy_matched_indices,
     search::GlobalSearchEntry,
     trash::TrashStore,
+    undo_backup::{create_unique_undo_backup_path, is_internal_temporary_name},
 };
 
 /// 產生同一程序內不重複的暫存檔序號，避免同時複製多個項目時互相覆蓋。
@@ -2973,13 +2974,13 @@ where
     let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
 
     let backup_path = (overwrite && target_path.exists())
-        .then(|| unique_transfer_path(&target_path, "undo-backup"));
+        .then(|| create_unique_undo_backup_path(&target_path));
     if let Some(backup_path) = &backup_path {
-        fs::rename(&target_path, backup_path)?;
+        move_path_with_fallback(&target_path, backup_path)?;
     }
     if let Err(error) = rename_source(source_path, &target_path) {
         if let Some(backup_path) = &backup_path {
-            let _ = fs::rename(backup_path, &target_path);
+            let _ = move_path_with_fallback(backup_path, &target_path);
         }
         return Err(error);
     }
@@ -3607,14 +3608,14 @@ fn commit_staged_copy(
 
     let backup_path = target_path
         .exists()
-        .then(|| unique_transfer_path(target_path, "backup"));
+        .then(|| create_unique_undo_backup_path(target_path));
     if let Some(backup_path) = &backup_path {
-        fs::rename(target_path, backup_path)?;
+        move_path_with_fallback(target_path, backup_path)?;
     }
 
     if let Err(error) = fs::rename(staged_path, target_path) {
         if let Some(backup_path) = &backup_path {
-            let _ = fs::rename(backup_path, target_path);
+            let _ = move_path_with_fallback(backup_path, target_path);
         }
         return Err(io::Error::new(
             error.kind(),
@@ -3636,6 +3637,24 @@ fn commit_staged_copy(
 /// 回傳：`io::Result<()>`；路徑不存在時視為已清理完成。
 pub(crate) fn remove_undo_backup(path: &Path) -> io::Result<()> {
     remove_transfer_path(path)
+}
+
+/// 將來源路徑移動到目標路徑，若跨裝置導致 rename 失敗，則退回 copy+delete。
+pub(crate) fn move_path_with_fallback(source: &Path, destination: &Path) -> io::Result<()> {
+    if fs::rename(source, destination).is_ok() {
+        return Ok(());
+    }
+    if source.is_dir() {
+        copy_dir_recursive(source, destination)?;
+        remove_existing_target(source)?;
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        copy_file_and_verify(source, destination)?;
+        remove_existing_target(source)?;
+    }
+    Ok(())
 }
 
 /// 在正式目標旁產生不衝突的隱藏暫存路徑。
@@ -4208,9 +4227,12 @@ where
         }
 
         let item = dir_entry_result?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if is_internal_temporary_name(&name) {
+            continue;
+        }
         let file_type = item.file_type().ok();
         let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
-        let name = item.file_name().to_string_lossy().into_owned();
         let entry_path = item.path();
 
         if !sent_first_chunk {
@@ -4309,7 +4331,11 @@ pub(crate) fn read_dir_entries_with_cancellation(
             "directory load cancelled",
         ));
     }
-    let items = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+    let items = fs::read_dir(path)?
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|entry| !is_internal_temporary_name(&entry.file_name().to_string_lossy()))
+        .collect::<Vec<_>>();
     if cancelled.load(AtomicOrdering::Relaxed) {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,

@@ -2133,12 +2133,22 @@ impl App {
             },
             PendingAction::LineModePicker { pane_id } => match key.code {
                 _ if key_matches_plain_letter(&key, 'm') => {
-                    self.status = String::from("normal mode");
+                    self.clear_pending_count();
+                    self.open_prefilled_command("move ");
+                }
+                _ if key_matches_plain_letter(&key, 'p') => {
+                    self.clear_pending_count();
+                    self.open_prefilled_command("move-panel ");
+                }
+                KeyCode::Char(digit @ '1'..='9') if key.modifiers.is_empty() => {
+                    self.clear_pending_count();
+                    let target_str = digit.to_string();
+                    self.move_selected_to_pane_id(&target_str)?;
                 }
                 _ if key_matches_plain_letter(&key, 's') => {
                     self.apply_line_mode(pane_id, LineMode::Size)?;
                 }
-                _ if key_matches_plain_letter(&key, 'p') => {
+                _ if key_matches_plain_letter(&key, 'r') => {
                     self.apply_line_mode(pane_id, LineMode::Permissions)?;
                 }
                 _ if key_matches_plain_letter(&key, 'b') => {
@@ -2158,7 +2168,7 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::LineModePicker { pane_id });
-                    self.status = String::from("linemode: choose a key from the panel");
+                    self.status = String::from("move / linemode: choose a key from the panel");
                 }
             },
             PendingAction::ThemePicker {

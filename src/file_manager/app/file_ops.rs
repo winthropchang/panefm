@@ -1175,6 +1175,13 @@ impl App {
         match self.trash_store.delete_many_by_ids(target_ids) {
             Ok(deleted_names) => {
                 let _ = self.reopen_trash_panel_after_mutation(pane_id, search, selected);
+                let remaining_trash = self.trash_store.list_entries().map(|e| e.len()).unwrap_or(0);
+                if remaining_trash == 0 {
+                    let _ = crate::file_manager::undo_backup::clear_undo_backup_dir();
+                } else {
+                    let _ = crate::file_manager::undo_backup::sync_delete_from_undo_backup(&deleted_names);
+                }
+
                 if deleted_names.is_empty() {
                     self.status = format!("trash item no longer exists: {target_name}");
                 } else if entry_count <= 1 {

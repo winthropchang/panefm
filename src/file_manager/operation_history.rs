@@ -4,12 +4,12 @@
 //! 歷史目前不寫入磁碟，避免重開程式後對已變動的檔案系統套用過期操作；覆蓋前內容則
 //! 暫存在目標旁的隱藏備份，直到該筆歷史被復原、淘汰或程式正常關閉。
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::{io, path::PathBuf};
 
-use super::{pane::remove_undo_backup, trash::TrashStore};
+use super::{
+    pane::{move_path_with_fallback, remove_undo_backup},
+    trash::TrashStore,
+};
 
 /// PaneFM 預設保留的批次操作數量，避免覆蓋備份無限制占用磁碟。
 pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 20;
@@ -197,35 +197,6 @@ fn undo_move_item(item: &OperationItem) -> io::Result<()> {
     Ok(())
 }
 
-/// 將來源路徑移動到目標路徑，若跨裝置導致 rename 失敗，則退回 copy+delete。
-fn move_path_with_fallback(source: &Path, destination: &Path) -> io::Result<()> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
-    }
-    if source.is_dir() {
-        copy_dir_recursive(source, destination)?;
-        fs::remove_dir_all(source)?;
-    } else {
-        fs::copy(source, destination)?;
-        fs::remove_file(source)?;
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let target_item = destination.join(entry.file_name());
-        let item_path = entry.path();
-        if item_path.is_dir() {
-            copy_dir_recursive(&item_path, &target_item)?;
-        } else {
-            fs::copy(&item_path, &target_item)?;
-        }
-    }
-    Ok(())
-}
 
 /// 清理由已淘汰歷史持有的覆蓋備份；清理失敗不應阻止主程式關閉。
 fn cleanup_operation_backups(operation: &FileOperation) {

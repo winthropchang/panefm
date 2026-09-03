@@ -2050,23 +2050,84 @@ fn app_linemode_picker_ignores_unknown_keys() {
         app.pending_action,
         Some(PendingAction::LineModePicker { pane_id: 1 })
     );
-    assert_eq!(app.status, "linemode: choose a key from the panel");
+    assert_eq!(app.status, "move / linemode: choose a key from the panel");
 }
 
 #[test]
-/// 驗證 linemode 面板打開後，再按一次 `m` 會直接關閉。
-/// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
-fn app_linemode_picker_m_toggles_closed() {
+/// 驗證 Move / LineMode 面板打開後，按 `m` 會開啟預填 `:move ` 的命令列。
+fn app_move_shortcut_mm_opens_move_command() {
     let dir = tempdir().expect("tempdir");
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
 
     app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
-        .expect("open linemode");
+        .expect("open move linemode");
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
-        .expect("toggle close linemode");
+        .expect("trigger move command");
 
     assert!(app.pending_action.is_none());
-    assert_eq!(app.status, "normal mode");
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "move ");
+}
+
+#[test]
+/// 驗證 Move / LineMode 面板打開後，按 `p` 會開啟預填 `:move-panel ` 的命令列。
+fn app_move_shortcut_mp_opens_move_panel_command() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+        .expect("open move linemode");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        .expect("trigger move-panel command");
+
+    assert!(app.pending_action.is_none());
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "move-panel ");
+}
+
+#[test]
+/// 驗證 Move / LineMode 面板打開後，按數字 `2` 會直接將檔案搬移到 Pane 2。
+fn app_move_shortcut_digit_moves_directly_to_target_pane() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("sample.txt");
+    fs::write(&source_file, "move sample").expect("write");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.focus_pane_by_id(1);
+    app.current_pane_mut().expect("pane").reload().expect("reload");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+        .expect("open move linemode");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .expect("trigger move to pane 2");
+
+    assert!(app.pending_action.is_none());
+    assert!(!source_file.exists());
+    assert!(target_dir.join("sample.txt").exists());
+    assert_eq!(app.status, format!("moved 1 item -> {}", target_dir.display()));
+}
+
+#[test]
+/// 驗證 Move / LineMode 面板打開後，按 `r` 會套用 permissions 欄位顯示。
+fn app_linemode_shortcut_mr_applies_permissions() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+        .expect("open move linemode");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+        .expect("apply permissions linemode");
+
+    let pane = app.panes.get(&1).expect("pane");
+    assert_eq!(pane.line_mode, Some(LineMode::Permissions));
+    assert_eq!(app.status, "linemode: permissions");
 }
 
 #[test]
@@ -2188,7 +2249,7 @@ fn app_help_panel_restores_pending_linemode_picker() {
         app.pending_action,
         Some(PendingAction::LineModePicker { pane_id: 1 })
     );
-    assert_eq!(app.status, "linemode: choose a key from the panel");
+    assert_eq!(app.status, "move / linemode: choose a key from the panel");
 }
 
 #[test]
@@ -4365,6 +4426,118 @@ fn app_undo_overwrite_paste_restores_previous_target() {
         "old"
     );
     assert_eq!(app.status, "undid copy: 1 items");
+}
+
+#[test]
+/// 驗證覆蓋貼上時，備份會存到專屬的 undoBackup 目錄，而不會留在專案目標目錄中。
+fn app_overwrite_paste_places_backup_in_undo_backup_dir_and_restores() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    fs::write(source_dir.join("Logo.png"), "new logo").expect("new source");
+    let target_file = target_dir.join("Logo.png");
+    fs::write(&target_file, "old logo").expect("old target");
+
+    let mut app = App::new(source_dir, default_loaded_config()).expect("app");
+    app.copy_selected();
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut().expect("pane").reload().expect("reload");
+
+    app.paste_into_focused_pane_with_overwrite()
+        .expect("overwrite paste");
+
+    // 驗證目標專案目錄內絕對沒有殘留任何 .backup 或 undo-backup 項目
+    let target_entries: Vec<_> = fs::read_dir(&target_dir)
+        .expect("read target")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(target_entries, vec!["Logo.png"]);
+
+    // 驗證內容已覆蓋成新檔
+    assert_eq!(
+        fs::read_to_string(&target_file).expect("new target content"),
+        "new logo"
+    );
+
+    // 驗證執行檔旁的 undoBackup 目錄中有備份檔案
+    let backup_dir = crate::file_manager::undo_backup::resolve_undo_backup_dir();
+    assert!(backup_dir.exists());
+    let backup_entries: Vec<_> = fs::read_dir(&backup_dir)
+        .expect("read backup dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("Logo.png-"))
+        .collect();
+    assert_eq!(backup_entries.len(), 1);
+
+    // 執行 Undo，驗證檔案還原成舊檔，且 undoBackup 中的備份已被移除
+    app.undo_latest_file_operation().expect("undo overwrite");
+    assert_eq!(
+        fs::read_to_string(&target_file).expect("restored old logo"),
+        "old logo"
+    );
+    assert!(!backup_dir.join(&backup_entries[0]).exists());
+}
+
+#[test]
+/// 驗證在 Trash 面板中永久刪除單一檔案時，會同步刪除 undoBackup 下對應的備份。
+fn app_trash_delete_permanently_syncs_with_undo_backup() {
+    let dir = tempdir().expect("tempdir");
+    let backup_dir = crate::file_manager::undo_backup::resolve_undo_backup_dir();
+    fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+    let backup_file = backup_dir.join(format!("Icon.png-{}-1.backup", std::process::id()));
+    fs::write(&backup_file, "backup bytes").expect("write backup");
+    assert!(backup_file.exists());
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    let test_file = dir.path().join("Icon.png");
+    fs::write(&test_file, "trashed bytes").expect("write test file");
+    app.trash_store.trash_path(&test_file, "Icon.png").expect("trash file");
+
+    let entries = app.trash_store.list_entries().expect("list");
+    assert_eq!(entries.len(), 1);
+    let target_id = entries[0].id.clone();
+
+    // 在 Trash 面板中永久刪除該項目
+    app.delete_trash_ids_in_panel(
+        1,
+        &[target_id],
+        PanelSearchState::default(),
+        0,
+        "Icon.png",
+        1,
+    )
+    .expect("delete in panel");
+
+    // 驗證 Trash 已清空，且 undoBackup 下的 Icon.png 備份也被同步刪除
+    assert_eq!(app.trash_store.list_entries().expect("list").len(), 0);
+    assert!(!backup_file.exists());
+}
+
+#[test]
+/// 驗證目錄讀取時即使開啟 show_hidden 也會自動過濾掉 .panefm-transfer-* 暫存檔案。
+fn app_directory_listing_ignores_internal_temporary_files() {
+    let dir = tempdir().expect("tempdir");
+    let test_dir = dir.path().join("project");
+    fs::create_dir(&test_dir).expect("create dir");
+
+    fs::write(test_dir.join("regular.txt"), "regular").expect("write regular");
+    fs::write(test_dir.join(".dotfile"), "dotfile").expect("write dotfile");
+    fs::write(test_dir.join(".panefm-transfer-999-1.part"), "temp").expect("write temp");
+
+    let mut app = App::new(test_dir, default_loaded_config()).expect("app");
+    let pane = app.current_pane_mut().expect("pane");
+    pane.set_show_hidden(true);
+    pane.reload().expect("reload");
+
+    let names: Vec<_> = pane.entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"regular.txt"));
+    assert!(names.contains(&".dotfile"));
+    assert!(!names.contains(&".panefm-transfer-999-1.part"));
 }
 
 #[test]

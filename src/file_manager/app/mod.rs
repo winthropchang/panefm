@@ -698,6 +698,7 @@ impl App {
             &base_dir
         };
         let trash_store = TrashStore::new(app_base)?;
+        let _ = crate::file_manager::undo_backup::resolve_undo_backup_dir();
         let config_source = source
             .clone()
             .unwrap_or_else(|| app_base.join("config.toml"));
@@ -3925,15 +3926,21 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":move <path>",
-            "",
+            "mm",
             "直接把目前選取或標記的項目移動到指定目錄",
             HelpAction::Command("move "),
         ),
         help_entry(
             ":move-panel",
-            "",
+            "mp / m1..9",
             "把目前選取或標記的項目移動到指定 panel 編號目前所在的目錄",
             HelpAction::Command("move-panel "),
+        ),
+        help_entry(
+            ":linemode",
+            "m",
+            "打開 Move / LineMode 功能面板，支援搬移與檔案欄位顯示設定",
+            HelpAction::Command("linemode"),
         ),
         help_entry(
             ":panel <id>",
@@ -5201,8 +5208,26 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
             ],
         ),
         ContextHelpKind::LineModePicker => (
-            String::from("Cheatsheet: Linemode (欄位顯示)"),
+            String::from("Cheatsheet: Move / Linemode (搬移與欄位顯示)"),
             vec![
+                help_entry(
+                    "move to path",
+                    "m",
+                    "開啟 :move 目錄搬移命令列",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "move to panel",
+                    "p",
+                    "開啟 :move-panel 編號搬移命令列",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "move to pane",
+                    "1..9",
+                    "直接將選取項目搬移到指定 Panel",
+                    HelpAction::QuitHint,
+                ),
                 help_entry(
                     "size",
                     "s",
@@ -5211,7 +5236,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 ),
                 help_entry(
                     "perms",
-                    "p",
+                    "r",
                     "右側欄位顯示檔案權限 (Permissions)",
                     HelpAction::QuitHint,
                 ),
@@ -5223,7 +5248,7 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 ),
                 help_entry(
                     "mtime",
-                    "t / m",
+                    "t",
                     "右側欄位顯示修改時間 (Modified Time)",
                     HelpAction::QuitHint,
                 ),
@@ -5235,8 +5260,8 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 ),
                 help_entry(
                     "cancel",
-                    "Esc / q / m",
-                    "取消退出欄位選單",
+                    "Esc / q / h",
+                    "取消退出選單",
                     HelpAction::QuitHint,
                 ),
             ],

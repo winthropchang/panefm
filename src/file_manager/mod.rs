@@ -28,6 +28,7 @@ pub(crate) mod task_history;
 pub(crate) mod tools;
 pub(crate) mod trash;
 pub(crate) mod ui;
+pub(crate) mod undo_backup;
 pub(crate) mod zoxide;
 
 use std::io::{self, BufRead, BufReader, Stdout, Write};

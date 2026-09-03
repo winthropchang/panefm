@@ -583,12 +583,12 @@ impl App {
         self.status = String::from("panel: choose h/j/k/l/c/o/t/d from the panel");
     }
 
-    /// 打開底部 linemode 面板，等待使用者輸入右側欄位顯示模式。
+    /// 打開底部 Move / LineMode 面板，等待使用者輸入搬移或欄位顯示模式。
     pub(crate) fn open_linemode_picker(&mut self) {
         self.pending_action = Some(PendingAction::LineModePicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("linemode: choose a key from the panel");
+        self.status = String::from("move / linemode: choose a key from the panel");
     }
 
     /// 打開書籤功能面板，列出目前可用的書籤操作。
@@ -1213,7 +1213,7 @@ impl App {
                 String::from("panel: choose h/j/k/l/c/o/t/d from the panel")
             }
             PendingAction::LineModePicker { .. } => {
-                String::from("linemode: choose a key from the panel")
+                String::from("move / linemode: choose a key from the panel")
             }
             PendingAction::ThemePicker { selected, .. } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
