@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use super::smb::percent_decode;
+use super::smb::{parse_smb_location, percent_decode};
 
 /// 描述書籤實際指向的目標類型，可能是本機路徑，也可能是遠端 SMB 位址。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +248,12 @@ fn parse_bookmark_target(raw: &str) -> Result<BookmarkTarget> {
 
     if trimmed.starts_with("smb://") {
         Ok(BookmarkTarget::SmbLocation(trimmed.to_string()))
+    } else if trimmed.starts_with("//") || trimmed.starts_with(r"\\") {
+        if let Ok(location) = parse_smb_location(trimmed) {
+            Ok(BookmarkTarget::SmbLocation(location.url))
+        } else {
+            Ok(BookmarkTarget::LocalPath(PathBuf::from(trimmed)))
+        }
     } else {
         Ok(BookmarkTarget::LocalPath(PathBuf::from(trimmed)))
     }
@@ -426,5 +432,22 @@ mod tests {
 
         assert!(store.list().is_empty());
         assert_eq!(store.next_available_key(), Some('a'));
+    }
+
+    #[test]
+    /// 驗證在 bookmark.toml 設定 UNC 格式時，能自動轉化並識別為 SMB 目標。
+    fn unc_bookmark_parses_to_smb_location() {
+        let target = parse_bookmark_target("//192.0.2.10/shared/docs").expect("parse unc");
+        assert_eq!(
+            target,
+            BookmarkTarget::SmbLocation(String::from("smb://192.0.2.10/shared/docs"))
+        );
+
+        let backslash_target =
+            parse_bookmark_target(r"\\192.0.2.10\shared\docs").expect("parse backslash");
+        assert_eq!(
+            backslash_target,
+            BookmarkTarget::SmbLocation(String::from("smb://192.0.2.10/shared/docs"))
+        );
     }
 }

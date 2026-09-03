@@ -32,17 +32,30 @@ pub(crate) enum ResolvedSmbLocation {
     },
 }
 
-/// 解析 `smb://host/share/path` 這類字串，整理出 host、share 與子路徑。
+/// 解析 `smb://host/share/path`、`//host/share/path` 或 `\\host\share\path` 這類字串，
+/// 整理出 host、share 與子路徑，並將 UNC 格式正規化為標準 `smb://` 格式。
 pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
     let trimmed = input.trim();
-    let Some(rest) = trimmed.strip_prefix("smb://") else {
+    let (rest, was_unc) = if let Some(rest) = trimmed.strip_prefix("smb://") {
+        (rest, false)
+    } else if let Some(rest) = trimmed.strip_prefix("//") {
+        (rest, true)
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\") {
+        (rest, true)
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "SMB location must start with smb://",
+            "SMB location must start with smb://, //, or \\\\",
         ));
     };
 
-    let mut segments = rest.split('/');
+    let normalized = if was_unc {
+        rest.replace('\\', "/")
+    } else {
+        rest.to_string()
+    };
+
+    let mut segments = normalized.split('/').filter(|s| !s.is_empty());
     let host = segments.next().unwrap_or_default().trim();
     let share = segments.next().unwrap_or_default().trim();
     if host.is_empty() || share.is_empty() {
@@ -54,15 +67,29 @@ pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
 
     let decoded_share = percent_decode(share)?;
     let mut subpath = PathBuf::new();
+    let mut subpath_segments = Vec::new();
     for segment in segments {
-        if segment.is_empty() {
+        let trimmed_seg = segment.trim();
+        if trimmed_seg.is_empty() {
             continue;
         }
-        subpath.push(percent_decode(segment)?);
+        subpath.push(percent_decode(trimmed_seg)?);
+        subpath_segments.push(trimmed_seg);
     }
 
+    let url = if was_unc {
+        let mut canonical = format!("smb://{host}/{share}");
+        for seg in subpath_segments {
+            canonical.push('/');
+            canonical.push_str(seg);
+        }
+        canonical
+    } else {
+        trimmed.to_string()
+    };
+
     Ok(SmbLocation {
-        url: trimmed.to_string(),
+        url,
         host: percent_decode(host)?,
         share: decoded_share,
         subpath,
@@ -390,6 +417,44 @@ mod tests {
         assert_eq!(
             decode_mount_field("/Volumes/Company\\040Share"),
             "/Volumes/Company Share"
+        );
+    }
+
+    #[test]
+    /// 驗證 UNC 正斜線格式 `//host/share[/path]` 能正確解析並轉為標準 `smb://` URL。
+    fn parse_smb_location_extracts_unc_forward_slashes() {
+        let root = parse_smb_location("//192.168.0.141/mingfong/").expect("parse root");
+        assert_eq!(root.host, "192.168.0.141");
+        assert_eq!(root.share, "mingfong");
+        assert_eq!(root.subpath, PathBuf::new());
+        assert_eq!(root.url, "smb://192.168.0.141/mingfong");
+
+        let nested =
+            parse_smb_location("//192.168.0.141/mingfong/docs/report.txt").expect("parse nested");
+        assert_eq!(nested.host, "192.168.0.141");
+        assert_eq!(nested.share, "mingfong");
+        assert_eq!(nested.subpath, Path::new("docs").join("report.txt"));
+        assert_eq!(nested.url, "smb://192.168.0.141/mingfong/docs/report.txt");
+    }
+
+    #[test]
+    /// 驗證 Windows UNC 反斜線格式 `\\host\share\path` 能正確解析並轉為標準 `smb://` URL。
+    fn parse_smb_location_extracts_unc_backslashes() {
+        let location =
+            parse_smb_location(r"\\192.168.0.141\mingfong\docs\report.txt").expect("parse");
+        assert_eq!(location.host, "192.168.0.141");
+        assert_eq!(location.share, "mingfong");
+        assert_eq!(location.subpath, Path::new("docs").join("report.txt"));
+        assert_eq!(location.url, "smb://192.168.0.141/mingfong/docs/report.txt");
+    }
+
+    #[test]
+    /// 驗證缺少 share 名稱的 UNC 路徑會被拒絕。
+    fn parse_smb_location_requires_share_name_for_unc() {
+        let error = parse_smb_location("//192.168.0.141").expect_err("missing share");
+        assert_eq!(
+            error.to_string(),
+            "SMB 位址格式錯誤：請使用 goto smb://host/share[/path]，不能只有 IP 或主機名稱"
         );
     }
 }

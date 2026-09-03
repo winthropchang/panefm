@@ -4706,6 +4706,78 @@ fn app_goto_smb_location_requests_mount_when_share_missing() {
 }
 
 #[test]
+/// 驗證 UNC 正斜線格式 `//host/share/path` 在已掛載時可直接切入 pane。
+fn app_goto_smb_location_with_unc_forward_slash_enters_mounted_share() {
+    let dir = tempdir().expect("tempdir");
+    let mount_root = dir.path().join("mounts");
+    let share_root = mount_root.join("shared");
+    fs::create_dir_all(share_root.join("docs")).expect("share docs");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.goto_smb_location_with_mount_root("//192.0.2.10/shared/docs", &mount_root)
+        .expect("goto unc forward slash");
+
+    let pane = app.current_pane_mut().expect("pane");
+    assert_eq!(pane.cwd, share_root.join("docs"));
+    assert_eq!(app.status, "jumped to smb: smb://192.0.2.10/shared/docs");
+}
+
+#[test]
+/// 驗證 Windows UNC 反斜線格式 `\\host\share\path` 在已掛載時可直接切入 pane。
+fn app_goto_smb_location_with_unc_backslash_enters_mounted_share() {
+    let dir = tempdir().expect("tempdir");
+    let mount_root = dir.path().join("mounts");
+    let share_root = mount_root.join("shared");
+    fs::create_dir_all(share_root.join("docs")).expect("share docs");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.goto_smb_location_with_mount_root(r"\\192.0.2.10\shared\docs", &mount_root)
+        .expect("goto unc backslash");
+
+    let pane = app.current_pane_mut().expect("pane");
+    assert_eq!(pane.cwd, share_root.join("docs"));
+    assert_eq!(app.status, "jumped to smb: smb://192.0.2.10/shared/docs");
+}
+
+#[test]
+/// 驗證 UNC 格式在尚未掛載時亦能正確轉為 `smb://` 併發出系統掛載請求。
+fn app_goto_smb_location_with_unc_requests_mount_when_share_missing() {
+    let dir = tempdir().expect("tempdir");
+    let mount_root = dir.path().join("mounts");
+    fs::create_dir_all(&mount_root).expect("mount root");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.goto_smb_location_with_mount_root("//192.0.2.10/shared/docs", &mount_root)
+        .expect("goto unc");
+
+    assert!(app.pending_launch.is_some());
+    assert_eq!(
+        app.status,
+        format!(
+            "已請求系統掛載 SMB：smb://192.0.2.10/shared/docs；若系統連線失敗，請檢查主機、share 名稱、網路與權限，成功後再重試。預期掛載位置：{}",
+            mount_root.join("shared").join("docs").display()
+        )
+    );
+}
+
+#[test]
+/// 驗證在 macOS 模式下，直接以 UNC 路徑呼叫 command 跳轉會自動進入 SMB 掛載與跳轉機制。
+fn app_change_directory_from_command_as_macos_routes_unc_to_smb() {
+    let dir = tempdir().expect("tempdir");
+    let mount_root = dir.path().join("mounts");
+    let share_root = mount_root.join("shared");
+    fs::create_dir_all(share_root.join("docs")).expect("share docs");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.change_directory_from_command_as_macos("//192.0.2.10/shared/docs", &mount_root)
+        .expect("goto unc as macos");
+
+    let pane = app.current_pane_mut().expect("pane");
+    assert_eq!(pane.cwd, share_root.join("docs"));
+    assert_eq!(app.status, "jumped to smb: smb://192.0.2.10/shared/docs");
+}
+
+#[test]
 /// 驗證 `:move-panel <id>` 若指定不存在的 pane，會提示目前可用的 pane 編號。
 /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
 fn app_move_panel_command_reports_available_panes_for_unknown_target() {

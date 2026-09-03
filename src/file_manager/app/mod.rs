@@ -1731,7 +1731,8 @@ pub(crate) fn looks_like_navigation_path(input: &str) -> bool {
             || trimmed.starts_with("../")
             || trimmed.starts_with("..\\")
             || is_windows_drive_path(trimmed)
-            || is_unc_path(trimmed))
+            || is_unc_path(trimmed)
+            || trimmed.starts_with("smb://"))
 }
 
 /// 判斷字串是否為 Windows 磁碟機開頭的絕對路徑，例如 `C:/work` 或 `D:\\repo`。
@@ -3763,7 +3764,7 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":goto <path>",
             "gt",
-            "讓目前 panel 直接跳到指定路徑，支援相對路徑、絕對路徑、Windows 磁碟機路徑與 smb:// share",
+            "讓目前 panel 直接跳到指定路徑，支援相對路徑、絕對路徑、Windows 磁碟機路徑、UNC (// 或 \\\\) 與 smb:// share",
             HelpAction::Command("goto "),
         ),
         help_entry(

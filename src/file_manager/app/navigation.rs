@@ -213,8 +213,14 @@ impl App {
     /// 回傳：`io::Result<()>`。
     /// - 成功時代表目前 pane 已切到指定目錄，或定位到指定檔案。
     pub(crate) fn change_directory_from_command(&mut self, target: &str) -> io::Result<()> {
-        if target.trim_start().starts_with("smb://") {
-            return self.goto_smb_location(target.trim());
+        let trimmed = target.trim();
+        if trimmed.starts_with("smb://") {
+            return self.goto_smb_location(trimmed);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        if is_unc_path(trimmed) {
+            return self.goto_smb_location(trimmed);
         }
 
         let Some(target_path) = self.resolve_path_argument(target) else {
@@ -222,7 +228,7 @@ impl App {
             return Ok(());
         };
 
-        if is_unc_path(target.trim()) {
+        if is_unc_path(trimmed) {
             return self.start_network_goto(target_path);
         }
 
@@ -235,6 +241,20 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    /// 在測試環境下模擬 macOS 的 command 跳轉行為，驗證 UNC 路徑會被自動導向 SMB 掛載機制。
+    pub(crate) fn change_directory_from_command_as_macos(
+        &mut self,
+        target: &str,
+        mount_root: &std::path::Path,
+    ) -> io::Result<()> {
+        let trimmed = target.trim();
+        if trimmed.starts_with("smb://") || is_unc_path(trimmed) {
+            return self.goto_smb_location_with_mount_root(trimmed, mount_root);
+        }
+        self.change_directory_from_command(target)
     }
 
     /// 讓目前焦點 pane 依 `goto smb://...` 進入指定的 SMB share；若尚未掛載則先請求系統掛載。
