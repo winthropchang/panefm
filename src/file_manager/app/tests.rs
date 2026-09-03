@@ -2099,9 +2099,15 @@ fn app_move_shortcut_digit_moves_directly_to_target_pane() {
     let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
     app.split_current(SplitDirection::Vertical).expect("split");
     app.current_pane_mut().expect("pane").cwd = target_dir.clone();
-    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
     app.focus_pane_by_id(1);
-    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
 
     app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
         .expect("open move linemode");
@@ -2111,7 +2117,10 @@ fn app_move_shortcut_digit_moves_directly_to_target_pane() {
     assert!(app.pending_action.is_none());
     assert!(!source_file.exists());
     assert!(target_dir.join("sample.txt").exists());
-    assert_eq!(app.status, format!("moved 1 item -> {}", target_dir.display()));
+    assert_eq!(
+        app.status,
+        format!("moved 1 item -> {}", target_dir.display())
+    );
 }
 
 #[test]
@@ -4443,7 +4452,10 @@ fn app_overwrite_paste_places_backup_in_undo_backup_dir_and_restores() {
     let mut app = App::new(source_dir, default_loaded_config()).expect("app");
     app.copy_selected();
     app.current_pane_mut().expect("pane").cwd = target_dir.clone();
-    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
 
     app.paste_into_focused_pane_with_overwrite()
         .expect("overwrite paste");
@@ -4496,7 +4508,9 @@ fn app_trash_delete_permanently_syncs_with_undo_backup() {
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
     let test_file = dir.path().join("Icon.png");
     fs::write(&test_file, "trashed bytes").expect("write test file");
-    app.trash_store.trash_path(&test_file, "Icon.png").expect("trash file");
+    app.trash_store
+        .trash_path(&test_file, "Icon.png")
+        .expect("trash file");
 
     let entries = app.trash_store.list_entries().expect("list");
     assert_eq!(entries.len(), 1);
@@ -4791,9 +4805,15 @@ fn app_move_panel_command_runs_in_background_when_target_is_external() {
     let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
     app.split_current(SplitDirection::Vertical).expect("split");
     app.current_pane_mut().expect("pane").cwd = target_dir.clone();
-    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
     app.focus_pane_by_id(1);
-    app.current_pane_mut().expect("pane").reload().expect("reload");
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
 
     app.execute_command("move-panel 2").expect("move panel");
 

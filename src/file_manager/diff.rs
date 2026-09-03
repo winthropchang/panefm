@@ -24,14 +24,14 @@ use super::open::{LaunchMode, LaunchSpec};
 
 /// 描述單一項目在某個 Panel 中的存在與內容特徵。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DiffEntryState {
+pub enum DiffEntryState {
     Present { size: u64, hash: u64, is_dir: bool },
     Missing,
 }
 
 /// 描述多個 Panel 之間對同一相對路徑的比對結論。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DiffStatus {
+pub enum DiffStatus {
     /// 所有包含此檔案的端點內容完全一致，且所有 Panel 都有此檔案。
     Identical,
     /// 存在於多個端點，但內容或大小有差異。
@@ -44,17 +44,17 @@ pub(crate) enum DiffStatus {
 
 /// 差異矩陣表格中的單一列資料。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiffMatrixRow {
-    pub(crate) relative_path: PathBuf,
-    pub(crate) is_dir: bool,
-    pub(crate) panel_states: Vec<DiffEntryState>,
-    pub(crate) status: DiffStatus,
-    pub(crate) display_size: u64,
+pub struct DiffMatrixRow {
+    pub relative_path: PathBuf,
+    pub is_dir: bool,
+    pub panel_states: Vec<DiffEntryState>,
+    pub status: DiffStatus,
+    pub display_size: u64,
 }
 
 /// 矩陣清單的過濾篩選模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum DiffFilterMode {
+pub enum DiffFilterMode {
     #[default]
     All,
     DiffOnly,
@@ -63,7 +63,7 @@ pub(crate) enum DiffFilterMode {
 }
 
 impl DiffFilterMode {
-    pub(crate) fn next(self) -> Self {
+    pub fn next(self) -> Self {
         match self {
             DiffFilterMode::All => DiffFilterMode::DiffOnly,
             DiffFilterMode::DiffOnly => DiffFilterMode::ExclusiveOnly,
@@ -72,7 +72,7 @@ impl DiffFilterMode {
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             DiffFilterMode::All => "All (全部)",
             DiffFilterMode::DiffOnly => "Diff Only (僅差異/缺失)",
@@ -84,7 +84,7 @@ impl DiffFilterMode {
 
 /// 背景比對工作事件。
 #[derive(Debug)]
-pub(crate) enum DiffJobEvent {
+pub enum DiffJobEvent {
     Discovered(usize),
     Done(Vec<DiffMatrixRow>),
     #[allow(dead_code)]
@@ -93,26 +93,26 @@ pub(crate) enum DiffJobEvent {
 
 /// 全螢幕差異比對工作區狀態。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiffMatrixState {
-    pub(crate) panel_ids: Vec<usize>,
-    pub(crate) panel_roots: Vec<PathBuf>,
-    pub(crate) panel_labels: Vec<String>,
-    pub(crate) rows: Vec<DiffMatrixRow>,
-    pub(crate) filtered_indices: Vec<usize>,
-    pub(crate) selected_index: usize,
-    pub(crate) scroll_offset: usize,
-    pub(crate) filter_mode: DiffFilterMode,
-    pub(crate) search_query: String,
-    pub(crate) search_active: bool,
-    pub(crate) loading: bool,
-    pub(crate) discovered_count: usize,
-    pub(crate) git_ignore: bool,
-    pub(crate) include_hidden: bool,
+pub struct DiffMatrixState {
+    pub panel_ids: Vec<usize>,
+    pub panel_roots: Vec<PathBuf>,
+    pub panel_labels: Vec<String>,
+    pub rows: Vec<DiffMatrixRow>,
+    pub filtered_indices: Vec<usize>,
+    pub selected_index: usize,
+    pub scroll_offset: usize,
+    pub filter_mode: DiffFilterMode,
+    pub search_query: String,
+    pub search_active: bool,
+    pub loading: bool,
+    pub discovered_count: usize,
+    pub git_ignore: bool,
+    pub include_hidden: bool,
 }
 
 impl DiffMatrixState {
     /// 建立新的差異比對狀態（初始化為 loading 狀態）。
-    pub(crate) fn new_loading(
+    pub fn new_loading(
         panel_ids: Vec<usize>,
         panel_roots: Vec<PathBuf>,
         panel_labels: Vec<String>,
@@ -137,12 +137,13 @@ impl DiffMatrixState {
 
     /// 建立同步比對狀態（主要供單元測試使用）。
     #[allow(dead_code)]
-    pub(crate) fn new_sync(
+    pub fn new_sync(
         panel_ids: Vec<usize>,
         panel_roots: Vec<PathBuf>,
         panel_labels: Vec<String>,
     ) -> io::Result<Self> {
-        let rows = compute_diff_matrix(&panel_roots)?;
+        let mut rows = compute_diff_matrix(&panel_roots)?;
+        sort_diff_rows(&mut rows);
         let mut state = Self {
             panel_ids,
             panel_roots,
@@ -164,14 +165,15 @@ impl DiffMatrixState {
     }
 
     /// 套用完成的比對結果。
-    pub(crate) fn set_completed_rows(&mut self, rows: Vec<DiffMatrixRow>) {
+    pub fn set_completed_rows(&mut self, mut rows: Vec<DiffMatrixRow>) {
+        sort_diff_rows(&mut rows);
         self.rows = rows;
         self.loading = false;
         self.refresh_filtered_indices();
     }
 
     /// 依據目前的 filter_mode 與 search_query 重新計算過濾後的列索引。
-    pub(crate) fn refresh_filtered_indices(&mut self) {
+    pub fn refresh_filtered_indices(&mut self) {
         let query = self.search_query.trim().to_lowercase();
         self.filtered_indices = self
             .rows
@@ -209,14 +211,14 @@ impl DiffMatrixState {
     }
 
     /// 向上移動游標。
-    pub(crate) fn move_up(&mut self) {
+    pub fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
         }
     }
 
     /// 向下移動游標。
-    pub(crate) fn move_down(&mut self) {
+    pub fn move_down(&mut self) {
         if !self.filtered_indices.is_empty()
             && self.selected_index + 1 < self.filtered_indices.len()
         {
@@ -225,28 +227,58 @@ impl DiffMatrixState {
     }
 
     /// 移動到開頭。
-    pub(crate) fn move_to_top(&mut self) {
+    pub fn move_to_top(&mut self) {
         self.selected_index = 0;
     }
 
     /// 移動到末尾。
-    pub(crate) fn move_to_bottom(&mut self) {
+    pub fn move_to_bottom(&mut self) {
         if !self.filtered_indices.is_empty() {
             self.selected_index = self.filtered_indices.len() - 1;
         }
     }
 
     /// 切換過濾模式。
-    pub(crate) fn cycle_filter_mode(&mut self) {
+    pub fn cycle_filter_mode(&mut self) {
         self.filter_mode = self.filter_mode.next();
         self.refresh_filtered_indices();
     }
 
     /// 取得目前選取的項目列。
-    pub(crate) fn selected_row(&self) -> Option<&DiffMatrixRow> {
+    pub fn selected_row(&self) -> Option<&DiffMatrixRow> {
         let row_idx = *self.filtered_indices.get(self.selected_index)?;
         self.rows.get(row_idx)
     }
+
+    /// 計算所有「不同」項目的數量（非 Identical 的項目，包含內容差異、單端獨有/新增、部分端點）。
+    pub fn different_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.status != DiffStatus::Identical)
+            .count()
+    }
+
+    /// 計算完全相同（Identical）項目的數量。
+    pub fn identical_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.status == DiffStatus::Identical)
+            .count()
+    }
+}
+
+/// 排序比對項目：所有「不同」（status != Identical）的檔案與目錄排在最前面，
+/// 完全相同（status == Identical）排在後面；同一組內按相對路徑字母排序。
+pub fn sort_diff_rows(rows: &mut [DiffMatrixRow]) {
+    rows.sort_by(|a, b| {
+        let a_diff = a.status != DiffStatus::Identical;
+        let b_diff = b.status != DiffStatus::Identical;
+        match (a_diff, b_diff) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.relative_path.cmp(&b.relative_path),
+        }
+    });
 }
 
 /// 快速計算檔案的取樣特徵雜湊碼。
@@ -293,7 +325,7 @@ fn should_ignore_component(comp: &str) -> bool {
 }
 
 /// 啟動非阻塞背景比對執行緒。
-pub(crate) fn spawn_background_diff(
+pub fn spawn_background_diff(
     roots: Vec<PathBuf>,
     git_ignore: bool,
     include_hidden: bool,
@@ -465,13 +497,14 @@ pub(crate) fn spawn_background_diff(
             });
         }
 
+        sort_diff_rows(&mut rows);
         let _ = sender.send(DiffJobEvent::Done(rows));
     });
 }
 
 /// 同步計算差異矩陣（供單元測試或本機小目錄使用）。
 #[allow(dead_code)]
-pub(crate) fn compute_diff_matrix(roots: &[PathBuf]) -> io::Result<Vec<DiffMatrixRow>> {
+pub fn compute_diff_matrix(roots: &[PathBuf]) -> io::Result<Vec<DiffMatrixRow>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     spawn_background_diff(roots.to_vec(), true, true, cancelled, tx);
@@ -498,10 +531,7 @@ fn is_command_available(cmd: &str) -> bool {
 }
 
 /// 依據比對數量與系統已安裝工具，產生最佳的外部 Diff 檢視命令規格。
-pub(crate) fn launch_content_diff_spec(
-    roots: &[PathBuf],
-    row: &DiffMatrixRow,
-) -> Option<LaunchSpec> {
+pub fn launch_content_diff_spec(roots: &[PathBuf], row: &DiffMatrixRow) -> Option<LaunchSpec> {
     if row.is_dir {
         return None;
     }
@@ -620,139 +650,4 @@ pub(crate) fn launch_content_diff_spec(
         args: vec![String::from("-u"), p1, p2],
         mode: LaunchMode::TerminalBlocking,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn compute_diff_matrix_identifies_identical_modified_and_exclusive() {
-        let dir1 = tempdir().expect("dir1");
-        let dir2 = tempdir().expect("dir2");
-        let dir3 = tempdir().expect("dir3");
-
-        // 1. 完全一致檔案 (在 1, 2, 3 都有且內容相同)
-        fs::write(dir1.path().join("same.txt"), b"hello world").expect("w1");
-        fs::write(dir2.path().join("same.txt"), b"hello world").expect("w2");
-        fs::write(dir3.path().join("same.txt"), b"hello world").expect("w3");
-
-        // 2. 內容不同檔案 (在 1, 2 都有但內容不同)
-        fs::write(dir1.path().join("diff.txt"), b"version A").expect("w1");
-        fs::write(dir2.path().join("diff.txt"), b"version B").expect("w2");
-
-        // 3. 獨有檔案 (僅在 3 有)
-        fs::write(dir3.path().join("only3.txt"), b"exclusive to 3").expect("w3");
-
-        // 4. 子集一致檔案 (在 1, 2 有且內容相同，但 3 沒有)
-        fs::write(dir1.path().join("subset.txt"), b"subset content").expect("w1");
-        fs::write(dir2.path().join("subset.txt"), b"subset content").expect("w2");
-
-        let roots = vec![
-            dir1.path().to_path_buf(),
-            dir2.path().to_path_buf(),
-            dir3.path().to_path_buf(),
-        ];
-
-        let rows = compute_diff_matrix(&roots).expect("matrix");
-        assert_eq!(rows.len(), 4);
-
-        let same_row = rows
-            .iter()
-            .find(|r| r.relative_path == Path::new("same.txt"))
-            .unwrap();
-        assert_eq!(same_row.status, DiffStatus::Identical);
-
-        let diff_row = rows
-            .iter()
-            .find(|r| r.relative_path == Path::new("diff.txt"))
-            .unwrap();
-        assert_eq!(diff_row.status, DiffStatus::Modified);
-
-        let only3_row = rows
-            .iter()
-            .find(|r| r.relative_path == Path::new("only3.txt"))
-            .unwrap();
-        assert_eq!(only3_row.status, DiffStatus::Exclusive { panel_index: 2 });
-
-        let subset_row = rows
-            .iter()
-            .find(|r| r.relative_path == Path::new("subset.txt"))
-            .unwrap();
-        assert_eq!(subset_row.status, DiffStatus::Subset);
-    }
-
-    #[test]
-    fn diff_filter_mode_cycles_and_filters_correctly() {
-        let dir1 = tempdir().expect("dir1");
-        let dir2 = tempdir().expect("dir2");
-
-        fs::write(dir1.path().join("same.txt"), b"same").expect("w1");
-        fs::write(dir2.path().join("same.txt"), b"same").expect("w2");
-
-        fs::write(dir1.path().join("diff.txt"), b"diff1").expect("w1");
-        fs::write(dir2.path().join("diff.txt"), b"diff2").expect("w2");
-
-        fs::write(dir1.path().join("only1.txt"), b"only1").expect("w1");
-
-        let roots = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()];
-        let labels = vec![String::from("Dir1"), String::from("Dir2")];
-        let mut state = DiffMatrixState::new_sync(vec![1, 2], roots, labels).expect("state");
-
-        // All: 3 rows
-        assert_eq!(state.filtered_indices.len(), 3);
-
-        // DiffOnly: 2 rows (diff.txt, only1.txt)
-        state.cycle_filter_mode();
-        assert_eq!(state.filter_mode, DiffFilterMode::DiffOnly);
-        assert_eq!(state.filtered_indices.len(), 2);
-
-        // ExclusiveOnly: 1 row (only1.txt)
-        state.cycle_filter_mode();
-        assert_eq!(state.filter_mode, DiffFilterMode::ExclusiveOnly);
-        assert_eq!(state.filtered_indices.len(), 1);
-
-        // IdenticalOnly: 1 row (same.txt)
-        state.cycle_filter_mode();
-        assert_eq!(state.filter_mode, DiffFilterMode::IdenticalOnly);
-        assert_eq!(state.filtered_indices.len(), 1);
-    }
-
-    #[test]
-    fn launch_content_diff_spec_builds_valid_spec() {
-        let roots = vec![
-            PathBuf::from("/a"),
-            PathBuf::from("/b"),
-            PathBuf::from("/c"),
-        ];
-        let row = DiffMatrixRow {
-            relative_path: PathBuf::from("src/main.rs"),
-            is_dir: false,
-            panel_states: vec![
-                DiffEntryState::Present {
-                    size: 10,
-                    hash: 1,
-                    is_dir: false,
-                },
-                DiffEntryState::Present {
-                    size: 12,
-                    hash: 2,
-                    is_dir: false,
-                },
-                DiffEntryState::Present {
-                    size: 10,
-                    hash: 1,
-                    is_dir: false,
-                },
-            ],
-            status: DiffStatus::Modified,
-            display_size: 12,
-        };
-
-        let spec = launch_content_diff_spec(&roots, &row);
-        assert!(spec.is_some());
-        let spec = spec.unwrap();
-        assert_eq!(spec.mode, LaunchMode::TerminalBlocking);
-    }
 }

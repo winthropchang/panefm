@@ -3074,7 +3074,7 @@ pub(crate) fn render_diff_matrix(
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // 頂部標題與篩選列
+            Constraint::Length(4), // 頂部標題、大綱統計與篩選列
             Constraint::Min(1),    // 中央矩陣表格
             Constraint::Length(1), // 底部快捷鍵提示列
         ])
@@ -3091,9 +3091,9 @@ pub(crate) fn render_diff_matrix(
 
     let header_title = format!(" [Diff Matrix] {} ", roots_title);
     let search_part = if !state.search_query.is_empty() {
-        format!(" | 搜尋: \"{}\"", state.search_query)
+        format!(" │ 搜尋: \"{}\"", state.search_query)
     } else if state.search_active {
-        String::from(" | 搜尋: [/]")
+        String::from(" │ 搜尋: [/]")
     } else {
         String::new()
     };
@@ -3109,15 +3109,54 @@ pub(crate) fn render_diff_matrix(
         "排除"
     };
 
-    let filter_text = format!(
-        " 篩選: [{}] (按 f) | 規則: [.gitignore: {} (按 i)] [隱藏檔: {} (按 .)] [.git: 排除]{} | 共 {} 項 (顯示 {} 項) ",
-        state.filter_mode.label(),
-        gitignore_label,
-        hidden_label,
-        search_part,
-        state.rows.len(),
-        state.filtered_indices.len()
-    );
+    let total_count = state.rows.len();
+    let diff_count = state.different_count();
+    let same_count = state.identical_count();
+
+    let diff_style = if diff_count > 0 {
+        theme.danger_style().add_modifier(Modifier::BOLD)
+    } else {
+        theme.success_style().add_modifier(Modifier::BOLD)
+    };
+    let same_style = theme.success_style().add_modifier(Modifier::BOLD);
+
+    let summary_line = Line::from(vec![
+        Span::styled(
+            " 大綱摘要: ",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("不同 {} 項", diff_count), diff_style),
+        Span::styled(" (內容差異/單端新檔) │ ", theme.muted_style()),
+        Span::styled(format!("相同 {} 項", same_count), same_style),
+        Span::styled(" (完全一致) │ ", theme.muted_style()),
+        Span::styled(format!("總計 {} 項", total_count), theme.accent_style()),
+        Span::styled(
+            format!(" (顯示 {} 項)", state.filtered_indices.len()),
+            theme.muted_style(),
+        ),
+    ]);
+
+    let filter_line = Line::from(vec![
+        Span::styled(" 篩選: ", theme.muted_style()),
+        Span::styled(
+            format!("[{}] (按 f)", state.filter_mode.label()),
+            theme.accent_style(),
+        ),
+        Span::styled(" │ 規則: ", theme.muted_style()),
+        Span::styled(
+            format!("[.gitignore: {} (按 i)]", gitignore_label),
+            theme.muted_style(),
+        ),
+        Span::styled(
+            format!(" [隱藏檔: {} (按 .)]", hidden_label),
+            theme.muted_style(),
+        ),
+        Span::styled(" [.git: 排除]", theme.muted_style()),
+        Span::styled(
+            search_part,
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        ),
+    ]);
 
     let header_block = Block::default()
         .title(Line::from(Span::styled(
@@ -3127,8 +3166,7 @@ pub(crate) fn render_diff_matrix(
         .borders(Borders::ALL)
         .border_style(theme.focused_border_style());
 
-    let header_para = Paragraph::new(Line::from(Span::styled(filter_text, theme.accent_style())))
-        .block(header_block);
+    let header_para = Paragraph::new(vec![summary_line, filter_line]).block(header_block);
     frame.render_widget(header_para, outer[0]);
 
     // 2. 中央矩陣表格 / 載入中狀態

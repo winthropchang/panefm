@@ -2938,12 +2938,7 @@ where
     ) {
         Ok(outcome) => Ok(outcome),
         Err(_rename_error) => {
-            let outcome = copy_path_into_dir(
-                source_path,
-                target_dir,
-                overwrite,
-                retain_backup,
-            )?;
+            let outcome = copy_path_into_dir(source_path, target_dir, overwrite, retain_backup)?;
             remove_existing_target(source_path)?;
             Ok(outcome)
         }
@@ -2973,8 +2968,8 @@ where
     })?;
     let target_path = target_path_for_paste(source_path, target_dir, file_name, overwrite)?;
 
-    let backup_path = (overwrite && target_path.exists())
-        .then(|| create_unique_undo_backup_path(&target_path));
+    let backup_path =
+        (overwrite && target_path.exists()).then(|| create_unique_undo_backup_path(&target_path));
     if let Some(backup_path) = &backup_path {
         move_path_with_fallback(&target_path, backup_path)?;
     }
@@ -5109,12 +5104,11 @@ mod tests {
         let bytes = b"payload bytes for cross device move";
         fs::write(&source, bytes).expect("source file");
 
-        let outcome = PaneState::move_path_to_dir_with_history_using_rename(
-            &source,
-            &target_dir,
-            |_, _| Err(std::io::Error::from_raw_os_error(18)),
-        )
-        .expect("cross device fallback");
+        let outcome =
+            PaneState::move_path_to_dir_with_history_using_rename(&source, &target_dir, |_, _| {
+                Err(std::io::Error::from_raw_os_error(18))
+            })
+            .expect("cross device fallback");
 
         assert!(!source.exists());
         assert_eq!(fs::read(&outcome.target_path).expect("target"), bytes);

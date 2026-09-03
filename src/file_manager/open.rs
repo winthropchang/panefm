@@ -56,21 +56,18 @@ pub(crate) enum OpenPickerAction {
 
 /// 描述真正要交給外部系統執行的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaunchSpec {
-    pub(crate) program: String,
-    pub(crate) args: Vec<String>,
-    pub(crate) mode: LaunchMode,
+pub struct LaunchSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub mode: LaunchMode,
 }
 
 /// 描述外部命令應該如何執行。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LaunchMode {
+pub enum LaunchMode {
     TerminalBlocking,
     Detached,
-    /// Windows 直接建立新 console 子程序，避免 `wt.exe` broker 丟失目前保護權杖。
-    NewTerminal {
-        current_dir: PathBuf,
-    },
+    NewTerminal { current_dir: PathBuf },
 }
 
 /// 建立「在指定目錄開新終端」的跨平台命令。

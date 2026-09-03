@@ -16,7 +16,7 @@ static UNDO_BACKUP_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 ///
 /// 依據規格，優先放置在執行檔同一層的 `undoBackup` 目錄；
 /// 若執行檔目錄唯讀或環境特殊，平滑退回 platform state 或暫存目錄。
-pub(crate) fn resolve_undo_backup_dir() -> PathBuf {
+pub fn resolve_undo_backup_dir() -> PathBuf {
     #[cfg(test)]
     {
         if let Some(custom) = std::env::var_os("PANEFM_UNDO_BACKUP_DIR") {
@@ -62,12 +62,12 @@ pub(crate) fn resolve_undo_backup_dir() -> PathBuf {
 }
 
 /// 在 `undoBackup` 目錄中建立具原始名稱與序號識別的唯一備份路徑。
-pub(crate) fn create_unique_undo_backup_path(target_path: &Path) -> PathBuf {
+pub fn create_unique_undo_backup_path(target_path: &Path) -> PathBuf {
     create_unique_undo_backup_path_in(target_path, &resolve_undo_backup_dir())
 }
 
 /// 在指定備份目錄中建立具原始名稱與序號識別的唯一備份路徑。
-pub(crate) fn create_unique_undo_backup_path_in(target_path: &Path, backup_dir: &Path) -> PathBuf {
+pub fn create_unique_undo_backup_path_in(target_path: &Path, backup_dir: &Path) -> PathBuf {
     let original_name = target_path
         .file_name()
         .map(|name| name.to_string_lossy())
@@ -85,12 +85,12 @@ pub(crate) fn create_unique_undo_backup_path_in(target_path: &Path, backup_dir: 
 }
 
 /// 依據 Trash 永久刪除的檔案名稱，同步刪除 `undoBackup` 目錄下對應的備份檔案或資料夾。
-pub(crate) fn sync_delete_from_undo_backup(target_names: &[String]) -> io::Result<usize> {
+pub fn sync_delete_from_undo_backup(target_names: &[String]) -> io::Result<usize> {
     sync_delete_from_undo_backup_in(target_names, &resolve_undo_backup_dir())
 }
 
 /// 在指定目錄中依據檔案名稱同步刪除對應的備份檔案或資料夾。
-pub(crate) fn sync_delete_from_undo_backup_in(
+pub fn sync_delete_from_undo_backup_in(
     target_names: &[String],
     backup_dir: &Path,
 ) -> io::Result<usize> {
@@ -119,12 +119,12 @@ pub(crate) fn sync_delete_from_undo_backup_in(
 }
 
 /// 清空 `undoBackup` 目錄下的所有備份檔案與資料夾。
-pub(crate) fn clear_undo_backup_dir() -> io::Result<usize> {
+pub fn clear_undo_backup_dir() -> io::Result<usize> {
     clear_undo_backup_dir_in(&resolve_undo_backup_dir())
 }
 
 /// 清空指定備份目錄下的所有備份檔案與資料夾。
-pub(crate) fn clear_undo_backup_dir_in(backup_dir: &Path) -> io::Result<usize> {
+pub fn clear_undo_backup_dir_in(backup_dir: &Path) -> io::Result<usize> {
     if !backup_dir.exists() {
         return Ok(0);
     }
@@ -143,64 +143,6 @@ pub(crate) fn clear_undo_backup_dir_in(backup_dir: &Path) -> io::Result<usize> {
 }
 
 /// 判斷檔名是否屬於 PaneFM 內部的暫存檔案（如寫入時的 `.part` 暫存檔）。
-pub(crate) fn is_internal_temporary_name(name: &str) -> bool {
+pub fn is_internal_temporary_name(name: &str) -> bool {
     name.starts_with(".panefm-transfer-")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn undo_backup_path_generation_and_sync_delete() {
-        let dir = tempdir().expect("tempdir");
-        let backup_dir = dir.path().join("undoBackup");
-        fs::create_dir_all(&backup_dir).expect("create dir");
-
-        let target_file = PathBuf::from("/some/project/LogoIcon.png");
-        let backup_path = create_unique_undo_backup_path_in(&target_file, &backup_dir);
-
-        assert!(backup_path.starts_with(&backup_dir));
-        assert!(
-            backup_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("LogoIcon.png-")
-        );
-
-        fs::write(&backup_path, "old content").expect("write backup");
-        assert!(backup_path.exists());
-
-        // 模擬從 Trash 永久刪除 LogoIcon.png，驗證同步刪除
-        let deleted = sync_delete_from_undo_backup_in(&["LogoIcon.png".to_string()], &backup_dir)
-            .expect("sync delete");
-        assert_eq!(deleted, 1);
-        assert!(!backup_path.exists());
-    }
-
-    #[test]
-    fn clear_undo_backup_dir_removes_all() {
-        let dir = tempdir().expect("tempdir");
-        let backup_dir = dir.path().join("undoBackup");
-        fs::create_dir_all(&backup_dir).expect("create dir");
-
-        let file1 = backup_dir.join("test1-1.backup");
-        let file2 = backup_dir.join("test2-2.backup");
-        fs::write(&file1, "b1").expect("write");
-        fs::write(&file2, "b2").expect("write");
-
-        let cleared = clear_undo_backup_dir_in(&backup_dir).expect("clear");
-        assert_eq!(cleared, 2);
-        assert!(!file1.exists());
-        assert!(!file2.exists());
-    }
-
-    #[test]
-    fn recognizes_internal_temporary_name() {
-        assert!(is_internal_temporary_name(".panefm-transfer-123-1.part"));
-        assert!(!is_internal_temporary_name(".gitignore"));
-        assert!(!is_internal_temporary_name(".DS_Store"));
-    }
 }

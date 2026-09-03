@@ -4,7 +4,7 @@
 //! 模組，避免內部狀態在尚未穩定前成為對外相容性承諾。
 
 pub mod config;
-mod file_manager;
+pub mod file_manager;
 pub mod theme;
 
 use anyhow::Result;

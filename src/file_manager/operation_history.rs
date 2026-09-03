@@ -197,7 +197,6 @@ fn undo_move_item(item: &OperationItem) -> io::Result<()> {
     Ok(())
 }
 
-
 /// 清理由已淘汰歷史持有的覆蓋備份；清理失敗不應阻止主程式關閉。
 fn cleanup_operation_backups(operation: &FileOperation) {
     for backup in operation
