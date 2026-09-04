@@ -1301,6 +1301,34 @@ pub(crate) fn render_linemode_picker(frame: &mut ratatui::Frame<'_>, area: Rect,
     );
 }
 
+/// 在畫面底部繪製 Yank 快捷鍵面板，供 `y` 使用。
+pub(crate) fn render_yank_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Yank ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "y",
+                label: "copy to clipboard",
+            },
+            ShortcutPanelItem {
+                shortcut: "p",
+                label: "copy to panel",
+            },
+            ShortcutPanelItem {
+                shortcut: "1..9",
+                label: "copy to pane <id>",
+            },
+            ShortcutPanelItem {
+                shortcut: "Esc",
+                label: "cancel",
+            },
+        ],
+    );
+}
+
 /// 在畫面中央繪製書籤列表彈窗，供 `:bookmark list` 使用。
 pub(crate) fn render_bookmark_action_picker(
     frame: &mut ratatui::Frame<'_>,

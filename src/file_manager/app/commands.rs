@@ -284,6 +284,18 @@ impl App {
                     self.available_pane_ids_label()
                 );
             }
+            "move-panel" | "move-pane" | "mp" => {
+                self.status = format!(
+                    "usage: move-panel <panel-id>. available: {}",
+                    self.available_pane_ids_label()
+                );
+            }
+            "copy-panel" | "copy-pane" | "cp" => {
+                self.status = format!(
+                    "usage: copy-panel <panel-id>. available: {}",
+                    self.available_pane_ids_label()
+                );
+            }
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
             "diff" | "df" | "d" => self.open_diff_matrix(None)?,
@@ -313,12 +325,24 @@ impl App {
                     .or_else(|| other.strip_prefix("reg "))
                 {
                     self.start_regex_rename_from_command(args)?;
-                } else if let Some(args) = other.strip_prefix("move-panel ") {
+                } else if let Some(args) = other
+                    .strip_prefix("copy-panel ")
+                    .or_else(|| other.strip_prefix("copy-pane "))
+                    .or_else(|| other.strip_prefix("cp "))
+                {
+                    self.copy_selected_to_pane_id(args.trim())?;
+                } else if let Some(args) = other
+                    .strip_prefix("move-panel ")
+                    .or_else(|| other.strip_prefix("move-pane "))
+                    .or_else(|| other.strip_prefix("mp "))
+                {
                     self.move_selected_to_pane_id(args.trim())?;
                 } else if let Some(args) = other.strip_prefix("panel ") {
                     self.focus_pane_by_id_argument(args.trim());
                 } else if let Some(args) = other.strip_prefix("pane ") {
                     self.focus_pane_by_id_argument(args.trim());
+                } else if let Some(path) = other.strip_prefix("copy ") {
+                    self.copy_selected_to_path(path.trim())?;
                 } else if let Some(path) = other.strip_prefix("move ") {
                     self.move_selected_to_path(path.trim())?;
                 } else if let Some(args) = other.strip_prefix("linemode ") {

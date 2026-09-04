@@ -247,6 +247,7 @@ impl App {
                 | PendingAction::SortPicker { .. }
                 | PendingAction::BookmarkPicker { .. }
                 | PendingAction::LineModePicker { .. }
+                | PendingAction::YankPicker { .. }
                 | PendingAction::ThemeCommandPicker { .. }
                 | PendingAction::ThemePicker { .. }
                 | PendingAction::CopyPicker { .. }

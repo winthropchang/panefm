@@ -2154,6 +2154,106 @@ fn app_move_shortcut_digit_moves_directly_to_target_pane() {
 }
 
 #[test]
+/// 驗證 Yank 面板打開後，按 `p` 會開啟預填 `:copy-panel ` 的命令列。
+fn app_copy_shortcut_yp_opens_copy_panel_command() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("open yank picker");
+    assert_eq!(
+        app.pending_action,
+        Some(PendingAction::YankPicker { pane_id: 1 })
+    );
+
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        .expect("trigger copy-panel command");
+
+    assert!(app.pending_action.is_none());
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "copy-panel ");
+}
+
+#[test]
+/// 驗證 Yank 面板打開後，按 `y` (yy) 會將選取項目複製到剪貼簿。
+fn app_copy_shortcut_yy_copies_selected_to_clipboard() {
+    let dir = tempdir().expect("tempdir");
+    let file = dir.path().join("sample.txt");
+    fs::write(&file, "content").expect("write");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("trigger yy");
+
+    assert!(app.pending_action.is_none());
+    assert!(app.clipboard.is_some());
+    let clipboard = app.clipboard.as_ref().unwrap();
+    assert_eq!(clipboard.operation, ClipboardOperation::Copy);
+    assert_eq!(clipboard.entries.len(), 1);
+    assert_eq!(clipboard.entries[0].source_path, file);
+}
+
+#[test]
+/// 驗證 Yank 面板打開後，按數字 `2` 會直接將檔案複製到 Pane 2，且來源檔案依然保留。
+fn app_copy_shortcut_digit_copies_directly_to_target_pane() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("sample.txt");
+    fs::write(&source_file, "copy sample").expect("write");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+    app.focus_pane_by_id(1);
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .expect("trigger copy to pane 2");
+
+    assert!(app.pending_action.is_none());
+    assert!(source_file.exists());
+    assert!(target_dir.join("sample.txt").exists());
+    assert_eq!(
+        app.status,
+        format!("copied 1 item -> {}", target_dir.display())
+    );
+}
+
+#[test]
+/// 驗證 Yank 面板打開後，按 Esc 或 q 可以正常取消並返回 normal mode。
+fn app_copy_shortcut_cancel_returns_to_normal_mode() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("open yank picker");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::YankPicker { .. })
+    ));
+
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("cancel");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "normal mode");
+}
+
+#[test]
 /// 驗證 Move / LineMode 面板打開後，按 `r` 會套用 permissions 欄位顯示。
 fn app_linemode_shortcut_mr_applies_permissions() {
     let dir = tempdir().expect("tempdir");
@@ -3760,7 +3860,9 @@ fn app_copy_and_paste_preserves_source_file() {
 
     let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .expect("copy");
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("copy yy");
 
     assert_eq!(
         app.clipboard.as_ref().map(|entry| entry.operation),
@@ -4675,7 +4777,9 @@ fn app_shift_y_and_shift_x_clear_clipboard_state() {
 
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .expect("copy");
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("copy yy");
     app.handle_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT))
         .expect("clear copied items");
     assert!(app.clipboard.is_none());
@@ -4705,7 +4809,9 @@ fn app_shift_p_pastes_with_overwrite_when_clipboard_exists() {
 
     let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .expect("copy");
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("copy yy");
 
     app.current_pane_mut().expect("pane").cwd = target_dir.clone();
     app.current_pane_mut()
@@ -4849,6 +4955,159 @@ fn app_move_panel_command_runs_in_background_when_target_is_external() {
 
     assert!(!app.file_job_receivers.is_empty());
     assert!(app.task_log.iter().any(|t| t.title.starts_with("move")));
+}
+
+#[test]
+/// 驗證 `:copy-panel <id>` 會把目前選取的檔案複製到指定 pane 的目錄，且來源保留。
+fn app_copy_panel_command_copies_selected_entry_to_target_pane_dir() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("delta.txt");
+    fs::write(&source_file, "hello").expect("file");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+    app.focus_pane_by_id(1);
+
+    app.execute_command("copy-panel 2").expect("copy panel");
+
+    assert!(source_file.exists());
+    assert!(target_dir.join("delta.txt").exists());
+    assert_eq!(
+        app.status,
+        format!("copied 1 item -> {}", target_dir.display())
+    );
+}
+
+#[test]
+/// 驗證 `:copy-panel <id>` 能將所有標記的項目批次複製到目標 pane。
+fn app_copy_panel_command_copies_multiple_marked_entries() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let file1 = source_dir.join("a.txt");
+    let file2 = source_dir.join("b.txt");
+    let file3 = source_dir.join("c.txt");
+    fs::write(&file1, "1").expect("file1");
+    fs::write(&file2, "2").expect("file2");
+    fs::write(&file3, "3").expect("file3");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+    app.focus_pane_by_id(1);
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+
+    // 標記 a.txt 與 b.txt
+    let pane = app.current_pane_mut().expect("pane");
+    pane.marked_paths.insert(file1.clone());
+    pane.marked_paths.insert(file2.clone());
+
+    app.execute_command("copy-panel 2").expect("copy panel");
+
+    assert!(file1.exists());
+    assert!(file2.exists());
+    assert!(file3.exists());
+    assert!(target_dir.join("a.txt").exists());
+    assert!(target_dir.join("b.txt").exists());
+    assert!(!target_dir.join("c.txt").exists());
+    assert_eq!(
+        app.status,
+        format!("copied 2 items -> {}", target_dir.display())
+    );
+}
+
+#[test]
+/// 驗證 `:copy-panel` 複製後按下 `u` (undo) 能自動清理目標 pane 的副本。
+fn app_copy_panel_command_supports_undo() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("delta.txt");
+    fs::write(&source_file, "hello").expect("file");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+    app.focus_pane_by_id(1);
+
+    app.execute_command("copy-panel 2").expect("copy panel");
+    assert!(target_dir.join("delta.txt").exists());
+
+    app.undo_latest_file_operation().expect("undo copy");
+    assert!(!target_dir.join("delta.txt").exists());
+    assert!(source_file.exists());
+    assert_eq!(app.status, "undid copy: 1 items");
+}
+
+#[test]
+/// 驗證 `:copy-panel <id>` 若指定不存在的 pane 或無參數，會提示可用編號與語法。
+fn app_copy_panel_reports_available_panes_on_invalid_id() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+
+    app.execute_command("copy-panel 9").expect("copy panel");
+    assert_eq!(app.status, "unknown panel 9. available: 1, 2");
+
+    app.execute_command("copy-panel").expect("copy panel");
+    assert_eq!(app.status, "usage: copy-panel <panel-id>. available: 1, 2");
+}
+
+#[test]
+/// 驗證 `:copy-panel` 複製大檔案時，會自動交給背景工作處理以避免卡住 TUI。
+fn app_copy_panel_command_runs_in_background_when_target_is_external() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("large.zip");
+    fs::File::create(&source_file)
+        .expect("create file")
+        .set_len(BACKGROUND_FILE_JOB_THRESHOLD_BYTES)
+        .expect("set len");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+    app.focus_pane_by_id(1);
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload");
+
+    app.execute_command("copy-panel 2").expect("copy panel");
+
+    assert!(!app.file_job_receivers.is_empty());
+    assert!(app.task_log.iter().any(|t| t.title.starts_with("copy")));
 }
 
 #[test]
@@ -6536,7 +6795,9 @@ fn app_visual_marked_entries_copy_into_clipboard_as_batch() {
     app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE))
         .expect("commit visual");
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .expect("copy batch");
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("copy batch yy");
 
     let clipboard = app.clipboard.as_ref().expect("clipboard");
     assert_eq!(clipboard.operation, ClipboardOperation::Copy);
@@ -6785,7 +7046,9 @@ fn app_paste_with_conflict_requires_confirmation_before_overwrite() {
 
     let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .expect("copy");
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("copy yy");
 
     app.current_pane_mut().expect("pane").cwd = target_dir.clone();
     app.current_pane_mut()
@@ -6832,7 +7095,9 @@ fn app_paste_with_conflict_can_be_cancelled() {
 
     let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .expect("copy");
+        .expect("open yank picker");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .expect("copy yy");
 
     app.current_pane_mut().expect("pane").cwd = target_dir.clone();
     app.current_pane_mut()

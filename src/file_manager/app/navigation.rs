@@ -591,6 +591,16 @@ impl App {
         self.status = String::from("move / linemode: choose a key from the panel");
     }
 
+    /// 打開底部 Yank 面板，等待使用者選擇複製到剪貼簿或複製到指定視窗。
+    pub(crate) fn open_yank_picker(&mut self) {
+        self.pending_action = Some(PendingAction::YankPicker {
+            pane_id: self.focused_pane,
+        });
+        self.status = String::from(
+            "yank: choose a key from the panel (y: clipboard, p: panel, 1..9: pane id)",
+        );
+    }
+
     /// 打開書籤功能面板，列出目前可用的書籤操作。
     pub(crate) fn open_bookmark_picker(&mut self) {
         self.pending_action = Some(PendingAction::BookmarkPicker {
@@ -1215,6 +1225,9 @@ impl App {
             PendingAction::LineModePicker { .. } => {
                 String::from("move / linemode: choose a key from the panel")
             }
+            PendingAction::YankPicker { .. } => String::from(
+                "yank: choose a key from the panel (y: clipboard, p: panel, 1..9: pane id)",
+            ),
             PendingAction::ThemePicker { selected, .. } => {
                 format!("theme picker: {}", ThemePreset::ALL[*selected].name())
             }

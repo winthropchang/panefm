@@ -79,7 +79,7 @@ use super::{
         render_command_palette, render_confirm_dialog, render_diff_matrix, render_filter_input,
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
-        render_theme_picker, render_trash_confirm_dialog, render_window_picker,
+        render_theme_picker, render_trash_confirm_dialog, render_window_picker, render_yank_picker,
         render_zoxide_picker, visible_list_window_range,
     },
     zoxide::{ZoxideTracker, query_zoxide_directories},
@@ -488,6 +488,9 @@ pub(crate) enum PendingAction {
         pane_id: usize,
     },
     LineModePicker {
+        pane_id: usize,
+    },
+    YankPicker {
         pane_id: usize,
     },
     ThemePicker {
@@ -1384,6 +1387,9 @@ impl App {
             }
             Some(PendingAction::LineModePicker { .. }) => {
                 render_linemode_picker(frame, frame.area(), self.theme);
+            }
+            Some(PendingAction::YankPicker { .. }) => {
+                render_yank_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::BookmarkPicker { .. }) => {
                 render_bookmark_action_picker(frame, frame.area(), self.theme);
@@ -3304,6 +3310,26 @@ impl App {
                         },
                     ]);
                 }
+                PendingAction::YankPicker { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "y",
+                            label: "clipboard",
+                        },
+                        StatusShortcutHint {
+                            key: "p",
+                            label: "panel",
+                        },
+                        StatusShortcutHint {
+                            key: "1..9",
+                            label: "pane",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc",
+                            label: "cancel",
+                        },
+                    ]);
+                }
                 PendingAction::ThemePicker { .. } | PendingAction::ThemeCommandPicker { .. } => {
                     hints.extend_from_slice(&[
                         StatusShortcutHint {
@@ -3922,7 +3948,7 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":mark-all",
-            "Ctrl-a",
+            "A",
             "把目前 panel 中所有可見的檔案與資料夾全部標記起來，方便批次操作",
             HelpAction::Command("mark-all"),
         ),
@@ -3934,7 +3960,7 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
         ),
         help_entry(
             ":unmark-all",
-            "Ctrl-Shift-a",
+            "U",
             "清掉目前 panel 內所有已標記項目",
             HelpAction::Command("unmark-all"),
         ),
@@ -3943,6 +3969,12 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
             "x",
             "剪下目前選取項目到內部剪貼簿",
             HelpAction::Command("cut"),
+        ),
+        help_entry(
+            ":copy-panel",
+            "yp / y1..9",
+            "把目前選取或標記的項目複製到指定 panel 編號目前所在的目錄",
+            HelpAction::Command("copy-panel "),
         ),
         help_entry(
             ":move <path>",
@@ -4297,6 +4329,7 @@ pub(crate) enum ContextHelpKind {
     SortPicker,
     GoPicker,
     LineModePicker,
+    YankPicker,
     ThemePicker,
     CommandMode,
     Filter,
@@ -4350,6 +4383,7 @@ impl App {
                 PendingAction::SortPicker { .. } => ContextHelpKind::SortPicker,
                 PendingAction::GoPicker { .. } => ContextHelpKind::GoPicker,
                 PendingAction::LineModePicker { .. } => ContextHelpKind::LineModePicker,
+                PendingAction::YankPicker { .. } => ContextHelpKind::YankPicker,
                 PendingAction::ThemePicker { .. } | PendingAction::ThemeCommandPicker { .. } => {
                     ContextHelpKind::ThemePicker
                 }
@@ -5282,6 +5316,35 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                     "cancel",
                     "Esc / q / h",
                     "取消退出選單",
+                    HelpAction::QuitHint,
+                ),
+            ],
+        ),
+        ContextHelpKind::YankPicker => (
+            String::from("Cheatsheet: Yank / Copy (複製到剪貼簿或視窗)"),
+            vec![
+                help_entry(
+                    "copy to clipboard",
+                    "y",
+                    "複製選取或標記檔案到內部剪貼簿 (yy)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "copy to panel",
+                    "p",
+                    "開啟 :copy-panel 編號複製命令列",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "copy to pane",
+                    "1..9",
+                    "直接將選取項目複製到指定 Panel",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "cancel",
+                    "Esc / q / h",
+                    "取消退出複製選單",
                     HelpAction::QuitHint,
                 ),
             ],

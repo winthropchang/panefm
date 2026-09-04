@@ -717,7 +717,7 @@ impl App {
                 self.pending_g = false;
                 self.pending_bookmark = None;
                 self.pending_y = false;
-                self.copy_selected();
+                self.open_yank_picker();
                 true
             }
             _ if key_matches_shifted_letter(&key, 'Y') => {
@@ -2173,6 +2173,33 @@ impl App {
                 _ => {
                     self.pending_action = Some(PendingAction::LineModePicker { pane_id });
                     self.status = String::from("move / linemode: choose a key from the panel");
+                }
+            },
+            PendingAction::YankPicker { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 'y') => {
+                    self.clear_pending_count();
+                    self.copy_selected();
+                }
+                _ if key_matches_plain_letter(&key, 'p') => {
+                    self.clear_pending_count();
+                    self.open_prefilled_command("copy-panel ");
+                }
+                KeyCode::Char(digit @ '1'..='9') if key.modifiers.is_empty() => {
+                    self.clear_pending_count();
+                    let target_str = digit.to_string();
+                    self.copy_selected_to_pane_id(&target_str)?;
+                }
+                KeyCode::Esc => {
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
+                    self.status = String::from("normal mode");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::YankPicker { pane_id });
+                    self.status = String::from(
+                        "yank: choose a key from the panel (y: clipboard, p: panel, 1..9: pane id)",
+                    );
                 }
             },
             PendingAction::ThemePicker {

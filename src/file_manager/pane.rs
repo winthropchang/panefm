@@ -1550,6 +1550,17 @@ impl PaneState {
         Ok(outcome)
     }
 
+    /// 將來源複製到指定目錄並回傳 Undo 所需結果，不要求目標是目前 panel。
+    ///
+    /// 參數：`source_path: &Path`，來源路徑；`target_dir: &Path`，目的目錄。
+    /// 回傳：`io::Result<PasteOutcome>`，成功時可直接寫入操作歷史。
+    pub(crate) fn copy_path_to_dir_with_history(
+        source_path: &Path,
+        target_dir: &Path,
+    ) -> io::Result<PasteOutcome> {
+        copy_path_into_dir(source_path, target_dir, false, true)
+    }
+
     /// 將來源移到指定目錄並回傳 Undo 所需結果，不要求目標是目前 panel。
     ///
     /// 參數：`source_path: &Path`，來源路徑；`target_dir: &Path`，目的目錄。
