@@ -31,7 +31,14 @@ jobs:
       - name: Install external CLI dependencies
         uses: taiki-e/install-action@v2
         with:
-          tool: ripgrep,fd-find,fzf,zoxide
+          tool: ripgrep,fd-find,zoxide
+
+      - name: Verify installed CLI tools
+        shell: bash
+        run: |
+          rg --version
+          fd --version
+          zoxide --version
 
       - name: Check code formatting (cargo fmt)
         shell: bash
