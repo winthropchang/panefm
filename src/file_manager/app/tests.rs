@@ -3710,6 +3710,10 @@ fn rename_basename_cursor_stops_before_extension() {
     assert_eq!(rename_basename_cursor("archive.tar.gz"), 11);
     assert_eq!(rename_basename_cursor(".gitignore"), 10);
     assert_eq!(rename_basename_cursor("folder"), 6);
+    assert_eq!(rename_basename_cursor("測試檔案.txt"), 4);
+    assert_eq!(rename_basename_cursor("中文.tar.gz"), 6);
+    assert_eq!(rename_basename_cursor(".隱藏檔"), 4);
+    assert_eq!(rename_basename_cursor("純中文"), 3);
 }
 
 #[test]
@@ -3844,6 +3848,139 @@ fn rename_normal_mode_supports_vim_word_motions_and_insert_shortcuts() {
             mode: RenameMode::Insert,
         })
     );
+}
+
+#[test]
+/// 驗證中文檔名在 rename 時，畫面游標會依字元全形寬度（每個中文字 2 欄位）精確定位在副檔名前，
+/// 且進行 Backspace、插入、Delete 等編輯時，實際字串與畫面游標皆同步正確，檔案能成功重新命名。
+/// 保護目的：避免將中文檔名字元數直接當成終端欄位數計算游標 X 座標，導致游標落在錯誤中文字元上而引導使用者改錯檔名。
+fn rename_chinese_filename_aligns_screen_cursor_and_edits_correctly() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("測試檔案.txt");
+    fs::write(&file_path, "hello").expect("file");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.start_rename();
+
+    // 初始進入 rename，游標應停在第 4 個字元（主檔名「測試檔案」末端、副檔名「.txt」前面）
+    assert_eq!(
+        app.pending_action,
+        Some(PendingAction::Rename {
+            pane_id: 1,
+            original_name: String::from("測試檔案.txt"),
+            buffer: String::from("測試檔案.txt"),
+            cursor: 4,
+            mode: RenameMode::Insert,
+        })
+    );
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut cursor_pos = None;
+    terminal
+        .draw(|frame| {
+            cursor_pos = app.render(frame);
+        })
+        .expect("render");
+
+    // 畫面上「測試檔案」4 個中文字佔用 8 欄位寬度（非 4 欄位）
+    // 游標 X 應位在輸入框內容起點 (input_inner.x) + 8 欄位處
+    let initial_x = cursor_pos.expect("cursor").0;
+
+    // 按 Backspace 刪除最後一個中文字「案」
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .expect("backspace");
+    assert_eq!(
+        app.pending_action,
+        Some(PendingAction::Rename {
+            pane_id: 1,
+            original_name: String::from("測試檔案.txt"),
+            buffer: String::from("測試檔.txt"),
+            cursor: 3,
+            mode: RenameMode::Insert,
+        })
+    );
+    terminal
+        .draw(|frame| {
+            cursor_pos = app.render(frame);
+        })
+        .expect("render after backspace");
+    // 刪除一個中文字應後退 2 欄位
+    assert_eq!(cursor_pos.expect("cursor").0, initial_x - 2);
+
+    // 輸入新中文字「新」
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('新'), KeyModifiers::NONE))
+        .expect("insert chinese char");
+    assert_eq!(
+        app.pending_action,
+        Some(PendingAction::Rename {
+            pane_id: 1,
+            original_name: String::from("測試檔案.txt"),
+            buffer: String::from("測試檔新.txt"),
+            cursor: 4,
+            mode: RenameMode::Insert,
+        })
+    );
+    terminal
+        .draw(|frame| {
+            cursor_pos = app.render(frame);
+        })
+        .expect("render after insert");
+    assert_eq!(cursor_pos.expect("cursor").0, initial_x);
+
+    // 測試 Home / End 鍵
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .expect("home");
+    terminal
+        .draw(|frame| {
+            cursor_pos = app.render(frame);
+        })
+        .expect("render after home");
+    assert_eq!(cursor_pos.expect("cursor").0, initial_x - 8);
+
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .expect("end");
+    terminal
+        .draw(|frame| {
+            cursor_pos = app.render(frame);
+        })
+        .expect("render after end");
+    // 「測試檔新.txt」: 4箇中文字(8) + 4個ASCII(4) = 12 欄位
+    assert_eq!(cursor_pos.expect("cursor").0, initial_x - 8 + 12);
+
+    // 回到主檔名末尾
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+        .expect("left");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+        .expect("left");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+        .expect("left");
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+        .expect("left");
+
+    // 測試 Delete 鍵刪除 '.'
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
+        .expect("delete dot");
+    assert_eq!(
+        app.pending_action,
+        Some(PendingAction::Rename {
+            pane_id: 1,
+            original_name: String::from("測試檔案.txt"),
+            buffer: String::from("測試檔新txt"),
+            cursor: 4,
+            mode: RenameMode::Insert,
+        })
+    );
+
+    // 補回 '.'
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+        .expect("insert dot");
+
+    // 按 Enter 確認重新命名
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("confirm rename");
+    assert!(dir.path().join("測試檔新.txt").exists());
+    assert!(!dir.path().join("測試檔案.txt").exists());
 }
 
 #[test]

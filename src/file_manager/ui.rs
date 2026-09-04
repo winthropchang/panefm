@@ -884,6 +884,24 @@ fn pad_preview_lines_for_render(
     lines
 }
 
+/// 計算字串前 `cursor_char_count` 個字元在終端機中的實際顯示寬度（欄數）。
+///
+/// 中文或全形字元在終端機會佔用 2 欄寬度，若直接使用字元數或 byte 數計算游標的
+/// 螢幕 X 座標，會導致游標落在錯誤字元上（例如中文檔名會使游標看起來停在中間）。
+/// 這裡逐字累加 [`UnicodeWidthChar::width`]，確保終端機光標精確對齊插入點。
+///
+/// 參數：
+/// - `text: &str`，輸入緩衝區的文字內容。
+/// - `cursor_char_count: usize`，以 Unicode scalar (char) 為單位的游標索引。
+///
+/// 回傳：`usize`，游標在終端機畫面上對應的顯示欄數。
+pub(crate) fn cursor_display_width(text: &str, cursor_char_count: usize) -> usize {
+    text.chars()
+        .take(cursor_char_count)
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
+}
+
 /// 在列表區域中繪製 inline 輸入視窗，供 rename / create 這類功能重用。
 ///
 /// 參數：
@@ -938,10 +956,11 @@ fn render_inline_editor(
         input_area,
     );
 
+    let cursor_col = cursor_display_width(state.buffer, state.cursor);
     Some((
         input_inner
             .x
-            .saturating_add(state.cursor.min(state.buffer.chars().count()) as u16),
+            .saturating_add(cursor_col.min(input_inner.width as usize) as u16),
         input_inner.y,
     ))
 }
@@ -1078,12 +1097,11 @@ fn render_top_right_input(
         input_area,
     );
 
+    let cursor_col = cursor_display_width(buffer, cursor);
     (
-        input_inner.x.saturating_add(
-            cursor
-                .min(buffer.chars().count())
-                .min(input_inner.width as usize) as u16,
-        ),
+        input_inner
+            .x
+            .saturating_add(cursor_col.min(input_inner.width as usize) as u16),
         input_inner.y,
     )
 }
@@ -1175,12 +1193,11 @@ pub(crate) fn render_global_search_panel(
     let input_inner = block.inner(panel_area);
     frame.render_widget(Paragraph::new(buffer.to_string()).block(block), panel_area);
 
+    let cursor_col = cursor_display_width(buffer, cursor);
     (
-        input_inner.x.saturating_add(
-            cursor
-                .min(buffer.chars().count())
-                .min(input_inner.width as usize) as u16,
-        ),
+        input_inner
+            .x
+            .saturating_add(cursor_col.min(input_inner.width as usize) as u16),
         input_inner.y,
     )
 }
@@ -1738,14 +1755,11 @@ pub(crate) fn render_command_palette(
         );
     }
 
+    let cursor_col = cursor_display_width(buffer, cursor);
     (
         inner
             .x
-            .saturating_add(
-                cursor
-                    .min(buffer.chars().count())
-                    .min(inner.width.saturating_sub(1) as usize) as u16,
-            )
+            .saturating_add(cursor_col.min(inner.width.saturating_sub(2) as usize) as u16)
             .saturating_add(1),
         inner.y,
     )
@@ -3385,5 +3399,27 @@ mod tests {
         assert!(formatted_long.contains('…'));
         assert!(formatted_long.starts_with(".cre"));
         assert!(formatted_long.ends_with(".url"));
+    }
+
+    #[test]
+    /// 驗證 `cursor_display_width` 會依終端機全形欄寬正確累加中英數混和字串。
+    /// 保護目的：避免中文或寬字元檔名被當成 1 欄位算，造成 rename 輸入框的游標錯位。
+    fn cursor_display_width_handles_ascii_and_wide_cjk() {
+        use super::cursor_display_width;
+
+        // ASCII: 1 字元 = 1 欄寬
+        assert_eq!(cursor_display_width("alpha.txt", 0), 0);
+        assert_eq!(cursor_display_width("alpha.txt", 5), 5);
+        assert_eq!(cursor_display_width("alpha.txt", 9), 9);
+        assert_eq!(cursor_display_width("alpha.txt", 99), 9);
+
+        // 中文: 1 字元 = 2 欄寬
+        assert_eq!(cursor_display_width("中文.txt", 0), 0);
+        assert_eq!(cursor_display_width("中文.txt", 1), 2); // 停在 '文' 前
+        assert_eq!(cursor_display_width("中文.txt", 2), 4); // 停在 '.' 前（主檔名末端）
+        assert_eq!(cursor_display_width("中文.txt", 6), 8); // 停在檔名最後
+
+        // 中英混和: 2 * 4 + 4 = 12 欄寬
+        assert_eq!(cursor_display_width("專案_v2_測試.rs", 8), 12);
     }
 }

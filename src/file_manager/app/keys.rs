@@ -3929,6 +3929,17 @@ impl App {
                         });
                         self.status = String::from("rename: insert");
                     }
+                    KeyCode::Delete => {
+                        delete_char_at(&mut buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: insert");
+                    }
                     KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
                         self.pending_action = Some(PendingAction::Rename {
@@ -3941,6 +3952,26 @@ impl App {
                     }
                     KeyCode::Right => {
                         cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Home => {
+                        cursor = 0;
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::End => {
+                        cursor = buffer.chars().count();
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
                             original_name,
@@ -4030,7 +4061,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('0') => {
+                    KeyCode::Home | KeyCode::Char('0') => {
                         cursor = 0;
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -4040,8 +4071,30 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('$') => {
+                    KeyCode::End | KeyCode::Char('$') => {
                         cursor = rename_line_end_cursor(&buffer);
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Delete => {
+                        delete_char_at(&mut buffer, cursor);
+                        cursor = cursor.min(rename_line_end_cursor(&buffer));
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    _ if key_matches_plain_letter(&key, 'x') => {
+                        delete_char_at(&mut buffer, cursor);
+                        cursor = cursor.min(rename_line_end_cursor(&buffer));
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
                             original_name,
@@ -4152,6 +4205,16 @@ impl App {
                         });
                         self.status = create_status_label("insert");
                     }
+                    KeyCode::Delete => {
+                        delete_char_at(&mut buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("insert");
+                    }
                     KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
                         self.pending_action = Some(PendingAction::CreateEntry {
@@ -4163,6 +4226,24 @@ impl App {
                     }
                     KeyCode::Right => {
                         cursor = move_cursor_right(&buffer, cursor);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Home => {
+                        cursor = 0;
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::End => {
+                        cursor = buffer.chars().count();
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
                             buffer,
@@ -4244,7 +4325,7 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('0') => {
+                    KeyCode::Home | KeyCode::Char('0') => {
                         cursor = 0;
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -4253,8 +4334,28 @@ impl App {
                             mode,
                         });
                     }
-                    KeyCode::Char('$') => {
+                    KeyCode::End | KeyCode::Char('$') => {
                         cursor = rename_line_end_cursor(&buffer);
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    KeyCode::Delete => {
+                        delete_char_at(&mut buffer, cursor);
+                        cursor = cursor.min(rename_line_end_cursor(&buffer));
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                    }
+                    _ if key_matches_plain_letter(&key, 'x') => {
+                        delete_char_at(&mut buffer, cursor);
+                        cursor = cursor.min(rename_line_end_cursor(&buffer));
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
                             buffer,
