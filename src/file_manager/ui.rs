@@ -1355,11 +1355,15 @@ pub(crate) fn render_go_picker(frame: &mut ratatui::Frame<'_>, area: Rect, theme
             },
             ShortcutPanelItem {
                 shortcut: "d",
-                label: "documents",
+                label: "[D]ocuments",
             },
             ShortcutPanelItem {
                 shortcut: "k",
-                label: "desktop",
+                label: "des[K]top",
+            },
+            ShortcutPanelItem {
+                shortcut: "l",
+                label: "down[L]oads",
             },
             ShortcutPanelItem {
                 shortcut: "Esc",

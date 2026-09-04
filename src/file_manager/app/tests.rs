@@ -433,7 +433,7 @@ fn app_g_opens_go_picker() {
         app.pending_action,
         Some(PendingAction::GoPicker { pane_id: 1 })
     ));
-    assert_eq!(app.status, "go: choose g/t/d/k from the panel");
+    assert_eq!(app.status, "go: choose g/t/d/k/l from the panel");
 }
 
 #[test]
@@ -521,6 +521,47 @@ fn app_gk_jumps_to_desktop_directory() {
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
             .expect("jump desktop");
         assert_eq!(app.panes.get(&1).expect("pane").cwd, desktop);
+    }
+
+    unsafe {
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+}
+
+#[test]
+/// 驗證 `gl` 會直接切到使用者的 Downloads 目錄。
+/// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
+fn app_gl_jumps_to_downloads_directory() {
+    let _guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock");
+    let dir = tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).expect("downloads");
+
+    let original_home = std::env::var_os("HOME");
+    let original_userprofile = std::env::var_os("USERPROFILE");
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+    }
+
+    {
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("open go picker");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .expect("jump downloads");
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, downloads);
     }
 
     unsafe {

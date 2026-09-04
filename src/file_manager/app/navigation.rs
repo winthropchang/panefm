@@ -572,7 +572,7 @@ impl App {
         self.pending_action = Some(PendingAction::GoPicker {
             pane_id: self.focused_pane,
         });
-        self.status = String::from("go: choose g/t/d/k from the panel");
+        self.status = String::from("go: choose g/t/d/k/l from the panel");
     }
 
     /// 打開底部 panel 操作面板，讓使用者可視化選擇 `w` 的第二個按鍵。
@@ -1204,7 +1204,7 @@ impl App {
                 entry_count,
                 ..
             } => trash_confirm_status(action, target_name, *entry_count),
-            PendingAction::GoPicker { .. } => String::from("go: choose g/t/d/k from the panel"),
+            PendingAction::GoPicker { .. } => String::from("go: choose g/t/d/k/l from the panel"),
             PendingAction::ThemeCommandPicker { .. } => {
                 String::from("theme/trash: choose l/n/t/u from the panel")
             }

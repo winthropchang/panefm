@@ -1781,6 +1781,7 @@ pub(crate) fn command_home_dir() -> Option<PathBuf> {
 pub(crate) enum GoSpecialDirectory {
     Documents,
     Desktop,
+    Downloads,
 }
 
 impl GoSpecialDirectory {
@@ -1792,6 +1793,7 @@ impl GoSpecialDirectory {
         match self {
             Self::Documents => "Documents",
             Self::Desktop => "Desktop",
+            Self::Downloads => "Downloads",
         }
     }
 
@@ -1803,6 +1805,7 @@ impl GoSpecialDirectory {
         match self {
             Self::Documents => "Documents",
             Self::Desktop => "Desktop",
+            Self::Downloads => "Downloads",
         }
     }
 }
@@ -3777,8 +3780,14 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
         help_entry(
             ":goto desktop",
             "gk",
-            "快速跳到 Desktop 目錄",
+            "快速跳到 Desktop 目錄 (desKtop)",
             HelpAction::Command("goto ~/Desktop"),
+        ),
+        help_entry(
+            ":goto downloads",
+            "gl",
+            "快速跳到 Downloads 目錄 (downLoad)",
+            HelpAction::Command("goto ~/Downloads"),
         ),
         help_entry(
             ":bookmark",
@@ -5278,7 +5287,13 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 help_entry(
                     "desktop",
                     "k",
-                    "快速跳轉至 ~/Desktop 目錄",
+                    "快速跳轉至 ~/Desktop 目錄 (desKtop)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "downloads",
+                    "l",
+                    "快速跳轉至 ~/Downloads 目錄 (downLoad)",
                     HelpAction::QuitHint,
                 ),
                 help_entry(

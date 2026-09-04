@@ -1951,6 +1951,12 @@ impl App {
                     self.pending_y = false;
                     self.go_to_special_directory(GoSpecialDirectory::Desktop)?;
                 }
+                _ if key_matches_plain_letter(&key, 'l') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.go_to_special_directory(GoSpecialDirectory::Downloads)?;
+                }
                 KeyCode::Esc => {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -1965,7 +1971,7 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::GoPicker { pane_id });
-                    self.status = String::from("go: choose g/t/d/k from the panel");
+                    self.status = String::from("go: choose g/t/d/k/l from the panel");
                 }
             },
             PendingAction::ThemeCommandPicker { pane_id } => match key.code {
