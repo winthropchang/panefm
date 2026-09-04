@@ -15,12 +15,12 @@ use super::{
     command_suggestion_navigation, command_suggestions, command_suggestions_for_buffer,
     ctrl_digit_target_pane_id, filtered_bookmark_entries, filtered_global_search_entries,
     help_entries, is_probably_network_or_external_path, is_windows_drive_path,
-    key_matches_ctrl_letter, key_matches_ctrl_shift_letter, key_matches_letter_any_case,
-    key_matches_plain_letter, key_matches_shifted_letter, looks_like_navigation_path,
-    missing_search_tool_status, paste_should_run_in_background, plain_digit_target_pane_id,
-    query_zoxide_directories, rename_basename_cursor, rename_next_word_start,
-    rename_previous_word_start, rename_word_end, task_progress_label, trash_confirm_panel_id,
-    trash_panel_overlay_state_from_pending_action, typed_char_from_key, visible_job_badge_paths,
+    key_matches_ctrl_letter, key_matches_letter_any_case, key_matches_plain_letter,
+    key_matches_shifted_letter, looks_like_navigation_path, missing_search_tool_status,
+    paste_should_run_in_background, plain_digit_target_pane_id, query_zoxide_directories,
+    rename_basename_cursor, rename_next_word_start, rename_previous_word_start, rename_word_end,
+    task_progress_label, trash_confirm_panel_id, trash_panel_overlay_state_from_pending_action,
+    typed_char_from_key, visible_job_badge_paths,
 };
 use crate::{
     config::{
@@ -286,13 +286,6 @@ fn key_normalization_helpers_accept_terminal_variants() {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT
         ),
         'p'
-    ));
-    assert!(key_matches_ctrl_shift_letter(
-        &KeyEvent::new(
-            KeyCode::Char('A'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        ),
-        'a'
     ));
     assert!(key_matches_letter_any_case(
         &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
@@ -7149,17 +7142,17 @@ fn app_apply_fzf_jump_selection_cancel_keeps_selection() {
 }
 
 #[test]
-/// 驗證 normal mode 按下 `Ctrl-a` 會把目前 pane 的所有可見項目全部標記起來。
-/// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
-fn app_ctrl_a_marks_all_visible_entries() {
+/// 驗證 normal mode 按下單鍵 `A` (Shift+a) 會把目前 pane 的所有可見項目全部標記起來。
+/// 保護目的：提供最直覺、好按的單手/雙鍵全選體驗。
+fn app_capital_a_marks_all_visible_entries() {
     let dir = tempdir().expect("tempdir");
     fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
     fs::write(dir.path().join("beta.txt"), "b").expect("beta");
     fs::write(dir.path().join("gamma.txt"), "c").expect("gamma");
 
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
-        .expect("mark all");
+    app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+        .expect("mark all via capital A");
 
     let pane = app.panes.get(&1).expect("pane");
     assert_eq!(pane.marked_count(), 3);
@@ -7180,6 +7173,42 @@ fn app_mark_all_command_marks_all_visible_entries() {
     let pane = app.panes.get(&1).expect("pane");
     assert_eq!(pane.marked_count(), 2);
     assert_eq!(app.status, "marked all visible items (+2, total 2)");
+}
+
+#[test]
+/// 驗證 normal mode 按下單鍵 `U` (Shift+u) 會清除目前 pane 標記。
+/// 保護目的：避免全選後無法以單鍵直覺清空標記。
+fn app_capital_u_clears_all_visible_marks() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+    fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.execute_command("mark-all").expect("mark-all command");
+    assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 2);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT))
+        .expect("shift+u");
+    assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 0);
+    assert_eq!(app.status, "cleared 2 marks");
+}
+
+#[test]
+/// 驗證 `:unmark-all` 命令能把目前 pane 的所有標記全部清除。
+/// 保護目的：避免命令列與 cheatsheet 執行 unmark-all 時狀態不如預期。
+fn app_unmark_all_command_clears_marks() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
+    fs::write(dir.path().join("beta.txt"), "b").expect("beta");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.execute_command("mark-all").expect("mark-all");
+    assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 2);
+
+    app.execute_command("unmark-all")
+        .expect("unmark-all command");
+    assert_eq!(app.panes.get(&1).expect("pane").marked_count(), 0);
+    assert_eq!(app.status, "cleared 2 marks");
 }
 
 #[test]
@@ -7251,27 +7280,6 @@ fn app_copy_picker_u_copies_file_path() {
         .expect("copy file path");
 
     assert_eq!(app.status, "copied file path: alpha.txt");
-}
-
-#[test]
-/// 驗證 normal mode 按下 `Ctrl-Shift-A` 會清掉目前 pane 的所有標記。
-/// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
-fn app_ctrl_shift_a_clears_all_marks_in_focused_pane() {
-    let dir = tempdir().expect("tempdir");
-    fs::write(dir.path().join("alpha.txt"), "a").expect("alpha");
-    fs::write(dir.path().join("beta.txt"), "b").expect("beta");
-
-    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-    app.execute_command("mark-all").expect("mark-all command");
-    app.handle_key(KeyEvent::new(
-        KeyCode::Char('A'),
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    ))
-    .expect("clear marks");
-
-    let pane = app.panes.get(&1).expect("pane");
-    assert_eq!(pane.marked_count(), 0);
-    assert_eq!(app.status, "cleared 2 marks");
 }
 
 #[test]

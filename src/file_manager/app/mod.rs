@@ -2035,15 +2035,6 @@ pub(crate) fn key_matches_ctrl_letter(key: &KeyEvent, letter: char) -> bool {
         && matches!(key.code, KeyCode::Char(c) if c == lower || c == upper)
 }
 
-/// 判斷 `Ctrl+Shift+字母` 指令，支援不同終端可能送出的大小寫字元格式。
-pub(crate) fn key_matches_ctrl_shift_letter(key: &KeyEvent, letter: char) -> bool {
-    let lower = letter.to_ascii_lowercase();
-    let upper = letter.to_ascii_uppercase();
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char(c) if c == lower || c == upper)
-}
-
 /// 把 `Ctrl+數字` 轉成目標 pane 編號。
 ///
 /// 目前規則：
@@ -4472,21 +4463,21 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                 ),
                 help_entry(
                     "mark-all",
-                    "Ctrl+a",
+                    "A",
                     "全選目前目錄所有檔案與資料夾",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("mark-all"),
                 ),
                 help_entry(
                     "unmark-all",
-                    "Ctrl+Shift+a",
+                    "U",
                     "清除目前目錄所有標記",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("unmark-all"),
                 ),
                 help_entry(
                     "invert-marks",
                     "Ctrl+r",
                     "反向切換目前目錄標記狀態",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("invert-marks"),
                 ),
                 help_entry(
                     "preview",

@@ -556,14 +556,14 @@ impl App {
                 self.pending_y = false;
                 true
             }
-            _ if key_matches_ctrl_shift_letter(&key, 'a') => {
+            _ if key_matches_shifted_letter(&key, 'U') => {
                 self.clear_pending_count();
                 self.clear_marks_in_focused_pane()?;
                 self.pending_g = false;
                 self.pending_y = false;
                 true
             }
-            _ if key_matches_ctrl_letter(&key, 'a') => {
+            _ if key_matches_shifted_letter(&key, 'A') => {
                 self.clear_pending_count();
                 self.mark_all_in_focused_pane()?;
                 self.pending_g = false;
