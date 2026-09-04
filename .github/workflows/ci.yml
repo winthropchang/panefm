@@ -28,6 +28,11 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
 
+      - name: Install external CLI dependencies
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep,fd-find,fzf,zoxide
+
       - name: Check code formatting (cargo fmt)
         shell: bash
         run: cargo fmt --check

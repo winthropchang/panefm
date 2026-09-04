@@ -304,6 +304,32 @@ fn windows_reveal_uses_explorer_select() {
 - 外部命令 builder 測試
 - 狀態切換前後的測試
 
+### 9.2 提交前測試與代碼品質強制門禁（Commit 前必備條件）
+
+在進行任何 `git commit` 或 `git push` 前，**絕對必須在本地終端機完整執行並通過以下三項檢驗，未通過者嚴禁提交**：
+
+1. **單元與整合測試全數通過（強制）**：
+   ```bash
+   cargo test --all-targets
+   ```
+   - 必須確保「0 failed」，所有測試 100% 通過。
+2. **Clippy 零警告把關（強制）**：
+   ```bash
+   cargo clippy --all-targets -- -D warnings
+   ```
+   - 專案採零容忍政策，警告視同錯誤，必須 0 warning。
+3. **代碼排版合規（強制）**：
+   ```bash
+   cargo fmt --check
+   ```
+
+> [!IMPORTANT]
+> **外部依賴工具環境要求**：
+> 本專案的搜尋與常用目錄學習整合測試依賴 4 個外部命令列工具：`fd`、`ripgrep (rg)`、`fzf`、`zoxide`。
+> 開發者本地環境與 CI 虛擬機皆必須安裝此 4 項工具，否則相關功能之整合測試會直接報錯中斷：
+> - Windows 本機安裝：`winget install sharkdp.fd BurntSushi.ripgrep.MSVC junegunn.fzf ajeetdsouza.zoxide`
+> - CI 虛擬機：由 `.github/workflows/ci.yml` 透過 `install-action` 自動安裝。
+
 ## 10. 程式結構規則
 
 - 功能要依責任切分，不可再把大量邏輯塞回單一巨大檔案。
@@ -337,17 +363,19 @@ fn windows_reveal_uses_explorer_select() {
 
 ## 13. 開發後檢查清單
 
-每次完工前，至少確認：
+每次完工與 **Commit 之前**，必須逐一確認：
 
-- `cargo fmt`
-- `cargo test`
-- 新功能有測試
-- 修 bug 有回歸測試
-- **測試代碼已完全拆分並存放於 `tests/` 目錄中，核心程式碼檔案內零殘留 `mod tests`**
-- 沒有把 panel 狀態做成不必要的全域
-- 沒有把平台差異散落在業務邏輯裡
-- 沒有讓外部程式吃到 TUI 的 terminal 狀態
-- 設定或文件有同步更新
+- [ ] `cargo fmt --check` 通過，排版乾淨
+- [ ] `cargo clippy --all-targets -- -D warnings` 通過，零 warning
+- [ ] `cargo test --all-targets` **全數通過（0 failed，本地未全過絕對嚴禁 commit）**
+- [ ] 本地環境具備 `fd`, `rg`, `fzf`, `zoxide` 以確保整合測試有效執行
+- [ ] 新功能有測試
+- [ ] 修 bug 有回歸測試
+- [ ] **測試代碼已完全拆分並存放於 `tests/` 目錄中，核心程式碼檔案內零殘留 `mod tests`**
+- [ ] 沒有把 panel 狀態做成不必要的全域
+- [ ] 沒有把平台差異散落在業務邏輯裡
+- [ ] 沒有讓外部程式吃到 TUI 的 terminal 狀態
+- [ ] 設定或文件有同步更新
 
 ## 14. 文件維護規則
 
