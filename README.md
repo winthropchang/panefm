@@ -7,6 +7,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/winthropchang/panefm/actions/workflows/ci.yml"><img src="https://github.com/winthropchang/panefm/actions/workflows/ci.yml/badge.svg" alt="CI Status"></a>
+  <a href="https://github.com/winthropchang/panefm/releases"><img src="https://img.shields.io/github/v/release/winthropchang/panefm?color=blue" alt="Latest Release"></a>
   <img src="https://img.shields.io/badge/Language-Rust_1.85+-orange.svg" alt="Rust 1.85+">
   <img src="https://img.shields.io/badge/Platform-macOS_%7C_Windows-blue.svg" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
