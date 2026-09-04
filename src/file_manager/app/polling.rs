@@ -239,6 +239,21 @@ impl App {
         self.delete_tasks_by_ids(&pane_task_ids)
     }
 
+    fn is_transient_picker(action: &PendingAction) -> bool {
+        matches!(
+            action,
+            PendingAction::GoPicker { .. }
+                | PendingAction::WindowPicker { .. }
+                | PendingAction::SortPicker { .. }
+                | PendingAction::BookmarkPicker { .. }
+                | PendingAction::LineModePicker { .. }
+                | PendingAction::ThemeCommandPicker { .. }
+                | PendingAction::ThemePicker { .. }
+                | PendingAction::CopyPicker { .. }
+                | PendingAction::OpenPicker { .. }
+        )
+    }
+
     /// 執行 help 面板中選到的功能，直接跳到對應模式或命令。
     pub(crate) fn execute_help_entry(
         &mut self,
@@ -260,6 +275,13 @@ impl App {
                 } else {
                     self.execute_command(command)
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    if matches!(
+                        self.help_return,
+                        Some(HelpReturnState::Pending(ref action)) if Self::is_transient_picker(action)
+                    ) {
+                        should_restore_help_return = false;
+                        self.help_return = None;
+                    }
                 }
             }
             HelpAction::Delete => self.start_delete_confirmation(false),

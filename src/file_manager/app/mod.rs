@@ -1998,6 +1998,26 @@ pub(crate) fn key_matches_tilde(key: &KeyEvent) -> bool {
         || (key.code == KeyCode::Char('`') && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// 判斷目前按鍵是否應視為 `?`，支援不同終端可能回報的格式差異（如帶有 Shift 或全形問號）。
+///
+/// 常見情況：
+/// - 直接回報 `Char('?')`（通常帶有 Shift，亦相容無 modifier）
+/// - 回報 `Char('/') + Shift`
+/// - 全形問號 `Char('？')`
+pub(crate) fn key_matches_question_mark(key: &KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('?' | '？') => true,
+        KeyCode::Char('/') if key.modifiers.contains(KeyModifiers::SHIFT) => true,
+        _ => false,
+    }
+}
+
 /// 判斷某個英文字母命令是否要接受大小寫等價輸入。
 ///
 /// 這主要用在 `y/n` 這種確認提示，或某些不區分大小寫的互動按鍵。
@@ -5282,31 +5302,31 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                     "documents",
                     "d",
                     "快速跳轉至 ~/Documents 目錄",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("goto ~/Documents"),
                 ),
                 help_entry(
                     "desktop",
                     "k",
                     "快速跳轉至 ~/Desktop 目錄 (desKtop)",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("goto ~/Desktop"),
                 ),
                 help_entry(
                     "downloads",
                     "l",
                     "快速跳轉至 ~/Downloads 目錄 (downLoad)",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("goto ~/Downloads"),
                 ),
                 help_entry(
                     "home",
                     "h",
                     "快速跳轉至使用者家目錄 ~",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("goto ~"),
                 ),
                 help_entry(
                     "goto-path",
                     "t",
                     "開啟路徑跳轉輸入框 (Goto path)",
-                    HelpAction::QuitHint,
+                    HelpAction::Command("goto "),
                 ),
                 help_entry(
                     "cancel",

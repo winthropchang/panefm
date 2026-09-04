@@ -8539,6 +8539,112 @@ fn cheatsheet_opens_context_specific_help_and_restores_state() {
 }
 
 #[test]
+/// 驗證不同終端回報的問號鍵位格式（如帶有 Shift 或中文全形問號）都能順利開啟 Cheatsheet。
+fn cheatsheet_opens_with_various_question_mark_formats() {
+    let dir = tempdir().expect("tempdir");
+
+    // 1. Shift + ?
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT))
+        .expect("press Shift+? in normal mode");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::HelpPanel { .. })
+    ));
+
+    // 2. Shift + /
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT))
+        .expect("press Shift+/ in normal mode");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::HelpPanel { .. })
+    ));
+
+    // 3. 全形問號 '？'
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.handle_key(KeyEvent::new(KeyCode::Char('？'), KeyModifiers::NONE))
+        .expect("press full-width ？ in normal mode");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::HelpPanel { .. })
+    ));
+
+    // 4. 單純的 '/'（無 Shift）不應觸發 cheatsheet，而是觸發 list find
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+        .expect("press / in normal mode");
+    assert!(!matches!(
+        app.pending_action,
+        Some(PendingAction::HelpPanel { .. })
+    ));
+}
+
+#[test]
+/// 驗證在 GoPicker (按 g) 下按 ? 開啟 Cheatsheet 後，按 Enter 選擇項目能正確執行跳轉命令。
+fn cheatsheet_from_go_picker_executes_jump_command() {
+    let _guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock");
+    let dir = tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).expect("downloads");
+
+    let original_home = std::env::var_os("HOME");
+    let original_userprofile = std::env::var_os("USERPROFILE");
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+    }
+
+    {
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+        // 1. 先按 g 打開 GoPicker
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("open go picker");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::GoPicker { .. })
+        ));
+
+        // 2. 按 ? 打開 GoPicker 專屬 Cheatsheet
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT))
+            .expect("open cheatsheet from go picker");
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::HelpPanel { .. })
+        ));
+
+        // 3. 移動到 downloads (索引 2: documents=0, desktop=1, downloads=2)
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("down to desktop");
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("down to downloads");
+
+        // 4. 按 Enter 執行所選命令
+        app.handle_pending_action_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute downloads jump");
+
+        // 應成功跳轉至 Downloads 目錄，且退回 Normal mode（不會卡在 GoPicker）
+        assert_eq!(app.panes.get(&1).expect("pane").cwd, downloads);
+        assert!(app.pending_action.is_none());
+    }
+
+    unsafe {
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+}
+
+#[test]
 /// 驗證 Cheatsheet 支援以 f 鍵開啟搜尋並在情境清單內進行模糊過濾。
 fn cheatsheet_search_filters_within_context_entries() {
     let dir = tempdir().expect("tempdir");

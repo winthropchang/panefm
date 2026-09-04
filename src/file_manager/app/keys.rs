@@ -226,7 +226,7 @@ impl App {
             self.pending_y = false;
             return Ok(true);
         }
-        if key_matches_plain_letter(&key, '?') && !self.is_text_input_active() {
+        if key_matches_question_mark(&key) && !self.is_text_input_active() {
             if matches!(self.pending_action, Some(PendingAction::HelpPanel { .. })) {
                 return self.handle_pending_action_key(key);
             }
@@ -2688,7 +2688,7 @@ impl App {
                             self.restore_help_return_state(false)?;
                             return Ok(true);
                         }
-                        _ if key_matches_tilde(&key) || key_matches_plain_letter(&key, '?') => {
+                        _ if key_matches_tilde(&key) || key_matches_question_mark(&key) => {
                             self.clear_pending_count();
                             self.pending_g = false;
                             self.restore_help_return_state(false)?;
