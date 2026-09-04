@@ -377,8 +377,63 @@ fn windows_reveal_uses_explorer_select() {
 - [ ] 沒有讓外部程式吃到 TUI 的 terminal 狀態
 - [ ] 設定或文件有同步更新
 
-## 14. 文件維護規則
+## 14. 版本定版與發布流程 (Release & Versioning)
+
+專案遵循標準的 **語意化版本 (Semantic Versioning, SemVer)**，格式為 `vMAJOR.MINOR.PATCH`（例如 `v0.1.5`）。
+
+### 14.1 版本號判定原則
+
+- **PATCH (修訂版，如 0.1.4 -> 0.1.5)**：
+  - 向下相容的缺陷修復 (Bugfix)。
+  - 微幅文字、說明、UI 細節微調。
+  - 內部效能優化或代碼重構，不影響現有操作行為。
+- **MINOR (次版本，如 0.1.5 -> 0.2.0)**：
+  - 新增向下相容的重大功能 (Feature)。
+  - 新增指令前綴、picker、自訂設定選項。
+  - 新增 panel 或主要視圖模式。
+- **MAJOR (主版本，如 0.2.0 -> 1.0.0)**：
+  - 含有重大不相容的改動 (Breaking Changes)。
+  - 破壞性架構變更或設定檔格式全面改版。
+  - 第一個正式長期穩定版本。
+
+### 14.2 發布前硬性約束 (CI Constraint)
+
+在 `.github/workflows/release.yml` 中設有嚴格的自動化防護：
+1. **Tag 格式必須嚴格符合** `^v[0-9]+\.[0-9]+\.[0-9]+$`（如 `v0.1.5`，不可使用 `v0.1` 或 `0.1.5`）。
+2. **`Cargo.toml` 內的版本號必須與 Git Tag 完全相符**（例如 `Cargo.toml` 的 `0.1.5` 必須對應 Tag `v0.1.5`），若不一致 Release CI 將立即中止。
+
+### 14.3 標準發布 SOP
+
+每次進行版本定版與發布時，必須嚴格按照以下流程執行：
+
+1. **本地完整驗證**：
+   確保工作目錄乾淨，並執行完整檢查（嚴禁跳過任何一項）：
+   ```bash
+   cargo fmt --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test --all-targets
+   ```
+2. **更新版本號**：
+   - 編輯 `Cargo.toml` 中的 `version = "X.Y.Z"`。
+   - 執行 `cargo check`，以確保 `Cargo.lock` 自動同步更新該版本號。
+3. **提交版本更動**：
+   ```bash
+   git add Cargo.toml Cargo.lock
+   git commit -m "chore(release): bump version to vX.Y.Z"
+   ```
+4. **建立與推送 Git Tag**：
+   ```bash
+   git tag vX.Y.Z
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+5. **確認自動化發布**：
+   - 進入 GitHub Actions 頁面確認 `Release` workflow 順利跑完。
+   - 檢查 GitHub Releases 是否已自動產出 Windows x64、macOS ARM64 與 macOS x64 的 release binary 與 release notes。
+
+## 15. 文件維護規則
 
 這份文件不是一次性文件。
 
 如果未來在開發中發現新的共通規則，或踩到新的跨平台 / terminal / UI 問題，必須把經驗補進這份文件，而不是只修一次 code 就結束。
+
