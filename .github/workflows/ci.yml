@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Code Quality & Tests
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Check code formatting (cargo fmt)
+        shell: bash
+        run: cargo fmt --check
+
+      - name: Run Clippy (zero-warning policy)
+        shell: bash
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run Tests (cargo test)
+        shell: bash
+        run: cargo test --all-targets
