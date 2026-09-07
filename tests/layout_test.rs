@@ -269,3 +269,83 @@ fn test_calculate_split_rects_integer_remainder_no_gap() {
     assert_eq!(total_width, 100, "子視窗寬度總和必須嚴格等於父容器寬度");
     assert_eq!(rects[2].x + rects[2].width, 100);
 }
+
+#[test]
+/// 驗證使用者特別指定的情境：
+/// 當一行有多個視窗時，current pane 權限最高；
+/// 當 current pane 擴大時，所有其他兄弟視窗同步一起變小；
+/// 當 current pane 縮小時，所有其他兄弟視窗同步一起放大。
+fn test_resize_pane_multi_sibling_co_shrinking_and_growing() {
+    let screen = Rect::new(0, 0, 100, 40);
+
+    // 建立 3 個並排視窗 (pane 1: 33, pane 2: 33, pane 3: 34)
+    let mut layout = LayoutNode::Leaf { pane_id: 1 }
+        .split_leaf(1, SplitDirection::Vertical, SplitPlacement::After, 2)
+        .split_leaf(2, SplitDirection::Vertical, SplitPlacement::After, 3);
+
+    let mut rects = BTreeMap::new();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 33);
+    assert_eq!(rects.get(&2).unwrap().width, 33);
+    assert_eq!(rects.get(&3).unwrap().width, 34);
+
+    // 1. 焦點在 pane 3：擴大 pane 3 (+4 欄)
+    // 預期：pane 1 和 pane 2 一起變小（各減 2 欄，33 -> 31）
+    let res = layout.resize_pane(3, SplitDirection::Vertical, 4, screen);
+    assert!(res.is_ok());
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 31, "pane 1 應同步變小至 31");
+    assert_eq!(rects.get(&2).unwrap().width, 31, "pane 2 應同步變小至 31");
+    assert_eq!(rects.get(&3).unwrap().width, 38, "pane 3 應擴大至 38");
+
+    // 再次擴大 pane 3 (+4 欄)
+    // 預期：pane 1 和 pane 2 再次一起變小（各減 2 欄，31 -> 29）
+    let res = layout.resize_pane(3, SplitDirection::Vertical, 4, screen);
+    assert!(res.is_ok());
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 29, "pane 1 應同步變小至 29");
+    assert_eq!(rects.get(&2).unwrap().width, 29, "pane 2 應同步變小至 29");
+    assert_eq!(rects.get(&3).unwrap().width, 42, "pane 3 應擴大至 42");
+
+    // 2. 焦點在 pane 3：縮小 pane 3 (-4 欄)
+    // 預期：pane 1 和 pane 2 一起放大（各加 2 欄，29 -> 31）
+    let res = layout.resize_pane(3, SplitDirection::Vertical, -4, screen);
+    assert!(res.is_ok());
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 31, "pane 1 應同步放大至 31");
+    assert_eq!(rects.get(&2).unwrap().width, 31, "pane 2 應同步放大至 31");
+    assert_eq!(rects.get(&3).unwrap().width, 38, "pane 3 應縮小至 38");
+
+    // 再次縮小 pane 3 (-4 欄)
+    // 預期：pane 1 和 pane 2 再次一起放大回到 (33, 33, 34)
+    let res = layout.resize_pane(3, SplitDirection::Vertical, -4, screen);
+    assert!(res.is_ok());
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 33, "pane 1 應回復至 33");
+    assert_eq!(rects.get(&2).unwrap().width, 33, "pane 2 應回復至 33");
+    assert_eq!(rects.get(&3).unwrap().width, 34, "pane 3 應回復至 34");
+
+    // 3. 焦點切換至中間的 pane 2：擴大 pane 2 (+4 欄)
+    // 預期：兩側的 pane 1 和 pane 3 一起變小（各減 2 欄）
+    let res = layout.resize_pane(2, SplitDirection::Vertical, 4, screen);
+    assert!(res.is_ok());
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 31, "pane 1 應同步變小至 31");
+    assert_eq!(rects.get(&2).unwrap().width, 37, "pane 2 應擴大至 37");
+    assert_eq!(rects.get(&3).unwrap().width, 32, "pane 3 應同步變小至 32");
+
+    // 縮小 pane 2 (-4 欄)
+    // 預期：兩側的 pane 1 和 pane 3 一起放大
+    let res = layout.resize_pane(2, SplitDirection::Vertical, -4, screen);
+    assert!(res.is_ok());
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(rects.get(&1).unwrap().width, 33, "pane 1 應同步放大至 33");
+    assert_eq!(rects.get(&2).unwrap().width, 33, "pane 2 應縮小至 33");
+    assert_eq!(rects.get(&3).unwrap().width, 34, "pane 3 應同步放大至 34");
+}

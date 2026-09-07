@@ -303,50 +303,72 @@ impl LayoutNode {
 
                 let cur_size = cur_lengths[child_idx];
 
+                let other_indices: Vec<usize> =
+                    (0..children.len()).filter(|&i| i != child_idx).collect();
+
                 if delta_cells > 0 {
-                    // 放大目前面板，需壓縮相鄰面板
-                    let neighbor_idx = if child_idx + 1 < children.len() {
-                        child_idx + 1
-                    } else {
-                        child_idx.saturating_sub(1)
-                    };
-                    let neighbor_size = cur_lengths[neighbor_idx];
-                    if neighbor_size <= min_size {
-                        return Err("neighbor panel reached minimum size");
+                    // 放大目前面板，需同時向外擠壓所有其他兄弟面板（current pane 權限最高，其他面板同步變小）
+                    let total_capacity: u16 = other_indices
+                        .iter()
+                        .map(|&i| cur_lengths[i].saturating_sub(min_size))
+                        .sum();
+
+                    if total_capacity == 0 {
+                        return Err("all other panels reached minimum size");
                     }
-                    let max_grow = (neighbor_size.saturating_sub(min_size)) as i32;
-                    let actual_grow = (delta_cells.min(max_grow)) as u16;
+
+                    let actual_grow = (delta_cells as u16).min(total_capacity);
                     if actual_grow == 0 {
-                        return Err("reached minimum panel size");
+                        return Err("all other panels reached minimum size");
                     }
 
                     let mut new_lengths = cur_lengths;
+                    // 將 actual_grow 均勻分配給其他兄弟面板進行扣減（round-robin 輪流扣減）
+                    let mut remaining = actual_grow;
+                    let mut round_idx = 0;
+                    while remaining > 0 {
+                        let eligible: Vec<usize> = other_indices
+                            .iter()
+                            .copied()
+                            .filter(|&i| new_lengths[i] > min_size)
+                            .collect();
+                        if eligible.is_empty() {
+                            break;
+                        }
+                        let chosen = eligible[round_idx % eligible.len()];
+                        new_lengths[chosen] = new_lengths[chosen].saturating_sub(1);
+                        remaining -= 1;
+                        round_idx += 1;
+                    }
+
                     new_lengths[child_idx] = new_lengths[child_idx].saturating_add(actual_grow);
-                    new_lengths[neighbor_idx] =
-                        new_lengths[neighbor_idx].saturating_sub(actual_grow);
                     *weights = new_lengths;
                     Ok(())
                 } else if delta_cells < 0 {
-                    // 縮小目前面板，需擴展相鄰面板
+                    // 縮小目前面板，釋放空間同時讓所有其他兄弟面板同步放大
                     if cur_size <= min_size {
                         return Err("panel reached minimum size");
                     }
-                    let max_shrink = (cur_size.saturating_sub(min_size)) as i32;
-                    let actual_shrink = ((-delta_cells).min(max_shrink)) as u16;
-                    if actual_shrink == 0 {
-                        return Err("reached minimum panel size");
-                    }
 
-                    let neighbor_idx = if child_idx + 1 < children.len() {
-                        child_idx + 1
-                    } else {
-                        child_idx.saturating_sub(1)
-                    };
+                    let max_shrink = cur_size.saturating_sub(min_size);
+                    let actual_shrink = ((-delta_cells) as u16).min(max_shrink);
+                    if actual_shrink == 0 {
+                        return Err("panel reached minimum size");
+                    }
 
                     let mut new_lengths = cur_lengths;
                     new_lengths[child_idx] = new_lengths[child_idx].saturating_sub(actual_shrink);
-                    new_lengths[neighbor_idx] =
-                        new_lengths[neighbor_idx].saturating_add(actual_shrink);
+
+                    // 將 actual_shrink 均勻分配給所有其他兄弟面板放大（round-robin 輪流增加）
+                    let mut remaining = actual_shrink;
+                    let mut round_idx = 0;
+                    while remaining > 0 {
+                        let chosen = other_indices[round_idx % other_indices.len()];
+                        new_lengths[chosen] = new_lengths[chosen].saturating_add(1);
+                        remaining -= 1;
+                        round_idx += 1;
+                    }
+
                     *weights = new_lengths;
                     Ok(())
                 } else {
