@@ -244,6 +244,7 @@ impl App {
             action,
             PendingAction::GoPicker { .. }
                 | PendingAction::WindowPicker { .. }
+                | PendingAction::WindowResize { .. }
                 | PendingAction::SortPicker { .. }
                 | PendingAction::BookmarkPicker { .. }
                 | PendingAction::LineModePicker { .. }

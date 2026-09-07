@@ -1486,6 +1486,14 @@ pub(crate) fn render_window_picker(frame: &mut ratatui::Frame<'_>, area: Rect, t
                 label: "split right",
             },
             ShortcutPanelItem {
+                shortcut: "r",
+                label: "resize mode",
+            },
+            ShortcutPanelItem {
+                shortcut: "=",
+                label: "equalize panes",
+            },
+            ShortcutPanelItem {
                 shortcut: "c",
                 label: "close panel",
             },
@@ -1504,6 +1512,46 @@ pub(crate) fn render_window_picker(frame: &mut ratatui::Frame<'_>, area: Rect, t
             ShortcutPanelItem {
                 shortcut: "Esc",
                 label: "cancel",
+            },
+        ],
+    );
+}
+
+/// 在畫面底部繪製 panel 尺寸調整快捷鍵面板，供 `wr` 連續調整模式使用。
+pub(crate) fn render_window_resize_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    theme: Theme,
+) {
+    render_shortcut_grid_panel(
+        frame,
+        area,
+        theme,
+        " Resize Pane ",
+        &[
+            ShortcutPanelItem {
+                shortcut: "h / Left",
+                label: "width -4",
+            },
+            ShortcutPanelItem {
+                shortcut: "l / Right",
+                label: "width +4",
+            },
+            ShortcutPanelItem {
+                shortcut: "k / Up",
+                label: "height +2",
+            },
+            ShortcutPanelItem {
+                shortcut: "j / Down",
+                label: "height -2",
+            },
+            ShortcutPanelItem {
+                shortcut: "=",
+                label: "equalize all",
+            },
+            ShortcutPanelItem {
+                shortcut: "Esc / Enter",
+                label: "done",
             },
         ],
     );

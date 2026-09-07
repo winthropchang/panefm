@@ -15,7 +15,7 @@ pub(crate) mod fd;
 pub(crate) mod filesystem_watcher;
 pub(crate) mod fuzzy;
 pub(crate) mod fzf;
-pub(crate) mod layout;
+pub mod layout;
 pub mod open;
 pub(crate) mod operation_history;
 pub(crate) mod osc7;

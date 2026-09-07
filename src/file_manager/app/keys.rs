@@ -2082,6 +2082,21 @@ impl App {
                     self.pending_y = false;
                     self.split_current_at(SplitDirection::Vertical, SplitPlacement::After)?;
                 }
+                _ if key_matches_plain_letter(&key, 'r') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                    self.status = String::from(
+                        "[RESIZE] h/l: width (±4) | j/k: height (±2) | =: equal | Esc/Enter: done",
+                    );
+                }
+                KeyCode::Char('=') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.equalize_layout();
+                }
                 _ if key_matches_plain_letter(&key, 'c') => {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -2132,7 +2147,55 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::WindowPicker { pane_id });
-                    self.status = String::from("panel: choose h/j/k/l/c/o/t/d from the panel");
+                    self.status = String::from("panel: choose h/j/k/l/r/=/c/o/t/d from the panel");
+                }
+            },
+            PendingAction::WindowResize { pane_id } => match key.code {
+                _ if key_matches_plain_letter(&key, 'h')
+                    || key.code == KeyCode::Left
+                    || key.code == KeyCode::Char('<')
+                    || key.code == KeyCode::Char(',') =>
+                {
+                    self.resize_focused_pane_width(-4);
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                }
+                _ if key_matches_plain_letter(&key, 'l')
+                    || key.code == KeyCode::Right
+                    || key.code == KeyCode::Char('>')
+                    || key.code == KeyCode::Char('.') =>
+                {
+                    self.resize_focused_pane_width(4);
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                }
+                _ if key_matches_plain_letter(&key, 'k')
+                    || key.code == KeyCode::Up
+                    || key.code == KeyCode::Char('+') =>
+                {
+                    self.resize_focused_pane_height(2);
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                }
+                _ if key_matches_plain_letter(&key, 'j')
+                    || key.code == KeyCode::Down
+                    || key.code == KeyCode::Char('-') =>
+                {
+                    self.resize_focused_pane_height(-2);
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                }
+                KeyCode::Char('=') => {
+                    self.equalize_layout();
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                }
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.status = String::from("normal mode");
+                }
+                _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'w') => {
+                    self.status = String::from("normal mode");
+                }
+                _ => {
+                    self.pending_action = Some(PendingAction::WindowResize { pane_id });
+                    self.status = String::from(
+                        "[RESIZE] h/l: width (±4) | j/k: height (±2) | =: equal | Esc/Enter: done",
+                    );
                 }
             },
             PendingAction::LineModePicker { pane_id } => match key.code {

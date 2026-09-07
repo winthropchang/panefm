@@ -25,7 +25,7 @@ use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ignore::{WalkBuilder, WalkState};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -79,8 +79,9 @@ use super::{
         render_command_palette, render_confirm_dialog, render_diff_matrix, render_filter_input,
         render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
         render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
-        render_theme_picker, render_trash_confirm_dialog, render_window_picker, render_yank_picker,
-        render_zoxide_picker, visible_list_window_range,
+        render_theme_picker, render_trash_confirm_dialog, render_window_picker,
+        render_window_resize_picker, render_yank_picker, render_zoxide_picker,
+        visible_list_window_range,
     },
     zoxide::{ZoxideTracker, query_zoxide_directories},
 };
@@ -487,6 +488,9 @@ pub(crate) enum PendingAction {
     WindowPicker {
         pane_id: usize,
     },
+    WindowResize {
+        pane_id: usize,
+    },
     LineModePicker {
         pane_id: usize,
     },
@@ -648,6 +652,8 @@ pub(crate) struct App {
     filesystem_refresh_deadline: Option<Instant>,
     /// 要求主事件迴圈在下一幀前清除實體 terminal 與 ratatui buffer。
     pub(crate) full_redraw_requested: bool,
+    /// 記錄最近一次 render 時 panels 所分配到的區域（不含頂部 tabs 與底部 status/hint）。
+    pub(crate) latest_pane_area: Option<Rect>,
 }
 
 /// 記錄 F1 help 關閉後應回復到哪一種互動上下文。
@@ -847,6 +853,7 @@ impl App {
             pending_watched_directories: BTreeSet::new(),
             filesystem_refresh_deadline: None,
             full_redraw_requested: false,
+            latest_pane_area: None,
         };
         if recovered_interrupted_tasks > 0 {
             save_task_history(&app.task_history_path, &app.task_log)?;
@@ -859,6 +866,15 @@ impl App {
         self.panes
             .get(&self.focused_pane)
             .map(|pane| pane.cwd.as_path())
+    }
+
+    /// 取得目前 panels 分配到的區域，若尚未 render 則回退至終端實際大小。
+    pub(crate) fn current_pane_area(&self) -> Rect {
+        self.latest_pane_area.unwrap_or_else(|| {
+            crossterm::terminal::size()
+                .map(|(w, h)| Rect::new(0, 0, w, h.saturating_sub(3)))
+                .unwrap_or_else(|_| Rect::new(0, 0, 120, 40))
+        })
     }
 
     /// 根據目前應用程式狀態繪製整個畫面。
@@ -897,6 +913,7 @@ impl App {
             ])
             .split(frame.area());
 
+        self.latest_pane_area = Some(outer[0]);
         let mut pane_rects = BTreeMap::new();
         self.layout.render_rects(outer[0], &mut pane_rects);
         // PATH 掃描只在 dependency 面板真正顯示時執行。一般檔案列表每幀都重查四個
@@ -1384,6 +1401,9 @@ impl App {
             }
             Some(PendingAction::WindowPicker { .. }) => {
                 render_window_picker(frame, frame.area(), self.theme);
+            }
+            Some(PendingAction::WindowResize { .. }) => {
+                render_window_resize_picker(frame, frame.area(), self.theme);
             }
             Some(PendingAction::LineModePicker { .. }) => {
                 render_linemode_picker(frame, frame.area(), self.theme);
@@ -3217,6 +3237,14 @@ impl App {
                             label: "split h/v",
                         },
                         StatusShortcutHint {
+                            key: "r",
+                            label: "resize",
+                        },
+                        StatusShortcutHint {
+                            key: "=",
+                            label: "equal",
+                        },
+                        StatusShortcutHint {
                             key: "q",
                             label: "close",
                         },
@@ -3239,6 +3267,26 @@ impl App {
                         StatusShortcutHint {
                             key: "Esc",
                             label: "close",
+                        },
+                    ]);
+                }
+                PendingAction::WindowResize { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "h/l",
+                            label: "width",
+                        },
+                        StatusShortcutHint {
+                            key: "j/k",
+                            label: "height",
+                        },
+                        StatusShortcutHint {
+                            key: "=",
+                            label: "equal",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc/Enter",
+                            label: "done",
                         },
                     ]);
                 }
@@ -4187,6 +4235,18 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("terminal"),
         ),
         help_entry(
+            ":resize-mode",
+            "wr",
+            "進入視窗連續尺寸調整模式 (Sticky Resize Mode，hjkl/方向鍵微調)",
+            HelpAction::Command("resize-mode"),
+        ),
+        help_entry(
+            ":equal",
+            "w=",
+            "均等重設所有分割視窗大小 (Equalize)",
+            HelpAction::Command("equal"),
+        ),
+        help_entry(
             ":theme list",
             "tl",
             "打開主題列表；游標會停在目前使用中的主題",
@@ -4338,6 +4398,7 @@ pub(crate) enum ContextHelpKind {
     BookmarkList,
     ZoxideList,
     WindowPicker,
+    WindowResize,
     SortPicker,
     GoPicker,
     LineModePicker,
@@ -4392,6 +4453,7 @@ impl App {
                 PendingAction::BookmarkList { .. } => ContextHelpKind::BookmarkList,
                 PendingAction::ZoxideList { .. } => ContextHelpKind::ZoxideList,
                 PendingAction::WindowPicker { .. } => ContextHelpKind::WindowPicker,
+                PendingAction::WindowResize { .. } => ContextHelpKind::WindowResize,
                 PendingAction::SortPicker { .. } => ContextHelpKind::SortPicker,
                 PendingAction::GoPicker { .. } => ContextHelpKind::GoPicker,
                 PendingAction::LineModePicker { .. } => ContextHelpKind::LineModePicker,
@@ -5096,6 +5158,18 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                     HelpAction::QuitHint,
                 ),
                 help_entry(
+                    "resize-mode",
+                    "r",
+                    "進入視窗連續尺寸調整模式 (Sticky Resize Mode)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "equalize",
+                    "=",
+                    "均等重設所有分割視窗大小 (Equalize)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
                     "select-pane",
                     "1..9",
                     "直接切換焦點至指定編號視窗",
@@ -5105,6 +5179,47 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                     "cancel",
                     "Esc / q / w",
                     "取消退出視窗管理選單",
+                    HelpAction::QuitHint,
+                ),
+            ],
+        ),
+        ContextHelpKind::WindowResize => (
+            String::from("Cheatsheet: Window Resize Mode (視窗尺寸調整)"),
+            vec![
+                help_entry(
+                    "shrink-width",
+                    "h / Left",
+                    "減少目前視窗寬度 (4 欄)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "expand-width",
+                    "l / Right",
+                    "增加目前視窗寬度 (4 欄)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "expand-height",
+                    "k / Up",
+                    "增加目前視窗高度 (2 列)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "shrink-height",
+                    "j / Down",
+                    "減少目前視窗高度 (2 列)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "equalize",
+                    "=",
+                    "均等平衡所有視窗尺寸 (Reset Equal)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "done",
+                    "Esc / Enter / q",
+                    "結束調整模式並返回檔案列表",
                     HelpAction::QuitHint,
                 ),
             ],

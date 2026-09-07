@@ -132,6 +132,50 @@ impl App {
         self.status = String::from("kept only focused panel");
     }
 
+    /// 均等重設所有分割視窗的尺寸。
+    pub(crate) fn equalize_layout(&mut self) {
+        self.layout.equalize();
+        self.status = String::from("equalized all panels");
+    }
+
+    /// 調整目前焦點 panel 的寬度（欄數）。
+    pub(crate) fn resize_focused_pane_width(&mut self, delta: i32) {
+        let area = self.current_pane_area();
+        match self
+            .layout
+            .resize_pane(self.focused_pane, SplitDirection::Vertical, delta, area)
+        {
+            Ok(()) => {
+                self.status = format!(
+                    "resized panel {} width ({:+} cols)",
+                    self.focused_pane, delta
+                );
+            }
+            Err(reason) => {
+                self.status = format!("cannot resize panel {} width: {reason}", self.focused_pane);
+            }
+        }
+    }
+
+    /// 調整目前焦點 panel 的高度（列數）。
+    pub(crate) fn resize_focused_pane_height(&mut self, delta: i32) {
+        let area = self.current_pane_area();
+        match self
+            .layout
+            .resize_pane(self.focused_pane, SplitDirection::Horizontal, delta, area)
+        {
+            Ok(()) => {
+                self.status = format!(
+                    "resized panel {} height ({:+} rows)",
+                    self.focused_pane, delta
+                );
+            }
+            Err(reason) => {
+                self.status = format!("cannot resize panel {} height: {reason}", self.focused_pane);
+            }
+        }
+    }
+
     /// 讓指定 panel 切換到目標路徑，並在成功後同步把最新目錄寫進 zoxide。
     ///
     /// 參數：
@@ -1223,8 +1267,11 @@ impl App {
             }
             PendingAction::SortPicker { .. } => String::from("sort: choose a key from the panel"),
             PendingAction::WindowPicker { .. } => {
-                String::from("panel: choose h/j/k/l/c/o/t/d from the panel")
+                String::from("panel: choose h/j/k/l/r/=/c/o/t/d from the panel")
             }
+            PendingAction::WindowResize { .. } => String::from(
+                "[RESIZE] h/l: width (±4) | j/k: height (±2) | =: equal | Esc/Enter: done",
+            ),
             PendingAction::LineModePicker { .. } => {
                 String::from("move / linemode: choose a key from the panel")
             }

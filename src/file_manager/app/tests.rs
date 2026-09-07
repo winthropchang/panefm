@@ -8613,6 +8613,59 @@ fn diff_command_opens_and_navigates_matrix() {
         .expect("D");
     assert!(app.command_mode);
     assert_eq!(app.command_buffer, "diff ");
+    app.command_mode = false;
+    app.command_buffer.clear();
+
+    // 測試快捷鍵 wr (WindowPicker -> r 進入連續尺寸調整模式)
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+        .expect("w");
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+        .expect("r");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::WindowResize { .. })
+    ));
+
+    // 在 Resize 模式下按 l 調整寬度，模式維持不變
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        .expect("l");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::WindowResize { .. })
+    ));
+
+    // 在 Resize 模式下按 = 平衡所有視窗，模式維持不變
+    app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE))
+        .expect("=");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::WindowResize { .. })
+    ));
+
+    // 按 Esc 退出連續調整模式
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert!(app.pending_action.is_none());
+
+    // 測試快捷鍵 w= (WindowPicker -> = 直接重設均等)
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+        .expect("w");
+    app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE))
+        .expect("=");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "equalized all panels");
+
+    // 測試指令 :resize-mode
+    app.execute_command("resize-mode").expect("resize-mode");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::WindowResize { .. })
+    ));
+    app.pending_action = None;
+
+    // 測試指令 :equal
+    app.execute_command("equal").expect("equal");
+    assert_eq!(app.status, "equalized all panels");
 }
 
 #[test]
@@ -9180,6 +9233,7 @@ fn cheatsheet_covers_all_context_kinds() {
         ContextHelpKind::BookmarkList,
         ContextHelpKind::ZoxideList,
         ContextHelpKind::WindowPicker,
+        ContextHelpKind::WindowResize,
         ContextHelpKind::SortPicker,
         ContextHelpKind::GoPicker,
         ContextHelpKind::LineModePicker,

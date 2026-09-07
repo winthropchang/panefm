@@ -298,6 +298,23 @@ impl App {
             }
             "close" => self.close_current_pane(),
             "only" => self.only_current_pane(),
+            "equal" | "balance" | "w=" => self.equalize_layout(),
+            "resize-mode" | "wr" => {
+                self.pending_action = Some(PendingAction::WindowResize {
+                    pane_id: self.focused_pane,
+                });
+                self.status = String::from(
+                    "[RESIZE] h/l: width (±4) | j/k: height (±2) | =: equal | Esc/Enter: done",
+                );
+            }
+            "width" | "vresize" => {
+                self.status =
+                    String::from("usage: width <+/-columns> (e.g. :width +4 or :width -4)");
+            }
+            "height" | "resize" => {
+                self.status =
+                    String::from("usage: height <+/-rows> (e.g. :height +2 or :height -2)");
+            }
             "diff" | "df" | "d" => self.open_diff_matrix(None)?,
             "rename-regex" | "reg" => {
                 self.status = String::from("usage: rename-regex <pattern> <replace>");
@@ -355,6 +372,26 @@ impl App {
                         return Ok(());
                     };
                     self.delete_bookmark(key)?;
+                } else if let Some(arg) = other
+                    .strip_prefix("width ")
+                    .or_else(|| other.strip_prefix("vresize "))
+                {
+                    match arg.trim().parse::<i32>() {
+                        Ok(delta) => self.resize_focused_pane_width(delta),
+                        Err(_) => {
+                            self.status = String::from("usage: width <+/-columns> (e.g. :width +4)")
+                        }
+                    }
+                } else if let Some(arg) = other
+                    .strip_prefix("height ")
+                    .or_else(|| other.strip_prefix("resize "))
+                {
+                    match arg.trim().parse::<i32>() {
+                        Ok(delta) => self.resize_focused_pane_height(delta),
+                        Err(_) => {
+                            self.status = String::from("usage: height <+/-rows> (e.g. :height +2)")
+                        }
+                    }
                 } else if looks_like_navigation_path(other) {
                     self.change_directory_from_command(other)?;
                 } else {
