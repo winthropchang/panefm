@@ -268,28 +268,65 @@ command = "git -C {parent} log --oneline"
 
 ## 📖 設定檔 (`config.toml`)
 
-詳細設定請參考 [config.toml.example](config.toml.example)。設定檔讀取順序：
+PaneFM 支援完整的自訂設定。初次啟動時，若尚未存在設定檔，系統會**自動在執行檔同層（便攜模式優先）或系統設定目錄建立帶有完整預設值與繁體中文詳細註解的 `config.toml`**，讓您立即開箱自訂！
 
-1. `PANE_FM_CONFIG` 環境變數指定的檔案
-2. 目前目錄的 `config.toml`
-3. macOS：`~/.config/panefm/config.toml` 或 `$XDG_CONFIG_HOME/panefm/config.toml`
-4. Windows：`%APPDATA%\panefm\config.toml`
+### 設定檔讀取順序
+1. `PANE_FM_CONFIG` 環境變數指定的路徑
+2. 執行檔同層目錄的 `config.toml`（便攜綠色模式）
+3. 使用者設定目錄：
+   - **macOS / Linux**：`~/.config/panefm/config.toml` 或 `$XDG_CONFIG_HOME/panefm/config.toml`
+   - **Windows**：`%APPDATA%\panefm\config.toml`
 
-可自由調整預設主題、隱藏檔顯示、排序偏好、移動步長與介面尺寸。
+### 常用設定預覽
+```toml
+[ui]
+# 介面色彩主題（內建 catppuccin-mocha、dracula、tokyo-night、gruvbox、nord 等 10 款）
+# 💡 在介面中按 t 鍵切換主題時，會自動寫回此設定檔永久保存！
+theme = "catppuccin-mocha"
+
+[pane]
+# 啟動時是否預設顯示隱藏檔案與目錄（. 開頭）
+show_hidden = false
+
+# 面板啟動時的預設排序方式（"natural"、"modified"、"created"、"size"、"extension"、"random"）
+default_sort = "natural"
+default_sort_reverse = false
+
+# 列表右側欄位預設顯示的資訊類型：
+#   - "mtime"      : 顯示最後修改時間（預設，格式為 MM/DD HH:MM）
+#   - "btime"      : 顯示建立時間 (Birth time)
+#   - "size"       : 顯示檔案容量大小 (B/K/M/G/T)
+#   - "permissions": 顯示權限標記 (rwx / readonly)
+#   - "none"       : 不顯示右側欄位，享受最寬敞純淨的檔名空間
+default_linemode = "mtime"
+
+[navigation]
+fast_move_step = 5      # Shift+J / Shift+K 大步跳躍列數
+panel_page_step = 10    # Ctrl+D / Ctrl+U 翻頁列數
+```
+
+詳細設定與其他區塊（`[ui.icons]`, `[ui.preview]`, `[search]`, `[watcher]`, `[behavior]`）請參考 [config.toml.example](config.toml.example)。
 
 ---
 
-## 🔄 一鍵自我更新（Self-Update）
+## 🔄 一鍵自我更新（Self-Update）與 CLI 參數
 
 PaneFM 支援跨 Windows 與 macOS 的全自動自我更新，無需手動前往瀏覽器下載與替換：
 
 ```bash
+# 檢查 GitHub 最新版本並原地自動置換更新
 panefm update
+
+# 查看目前安裝之版本號
+panefm --version    # 或 panefm -V
+
+# 查看命令列說明
+panefm --help       # 或 panefm -h
 ```
 
-- **自動檢查**：向 GitHub Releases 查詢最新穩定版本。
-- **雙平台原生對齊**：自動識別 Windows x64、macOS Apple Silicon (ARM64) 與 macOS Intel (x64) 架構，精準下載對應資產。
-- **安全無副作用**：具備離線超時保護與友好中文錯誤診斷；新版本完整下載驗證前絕不觸碰現有執行檔。
+- **自動比對**：透過 GitHub Releases API 進行標準語意化版本（SemVer）比對。
+- **雙平台原生對齊**：自動精準識別 Windows x64、macOS Apple Silicon (ARM64) 與 macOS Intel (x64) 架構，下載正確二進位資產。
+- **安全無副作用**：具備離線超時保護與友善中文診斷；新版本在串流下載並完整驗證前絕不更動現有執行檔。
 
 ---
 
@@ -297,7 +334,7 @@ panefm update
 
 PaneFM 是一個以 **Vibe Coding** 方式開發的軟體，也是我嘗試使用 AI 建立自己真正會每天使用之終端生產力工具的專案。
 
-功能方向、操作流程與使用體驗來自真實開發痛點與需求；程式碼則透過與 AI 持續對話、架構設計、實作、嚴格測試（**450+ 自動化測試保護**）逐步打磨而成。希望這款工具能讓每一位熱愛命令列與鍵盤流的開發者感受到極致流暢的操作樂趣！
+功能方向、操作流程與使用體驗來自真實開發痛點與需求；程式碼則透過與 AI 持續對話、架構設計、實作、嚴格測試（**500+ 自動化測試保護**）逐步打磨而成。希望這款工具能讓每一位熱愛命令列與鍵盤流的開發者感受到極致流暢的操作樂趣！
 
 ---
 
