@@ -120,6 +120,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let app_dir = platform::executable_dir().unwrap_or_else(|| cwd.clone());
+    let _ = crate::config::ensure_default_config_file(&app_dir);
     let loaded_config = load_config(&app_dir)?;
     let poll_rate = loaded_config.config.ui.poll_rate;
     let mut app = App::new(cwd, loaded_config)?;

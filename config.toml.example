@@ -25,6 +25,8 @@ height = 20
 show_hidden = false
 default_sort = "natural"
 default_sort_reverse = false
+# 列表右側欄位預設顯示內容：mtime（最後修改時間）、btime（建立時間）、size（大小）、permissions（權限）、none（不顯示）
+default_linemode = "mtime"
 
 [search]
 global_search_limit = 200

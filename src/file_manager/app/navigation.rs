@@ -34,6 +34,9 @@ impl App {
         let mut pane = PaneState::new(cwd)?;
         pane.set_show_hidden(show_hidden);
         pane.set_sort_mode(sort_mode);
+        if let Some(line_mode) = source_pane.line_mode {
+            pane.set_line_mode(line_mode);
+        }
         self.panes.insert(new_id, pane);
         self.layout =
             self.layout

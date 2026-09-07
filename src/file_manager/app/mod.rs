@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    config::{AppConfig, LoadedConfig, StartupSort, persist_theme},
+    config::{AppConfig, LoadedConfig, StartupLinemode, StartupSort, persist_theme},
     theme::{Theme, ThemePreset},
 };
 
@@ -1562,6 +1562,18 @@ pub(crate) fn apply_config_to_pane(config: &AppConfig, pane: &mut PaneState) {
         config.pane.default_sort,
         config.pane.default_sort_reverse,
     ));
+    pane.set_line_mode(linemode_from_config(config.pane.default_linemode));
+}
+
+/// 將設定檔中的 linemode 偏好轉成 pane 實際使用的模式。
+pub(crate) fn linemode_from_config(linemode: StartupLinemode) -> LineMode {
+    match linemode {
+        StartupLinemode::Mtime => LineMode::Mtime,
+        StartupLinemode::Btime => LineMode::Btime,
+        StartupLinemode::Size => LineMode::Size,
+        StartupLinemode::Permissions => LineMode::Permissions,
+        StartupLinemode::None => LineMode::None,
+    }
 }
 
 /// 收集目前 viewport 中需要查詢背景工作標籤的檔案路徑。

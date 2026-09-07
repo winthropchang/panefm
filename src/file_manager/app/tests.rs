@@ -1094,6 +1094,7 @@ fn app_new_applies_startup_pane_preferences() {
                 show_hidden: true,
                 default_sort: StartupSort::Size,
                 default_sort_reverse: true,
+                default_linemode: crate::config::StartupLinemode::Size,
             },
             ..AppConfig::default()
         },
@@ -1106,6 +1107,7 @@ fn app_new_applies_startup_pane_preferences() {
 
     assert!(pane.show_hidden);
     assert_eq!(pane.sort_mode, SortMode::Size { reverse: true });
+    assert_eq!(pane.line_mode, Some(LineMode::Size));
     assert_eq!(pane.visible_indices.len(), 2);
 }
 
@@ -1122,6 +1124,7 @@ fn app_split_inherits_pane_preferences() {
         let pane = app.panes.get_mut(&1).expect("pane");
         pane.set_show_hidden(true);
         pane.set_sort_mode(SortMode::Modified { reverse: true });
+        pane.set_line_mode(LineMode::Permissions);
     }
 
     app.split_current(SplitDirection::Vertical).expect("split");
@@ -1129,6 +1132,7 @@ fn app_split_inherits_pane_preferences() {
     let pane = app.panes.get(&2).expect("new pane");
     assert!(pane.show_hidden);
     assert_eq!(pane.sort_mode, SortMode::Modified { reverse: true });
+    assert_eq!(pane.line_mode, Some(LineMode::Permissions));
     assert_eq!(pane.visible_indices.len(), 2);
 }
 
