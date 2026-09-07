@@ -6,6 +6,7 @@
 pub mod config;
 pub mod file_manager;
 pub mod theme;
+pub mod updater;
 
 use anyhow::Result;
 

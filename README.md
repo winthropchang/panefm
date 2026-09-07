@@ -279,6 +279,20 @@ command = "git -C {parent} log --oneline"
 
 ---
 
+## 🔄 一鍵自我更新（Self-Update）
+
+PaneFM 支援跨 Windows 與 macOS 的全自動自我更新，無需手動前往瀏覽器下載與替換：
+
+```bash
+panefm update
+```
+
+- **自動檢查**：向 GitHub Releases 查詢最新穩定版本。
+- **雙平台原生對齊**：自動識別 Windows x64、macOS Apple Silicon (ARM64) 與 macOS Intel (x64) 架構，精準下載對應資產。
+- **安全無副作用**：具備離線超時保護與友好中文錯誤診斷；新版本完整下載驗證前絕不觸碰現有執行檔。
+
+---
+
 ## 💖 Vibe Coding 專案故事
 
 PaneFM 是一個以 **Vibe Coding** 方式開發的軟體，也是我嘗試使用 AI 建立自己真正會每天使用之終端生產力工具的專案。
