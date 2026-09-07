@@ -349,3 +349,98 @@ fn test_resize_pane_multi_sibling_co_shrinking_and_growing() {
     assert_eq!(rects.get(&2).unwrap().width, 33, "pane 2 應縮小至 33");
     assert_eq!(rects.get(&3).unwrap().width, 34, "pane 3 應同步放大至 34");
 }
+
+#[test]
+/// 驗證使用者情境：
+/// 當建立 4 個 pane 並將第四個 pane (pane 4) 放大後，
+/// 在 pane 4 下方分割建立 pane 5 (wj) 或繼續分割 pane 6 時，
+/// 第四欄既有的放大寬度必須被完整保留，不能被重設為均等寬度。
+fn test_split_nested_preserves_ancestor_custom_weights() {
+    let screen = Rect::new(0, 0, 100, 40);
+
+    // 建立 4 個直向並排 pane (pane 1, 2, 3, 4)
+    let mut layout = LayoutNode::Leaf { pane_id: 1 }
+        .split_leaf(1, SplitDirection::Vertical, SplitPlacement::After, 2)
+        .split_leaf(2, SplitDirection::Vertical, SplitPlacement::After, 3)
+        .split_leaf(3, SplitDirection::Vertical, SplitPlacement::After, 4);
+
+    // 將 pane 4 大幅擴大 (+24 欄)
+    let res = layout.resize_pane(4, SplitDirection::Vertical, 24, screen);
+    assert!(res.is_ok());
+
+    let mut rects = BTreeMap::new();
+    layout.render_rects(screen, &mut rects);
+    let pane4_resized_width = rects.get(&4).unwrap().width;
+    let pane1_width = rects.get(&1).unwrap().width;
+    let pane2_width = rects.get(&2).unwrap().width;
+    let pane3_width = rects.get(&3).unwrap().width;
+    assert!(pane4_resized_width > 40, "pane 4 應已放大至 40 以上");
+
+    // 在 pane 4 下方分割新增 pane 5 (wj - 水平分割)
+    layout = layout.split_leaf(4, SplitDirection::Horizontal, SplitPlacement::After, 5);
+
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+
+    // 驗證：pane 1, 2, 3 的寬度維持不變，pane 4 與 pane 5 的寬度仍然維持放大後的寬度！
+    assert_eq!(
+        rects.get(&1).unwrap().width,
+        pane1_width,
+        "pane 1 寬度應維持原樣"
+    );
+    assert_eq!(
+        rects.get(&2).unwrap().width,
+        pane2_width,
+        "pane 2 寬度應維持原樣"
+    );
+    assert_eq!(
+        rects.get(&3).unwrap().width,
+        pane3_width,
+        "pane 3 寬度應維持原樣"
+    );
+    assert_eq!(
+        rects.get(&4).unwrap().width,
+        pane4_resized_width,
+        "pane 4 放大寬度必須被保留"
+    );
+    assert_eq!(
+        rects.get(&5).unwrap().width,
+        pane4_resized_width,
+        "pane 5 寬度應與 pane 4 一致"
+    );
+    // 高度平分
+    assert_eq!(rects.get(&4).unwrap().height, 20);
+    assert_eq!(rects.get(&5).unwrap().height, 20);
+
+    // 繼續在 pane 4 下方分割新增 pane 6 (wj)
+    layout = layout.split_leaf(4, SplitDirection::Horizontal, SplitPlacement::After, 6);
+
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(
+        rects.get(&4).unwrap().width,
+        pane4_resized_width,
+        "新增第三個子視窗後 pane 4 寬度依然維持"
+    );
+    assert_eq!(
+        rects.get(&6).unwrap().width,
+        pane4_resized_width,
+        "pane 6 寬度亦為該欄放大寬度"
+    );
+    assert_eq!(
+        rects.get(&5).unwrap().width,
+        pane4_resized_width,
+        "pane 5 寬度亦為該欄放大寬度"
+    );
+
+    // 關閉 pane 6，第四欄寬度依然維持
+    layout = layout.close_pane(6).unwrap();
+    rects.clear();
+    layout.render_rects(screen, &mut rects);
+    assert_eq!(
+        rects.get(&4).unwrap().width,
+        pane4_resized_width,
+        "關閉子視窗後該欄寬度依然維持"
+    );
+    assert_eq!(rects.get(&5).unwrap().width, pane4_resized_width);
+}

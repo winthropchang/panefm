@@ -82,7 +82,7 @@ impl LayoutNode {
             LayoutNode::Split {
                 direction: split_direction,
                 mut children,
-                weights: _,
+                weights,
             } => {
                 // 若分割方向相同，且目標為此節點的直接 Leaf 子節點，直接吸收為同級視窗
                 if split_direction == direction
@@ -106,16 +106,15 @@ impl LayoutNode {
                     };
                 }
 
-                // 否則遞迴進入子樹尋找 target
+                // 否則遞迴進入子樹尋找 target（保留此節點既有的 weights 尺寸分配）
                 let new_children: Vec<LayoutNode> = children
                     .into_iter()
                     .map(|child| child.split_leaf(target, direction, placement, new_pane_id))
                     .collect();
-                let count = new_children.len();
                 LayoutNode::Split {
                     direction: split_direction,
                     children: new_children,
-                    weights: vec![100; count],
+                    weights,
                 }
             }
         }
@@ -136,22 +135,32 @@ impl LayoutNode {
             LayoutNode::Split {
                 direction,
                 children,
-                weights: _,
+                weights,
             } => {
+                let initial_len = children.len();
                 let mut new_children = Vec::new();
-                for child in children {
+                let mut new_weights = Vec::new();
+                for (child, w) in children.into_iter().zip(weights) {
                     if let Some(c) = child.close_pane(target) {
                         new_children.push(c);
+                        new_weights.push(w);
                     }
                 }
                 match new_children.len() {
                     0 => None,
                     1 => Some(new_children.remove(0)),
-                    len => Some(LayoutNode::Split {
-                        direction,
-                        children: new_children,
-                        weights: vec![100; len],
-                    }),
+                    len => {
+                        let final_weights = if len < initial_len {
+                            vec![100; len]
+                        } else {
+                            new_weights
+                        };
+                        Some(LayoutNode::Split {
+                            direction,
+                            children: new_children,
+                            weights: final_weights,
+                        })
+                    }
                 }
             }
         }
