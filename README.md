@@ -268,11 +268,11 @@ command = "git -C {parent} log --oneline"
 
 ## 📖 設定檔 (`config.toml`)
 
-PaneFM 支援完整的自訂設定。初次啟動時，若尚未存在設定檔，系統會**自動在執行檔同層（便攜模式優先）或系統設定目錄建立帶有完整預設值與繁體中文詳細註解的 `config.toml`**，讓您立即開箱自訂！
+PaneFM 支援完整的自訂設定。初次啟動時，若尚未存在設定檔，系統會**自動在執行檔同層或系統設定目錄建立帶有完整預設值與繁體中文詳細註解的 `config.toml`**，讓您立即開箱自訂！
 
 ### 設定檔讀取順序
 1. `PANE_FM_CONFIG` 環境變數指定的路徑
-2. 執行檔同層目錄的 `config.toml`（便攜綠色模式）
+2. 執行檔同層目錄的 `config.toml`
 3. 使用者設定目錄：
    - **macOS / Linux**：`~/.config/panefm/config.toml` 或 `$XDG_CONFIG_HOME/panefm/config.toml`
    - **Windows**：`%APPDATA%\panefm\config.toml`

@@ -788,7 +788,7 @@ cancel_search_on_leave = true
 /// 檢查目前環境是否已有任何有效的 `config.toml`；若無，則自動在適當位置建立預設設定檔。
 ///
 /// 優先順序：
-/// 1. 若可執行檔所在目錄可寫入，直接在該處建立 `config.toml`（便攜模式）。
+/// 1. 若可執行檔所在目錄可寫入，直接在該處建立 `config.toml`。
 /// 2. 若不可寫入（如位於系統保護目錄），則回退到使用者設定目錄：
 ///    - Windows: `%APPDATA%\panefm\config.toml`
 ///    - macOS/Linux: `~/.config/panefm/config.toml` 或 `$XDG_CONFIG_HOME/panefm/config.toml`
