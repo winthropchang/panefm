@@ -73,6 +73,31 @@
 - `Esc` 的行為必須一致且可預期，優先代表離開輸入、取消暫時模式、回到上一層。
 - 如果某個模式是兩段式離開，必須在狀態列清楚說明目前狀態。
 
+### 4.3 指令與快捷鍵閉環原則
+
+在 PaneFM 中，任何新增或修改的**冒號指令（Command）**與**快捷鍵（Keybinding）**，絕不可只在執行端寫完就視為完工，必須滿足完整的閉環生命週期鏈路：
+
+1. **指令執行端實作（`commands.rs`）**：
+   - 負責指令名稱比對、前綴比對、參數解析（如數值、路徑、flags）與防呆錯誤提示（如缺少參數時的 `usage: ...`）。
+2. **自動補全與說明清單註冊（`help_entries`，強制）**：
+   - 所有供使用者輸入的指令，**必須同時在 `src/file_manager/app/mod.rs` 的 `help_entries()` 中註冊**。
+   - `help_entry` 必須提供：完整命令樣板（如 `:width <+/-cols>`）、對應快捷鍵（若無填 `""`）、繁體中文清晰說明，以及對應的 `HelpAction::Command("width ")`。
+   - **保護目的**：Command Palette（`:`）的候選下拉選單與 `Tab` 自動補全完全依賴此清單；未註冊者將導致使用者在介面上看到空白候選框或按 Tab 無反應，誤以為指令不存在。
+3. **快捷鍵與選單整合**：
+   - 若該指令有專屬快捷鍵（如 `w` 視窗選單下的 `wW` / `wH`、或 `m` 下的 `mp`）：
+     - 需於對應的 `PendingAction` 處理器（如 `WindowPicker`、`MovePicker`）加入鍵盤事件映射。
+     - 若為輸入參數型快捷鍵，優先使用 `open_prefilled_command("command ")` 喚醒預填命令列。
+     - 必須同步更新該模式的底部即時提示（`active_status_shortcut_hints`）與情境速查（`ContextHelpKind` Cheatsheet）。
+4. **全域說明面板字典（`~/F1`）**：
+   - 確保按下 `~/F1` 呼叫全局說明時，能以繁體中文清楚檢索到該指令與快捷鍵。
+5. **整合與回歸測試覆蓋**：
+   - 必須於測試檔案中補齊：
+     - 指令執行與邊界參數測試（成功與語法錯誤路徑）。
+     - `command_suggestions` 候選與補全測試。
+     - 快捷鍵喚醒行為測試（確認 buffer 正確預填）。
+6. **文件同步（`README.md`）**：
+   - 同步更新功能介紹特點清單與「全鍵盤操作字典」表格。
+
 ## 5. Terminal 相容性規則
 
 這個專案不是只跑在單一 terminal，因此不能依賴某一個 terminal 的特殊行為。
@@ -353,6 +378,7 @@ fn windows_reveal_uses_explorer_select() {
 
 - 這個功能是 panel-local 還是 global？
 - 是否符合 Vim 核心操作？
+- 若新增指令或快捷鍵，是否規劃好 `commands.rs`、`help_entries`（Tab 補全）、狀態提示與說明的完整閉環？
 - 是否有平台差異？
 - 是否會碰到 terminal keyboard / raw mode / alternate screen？
 - 是否會呼叫外部程式？
@@ -375,6 +401,7 @@ fn windows_reveal_uses_explorer_select() {
 - [ ] 沒有把 panel 狀態做成不必要的全域
 - [ ] 沒有把平台差異散落在業務邏輯裡
 - [ ] 沒有讓外部程式吃到 TUI 的 terminal 狀態
+- [ ] 新增指令或快捷鍵已滿足閉環原則（已註冊至 `help_entries` 支援 Tab 補全、已加入 Cheatsheet/Status hints、已同步 README 與測試）
 - [ ] 設定或文件有同步更新
 
 ## 14. 版本定版與發布流程 (Release & Versioning)
