@@ -9577,3 +9577,41 @@ fn q_cancels_panel_search_in_normal_mode() {
         panic!("expected TrashPanel");
     }
 }
+
+#[test]
+fn window_picker_w_and_h_open_prefilled_commands() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.pending_action = Some(PendingAction::WindowPicker { pane_id: 1 });
+
+    // 按下 Shift+W (wW) 開啟 :width 
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT))
+        .expect("wW");
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "width ");
+
+    // 重設 command mode
+    app.command_mode = false;
+    app.command_buffer.clear();
+
+    // 按下 Shift+H (wH) 開啟 :height 
+    app.pending_action = Some(PendingAction::WindowPicker { pane_id: 1 });
+    app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT))
+        .expect("wH");
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "height ");
+}
+
+#[test]
+fn command_suggestions_include_width_and_height() {
+    let width_suggestions = command_suggestions("width");
+    assert!(!width_suggestions.is_empty());
+    assert_eq!(width_suggestions[0].command, "width ");
+    assert_eq!(width_suggestions[0].shortcut, "wW");
+
+    let height_suggestions = command_suggestions("height");
+    assert!(!height_suggestions.is_empty());
+    assert_eq!(height_suggestions[0].command, "height ");
+    assert_eq!(height_suggestions[0].shortcut, "wH");
+}
+

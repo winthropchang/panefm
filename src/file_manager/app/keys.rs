@@ -2127,6 +2127,30 @@ impl App {
                         self.status = String::from("panel focus changed");
                     }
                 }
+                _ if key_matches_plain_letter(&key, 's') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.split_current_at(SplitDirection::Horizontal, SplitPlacement::After)?;
+                }
+                _ if key_matches_plain_letter(&key, 'v') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.split_current_at(SplitDirection::Vertical, SplitPlacement::After)?;
+                }
+                _ if key_matches_shifted_letter(&key, 'W') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.open_prefilled_command("width ");
+                }
+                _ if key_matches_shifted_letter(&key, 'H') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.open_prefilled_command("height ");
+                }
                 _ if key_matches_plain_letter(&key, 'd') => {
                     self.clear_pending_count();
                     self.pending_g = false;
@@ -2139,6 +2163,12 @@ impl App {
                     self.pending_y = false;
                     self.open_prefilled_command("diff ");
                 }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    self.clear_pending_count();
+                    self.pending_g = false;
+                    self.pending_y = false;
+                    self.focus_pane_by_id_argument(&ch.to_string());
+                }
                 KeyCode::Esc => {
                     self.status = String::from("normal mode");
                 }
@@ -2147,7 +2177,7 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::WindowPicker { pane_id });
-                    self.status = String::from("panel: choose h/j/k/l/r/=/c/o/t/d from the panel");
+                    self.status = String::from("panel: choose h/j/k/l/s/v/r/=/W/H/c/o/t/d/1..9 from the panel");
                 }
             },
             PendingAction::WindowResize { pane_id } => match key.code {

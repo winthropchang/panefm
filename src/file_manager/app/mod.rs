@@ -3245,6 +3245,10 @@ impl App {
                             label: "equal",
                         },
                         StatusShortcutHint {
+                            key: "W/H",
+                            label: "width/height",
+                        },
+                        StatusShortcutHint {
                             key: "q",
                             label: "close",
                         },
@@ -4247,6 +4251,18 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
             HelpAction::Command("equal"),
         ),
         help_entry(
+            ":width <+/-cols>",
+            "wW",
+            "調整目前視窗寬度（例如 :width +15 或 :width -10）",
+            HelpAction::Command("width "),
+        ),
+        help_entry(
+            ":height <+/-rows>",
+            "wH",
+            "調整目前視窗高度（例如 :height +5 或 :height -5）",
+            HelpAction::Command("height "),
+        ),
+        help_entry(
             ":theme list",
             "tl",
             "打開主題列表；游標會停在目前使用中的主題",
@@ -5167,6 +5183,18 @@ pub(crate) fn context_cheatsheet_entries(kind: ContextHelpKind) -> (String, Vec<
                     "equalize",
                     "=",
                     "均等重設所有分割視窗大小 (Equalize)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "width",
+                    "W",
+                    "調整目前視窗寬度 (預填 :width 指令)",
+                    HelpAction::QuitHint,
+                ),
+                help_entry(
+                    "height",
+                    "H",
+                    "調整目前視窗高度 (預填 :height 指令)",
                     HelpAction::QuitHint,
                 ),
                 help_entry(
