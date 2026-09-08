@@ -4449,7 +4449,13 @@ fn file_entry_from_dir_entry(item: fs::DirEntry) -> FileEntry {
             read_unix_mode(&meta),
         )
     } else {
-        (0, SystemTime::UNIX_EPOCH, SystemTime::UNIX_EPOCH, false, None)
+        (
+            0,
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            false,
+            None,
+        )
     };
 
     FileEntry {

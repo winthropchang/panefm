@@ -9592,7 +9592,7 @@ fn window_picker_w_and_h_open_prefilled_commands() {
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
     app.pending_action = Some(PendingAction::WindowPicker { pane_id: 1 });
 
-    // 按下 Shift+W (wW) 開啟 :width 
+    // 按下 Shift+W (wW) 開啟 :width
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT))
         .expect("wW");
     assert!(app.command_mode);
@@ -9602,7 +9602,7 @@ fn window_picker_w_and_h_open_prefilled_commands() {
     app.command_mode = false;
     app.command_buffer.clear();
 
-    // 按下 Shift+H (wH) 開啟 :height 
+    // 按下 Shift+H (wH) 開啟 :height
     app.pending_action = Some(PendingAction::WindowPicker { pane_id: 1 });
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT))
         .expect("wH");
@@ -9770,7 +9770,10 @@ fn test_gt_flow_copy_cd_then_gt_esc_p_pastes() {
     // 模擬在 pane 中使用 c 然後 d 複製目錄路徑
     app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
         .expect("press c");
-    assert!(matches!(app.pending_action, Some(PendingAction::CopyPicker { .. })));
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::CopyPicker { .. })
+    ));
     app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
         .expect("press d");
     assert!(app.pending_action.is_none());
@@ -9801,5 +9804,3 @@ fn test_gt_flow_copy_cd_then_gt_esc_p_pastes() {
         app.command_buffer
     );
 }
-
-

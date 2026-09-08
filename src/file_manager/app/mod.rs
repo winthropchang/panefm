@@ -76,12 +76,12 @@ use super::{
         BookmarkPanelLine, CommandPaletteState, CommandSuggestionLine, HelpPanelLine,
         InlineEditorState, InlinePickerState, PaneListState, RegexRenamePanelLine, SearchListState,
         TaskPanelLine, TrashPanelLine, ZoxidePanelLine, render_bookmark_action_picker,
-        render_bookmark_picker, render_command_palette, render_confirm_dialog, render_diff_matrix, render_filter_input,
-        render_global_search_panel, render_go_picker, render_linemode_picker, render_pane,
-        render_paste_overwrite_dialog, render_preview_search_input, render_theme_command_picker,
-        render_theme_picker, render_trash_confirm_dialog, render_window_picker,
-        render_window_resize_picker, render_yank_picker, render_zoxide_picker,
-        visible_list_window_range,
+        render_bookmark_picker, render_command_palette, render_confirm_dialog, render_diff_matrix,
+        render_filter_input, render_global_search_panel, render_go_picker, render_linemode_picker,
+        render_pane, render_paste_overwrite_dialog, render_preview_search_input,
+        render_theme_command_picker, render_theme_picker, render_trash_confirm_dialog,
+        render_window_picker, render_window_resize_picker, render_yank_picker,
+        render_zoxide_picker, visible_list_window_range,
     },
     zoxide::{ZoxideTracker, query_zoxide_directories},
 };
@@ -6546,9 +6546,7 @@ pub(crate) fn insert_str(buffer: &mut String, cursor: &mut usize, text: &str) {
 /// 回傳：`String`，清理後可安全插入單行輸入框的字串。
 pub(crate) fn sanitize_pasted_text(text: &str) -> String {
     let trimmed = text.trim_end_matches(['\r', '\n']);
-    trimmed
-        .replace("\r\n", " ")
-        .replace(['\n', '\r'], " ")
+    trimmed.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }
 
 /// 刪除游標左側的一個字元，行為對齊一般文字編輯器的 Backspace。

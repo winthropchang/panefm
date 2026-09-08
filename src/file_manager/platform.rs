@@ -1074,10 +1074,16 @@ mod tests {
     #[test]
     /// 驗證系統剪貼簿讀寫在當前平台能夠正常寫入與取出純文字。
     fn clipboard_roundtrip_test() {
-        let _lock = super::TEST_CLIPBOARD_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::TEST_CLIPBOARD_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let text = "panefm_test_clipboard_roundtrip_42";
         let write_res = super::write_text_to_system_clipboard(text);
-        assert!(write_res.is_ok(), "failed to write to clipboard: {:?}", write_res);
+        assert!(
+            write_res.is_ok(),
+            "failed to write to clipboard: {:?}",
+            write_res
+        );
         let read = super::read_text_from_system_clipboard();
         assert_eq!(read.as_deref(), Some(text));
     }

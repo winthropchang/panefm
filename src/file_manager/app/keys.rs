@@ -2215,7 +2215,9 @@ impl App {
                 }
                 _ => {
                     self.pending_action = Some(PendingAction::WindowPicker { pane_id });
-                    self.status = String::from("panel: choose h/j/k/l/s/v/r/=/W/H/c/o/t/d/1..9 from the panel");
+                    self.status = String::from(
+                        "panel: choose h/j/k/l/s/v/r/=/W/H/c/o/t/d/1..9 from the panel",
+                    );
                 }
             },
             PendingAction::WindowResize { pane_id } => match key.code {
@@ -4210,162 +4212,162 @@ impl App {
                         return Ok(true);
                     }
                     match key.code {
-                    KeyCode::Left => {
-                        cursor = cursor.saturating_sub(1);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'h') => {
-                        cursor = cursor.saturating_sub(1);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Right => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'l') => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Home | KeyCode::Char('0') => {
-                        cursor = 0;
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::End | KeyCode::Char('$') => {
-                        cursor = rename_line_end_cursor(&buffer);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Delete => {
-                        delete_char_at(&mut buffer, cursor);
-                        cursor = cursor.min(rename_line_end_cursor(&buffer));
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'x') => {
-                        delete_char_at(&mut buffer, cursor);
-                        cursor = cursor.min(rename_line_end_cursor(&buffer));
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'w') => {
-                        cursor = rename_next_word_start(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'b') => {
-                        cursor = rename_previous_word_start(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'e') => {
-                        cursor = rename_word_end(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'i') => {
-                        mode = RenameMode::Insert;
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = String::from("rename: insert");
-                    }
-                    _ if key_matches_plain_letter(&key, 'a') => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        mode = RenameMode::Insert;
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = String::from("rename: insert");
-                    }
-                    KeyCode::Enter => {
-                        self.confirm_rename(pane_id, &original_name, &buffer)?;
-                    }
-                    KeyCode::Esc => {
-                        self.status = format!("rename cancelled: {original_name}");
-                    }
-                    _ if key_matches_plain_letter(&key, 'q') => {
-                        self.status = format!("rename cancelled: {original_name}");
-                    }
-                    _ => {
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
+                        KeyCode::Left => {
+                            cursor = cursor.saturating_sub(1);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'h') => {
+                            cursor = cursor.saturating_sub(1);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Right => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'l') => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Home | KeyCode::Char('0') => {
+                            cursor = 0;
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::End | KeyCode::Char('$') => {
+                            cursor = rename_line_end_cursor(&buffer);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Delete => {
+                            delete_char_at(&mut buffer, cursor);
+                            cursor = cursor.min(rename_line_end_cursor(&buffer));
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'x') => {
+                            delete_char_at(&mut buffer, cursor);
+                            cursor = cursor.min(rename_line_end_cursor(&buffer));
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'w') => {
+                            cursor = rename_next_word_start(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'b') => {
+                            cursor = rename_previous_word_start(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'e') => {
+                            cursor = rename_word_end(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'i') => {
+                            mode = RenameMode::Insert;
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = String::from("rename: insert");
+                        }
+                        _ if key_matches_plain_letter(&key, 'a') => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            mode = RenameMode::Insert;
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = String::from("rename: insert");
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_rename(pane_id, &original_name, &buffer)?;
+                        }
+                        KeyCode::Esc => {
+                            self.status = format!("rename cancelled: {original_name}");
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            self.status = format!("rename cancelled: {original_name}");
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
                     }
                 }
-            }
-        },
+            },
             PendingAction::CreateEntry {
                 pane_id,
                 mut buffer,
@@ -4534,148 +4536,148 @@ impl App {
                         return Ok(true);
                     }
                     match key.code {
-                    KeyCode::Left => {
-                        cursor = cursor.saturating_sub(1);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'h') => {
-                        cursor = cursor.saturating_sub(1);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Right => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'l') => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Home | KeyCode::Char('0') => {
-                        cursor = 0;
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::End | KeyCode::Char('$') => {
-                        cursor = rename_line_end_cursor(&buffer);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Delete => {
-                        delete_char_at(&mut buffer, cursor);
-                        cursor = cursor.min(rename_line_end_cursor(&buffer));
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'x') => {
-                        delete_char_at(&mut buffer, cursor);
-                        cursor = cursor.min(rename_line_end_cursor(&buffer));
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'w') => {
-                        cursor = rename_next_word_start(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'b') => {
-                        cursor = rename_previous_word_start(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'e') => {
-                        cursor = rename_word_end(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    _ if key_matches_plain_letter(&key, 'i') => {
-                        mode = RenameMode::Insert;
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = create_status_label("insert");
-                    }
-                    _ if key_matches_plain_letter(&key, 'a') => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        mode = RenameMode::Insert;
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = create_status_label("insert");
-                    }
-                    KeyCode::Enter => {
-                        self.confirm_create_entry(pane_id, &buffer)?;
-                    }
-                    KeyCode::Esc => {
-                        self.status = String::from("create cancelled");
-                    }
-                    _ if key_matches_plain_letter(&key, 'q') => {
-                        self.status = String::from("create cancelled");
-                    }
-                    _ => {
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
+                        KeyCode::Left => {
+                            cursor = cursor.saturating_sub(1);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'h') => {
+                            cursor = cursor.saturating_sub(1);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Right => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'l') => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Home | KeyCode::Char('0') => {
+                            cursor = 0;
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::End | KeyCode::Char('$') => {
+                            cursor = rename_line_end_cursor(&buffer);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Delete => {
+                            delete_char_at(&mut buffer, cursor);
+                            cursor = cursor.min(rename_line_end_cursor(&buffer));
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'x') => {
+                            delete_char_at(&mut buffer, cursor);
+                            cursor = cursor.min(rename_line_end_cursor(&buffer));
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'w') => {
+                            cursor = rename_next_word_start(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'b') => {
+                            cursor = rename_previous_word_start(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'e') => {
+                            cursor = rename_word_end(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        _ if key_matches_plain_letter(&key, 'i') => {
+                            mode = RenameMode::Insert;
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = create_status_label("insert");
+                        }
+                        _ if key_matches_plain_letter(&key, 'a') => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            mode = RenameMode::Insert;
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = create_status_label("insert");
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_create_entry(pane_id, &buffer)?;
+                        }
+                        KeyCode::Esc => {
+                            self.status = String::from("create cancelled");
+                        }
+                        _ if key_matches_plain_letter(&key, 'q') => {
+                            self.status = String::from("create cancelled");
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
                     }
                 }
-            }
-        },
+            },
             PendingAction::RegexRename {
                 pane_id,
                 pattern,
@@ -5249,7 +5251,11 @@ impl App {
                 self.global_search = Some(search);
                 return Ok(true);
             } else if search.filter.editing {
-                insert_str(&mut search.filter.buffer, &mut self.text_input_cursor, &text);
+                insert_str(
+                    &mut search.filter.buffer,
+                    &mut self.text_input_cursor,
+                    &text,
+                );
                 search.selected = 0;
                 let visible =
                     filtered_global_search_entries(&search.results, &search.filter.buffer);

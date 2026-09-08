@@ -209,10 +209,7 @@ fn find_macos_smb_mount(
 ///
 /// 回傳：`Option<PathBuf>`；找到相符的 smbfs 掛載時回傳本機掛載目錄。
 #[cfg(any(test, target_os = "macos"))]
-fn find_macos_smb_mount_by_share(
-    mount_output: &str,
-    expected_share: &str,
-) -> Option<PathBuf> {
+fn find_macos_smb_mount_by_share(mount_output: &str, expected_share: &str) -> Option<PathBuf> {
     mount_output.lines().find_map(|line| {
         let (source, mounted) = line.split_once(" on ")?;
         let (mounted_path, fs_info) = mounted.split_once(" (")?;

@@ -1127,7 +1127,10 @@ pub(crate) fn compute_scrolled_input(
         if !prefix_str.is_empty() {
             spans.push(Span::raw(prefix_str.to_string()));
         }
-        spans.push(Span::styled(">", theme.accent_style().add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            ">",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        ));
         return ScrolledInputView {
             spans,
             cursor_col: prefix_w as u16,
@@ -1293,13 +1296,7 @@ fn render_top_right_input(
         .borders(Borders::ALL)
         .border_style(theme.focused_border_style());
     let input_inner = input_block.inner(input_area);
-    let scrolled = compute_scrolled_input(
-        buffer,
-        cursor,
-        input_inner.width as usize,
-        None,
-        theme,
-    );
+    let scrolled = compute_scrolled_input(buffer, cursor, input_inner.width as usize, None, theme);
     frame.render_widget(
         Paragraph::new(Line::from(scrolled.spans)).block(input_block),
         input_area,
@@ -1396,14 +1393,11 @@ pub(crate) fn render_global_search_panel(
         .borders(Borders::ALL)
         .border_style(theme.accent_style());
     let input_inner = block.inner(panel_area);
-    let scrolled = compute_scrolled_input(
-        buffer,
-        cursor,
-        input_inner.width as usize,
-        None,
-        theme,
+    let scrolled = compute_scrolled_input(buffer, cursor, input_inner.width as usize, None, theme);
+    frame.render_widget(
+        Paragraph::new(Line::from(scrolled.spans)).block(block),
+        panel_area,
     );
-    frame.render_widget(Paragraph::new(Line::from(scrolled.spans)).block(block), panel_area);
 
     (
         input_inner.x.saturating_add(scrolled.cursor_col),
@@ -1962,7 +1956,9 @@ pub(crate) fn render_command_palette(
     theme: Theme,
     state: CommandPaletteState<'_>,
 ) -> (u16, u16) {
-    let popup_height = (state.suggestions.len().min(6) as u16).saturating_add(3).max(3);
+    let popup_height = (state.suggestions.len().min(6) as u16)
+        .saturating_add(3)
+        .max(3);
     let popup_area = centered_rect(area, 70, popup_height);
     frame.render_widget(Clear, popup_area);
     let title_text = match state.mode {
@@ -2011,7 +2007,11 @@ pub(crate) fn render_command_palette(
             })
             .collect::<Vec<_>>();
         let mut list_state = ListState::default();
-        list_state.select(Some(state.selected.min(state.suggestions.len().saturating_sub(1))));
+        list_state.select(Some(
+            state
+                .selected
+                .min(state.suggestions.len().saturating_sub(1)),
+        ));
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(theme.selected_item_style())
@@ -2021,10 +2021,7 @@ pub(crate) fn render_command_palette(
         );
     }
 
-    (
-        inner.x.saturating_add(scrolled.cursor_col),
-        inner.y,
-    )
+    (inner.x.saturating_add(scrolled.cursor_col), inner.y)
 }
 
 /// 將過長文字裁切成指定寬度，避免面板欄位爆掉。
@@ -3700,14 +3697,19 @@ mod tests {
         // 2. 游標靠左，右側溢位：顯示 `>`
         let long_path = "goto D:\\otto-documents\\github-panefm\\panefm\\src";
         let view_start = compute_scrolled_input(long_path, 5, 25, Some(":"), theme);
-        let text_start: String = view_start.spans.iter().map(|s| s.content.as_ref()).collect();
+        let text_start: String = view_start
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(text_start.starts_with(":goto "));
         assert!(text_start.ends_with('>'));
         assert!(!text_start.contains('<'));
         assert_eq!(view_start.cursor_col, 6); // 1 (for :) + 5
 
         // 3. 游標靠右，左側溢位：顯示 `<`
-        let view_end = compute_scrolled_input(long_path, long_path.chars().count(), 25, Some(":"), theme);
+        let view_end =
+            compute_scrolled_input(long_path, long_path.chars().count(), 25, Some(":"), theme);
         let text_end: String = view_end.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text_end.starts_with(":<"));
         assert!(text_end.ends_with("src"));
@@ -3720,9 +3722,17 @@ mod tests {
 
         // 游標在字尾與最後一個字元之間移動時，可見文字內容完全固定不晃動，且游標正確左右位移
         let total_chars = long_path.chars().count();
-        let view_last_char = compute_scrolled_input(long_path, total_chars - 1, 25, Some(":"), theme);
-        let text_last_char: String = view_last_char.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text_last_char, text_end, "visible text must remain identical when moving near end");
+        let view_last_char =
+            compute_scrolled_input(long_path, total_chars - 1, 25, Some(":"), theme);
+        let text_last_char: String = view_last_char
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            text_last_char, text_end,
+            "visible text must remain identical when moving near end"
+        );
         assert_eq!(view_last_char.cursor_col + 1, view_end.cursor_col);
 
         // 4. 游標在中間，雙向溢位：同時顯示 `<` 與 `>`
