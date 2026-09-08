@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    app::TrashConfirmAction,
+    app::{RenameMode, TrashConfirmAction},
     diff::{DiffEntryState, DiffMatrixState, DiffStatus},
     pane::{PaneState, SortDetailKind},
     search::GlobalSearchEntry,
@@ -32,6 +32,15 @@ use super::{
 struct ShortcutPanelItem<'a> {
     shortcut: &'a str,
     label: &'a str,
+}
+
+/// 描述 command palette 繪製所需的狀態。
+pub(crate) struct CommandPaletteState<'a> {
+    pub(crate) buffer: &'a str,
+    pub(crate) suggestions: &'a [CommandSuggestionLine],
+    pub(crate) selected: usize,
+    pub(crate) cursor: usize,
+    pub(crate) mode: RenameMode,
 }
 
 /// 描述 inline 編輯器目前需要顯示的內容、標題與游標位置。
@@ -895,6 +904,7 @@ fn pad_preview_lines_for_render(
 /// - `cursor_char_count: usize`，以 Unicode scalar (char) 為單位的游標索引。
 ///
 /// 回傳：`usize`，游標在終端機畫面上對應的顯示欄數。
+#[allow(dead_code)]
 pub(crate) fn cursor_display_width(text: &str, cursor_char_count: usize) -> usize {
     text.chars()
         .take(cursor_char_count)
@@ -951,16 +961,20 @@ fn render_inline_editor(
         .borders(Borders::ALL)
         .border_style(theme.accent_style());
     let input_inner = input_block.inner(input_area);
+    let scrolled = compute_scrolled_input(
+        state.buffer,
+        state.cursor,
+        input_inner.width as usize,
+        None,
+        theme,
+    );
     frame.render_widget(
-        Paragraph::new(state.buffer.to_string()).block(input_block),
+        Paragraph::new(Line::from(scrolled.spans)).block(input_block),
         input_area,
     );
 
-    let cursor_col = cursor_display_width(state.buffer, state.cursor);
     Some((
-        input_inner
-            .x
-            .saturating_add(cursor_col.min(input_inner.width as usize) as u16),
+        input_inner.x.saturating_add(scrolled.cursor_col),
         input_inner.y,
     ))
 }
@@ -1057,6 +1071,193 @@ pub(crate) fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect
     horizontal[1]
 }
 
+/// 描述單行文字輸入框經過水平滑動視窗計算後的顯示內容與游標欄位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScrolledInputView {
+    pub(crate) spans: Vec<Span<'static>>,
+    pub(crate) cursor_col: u16,
+}
+
+/// 針對長文字輸入框計算水平滑動視窗（Scheme A: Viewport Scrolling）。
+///
+/// 當文字長度超過可用寬度時，自動依目前游標位置決定可見切片，
+/// 並在被截斷的一側或兩側加上 `<` / `>` 溢位提示符號。
+pub(crate) fn compute_scrolled_input(
+    buffer: &str,
+    cursor: usize,
+    available_width: usize,
+    prefix: Option<&str>,
+    theme: Theme,
+) -> ScrolledInputView {
+    let prefix_str = prefix.unwrap_or("");
+    let prefix_w = UnicodeWidthStr::width(prefix_str);
+    if available_width <= prefix_w {
+        return ScrolledInputView {
+            spans: vec![Span::raw(prefix_str.to_string())],
+            cursor_col: 0,
+        };
+    }
+
+    let w = available_width - prefix_w;
+    let chars: Vec<char> = buffer.chars().collect();
+    let char_widths: Vec<usize> = chars
+        .iter()
+        .map(|c| UnicodeWidthChar::width(*c).unwrap_or(1).max(1))
+        .collect();
+    let total_w: usize = char_widths.iter().sum();
+    let cursor = cursor.min(chars.len());
+    let cursor_w: usize = char_widths[..cursor].iter().sum();
+
+    // 寬度足夠顯示全部內容（包括字尾游標預留空間），無需滑動視窗
+    if total_w < w {
+        let mut spans = Vec::with_capacity(2);
+        if !prefix_str.is_empty() {
+            spans.push(Span::raw(prefix_str.to_string()));
+        }
+        spans.push(Span::raw(buffer.to_string()));
+        return ScrolledInputView {
+            spans,
+            cursor_col: prefix_len_clamp(prefix_w + cursor_w, available_width) as u16,
+        };
+    }
+
+    // 空間極小時的最小保護
+    if w <= 2 {
+        let mut spans = Vec::new();
+        if !prefix_str.is_empty() {
+            spans.push(Span::raw(prefix_str.to_string()));
+        }
+        spans.push(Span::styled(">", theme.accent_style().add_modifier(Modifier::BOLD)));
+        return ScrolledInputView {
+            spans,
+            cursor_col: prefix_w as u16,
+        };
+    }
+
+    // 判斷左溢位 (<) 與右溢位 (>)
+    let indicator_style = theme.accent_style().add_modifier(Modifier::BOLD);
+
+    // Case 1: 游標靠左側（起點固定為 0，只有右側溢位）
+    // 右側預留 1 格給 `>`，可用寬度為 w - 1
+    if cursor_w < w.saturating_sub(1) {
+        let budget = w.saturating_sub(1);
+        let mut accumulated = 0;
+        let mut end_idx = 0;
+        for (i, &cw) in char_widths.iter().enumerate() {
+            if accumulated + cw > budget {
+                break;
+            }
+            accumulated += cw;
+            end_idx = i + 1;
+        }
+        end_idx = end_idx.max(cursor).min(chars.len());
+
+        let visible_str: String = chars[0..end_idx].iter().collect();
+        let mut spans = Vec::with_capacity(3);
+        if !prefix_str.is_empty() {
+            spans.push(Span::raw(prefix_str.to_string()));
+        }
+        spans.push(Span::raw(visible_str));
+        spans.push(Span::styled(">", indicator_style));
+
+        return ScrolledInputView {
+            spans,
+            cursor_col: prefix_len_clamp(prefix_w + cursor_w, available_width) as u16,
+        };
+    }
+
+    // 剩餘寬度從游標到尾端
+    let remaining_w: usize = char_widths[cursor..].iter().sum();
+
+    // Case 2: 游標靠右側尾端（終點固定為 chars.len()，只有左側溢位）
+    // 左側預留 1 格給 `<`；右側恆定預留 1 格給字尾游標（不顯示 `>`）。
+    // 關鍵設計：此預算恆定為 w - 2，絕不隨 cursor == chars.len() 切換而改變。
+    // 如此一來，游標在字尾與最後字元之間移動時，start_idx 與可見文字完全固定不動，
+    // 字尾與邊界的間距完全保持恆定，徹底杜絕忽大忽小與震盪現象。
+    if remaining_w <= 2 || cursor == chars.len() {
+        let budget = w.saturating_sub(2);
+        let mut accumulated = 0;
+        let mut start_idx = chars.len();
+        for (i, &cw) in char_widths.iter().enumerate().rev() {
+            if accumulated + cw > budget {
+                break;
+            }
+            accumulated += cw;
+            start_idx = i;
+        }
+        start_idx = start_idx.min(cursor);
+
+        let visible_str: String = chars[start_idx..chars.len()].iter().collect();
+        let cursor_offset: usize = char_widths[start_idx..cursor].iter().sum();
+
+        let mut spans = Vec::with_capacity(3);
+        if !prefix_str.is_empty() {
+            spans.push(Span::raw(prefix_str.to_string()));
+        }
+        spans.push(Span::styled("<", indicator_style));
+        spans.push(Span::raw(visible_str));
+
+        return ScrolledInputView {
+            spans,
+            cursor_col: prefix_len_clamp(prefix_w + 1 + cursor_offset, available_width) as u16,
+        };
+    }
+
+    // Case 3: 游標在中間（兩側皆有溢位，左右各留 1 格給 `<` 與 `>`）
+    let budget = w.saturating_sub(2);
+    let margin_right = 3.min(budget / 3);
+    let target_cursor_pos = budget.saturating_sub(margin_right).max(1);
+
+    let mut accumulated = 0;
+    let mut start_idx = cursor;
+    for (i, &cw) in char_widths[..cursor].iter().enumerate().rev() {
+        if accumulated + cw > target_cursor_pos {
+            break;
+        }
+        accumulated += cw;
+        start_idx = i;
+    }
+
+    let mut forward_acc = 0;
+    let mut end_idx = start_idx;
+    for (i, &cw) in char_widths[start_idx..].iter().enumerate() {
+        if forward_acc + cw > budget {
+            break;
+        }
+        forward_acc += cw;
+        end_idx = start_idx + i + 1;
+    }
+    end_idx = end_idx.max(cursor).min(chars.len());
+
+    let visible_str: String = chars[start_idx..end_idx].iter().collect();
+    let cursor_offset: usize = char_widths[start_idx..cursor].iter().sum();
+
+    let has_left = start_idx > 0;
+    let has_right = end_idx < chars.len();
+
+    let mut spans = Vec::with_capacity(4);
+    if !prefix_str.is_empty() {
+        spans.push(Span::raw(prefix_str.to_string()));
+    }
+    if has_left {
+        spans.push(Span::styled("<", indicator_style));
+    }
+    spans.push(Span::raw(visible_str));
+    if has_right {
+        spans.push(Span::styled(">", indicator_style));
+    }
+
+    let left_pad = if has_left { 1 } else { 0 };
+    ScrolledInputView {
+        spans,
+        cursor_col: prefix_len_clamp(prefix_w + left_pad + cursor_offset, available_width) as u16,
+    }
+}
+
+fn prefix_len_clamp(val: usize, max: usize) -> usize {
+    val.min(max.saturating_sub(1))
+}
+
 /// 在畫面右上方繪製小型輸入框，供 filter 與 preview search 這類短文字輸入重用。
 fn render_top_right_input(
     frame: &mut ratatui::Frame<'_>,
@@ -1092,16 +1293,20 @@ fn render_top_right_input(
         .borders(Borders::ALL)
         .border_style(theme.focused_border_style());
     let input_inner = input_block.inner(input_area);
+    let scrolled = compute_scrolled_input(
+        buffer,
+        cursor,
+        input_inner.width as usize,
+        None,
+        theme,
+    );
     frame.render_widget(
-        Paragraph::new(buffer.to_string()).block(input_block),
+        Paragraph::new(Line::from(scrolled.spans)).block(input_block),
         input_area,
     );
 
-    let cursor_col = cursor_display_width(buffer, cursor);
     (
-        input_inner
-            .x
-            .saturating_add(cursor_col.min(input_inner.width as usize) as u16),
+        input_inner.x.saturating_add(scrolled.cursor_col),
         input_inner.y,
     )
 }
@@ -1191,13 +1396,17 @@ pub(crate) fn render_global_search_panel(
         .borders(Borders::ALL)
         .border_style(theme.accent_style());
     let input_inner = block.inner(panel_area);
-    frame.render_widget(Paragraph::new(buffer.to_string()).block(block), panel_area);
+    let scrolled = compute_scrolled_input(
+        buffer,
+        cursor,
+        input_inner.width as usize,
+        None,
+        theme,
+    );
+    frame.render_widget(Paragraph::new(Line::from(scrolled.spans)).block(block), panel_area);
 
-    let cursor_col = cursor_display_width(buffer, cursor);
     (
-        input_inner
-            .x
-            .saturating_add(cursor_col.min(input_inner.width as usize) as u16),
+        input_inner.x.saturating_add(scrolled.cursor_col),
         input_inner.y,
     )
 }
@@ -1751,17 +1960,18 @@ pub(crate) fn render_command_palette(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     theme: Theme,
-    buffer: &str,
-    suggestions: &[CommandSuggestionLine],
-    selected: usize,
-    cursor: usize,
+    state: CommandPaletteState<'_>,
 ) -> (u16, u16) {
-    let popup_height = (suggestions.len().min(6) as u16).saturating_add(3).max(3);
+    let popup_height = (state.suggestions.len().min(6) as u16).saturating_add(3).max(3);
     let popup_area = centered_rect(area, 70, popup_height);
     frame.render_widget(Clear, popup_area);
+    let title_text = match state.mode {
+        RenameMode::Insert => " Command (insert) ",
+        RenameMode::Normal => " Command (normal) ",
+    };
     let block = Block::default()
         .title(Line::from(Span::styled(
-            " Command ",
+            title_text,
             theme.accent_style().add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)
@@ -1773,10 +1983,18 @@ pub(crate) fn render_command_palette(
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
-    frame.render_widget(Paragraph::new(format!(":{}", buffer)), chunks[0]);
+    let scrolled = compute_scrolled_input(
+        state.buffer,
+        state.cursor,
+        chunks[0].width as usize,
+        Some(":"),
+        theme,
+    );
+    frame.render_widget(Paragraph::new(Line::from(scrolled.spans)), chunks[0]);
 
-    if !suggestions.is_empty() && chunks.len() > 1 {
-        let items = suggestions
+    if !state.suggestions.is_empty() && chunks.len() > 1 {
+        let items = state
+            .suggestions
             .iter()
             .map(|line| {
                 let text = if line.description.trim().is_empty() {
@@ -1793,7 +2011,7 @@ pub(crate) fn render_command_palette(
             })
             .collect::<Vec<_>>();
         let mut list_state = ListState::default();
-        list_state.select(Some(selected.min(suggestions.len().saturating_sub(1))));
+        list_state.select(Some(state.selected.min(state.suggestions.len().saturating_sub(1))));
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(theme.selected_item_style())
@@ -1803,12 +2021,8 @@ pub(crate) fn render_command_palette(
         );
     }
 
-    let cursor_col = cursor_display_width(buffer, cursor);
     (
-        inner
-            .x
-            .saturating_add(cursor_col.min(inner.width.saturating_sub(2) as usize) as u16)
-            .saturating_add(1),
+        inner.x.saturating_add(scrolled.cursor_col),
         inner.y,
     )
 }
@@ -3469,5 +3683,53 @@ mod tests {
 
         // 中英混和: 2 * 4 + 4 = 12 欄寬
         assert_eq!(cursor_display_width("專案_v2_測試.rs", 8), 12);
+    }
+
+    #[test]
+    /// 驗證長文字輸入框在空間不足時會採用 Scheme A 水平滑動視窗，並附帶 `<` / `>` 溢位提示。
+    fn scrolled_input_handles_overflow_and_cursor_tracking() {
+        use super::compute_scrolled_input;
+        let theme = Theme::default();
+
+        // 1. 完全裝得下：無任何溢位符號
+        let view = compute_scrolled_input("goto docs", 4, 20, Some(":"), theme);
+        let text: String = view.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, ":goto docs");
+        assert_eq!(view.cursor_col, 5); // 1 (for :) + 4
+
+        // 2. 游標靠左，右側溢位：顯示 `>`
+        let long_path = "goto D:\\otto-documents\\github-panefm\\panefm\\src";
+        let view_start = compute_scrolled_input(long_path, 5, 25, Some(":"), theme);
+        let text_start: String = view_start.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text_start.starts_with(":goto "));
+        assert!(text_start.ends_with('>'));
+        assert!(!text_start.contains('<'));
+        assert_eq!(view_start.cursor_col, 6); // 1 (for :) + 5
+
+        // 3. 游標靠右，左側溢位：顯示 `<`
+        let view_end = compute_scrolled_input(long_path, long_path.chars().count(), 25, Some(":"), theme);
+        let text_end: String = view_end.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text_end.starts_with(":<"));
+        assert!(text_end.ends_with("src"));
+        assert!(!text_end.ends_with('>'));
+        assert!(view_end.cursor_col < 25);
+        assert_eq!(
+            view_end.cursor_col as usize,
+            unicode_width::UnicodeWidthStr::width(text_end.as_str())
+        );
+
+        // 游標在字尾與最後一個字元之間移動時，可見文字內容完全固定不晃動，且游標正確左右位移
+        let total_chars = long_path.chars().count();
+        let view_last_char = compute_scrolled_input(long_path, total_chars - 1, 25, Some(":"), theme);
+        let text_last_char: String = view_last_char.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text_last_char, text_end, "visible text must remain identical when moving near end");
+        assert_eq!(view_last_char.cursor_col + 1, view_end.cursor_col);
+
+        // 4. 游標在中間，雙向溢位：同時顯示 `<` 與 `>`
+        let view_mid = compute_scrolled_input(long_path, 28, 25, Some(":"), theme);
+        let text_mid: String = view_mid.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text_mid.starts_with(":<"));
+        assert!(text_mid.ends_with('>'));
+        assert!(view_mid.cursor_col < 25);
     }
 }

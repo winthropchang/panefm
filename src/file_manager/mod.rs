@@ -41,8 +41,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -168,12 +168,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             last_synced_cwd = Some(active_cwd.to_path_buf());
         }
 
-        if event::poll(poll_rate)?
-            && let Event::Key(key) = event::read()?
-            && should_handle_key_event(key.kind)
-            && !app.handle_key(key)?
-        {
-            break;
+        if event::poll(poll_rate)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if should_handle_key_event(key.kind) && !app.handle_key(key)? {
+                        break;
+                    }
+                }
+                Event::Paste(text) => {
+                    app.handle_bracketed_paste(&text)?;
+                }
+                _ => {}
+            }
         }
 
         // Attached 外部程式可能需要暫時擁有 terminal；統一在 render/event 週期外
@@ -449,9 +455,9 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
 }
 
-/// 進入 TUI 所需的 terminal 模式，並在支援時啟用最小必要的 keyboard enhancement。
+/// 進入 TUI 所需的 terminal 模式，並在支援時啟用最小必要的 keyboard enhancement 與 bracketed paste。
 fn enter_tui_mode<W: Write>(writer: &mut W) -> Result<()> {
-    execute!(writer, EnterAlternateScreen)?;
+    execute!(writer, EnterAlternateScreen, EnableBracketedPaste)?;
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         execute!(
             writer,
@@ -463,6 +469,7 @@ fn enter_tui_mode<W: Write>(writer: &mut W) -> Result<()> {
 
 /// 離開 TUI 前還原 terminal 狀態，避免把進階鍵盤協定留給外部程式。
 fn leave_tui_mode<W: Write>(writer: &mut W) -> Result<()> {
+    let _ = execute!(writer, DisableBracketedPaste);
     execute!(writer, SetCursorStyle::DefaultUserShape)?;
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         execute!(writer, PopKeyboardEnhancementFlags)?;

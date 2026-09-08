@@ -210,7 +210,7 @@ impl App {
     pub(crate) fn execute_command(&mut self, command: &str) -> Result<()> {
         match command {
             "q" => self.status = String::from("use q in normal mode to quit"),
-            "goto" => self.status = String::from("usage: goto <path>"),
+            "goto" | "gt" => self.status = String::from("usage: goto <path>"),
             "rename" => self.start_rename(),
             "create" => self.start_create_entry(),
             "copy" => self.copy_selected(),
@@ -333,7 +333,10 @@ impl App {
                     self.open_diff_matrix(Some(ids))?;
                 } else if let Some(name) = other.strip_prefix("theme ") {
                     self.set_theme_by_name(name.trim());
-                } else if let Some(path) = other.strip_prefix("goto ") {
+                } else if let Some(path) = other
+                    .strip_prefix("goto ")
+                    .or_else(|| other.strip_prefix("gt "))
+                {
                     self.change_directory_from_command(path.trim())?;
                 } else if let Some(name) = other.strip_prefix("create ") {
                     self.create_entry_from_command(name)?;

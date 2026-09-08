@@ -108,53 +108,91 @@ impl App {
     ) -> TextEditResult {
         self.text_input_cursor = self.text_input_cursor.min(buffer.chars().count());
         match self.text_input_mode {
-            RenameMode::Insert => match key.code {
-                KeyCode::Char(_) => {
-                    if let Some(character) = typed_char_from_key(key) {
-                        insert_char(buffer, &mut self.text_input_cursor, character);
+            RenameMode::Insert => {
+                if key_matches_ctrl_letter(key, 'v') {
+                    if let Some(text) = read_text_from_system_clipboard() {
+                        let text = sanitize_pasted_text(&text);
+                        if !text.is_empty() {
+                            insert_str(buffer, &mut self.text_input_cursor, &text);
+                            return TextEditResult::Changed;
+                        }
+                    }
+                    return TextEditResult::Consumed;
+                }
+                match key.code {
+                    KeyCode::Char(_) => {
+                        if let Some(character) = typed_char_from_key(key) {
+                            insert_char(buffer, &mut self.text_input_cursor, character);
+                            TextEditResult::Changed
+                        } else {
+                            TextEditResult::Consumed
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        backspace_char(buffer, &mut self.text_input_cursor);
                         TextEditResult::Changed
-                    } else {
+                    }
+                    KeyCode::Delete => {
+                        delete_char_at(buffer, self.text_input_cursor);
+                        TextEditResult::Changed
+                    }
+                    KeyCode::Left => {
+                        self.text_input_cursor = self.text_input_cursor.saturating_sub(1);
                         TextEditResult::Consumed
                     }
-                }
-                KeyCode::Backspace => {
-                    backspace_char(buffer, &mut self.text_input_cursor);
-                    TextEditResult::Changed
-                }
-                KeyCode::Delete => {
-                    delete_char_at(buffer, self.text_input_cursor);
-                    TextEditResult::Changed
-                }
-                KeyCode::Left => {
-                    self.text_input_cursor = self.text_input_cursor.saturating_sub(1);
-                    TextEditResult::Consumed
-                }
-                KeyCode::Right => {
-                    self.text_input_cursor = move_cursor_right(buffer, self.text_input_cursor);
-                    TextEditResult::Consumed
-                }
-                KeyCode::Home => {
-                    self.text_input_cursor = 0;
-                    TextEditResult::Consumed
-                }
-                KeyCode::End => {
-                    self.text_input_cursor = buffer.chars().count();
-                    TextEditResult::Consumed
-                }
-                KeyCode::Esc => {
-                    if buffer.trim().is_empty() {
-                        return TextEditResult::PassThrough;
+                    KeyCode::Right => {
+                        self.text_input_cursor = move_cursor_right(buffer, self.text_input_cursor);
+                        TextEditResult::Consumed
                     }
-                    self.text_input_mode = RenameMode::Normal;
-                    self.text_input_cursor = normal_cursor(buffer, self.text_input_cursor);
-                    TextEditResult::Consumed
+                    KeyCode::Home => {
+                        self.text_input_cursor = 0;
+                        TextEditResult::Consumed
+                    }
+                    KeyCode::End => {
+                        self.text_input_cursor = buffer.chars().count();
+                        TextEditResult::Consumed
+                    }
+                    KeyCode::Esc => {
+                        if buffer.trim().is_empty() {
+                            return TextEditResult::PassThrough;
+                        }
+                        self.text_input_mode = RenameMode::Normal;
+                        self.text_input_cursor = normal_cursor(buffer, self.text_input_cursor);
+                        TextEditResult::Consumed
+                    }
+                    _ => TextEditResult::PassThrough,
                 }
-                _ => TextEditResult::PassThrough,
-            },
+            }
             RenameMode::Normal => {
                 if key_matches_shifted_letter(key, 'A') {
                     self.text_input_cursor = buffer.chars().count();
                     self.text_input_mode = RenameMode::Insert;
+                    return TextEditResult::Consumed;
+                }
+                if key_matches_plain_letter(key, 'p') {
+                    if let Some(text) = read_text_from_system_clipboard() {
+                        let text = sanitize_pasted_text(&text);
+                        if !text.is_empty() {
+                            self.text_input_cursor =
+                                move_cursor_right(buffer, self.text_input_cursor);
+                            insert_str(buffer, &mut self.text_input_cursor, &text);
+                            self.text_input_cursor =
+                                normal_cursor(buffer, self.text_input_cursor.saturating_sub(1));
+                            return TextEditResult::Changed;
+                        }
+                    }
+                    return TextEditResult::Consumed;
+                }
+                if key_matches_shifted_letter(key, 'P') {
+                    if let Some(text) = read_text_from_system_clipboard() {
+                        let text = sanitize_pasted_text(&text);
+                        if !text.is_empty() {
+                            insert_str(buffer, &mut self.text_input_cursor, &text);
+                            self.text_input_cursor =
+                                normal_cursor(buffer, self.text_input_cursor.saturating_sub(1));
+                            return TextEditResult::Changed;
+                        }
+                    }
                     return TextEditResult::Consumed;
                 }
                 match key.code {
@@ -3997,10 +4035,13 @@ impl App {
                 mut cursor,
                 mut mode,
             } => match mode {
-                RenameMode::Insert => match key.code {
-                    KeyCode::Char(_) => {
-                        if let Some(c) = typed_char_from_key(&key) {
-                            insert_char(&mut buffer, &mut cursor, c);
+                RenameMode::Insert => {
+                    if key_matches_ctrl_letter(&key, 'v') {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            let text = sanitize_pasted_text(&text);
+                            if !text.is_empty() {
+                                insert_str(&mut buffer, &mut cursor, &text);
+                            }
                         }
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
@@ -4010,77 +4051,13 @@ impl App {
                             mode,
                         });
                         self.status = String::from("rename: insert");
+                        return Ok(true);
                     }
-                    KeyCode::Backspace => {
-                        backspace_char(&mut buffer, &mut cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = String::from("rename: insert");
-                    }
-                    KeyCode::Delete => {
-                        delete_char_at(&mut buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = String::from("rename: insert");
-                    }
-                    KeyCode::Left => {
-                        cursor = cursor.saturating_sub(1);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Right => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Home => {
-                        cursor = 0;
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::End => {
-                        cursor = buffer.chars().count();
-                        self.pending_action = Some(PendingAction::Rename {
-                            pane_id,
-                            original_name,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Enter => {
-                        self.confirm_rename(pane_id, &original_name, &buffer)?;
-                    }
-                    KeyCode::Esc => {
-                        if buffer.trim().is_empty() {
-                            self.status = format!("rename cancelled: {original_name}");
-                        } else {
-                            mode = RenameMode::Normal;
+                    match key.code {
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                insert_char(&mut buffer, &mut cursor, c);
+                            }
                             self.pending_action = Some(PendingAction::Rename {
                                 pane_id,
                                 original_name,
@@ -4088,10 +4065,103 @@ impl App {
                                 cursor,
                                 mode,
                             });
-                            self.status = String::from("rename: normal");
+                            self.status = String::from("rename: insert");
+                        }
+                        KeyCode::Backspace => {
+                            backspace_char(&mut buffer, &mut cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = String::from("rename: insert");
+                        }
+                        KeyCode::Delete => {
+                            delete_char_at(&mut buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = String::from("rename: insert");
+                        }
+                        KeyCode::Left => {
+                            cursor = cursor.saturating_sub(1);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Right => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Home => {
+                            cursor = 0;
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::End => {
+                            cursor = buffer.chars().count();
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_rename(pane_id, &original_name, &buffer)?;
+                        }
+                        KeyCode::Esc => {
+                            if buffer.trim().is_empty() {
+                                self.status = format!("rename cancelled: {original_name}");
+                            } else {
+                                mode = RenameMode::Normal;
+                                self.pending_action = Some(PendingAction::Rename {
+                                    pane_id,
+                                    original_name,
+                                    buffer,
+                                    cursor,
+                                    mode,
+                                });
+                                self.status = String::from("rename: normal");
+                            }
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::Rename {
+                                pane_id,
+                                original_name,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
                         }
                     }
-                    _ => {
+                }
+                RenameMode::Normal => {
+                    if key_matches_shifted_letter(&key, 'A') {
+                        cursor = buffer.chars().count();
+                        mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::Rename {
                             pane_id,
                             original_name,
@@ -4099,21 +4169,47 @@ impl App {
                             cursor,
                             mode,
                         });
+                        self.status = String::from("rename: insert");
+                        return Ok(true);
                     }
-                },
-                RenameMode::Normal if key_matches_shifted_letter(&key, 'A') => {
-                    cursor = buffer.chars().count();
-                    mode = RenameMode::Insert;
-                    self.pending_action = Some(PendingAction::Rename {
-                        pane_id,
-                        original_name,
-                        buffer,
-                        cursor,
-                        mode,
-                    });
-                    self.status = String::from("rename: insert");
-                }
-                RenameMode::Normal => match key.code {
+                    if key_matches_plain_letter(&key, 'p') {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            let text = sanitize_pasted_text(&text);
+                            if !text.is_empty() {
+                                cursor = move_cursor_right(&buffer, cursor);
+                                insert_str(&mut buffer, &mut cursor, &text);
+                                cursor = normal_cursor(&buffer, cursor.saturating_sub(1));
+                            }
+                        }
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: normal");
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'P') {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            let text = sanitize_pasted_text(&text);
+                            if !text.is_empty() {
+                                insert_str(&mut buffer, &mut cursor, &text);
+                                cursor = normal_cursor(&buffer, cursor.saturating_sub(1));
+                            }
+                        }
+                        self.pending_action = Some(PendingAction::Rename {
+                            pane_id,
+                            original_name,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = String::from("rename: normal");
+                        return Ok(true);
+                    }
+                    match key.code {
                     KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
                         self.pending_action = Some(PendingAction::Rename {
@@ -4267,18 +4363,22 @@ impl App {
                             mode,
                         });
                     }
-                },
-            },
+                }
+            }
+        },
             PendingAction::CreateEntry {
                 pane_id,
                 mut buffer,
                 mut cursor,
                 mut mode,
             } => match mode {
-                RenameMode::Insert => match key.code {
-                    KeyCode::Char(_) => {
-                        if let Some(c) = typed_char_from_key(&key) {
-                            insert_char(&mut buffer, &mut cursor, c);
+                RenameMode::Insert => {
+                    if key_matches_ctrl_letter(&key, 'v') {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            let text = sanitize_pasted_text(&text);
+                            if !text.is_empty() {
+                                insert_str(&mut buffer, &mut cursor, &text);
+                            }
                         }
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
@@ -4287,101 +4387,153 @@ impl App {
                             mode,
                         });
                         self.status = create_status_label("insert");
+                        return Ok(true);
                     }
-                    KeyCode::Backspace => {
-                        backspace_char(&mut buffer, &mut cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = create_status_label("insert");
-                    }
-                    KeyCode::Delete => {
-                        delete_char_at(&mut buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                        self.status = create_status_label("insert");
-                    }
-                    KeyCode::Left => {
-                        cursor = cursor.saturating_sub(1);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Right => {
-                        cursor = move_cursor_right(&buffer, cursor);
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Home => {
-                        cursor = 0;
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::End => {
-                        cursor = buffer.chars().count();
-                        self.pending_action = Some(PendingAction::CreateEntry {
-                            pane_id,
-                            buffer,
-                            cursor,
-                            mode,
-                        });
-                    }
-                    KeyCode::Enter => {
-                        self.confirm_create_entry(pane_id, &buffer)?;
-                    }
-                    KeyCode::Esc => {
-                        if buffer.trim().is_empty() {
-                            self.status = String::from("create cancelled");
-                        } else {
-                            mode = RenameMode::Normal;
+                    match key.code {
+                        KeyCode::Char(_) => {
+                            if let Some(c) = typed_char_from_key(&key) {
+                                insert_char(&mut buffer, &mut cursor, c);
+                            }
                             self.pending_action = Some(PendingAction::CreateEntry {
                                 pane_id,
                                 buffer,
                                 cursor,
                                 mode,
                             });
-                            self.status = create_status_label("normal");
+                            self.status = create_status_label("insert");
+                        }
+                        KeyCode::Backspace => {
+                            backspace_char(&mut buffer, &mut cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = create_status_label("insert");
+                        }
+                        KeyCode::Delete => {
+                            delete_char_at(&mut buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                            self.status = create_status_label("insert");
+                        }
+                        KeyCode::Left => {
+                            cursor = cursor.saturating_sub(1);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Right => {
+                            cursor = move_cursor_right(&buffer, cursor);
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Home => {
+                            cursor = 0;
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::End => {
+                            cursor = buffer.chars().count();
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_create_entry(pane_id, &buffer)?;
+                        }
+                        KeyCode::Esc => {
+                            if buffer.trim().is_empty() {
+                                self.status = String::from("create cancelled");
+                            } else {
+                                mode = RenameMode::Normal;
+                                self.pending_action = Some(PendingAction::CreateEntry {
+                                    pane_id,
+                                    buffer,
+                                    cursor,
+                                    mode,
+                                });
+                                self.status = create_status_label("normal");
+                            }
+                        }
+                        _ => {
+                            self.pending_action = Some(PendingAction::CreateEntry {
+                                pane_id,
+                                buffer,
+                                cursor,
+                                mode,
+                            });
                         }
                     }
-                    _ => {
+                }
+                RenameMode::Normal => {
+                    if key_matches_shifted_letter(&key, 'A') {
+                        cursor = buffer.chars().count();
+                        mode = RenameMode::Insert;
                         self.pending_action = Some(PendingAction::CreateEntry {
                             pane_id,
                             buffer,
                             cursor,
                             mode,
                         });
+                        self.status = create_status_label("insert");
+                        return Ok(true);
                     }
-                },
-                RenameMode::Normal if key_matches_shifted_letter(&key, 'A') => {
-                    cursor = buffer.chars().count();
-                    mode = RenameMode::Insert;
-                    self.pending_action = Some(PendingAction::CreateEntry {
-                        pane_id,
-                        buffer,
-                        cursor,
-                        mode,
-                    });
-                    self.status = create_status_label("insert");
-                }
-                RenameMode::Normal => match key.code {
+                    if key_matches_plain_letter(&key, 'p') {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            let text = sanitize_pasted_text(&text);
+                            if !text.is_empty() {
+                                cursor = move_cursor_right(&buffer, cursor);
+                                insert_str(&mut buffer, &mut cursor, &text);
+                                cursor = normal_cursor(&buffer, cursor.saturating_sub(1));
+                            }
+                        }
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("normal");
+                        return Ok(true);
+                    }
+                    if key_matches_shifted_letter(&key, 'P') {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            let text = sanitize_pasted_text(&text);
+                            if !text.is_empty() {
+                                insert_str(&mut buffer, &mut cursor, &text);
+                                cursor = normal_cursor(&buffer, cursor.saturating_sub(1));
+                            }
+                        }
+                        self.pending_action = Some(PendingAction::CreateEntry {
+                            pane_id,
+                            buffer,
+                            cursor,
+                            mode,
+                        });
+                        self.status = create_status_label("normal");
+                        return Ok(true);
+                    }
+                    match key.code {
                     KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
                         self.pending_action = Some(PendingAction::CreateEntry {
@@ -4521,8 +4673,9 @@ impl App {
                             mode,
                         });
                     }
-                },
-            },
+                }
+            }
+        },
             PendingAction::RegexRename {
                 pane_id,
                 pattern,
@@ -4977,5 +5130,146 @@ impl App {
         }
 
         self.status = String::from("normal mode");
+    }
+
+    /// 處理終端送入的 bracketed paste 事件（例如滑鼠右鍵貼上或終端快捷鍵貼上）。
+    ///
+    /// 依目前焦點所在的輸入框（command mode、filter、preview search、list find、
+    /// global search、rename、create entry 或 modal search）直接貼入文字。
+    pub(crate) fn handle_bracketed_paste(&mut self, text: &str) -> Result<bool> {
+        let text = sanitize_pasted_text(text);
+        if text.is_empty() {
+            return Ok(true);
+        }
+
+        // 1. PendingAction 專屬輸入框
+        if let Some(mut action) = self.pending_action.take() {
+            match &mut action {
+                PendingAction::Rename {
+                    buffer,
+                    cursor,
+                    mode,
+                    ..
+                } => {
+                    insert_str(buffer, cursor, &text);
+                    self.status = match mode {
+                        RenameMode::Insert => String::from("rename: insert"),
+                        RenameMode::Normal => String::from("rename: normal"),
+                    };
+                    self.pending_action = Some(action);
+                    return Ok(true);
+                }
+                PendingAction::CreateEntry {
+                    buffer,
+                    cursor,
+                    mode,
+                    ..
+                } => {
+                    insert_str(buffer, cursor, &text);
+                    self.status = match mode {
+                        RenameMode::Insert => create_status_label("insert"),
+                        RenameMode::Normal => create_status_label("normal"),
+                    };
+                    self.pending_action = Some(action);
+                    return Ok(true);
+                }
+                PendingAction::TrashPanel {
+                    selected, search, ..
+                }
+                | PendingAction::HelpPanel {
+                    selected, search, ..
+                }
+                | PendingAction::TaskPanel {
+                    selected, search, ..
+                }
+                | PendingAction::BookmarkList {
+                    selected, search, ..
+                }
+                | PendingAction::ZoxideList {
+                    selected, search, ..
+                } if search.editing => {
+                    insert_str(&mut search.buffer, &mut self.text_input_cursor, &text);
+                    *selected = 0;
+                    self.status = self.status_for_pending_action(&action)?;
+                    self.pending_action = Some(action);
+                    return Ok(true);
+                }
+                _ => {
+                    self.pending_action = Some(action);
+                }
+            }
+        }
+
+        // 2. Filter
+        if self.filter.as_ref().is_some_and(|f| f.editing) {
+            let mut filter = self.filter.take().unwrap();
+            insert_str(&mut filter.buffer, &mut self.text_input_cursor, &text);
+            self.apply_filter_buffer(&filter);
+            self.status = format_filter_status(&filter);
+            self.filter = Some(filter);
+            return Ok(true);
+        }
+
+        // 3. Preview search
+        if self.preview_search.as_ref().is_some_and(|s| s.editing) {
+            let mut search = self.preview_search.take().unwrap();
+            insert_str(&mut search.buffer, &mut self.text_input_cursor, &text);
+            self.apply_preview_search_buffer(&search);
+            self.status =
+                preview_search_status(&search.buffer, self.preview_match_count(search.pane_id));
+            self.preview_search = Some(search);
+            return Ok(true);
+        }
+
+        // 4. List find
+        if let Some(mut find) = self.list_find.take() {
+            insert_str(&mut find.buffer, &mut self.text_input_cursor, &text);
+            self.apply_list_find_buffer(&find);
+            self.status = list_find_status(&find.buffer, self.list_find_match_count(find.pane_id));
+            self.list_find = Some(find);
+            return Ok(true);
+        }
+
+        // 5. Global search
+        if let Some(mut search) = self.global_search.take() {
+            if search.editing {
+                insert_str(&mut search.buffer, &mut self.text_input_cursor, &text);
+                search.searched = false;
+                search.loading = false;
+                search.selected = 0;
+                search.results.clear();
+                self.status = global_search_status(
+                    search.mode,
+                    &search.buffer,
+                    search.results.len(),
+                    search.editing,
+                    search.searched,
+                    search.loading,
+                );
+                self.global_search = Some(search);
+                return Ok(true);
+            } else if search.filter.editing {
+                insert_str(&mut search.filter.buffer, &mut self.text_input_cursor, &text);
+                search.selected = 0;
+                let visible =
+                    filtered_global_search_entries(&search.results, &search.filter.buffer);
+                search.selected = search.selected.min(visible.len().saturating_sub(1));
+                self.status = global_search_filter_status(&search.filter, visible.len());
+                self.global_search = Some(search);
+                return Ok(true);
+            } else {
+                self.global_search = Some(search);
+            }
+        }
+
+        // 6. Command mode
+        if self.command_mode {
+            insert_str(&mut self.command_buffer, &mut self.text_input_cursor, &text);
+            self.command_suggestion_selected = 0;
+            self.command_completion_cycle = None;
+            return Ok(true);
+        }
+
+        Ok(true)
     }
 }

@@ -246,6 +246,14 @@ fn typed_char_from_key_normalizes_shifted_symbols() {
         typed_char_from_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT)),
         Some('A')
     );
+    assert_eq!(
+        typed_char_from_key(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+        None
+    );
+    assert_eq!(
+        typed_char_from_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+        None
+    );
 }
 
 #[test]
@@ -9614,4 +9622,178 @@ fn command_suggestions_include_width_and_height() {
     assert_eq!(height_suggestions[0].command, "height ");
     assert_eq!(height_suggestions[0].shortcut, "wH");
 }
+
+#[test]
+/// 驗證 sanitize_pasted_text 能移除結尾 \r\n 並將內部換行替換為空白。
+fn test_sanitize_pasted_text() {
+    assert_eq!(sanitize_pasted_text("C:\\work\\dir\r\n"), "C:\\work\\dir");
+    assert_eq!(sanitize_pasted_text("/home/user/dir\n"), "/home/user/dir");
+    assert_eq!(
+        sanitize_pasted_text("line1\r\nline2\nline3"),
+        "line1 line2 line3"
+    );
+    assert_eq!(sanitize_pasted_text("simple"), "simple");
+    assert_eq!(sanitize_pasted_text(""), "");
+}
+
+#[test]
+/// 驗證 insert_str 可以在指定字元游標處插入字串並正確推進游標，且支援 UTF-8。
+fn test_insert_str_unicode() {
+    let mut buffer = String::from("hello world");
+    let mut cursor = 5;
+    insert_str(&mut buffer, &mut cursor, " 中文");
+    assert_eq!(buffer, "hello 中文 world");
+    assert_eq!(cursor, 8);
+
+    insert_str(&mut buffer, &mut cursor, "");
+    assert_eq!(buffer, "hello 中文 world");
+    assert_eq!(cursor, 8);
+}
+
+#[test]
+/// 驗證 handle_bracketed_paste 能正確將路徑貼上到 command_mode（模擬 gt 貼上路徑流程）。
+fn test_handle_bracketed_paste_into_command_mode() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    app.open_prefilled_command("goto ");
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "goto ");
+    assert_eq!(app.text_input_cursor, 5);
+
+    app.handle_bracketed_paste("D:\\target\\folder\r\n")
+        .expect("paste");
+    assert_eq!(app.command_buffer, "goto D:\\target\\folder");
+    assert_eq!(app.text_input_cursor, 21);
+}
+
+#[test]
+/// 驗證 handle_bracketed_paste 能正確貼入 Rename 與 CreateEntry 的輸入框。
+fn test_handle_bracketed_paste_into_modal_actions() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    // Rename
+    app.pending_action = Some(PendingAction::Rename {
+        pane_id: 1,
+        original_name: "doc.txt".into(),
+        buffer: "doc".into(),
+        cursor: 3,
+        mode: RenameMode::Insert,
+    });
+    app.handle_bracketed_paste("_backup\n").expect("paste");
+    if let Some(PendingAction::Rename { buffer, cursor, .. }) = app.pending_action.as_ref() {
+        assert_eq!(buffer, "doc_backup");
+        assert_eq!(*cursor, 10);
+    } else {
+        panic!("expected Rename action");
+    }
+
+    // CreateEntry
+    app.pending_action = Some(PendingAction::CreateEntry {
+        pane_id: 1,
+        buffer: "src/".into(),
+        cursor: 4,
+        mode: RenameMode::Insert,
+    });
+    app.handle_bracketed_paste("main.rs\r\n").expect("paste");
+    if let Some(PendingAction::CreateEntry { buffer, cursor, .. }) = app.pending_action.as_ref() {
+        assert_eq!(buffer, "src/main.rs");
+        assert_eq!(*cursor, 11);
+    } else {
+        panic!("expected CreateEntry action");
+    }
+}
+
+#[test]
+/// 驗證在系統剪貼簿有內容時，edit_text_buffer 於 Insert 模式支援 Ctrl+v，於 Normal 模式支援 p 與 P。
+fn test_edit_text_buffer_paste_insert_and_normal() {
+    let test_str = "pasted_path";
+    let write_res = write_text_to_system_clipboard(test_str);
+    let read_res = read_text_from_system_clipboard();
+    if write_res.is_ok()
+        && let Some(clipboard_text) = read_res
+        && clipboard_text.contains(test_str)
+    {
+        let dir = tempdir().expect("tempdir");
+        let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+        // 1. Insert 模式下的 Ctrl+v
+        let mut buffer = String::from("goto ");
+        app.text_input_mode = RenameMode::Insert;
+        app.text_input_cursor = 5;
+        let result = app.edit_text_buffer(
+            &mut buffer,
+            &KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(result, TextEditResult::Changed);
+        assert!(buffer.starts_with("goto pasted_path"));
+
+        // 2. Normal 模式下的 p (在游標後貼上)
+        let mut buffer_p = String::from("goto ");
+        app.text_input_mode = RenameMode::Normal;
+        app.text_input_cursor = 4; // 游標停在最後一個空白上
+        let result_p = app.edit_text_buffer(
+            &mut buffer_p,
+            &KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert_eq!(result_p, TextEditResult::Changed);
+        assert!(buffer_p.starts_with("goto pasted_path"));
+
+        // 3. Normal 模式下的 P (在游標前貼上)
+        let mut buffer_cap_p = String::from("goto ");
+        app.text_input_mode = RenameMode::Normal;
+        app.text_input_cursor = 4; // 游標停在空白上，P 應在空白前貼上
+        let result_cap_p = app.edit_text_buffer(
+            &mut buffer_cap_p,
+            &KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(result_cap_p, TextEditResult::Changed);
+        assert!(buffer_cap_p.starts_with("gotopasted_path"));
+    }
+}
+
+#[test]
+/// 驗證使用者從 c->d 拷貝目錄，再到 gt 開啟 goto 命令、按 Esc 轉 Normal 模式後按 p 貼上的完整流程。
+fn test_gt_flow_copy_cd_then_gt_esc_p_pastes() {
+    let dir = tempdir().expect("tempdir");
+    let test_folder = dir.path().join("my_subfolder");
+    fs::create_dir_all(&test_folder).expect("create folder");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    // 模擬在 pane 中使用 c 然後 d 複製目錄路徑
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+        .expect("press c");
+    assert!(matches!(app.pending_action, Some(PendingAction::CopyPicker { .. })));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .expect("press d");
+    assert!(app.pending_action.is_none());
+
+    // 模擬執行 gt 打開 goto 輸入框
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+        .expect("press g");
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+        .expect("press t");
+    assert!(app.command_mode);
+    assert_eq!(app.command_buffer, "goto ");
+    assert_eq!(app.text_input_mode, RenameMode::Insert);
+
+    // 按下 Esc 切換到 Normal 模式
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("press Esc");
+    assert!(app.command_mode);
+    assert_eq!(app.text_input_mode, RenameMode::Normal);
+
+    // 在 Normal 模式下按下 p
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        .expect("press p");
+
+    assert!(app.command_buffer.starts_with("goto "));
+    assert!(
+        app.command_buffer.len() > "goto ".len(),
+        "command buffer was not updated: '{}'",
+        app.command_buffer
+    );
+}
+
 

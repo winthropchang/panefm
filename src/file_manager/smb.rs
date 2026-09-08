@@ -116,18 +116,36 @@ pub(crate) fn resolve_smb_location(location: &SmbLocation) -> ResolvedSmbLocatio
     }
 }
 
-/// 從 macOS 的 mount table 找出 host 與 share 都相符的 SMB 掛載點。
+/// 從 macOS 的 mount table 找出 host 與 share 都相符的 SMB 掛載點，
+/// 若主機名稱不完全一致則 fallback 至 share 名稱相符的 smbfs 掛載點，
+/// 若依然沒有則檢查本機 `/Volumes/{share}` 是否已是現存目錄。
 ///
 /// 參數：`location: &SmbLocation`，使用者輸入的 SMB 位址。
 /// 回傳：`ResolvedSmbLocation`；找到正確掛載點時會再接上 SMB 子路徑。
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
-    let mounted_root = Command::new("mount")
+    let mount_output = Command::new("mount")
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|output| find_macos_smb_mount(&output, &location.host, &location.share));
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+
+    let mounted_root = mount_output
+        .as_deref()
+        .and_then(|output| find_macos_smb_mount(output, &location.host, &location.share))
+        .or_else(|| {
+            mount_output
+                .as_deref()
+                .and_then(|output| find_macos_smb_mount_by_share(output, &location.share))
+        })
+        .or_else(|| {
+            let volumes_share = Path::new("/Volumes").join(&location.share);
+            if volumes_share.is_dir() {
+                Some(volumes_share)
+            } else {
+                None
+            }
+        });
 
     let Some(share_root) = mounted_root else {
         return ResolvedSmbLocation::NeedsMount {
@@ -148,13 +166,14 @@ fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
 ///
 /// 例如 `//user@server/share on /Volumes/share-1 (smbfs, ...)` 會回傳
 /// `/Volumes/share-1`，而不是只依 share 名稱猜測 `/Volumes/share`。
+/// 支援 host 欄位包含 port (例如 `server:445`) 時的比對。
 ///
 /// 參數：
 /// - `mount_output: &str`，`mount` 命令的完整標準輸出。
 /// - `expected_host: &str`，SMB 主機名稱或 IP。
 /// - `expected_share: &str`，SMB share 名稱。
 ///
-/// 回傳：`Option<PathBuf>`；找不到完全相符的 SMB 掛載時回傳 `None`。
+/// 回傳：`Option<PathBuf>`；找不到相符的 SMB 掛載時回傳 `None`。
 #[cfg(any(test, target_os = "macos"))]
 fn find_macos_smb_mount(
     mount_output: &str,
@@ -169,9 +188,45 @@ fn find_macos_smb_mount(
         let host = authority.rsplit('@').next().unwrap_or(authority);
         let decoded_share = percent_decode(share).unwrap_or_else(|_| share.to_string());
 
-        (host.eq_ignore_ascii_case(expected_host)
-            && decoded_share.eq_ignore_ascii_case(expected_share))
-        .then(|| PathBuf::from(decode_mount_field(mounted_path)))
+        let host_without_port = host.split(':').next().unwrap_or(host);
+        let expected_host_without_port = expected_host.split(':').next().unwrap_or(expected_host);
+
+        let host_matches = host.eq_ignore_ascii_case(expected_host)
+            || host_without_port.eq_ignore_ascii_case(expected_host_without_port);
+
+        (host_matches && decoded_share.eq_ignore_ascii_case(expected_share))
+            .then(|| PathBuf::from(decode_mount_field(mounted_path)))
+    })
+}
+
+/// 從 macOS 的 mount 輸出中，尋找檔案系統為 smbfs 且 share 名稱相符的掛載點。
+/// 當使用者以 IP 輸入但 mount 紀錄中是 hostname 或帶有 port (如 :445) 時，
+/// 此函式可作為 fallback 正確找到掛載目錄（例如 `/Volumes/mingfong` 或 `/Volumes/mingfong-1`）。
+///
+/// 參數：
+/// - `mount_output: &str`，`mount` 命令的完整標準輸出。
+/// - `expected_share: &str`，SMB share 名稱。
+///
+/// 回傳：`Option<PathBuf>`；找到相符的 smbfs 掛載時回傳本機掛載目錄。
+#[cfg(any(test, target_os = "macos"))]
+fn find_macos_smb_mount_by_share(
+    mount_output: &str,
+    expected_share: &str,
+) -> Option<PathBuf> {
+    mount_output.lines().find_map(|line| {
+        let (source, mounted) = line.split_once(" on ")?;
+        let (mounted_path, fs_info) = mounted.split_once(" (")?;
+        if !fs_info.starts_with("smbfs") {
+            return None;
+        }
+        let remote = source.strip_prefix("//")?;
+        let (_authority, share) = remote.split_once('/')?;
+        let decoded_share = percent_decode(share).unwrap_or_else(|_| share.to_string());
+        if decoded_share.eq_ignore_ascii_case(expected_share) {
+            Some(PathBuf::from(decode_mount_field(mounted_path)))
+        } else {
+            None
+        }
     })
 }
 
@@ -329,8 +384,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ResolvedSmbLocation, decode_mount_field, find_macos_smb_mount, parse_smb_location,
-        resolve_smb_location_with_mount_root,
+        ResolvedSmbLocation, decode_mount_field, find_macos_smb_mount,
+        find_macos_smb_mount_by_share, parse_smb_location, resolve_smb_location_with_mount_root,
     };
 
     #[test]
@@ -455,6 +510,26 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "SMB 位址格式錯誤：請使用 goto smb://host/share[/path]，不能只有 IP 或主機名稱"
+        );
+    }
+
+    #[test]
+    /// 驗證 macOS mount table 中 host 帶有 port (如 :445) 時依然能正確比對。
+    fn macos_mount_parser_matches_host_with_port() {
+        let output = "//otto@192.168.0.141:445/mingfong on /Volumes/mingfong (smbfs, nodev)\n";
+        assert_eq!(
+            find_macos_smb_mount(output, "192.168.0.141", "mingfong"),
+            Some(PathBuf::from("/Volumes/mingfong"))
+        );
+    }
+
+    #[test]
+    /// 驗證當 host 名稱不同 (如 hostname vs IP) 時，能 fallback 依 share 名稱找出 smbfs 掛載點。
+    fn macos_mount_parser_matches_by_share_fallback() {
+        let output = "//otto@mingfong-nas.local/mingfong on /Volumes/mingfong (smbfs, nodev)\n";
+        assert_eq!(
+            find_macos_smb_mount_by_share(output, "mingfong"),
+            Some(PathBuf::from("/Volumes/mingfong"))
         );
     }
 }

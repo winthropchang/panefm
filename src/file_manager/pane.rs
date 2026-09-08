@@ -4230,13 +4230,16 @@ where
             ));
         }
 
-        let item = dir_entry_result?;
+        let item = match dir_entry_result {
+            Ok(item) => item,
+            Err(_) => continue,
+        };
         let name = item.file_name().to_string_lossy().into_owned();
         if is_internal_temporary_name(&name) {
             continue;
         }
         let file_type = item.file_type().ok();
-        let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+        let is_dir = file_type.as_ref().map(|t| t.is_dir()).unwrap_or(false);
         let entry_path = item.path();
 
         if !sent_first_chunk {
@@ -4336,8 +4339,7 @@ pub(crate) fn read_dir_entries_with_cancellation(
         ));
     }
     let items = fs::read_dir(path)?
-        .collect::<io::Result<Vec<_>>>()?
-        .into_iter()
+        .filter_map(Result::ok)
         .filter(|entry| !is_internal_temporary_name(&entry.file_name().to_string_lossy()))
         .collect::<Vec<_>>();
     if cancelled.load(AtomicOrdering::Relaxed) {
@@ -4371,7 +4373,7 @@ fn read_metadata_for_dir_entries(
                     "directory load cancelled",
                 ));
             }
-            entries.push(file_entry_from_dir_entry(item)?);
+            entries.push(file_entry_from_dir_entry(item));
         }
         return Ok(entries);
     }
@@ -4394,7 +4396,7 @@ fn read_metadata_for_dir_entries(
                             "directory load cancelled",
                         ));
                     }
-                    chunk_entries.push(file_entry_from_dir_entry(item)?);
+                    chunk_entries.push(file_entry_from_dir_entry(item));
                 }
                 Ok(chunk_entries)
             }));
@@ -4422,25 +4424,46 @@ fn read_metadata_for_dir_entries(
 
 /// 將單一 `DirEntry` 轉成 PaneFM 列表資料。
 ///
-/// 參數：`item: fs::DirEntry`，由目前目錄讀出的項目。
-/// 回傳：`io::Result<FileEntry>`；metadata 無法讀取時保留原始作業系統錯誤。
-fn file_entry_from_dir_entry(item: fs::DirEntry) -> io::Result<FileEntry> {
-    let file_type = item.file_type()?;
-    let metadata = item.metadata()?;
+/// 優先讀取 target metadata；若為 broken symlink 或 target 不存在，回退至 `symlink_metadata`。
+/// 若仍無法讀取，使用安全預設值，保證單一損壞或暫時鎖定項目絕不破壞整個目錄的載入。
+fn file_entry_from_dir_entry(item: fs::DirEntry) -> FileEntry {
+    let name = item.file_name().to_string_lossy().into_owned();
     let entry_path = item.path();
-    Ok(FileEntry {
-        name: item.file_name().to_string_lossy().into_owned(),
+    let file_type = item.file_type().ok();
+    let metadata = item
+        .metadata()
+        .or_else(|_| fs::symlink_metadata(&entry_path))
+        .ok();
+    let is_dir = file_type
+        .as_ref()
+        .map(|t| t.is_dir())
+        .or_else(|| metadata.as_ref().map(|m| m.is_dir()))
+        .unwrap_or(false);
+
+    let (size, modified, created, readonly, unix_mode) = if let Some(meta) = metadata {
+        (
+            meta.len(),
+            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            meta.created().unwrap_or(SystemTime::UNIX_EPOCH),
+            meta.permissions().readonly(),
+            read_unix_mode(&meta),
+        )
+    } else {
+        (0, SystemTime::UNIX_EPOCH, SystemTime::UNIX_EPOCH, false, None)
+    };
+
+    FileEntry {
+        name,
         path: entry_path,
-        is_dir: file_type.is_dir(),
-        size: metadata.len(),
-        // 遞迴目錄容量由 App 的背景 worker 計算；一般列表載入不可同步掃描。
+        is_dir,
+        size,
         directory_size: None,
         directory_size_complete: false,
-        modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        created: metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
-        readonly: metadata.permissions().readonly(),
-        unix_mode: read_unix_mode(&metadata),
-    })
+        modified,
+        created,
+        readonly,
+        unix_mode,
+    }
 }
 
 /// 讀取目前平台可提供的 Unix 權限位元，供 linemode permissions 顯示。
