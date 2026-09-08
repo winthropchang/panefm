@@ -9708,6 +9708,9 @@ fn test_handle_bracketed_paste_into_modal_actions() {
 #[test]
 /// 驗證在系統剪貼簿有內容時，edit_text_buffer 於 Insert 模式支援 Ctrl+v，於 Normal 模式支援 p 與 P。
 fn test_edit_text_buffer_paste_insert_and_normal() {
+    let _lock = crate::file_manager::platform::TEST_CLIPBOARD_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let test_str = "pasted_path";
     let write_res = write_text_to_system_clipboard(test_str);
     let read_res = read_text_from_system_clipboard();
@@ -9756,6 +9759,9 @@ fn test_edit_text_buffer_paste_insert_and_normal() {
 #[test]
 /// 驗證使用者從 c->d 拷貝目錄，再到 gt 開啟 goto 命令、按 Esc 轉 Normal 模式後按 p 貼上的完整流程。
 fn test_gt_flow_copy_cd_then_gt_esc_p_pastes() {
+    let _lock = crate::file_manager::platform::TEST_CLIPBOARD_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().expect("tempdir");
     let test_folder = dir.path().join("my_subfolder");
     fs::create_dir_all(&test_folder).expect("create folder");

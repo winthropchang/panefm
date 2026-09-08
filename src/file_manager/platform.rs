@@ -625,6 +625,9 @@ pub(crate) fn write_text_to_system_clipboard(text: &str) -> io::Result<()> {
     write_text_to_system_clipboard_for_platform(text, current_platform())
 }
 
+#[cfg(test)]
+pub(crate) static TEST_CLIPBOARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(target_os = "windows")]
 mod win_clipboard {
     use std::{io, ptr::null_mut};
@@ -661,10 +664,7 @@ mod win_clipboard {
         ) -> u32;
     }
 
-    static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     pub fn read_clipboard_text() -> Option<String> {
-        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut opened = false;
             for _ in 0..30 {
@@ -736,7 +736,6 @@ mod win_clipboard {
     }
 
     pub fn write_clipboard_text(text: &str) -> io::Result<()> {
-        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes = utf16.len() * std::mem::size_of::<u16>();
         unsafe {
@@ -1075,6 +1074,7 @@ mod tests {
     #[test]
     /// 驗證系統剪貼簿讀寫在當前平台能夠正常寫入與取出純文字。
     fn clipboard_roundtrip_test() {
+        let _lock = super::TEST_CLIPBOARD_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let text = "panefm_test_clipboard_roundtrip_42";
         let write_res = super::write_text_to_system_clipboard(text);
         assert!(write_res.is_ok(), "failed to write to clipboard: {:?}", write_res);
