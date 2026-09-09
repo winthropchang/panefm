@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use panefm::file_manager::layout::{
     LayoutNode, MIN_PANE_HEIGHT, MIN_PANE_WIDTH, SplitDirection, SplitPlacement,
-    calculate_split_rects,
+    calculate_split_rects, pane_spatial_cmp,
 };
 use ratatui::layout::Rect;
 
@@ -443,4 +443,197 @@ fn test_split_nested_preserves_ancestor_custom_weights() {
         "關閉子視窗後該欄寬度依然維持"
     );
     assert_eq!(rects.get(&5).unwrap().width, pane4_resized_width);
+}
+
+#[test]
+/// 驗證 split 操作會將目標葉節點替換成新的分割節點。
+fn split_leaf_replaces_target_with_split_node() {
+    let layout = LayoutNode::Leaf { pane_id: 1 };
+    let updated = layout.split_leaf(1, SplitDirection::Vertical, SplitPlacement::After, 2);
+
+    assert_eq!(
+        updated,
+        LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            children: vec![
+                LayoutNode::Leaf { pane_id: 1 },
+                LayoutNode::Leaf { pane_id: 2 },
+            ],
+            weights: vec![100, 100],
+        }
+    );
+}
+
+#[test]
+/// 驗證當指定 `Before` 時，新 pane 會出現在目前 pane 的前面。
+fn split_leaf_can_insert_new_pane_before_current_one() {
+    let layout = LayoutNode::Leaf { pane_id: 1 };
+    let updated = layout.split_leaf(1, SplitDirection::Horizontal, SplitPlacement::Before, 2);
+
+    assert_eq!(
+        updated,
+        LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            children: vec![
+                LayoutNode::Leaf { pane_id: 2 },
+                LayoutNode::Leaf { pane_id: 1 },
+            ],
+            weights: vec![100, 100],
+        }
+    );
+}
+
+#[test]
+/// 驗證關閉其中一個 pane 後，父 split 會正確收斂為單一節點。
+fn close_pane_collapses_parent_split() {
+    let layout = LayoutNode::Split {
+        direction: SplitDirection::Horizontal,
+        children: vec![
+            LayoutNode::Leaf { pane_id: 1 },
+            LayoutNode::Leaf { pane_id: 2 },
+        ],
+        weights: vec![100, 100],
+    };
+
+    assert_eq!(layout.close_pane(2), Some(LayoutNode::Leaf { pane_id: 1 }));
+}
+
+#[test]
+/// 驗證 remap_pane_ids 能正確批次遞迴替換整棵樹的 pane id。
+fn remap_pane_ids_updates_all_leaves() {
+    let mut layout = LayoutNode::Split {
+        direction: SplitDirection::Vertical,
+        children: vec![
+            LayoutNode::Leaf { pane_id: 10 },
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                children: vec![
+                    LayoutNode::Leaf { pane_id: 20 },
+                    LayoutNode::Leaf { pane_id: 30 },
+                ],
+                weights: vec![100, 100],
+            },
+        ],
+        weights: vec![100, 100],
+    };
+
+    let mut map = std::collections::HashMap::new();
+    map.insert(10, 1);
+    map.insert(20, 2);
+    map.insert(30, 3);
+    layout.remap_pane_ids(&map);
+
+    let mut ids = Vec::new();
+    layout.pane_ids(&mut ids);
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[test]
+/// 驗證 pane_spatial_cmp 符合「先上下（直欄優先），再左右」的所有排列規範。
+fn pane_spatial_cmp_orders_by_column_major() {
+    // 1. 左右分割：左側 1，右側 2
+    let left = Rect {
+        x: 0,
+        y: 0,
+        width: 50,
+        height: 100,
+    };
+    let right = Rect {
+        x: 50,
+        y: 0,
+        width: 50,
+        height: 100,
+    };
+    assert_eq!(pane_spatial_cmp(&left, &right), std::cmp::Ordering::Less);
+    assert_eq!(pane_spatial_cmp(&right, &left), std::cmp::Ordering::Greater);
+
+    // 2. 上下分割：上方 1，下方 2
+    let top = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 50,
+    };
+    let bottom = Rect {
+        x: 0,
+        y: 50,
+        width: 100,
+        height: 50,
+    };
+    assert_eq!(pane_spatial_cmp(&top, &bottom), std::cmp::Ordering::Less);
+
+    // 3. 2x2 格狀視窗：左上 1、左下 2、右上 3、右下 4
+    let tl = Rect {
+        x: 0,
+        y: 0,
+        width: 50,
+        height: 50,
+    };
+    let bl = Rect {
+        x: 0,
+        y: 50,
+        width: 50,
+        height: 50,
+    };
+    let tr = Rect {
+        x: 50,
+        y: 0,
+        width: 50,
+        height: 50,
+    };
+    let br = Rect {
+        x: 50,
+        y: 50,
+        width: 50,
+        height: 50,
+    };
+    let mut grid = vec![br, tl, tr, bl];
+    grid.sort_by(pane_spatial_cmp);
+    assert_eq!(grid, vec![tl, bl, tr, br]);
+
+    // 4. 左單欄 + 右雙欄：左側 1、右上 2、右下 3
+    let left_col = Rect {
+        x: 0,
+        y: 0,
+        width: 50,
+        height: 100,
+    };
+    let right_top = Rect {
+        x: 50,
+        y: 0,
+        width: 50,
+        height: 50,
+    };
+    let right_bottom = Rect {
+        x: 50,
+        y: 50,
+        width: 50,
+        height: 50,
+    };
+    let mut layout4 = vec![right_bottom, left_col, right_top];
+    layout4.sort_by(pane_spatial_cmp);
+    assert_eq!(layout4, vec![left_col, right_top, right_bottom]);
+
+    // 5. 左雙欄 + 右單欄：左上 1、左下 2、右側 3
+    let left_top = Rect {
+        x: 0,
+        y: 0,
+        width: 50,
+        height: 50,
+    };
+    let left_bottom = Rect {
+        x: 0,
+        y: 50,
+        width: 50,
+        height: 50,
+    };
+    let right_col = Rect {
+        x: 50,
+        y: 0,
+        width: 50,
+        height: 100,
+    };
+    let mut layout5 = vec![right_col, left_bottom, left_top];
+    layout5.sort_by(pane_spatial_cmp);
+    assert_eq!(layout5, vec![left_top, left_bottom, right_col]);
 }
