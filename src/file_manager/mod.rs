@@ -46,8 +46,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        supports_keyboard_enhancement,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
     },
 };
 use ignore::WalkBuilder;
@@ -134,7 +134,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         // 留下舊 cell 的情況，平常交給 ratatui diff rendering 降低閃爍。
         app.poll_background_tasks();
         let full_redraw_requested = app.take_full_redraw_request();
+        let mut in_synchronized_update = false;
         if full_redraw_requested {
+            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            in_synchronized_update = true;
             terminal.clear()?;
         }
         terminal.autoresize()?;
@@ -151,21 +154,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                     previous_buffer != &buffer || *previous_cursor != cursor_position
                 });
         if frame_changed {
+            if !in_synchronized_update {
+                let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            }
             terminal.apply_buffer_with_cursor(cursor_position)?;
             presented_frame = Some((buffer, cursor_position));
+            sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
+            if let Some(active_cwd) = app.active_pane_cwd()
+                && last_synced_cwd.as_deref() != Some(active_cwd)
+            {
+                let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
+                last_synced_cwd = Some(active_cwd.to_path_buf());
+            }
+            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
         } else {
             // Manual rendering leaves the candidate buffer active when it is not presented.
             // Reset it so the next pass starts from the same clean state as Terminal::draw().
             terminal.current_buffer_mut().reset();
-        }
-        sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
-
-        // 向外層終端（WezTerm, Windows Terminal, Alacritty 等）同步目前 active panel 目錄 (OSC 7)
-        if let Some(active_cwd) = app.active_pane_cwd()
-            && last_synced_cwd.as_deref() != Some(active_cwd)
-        {
-            let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
-            last_synced_cwd = Some(active_cwd.to_path_buf());
+            sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
         }
 
         if event::poll(poll_rate)? {
@@ -469,6 +475,7 @@ fn enter_tui_mode<W: Write>(writer: &mut W) -> Result<()> {
 
 /// 離開 TUI 前還原 terminal 狀態，避免把進階鍵盤協定留給外部程式。
 fn leave_tui_mode<W: Write>(writer: &mut W) -> Result<()> {
+    let _ = execute!(writer, EndSynchronizedUpdate);
     let _ = execute!(writer, DisableBracketedPaste);
     execute!(writer, SetCursorStyle::DefaultUserShape)?;
     if matches!(supports_keyboard_enhancement(), Ok(true)) {

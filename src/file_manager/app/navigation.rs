@@ -121,7 +121,10 @@ impl App {
     }
 
     /// 將所有依附於 pane_id 的內部狀態、背景工作與暫時面板同步更新至新編號。
-    pub(crate) fn remap_dependent_pane_ids(&mut self, map: &std::collections::HashMap<usize, usize>) {
+    pub(crate) fn remap_dependent_pane_ids(
+        &mut self,
+        map: &std::collections::HashMap<usize, usize>,
+    ) {
         // 重映射 directory_size_jobs
         let old_size_jobs = std::mem::take(&mut self.directory_size_jobs);
         let mut new_size_jobs = std::collections::BTreeMap::new();
@@ -246,15 +249,18 @@ impl App {
 
     /// 將焦點直接切到指定 pane 編號。
     pub(crate) fn focus_pane_by_id(&mut self, target_pane_id: usize) {
-        if self.panes.contains_key(&target_pane_id) {
-            self.focused_pane = target_pane_id;
-            self.status = format!("focused panel {target_pane_id}");
-        } else {
+        if !self.panes.contains_key(&target_pane_id) {
             self.status = format!(
                 "unknown panel {target_pane_id}. available: {}",
                 self.available_pane_ids_label()
             );
+            return;
         }
+        if self.focused_pane == target_pane_id {
+            return;
+        }
+        self.focused_pane = target_pane_id;
+        self.status = format!("focused panel {target_pane_id}");
     }
 
     /// 從 `:panel <id>` 的參數解析目標 panel 編號並切換焦點。

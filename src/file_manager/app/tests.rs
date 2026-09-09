@@ -9819,7 +9819,8 @@ fn app_dynamic_pane_renumbering_scenarios() {
     assert_eq!(app.ordered_pane_ids(), vec![1]);
 
     // 情境 1：左右分割 -> 左側 1，右側 2
-    app.split_current(SplitDirection::Vertical).expect("split vertical");
+    app.split_current(SplitDirection::Vertical)
+        .expect("split vertical");
     assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
     assert_eq!(app.focused_pane, 2);
 
@@ -9829,7 +9830,8 @@ fn app_dynamic_pane_renumbering_scenarios() {
     assert_eq!(app.focused_pane, 1);
 
     // 情境 2：上下分割 -> 上方 1，下方 2
-    app.split_current(SplitDirection::Horizontal).expect("split horizontal");
+    app.split_current(SplitDirection::Horizontal)
+        .expect("split horizontal");
     assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
     assert_eq!(app.focused_pane, 2);
 
@@ -9838,8 +9840,10 @@ fn app_dynamic_pane_renumbering_scenarios() {
     assert_eq!(app.ordered_pane_ids(), vec![1]);
 
     // 情境 4：左單欄 + 右雙欄 -> 左側為 1、右上為 2、右下為 3
-    app.split_current(SplitDirection::Vertical).expect("split vertical");
-    app.split_current(SplitDirection::Horizontal).expect("split right horizontally");
+    app.split_current(SplitDirection::Vertical)
+        .expect("split vertical");
+    app.split_current(SplitDirection::Horizontal)
+        .expect("split right horizontally");
     assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3]);
     assert_eq!(app.focused_pane, 3);
 
@@ -9848,15 +9852,18 @@ fn app_dynamic_pane_renumbering_scenarios() {
     assert_eq!(app.ordered_pane_ids(), vec![1]);
 
     // 情境 5：左雙欄 + 右單欄 -> 左上為 1、左下為 2、右側為 3
-    app.split_current(SplitDirection::Vertical).expect("split vertical");
+    app.split_current(SplitDirection::Vertical)
+        .expect("split vertical");
     app.focus_pane_by_id(1);
-    app.split_current(SplitDirection::Horizontal).expect("split left horizontally");
+    app.split_current(SplitDirection::Horizontal)
+        .expect("split left horizontally");
     assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3]);
     assert_eq!(app.focused_pane, 2);
 
     // 情境 3：2x2 格狀視窗 -> 左上 1、左下為 2、右上為 3、右下為 4
     app.focus_pane_by_id(3);
-    app.split_current(SplitDirection::Horizontal).expect("split right horizontally");
+    app.split_current(SplitDirection::Horizontal)
+        .expect("split right horizontally");
     assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3, 4]);
     assert_eq!(app.focused_pane, 4);
 
@@ -9871,3 +9878,28 @@ fn app_dynamic_pane_renumbering_scenarios() {
     assert!(!app.panes.contains_key(&4));
 }
 
+#[test]
+/// 驗證當目標 panel 已經擁有焦點時，再次切換焦點為 no-op，不會覆寫 status 或觸發冗餘重繪。
+fn focus_pane_by_id_noop_when_already_focused() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.split_current(SplitDirection::Vertical).expect("split");
+    assert_eq!(app.focused_pane, 2);
+
+    app.status = String::from("custom status");
+    // 目標已是 pane 2，不應改變 status
+    app.focus_pane_by_id(2);
+    assert_eq!(app.focused_pane, 2);
+    assert_eq!(app.status, "custom status");
+
+    // 切到 pane 1，status 應更新為 focused panel 1
+    app.focus_pane_by_id(1);
+    assert_eq!(app.focused_pane, 1);
+    assert_eq!(app.status, "focused panel 1");
+
+    // 再次按 1 聚焦 pane 1，維持原狀
+    app.status = String::from("preserve status");
+    app.focus_pane_by_id(1);
+    assert_eq!(app.focused_pane, 1);
+    assert_eq!(app.status, "preserve status");
+}

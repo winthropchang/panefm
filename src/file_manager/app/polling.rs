@@ -1429,7 +1429,10 @@ impl App {
                             Some(pane_id)
                         } else {
                             archive_path.parent().and_then(|parent| {
-                                self.panes.iter().find(|(_, p)| p.cwd == parent).map(|(&id, _)| id)
+                                self.panes
+                                    .iter()
+                                    .find(|(_, p)| p.cwd == parent)
+                                    .map(|(&id, _)| id)
                             })
                         };
                         if let Some(target_id) = target_pane_id
@@ -1473,7 +1476,10 @@ impl App {
                                 Some(pane_id)
                             } else {
                                 first.output_path.parent().and_then(|parent| {
-                                    self.panes.iter().find(|(_, p)| p.cwd == parent).map(|(&id, _)| id)
+                                    self.panes
+                                        .iter()
+                                        .find(|(_, p)| p.cwd == parent)
+                                        .map(|(&id, _)| id)
                                 })
                             };
                             if let Some(target_id) = target_pane_id

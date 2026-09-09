@@ -595,41 +595,111 @@ mod tests {
     #[test]
     /// 驗證 pane_spatial_cmp 符合「先上下（直欄優先），再左右」的所有排列規範。
     fn pane_spatial_cmp_orders_by_column_major() {
-        use ratatui::layout::Rect;
         use super::pane_spatial_cmp;
+        use ratatui::layout::Rect;
 
         // 1. 左右分割：左側 1，右側 2
-        let left = Rect { x: 0, y: 0, width: 50, height: 100 };
-        let right = Rect { x: 50, y: 0, width: 50, height: 100 };
+        let left = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 100,
+        };
+        let right = Rect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 100,
+        };
         assert_eq!(pane_spatial_cmp(&left, &right), std::cmp::Ordering::Less);
         assert_eq!(pane_spatial_cmp(&right, &left), std::cmp::Ordering::Greater);
 
         // 2. 上下分割：上方 1，下方 2
-        let top = Rect { x: 0, y: 0, width: 100, height: 50 };
-        let bottom = Rect { x: 0, y: 50, width: 100, height: 50 };
+        let top = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let bottom = Rect {
+            x: 0,
+            y: 50,
+            width: 100,
+            height: 50,
+        };
         assert_eq!(pane_spatial_cmp(&top, &bottom), std::cmp::Ordering::Less);
 
         // 3. 2x2 格狀視窗：左上 1、左下 2、右上 3、右下 4
-        let tl = Rect { x: 0, y: 0, width: 50, height: 50 };
-        let bl = Rect { x: 0, y: 50, width: 50, height: 50 };
-        let tr = Rect { x: 50, y: 0, width: 50, height: 50 };
-        let br = Rect { x: 50, y: 50, width: 50, height: 50 };
+        let tl = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let bl = Rect {
+            x: 0,
+            y: 50,
+            width: 50,
+            height: 50,
+        };
+        let tr = Rect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let br = Rect {
+            x: 50,
+            y: 50,
+            width: 50,
+            height: 50,
+        };
         let mut grid = vec![br, tl, tr, bl];
         grid.sort_by(pane_spatial_cmp);
         assert_eq!(grid, vec![tl, bl, tr, br]);
 
         // 4. 左單欄 + 右雙欄：左側 1、右上 2、右下 3
-        let left_col = Rect { x: 0, y: 0, width: 50, height: 100 };
-        let right_top = Rect { x: 50, y: 0, width: 50, height: 50 };
-        let right_bottom = Rect { x: 50, y: 50, width: 50, height: 50 };
+        let left_col = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 100,
+        };
+        let right_top = Rect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let right_bottom = Rect {
+            x: 50,
+            y: 50,
+            width: 50,
+            height: 50,
+        };
         let mut layout4 = vec![right_bottom, left_col, right_top];
         layout4.sort_by(pane_spatial_cmp);
         assert_eq!(layout4, vec![left_col, right_top, right_bottom]);
 
         // 5. 左雙欄 + 右單欄：左上 1、左下 2、右側 3
-        let left_top = Rect { x: 0, y: 0, width: 50, height: 50 };
-        let left_bottom = Rect { x: 0, y: 50, width: 50, height: 50 };
-        let right_col = Rect { x: 50, y: 0, width: 50, height: 100 };
+        let left_top = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let left_bottom = Rect {
+            x: 0,
+            y: 50,
+            width: 50,
+            height: 50,
+        };
+        let right_col = Rect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 100,
+        };
         let mut layout5 = vec![right_col, left_bottom, left_top];
         layout5.sort_by(pane_spatial_cmp);
         assert_eq!(layout5, vec![left_top, left_bottom, right_col]);
