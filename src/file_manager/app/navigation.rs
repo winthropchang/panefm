@@ -145,44 +145,32 @@ impl App {
 
         // 重映射 visual_selection
         if let Some(vs) = &mut self.visual_selection {
-            if let Some(&new_id) = map.get(&vs.pane_id) {
-                vs.pane_id = new_id;
-            }
+            vs.pane_id = map.get(&vs.pane_id).copied().unwrap_or(vs.pane_id);
         }
 
         // 重映射 filter
         if let Some(f) = &mut self.filter {
-            if let Some(&new_id) = map.get(&f.pane_id) {
-                f.pane_id = new_id;
-            }
+            f.pane_id = map.get(&f.pane_id).copied().unwrap_or(f.pane_id);
         }
 
         // 重映射 preview_search
         if let Some(ps) = &mut self.preview_search {
-            if let Some(&new_id) = map.get(&ps.pane_id) {
-                ps.pane_id = new_id;
-            }
+            ps.pane_id = map.get(&ps.pane_id).copied().unwrap_or(ps.pane_id);
         }
 
         // 重映射 list_find
         if let Some(lf) = &mut self.list_find {
-            if let Some(&new_id) = map.get(&lf.pane_id) {
-                lf.pane_id = new_id;
-            }
+            lf.pane_id = map.get(&lf.pane_id).copied().unwrap_or(lf.pane_id);
         }
 
         // 重映射 global_search
         if let Some(gs) = &mut self.global_search {
-            if let Some(&new_id) = map.get(&gs.pane_id) {
-                gs.pane_id = new_id;
-            }
+            gs.pane_id = map.get(&gs.pane_id).copied().unwrap_or(gs.pane_id);
         }
 
         // 重映射 pending_fzf_jump
         if let Some(req) = &mut self.pending_fzf_jump {
-            if let Some(&new_id) = map.get(&req.pane_id) {
-                req.pane_id = new_id;
-            }
+            req.pane_id = map.get(&req.pane_id).copied().unwrap_or(req.pane_id);
         }
 
         // 重映射 help_return
@@ -233,9 +221,7 @@ impl App {
         // 重映射 task_log 中正在執行的任務之 pane_id
         for record in &mut self.task_log {
             if record.state == TaskState::Running {
-                if let Some(&new_id) = map.get(&record.pane_id) {
-                    record.pane_id = new_id;
-                }
+                record.pane_id = map.get(&record.pane_id).copied().unwrap_or(record.pane_id);
             }
         }
     }

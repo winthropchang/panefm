@@ -395,7 +395,7 @@ fn shell_join_os_args(args: &[std::ffi::OsString]) -> String {
     #[cfg(not(windows))]
     {
         args.iter()
-            .map(|arg| quote_posix_shell_arg(arg))
+            .map(quote_posix_shell_arg)
             .collect::<Vec<_>>()
             .join(" ")
     }

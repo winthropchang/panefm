@@ -115,8 +115,7 @@ pub(crate) fn clone_dir_cow(source: &Path, target: &Path) -> io::Result<()> {
                 return Ok(());
             } else {
                 let _ = fs::remove_dir_all(target);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "CoW clone directory did not create a directory",
                 ));
             }

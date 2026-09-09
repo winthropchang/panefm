@@ -1170,10 +1170,10 @@ impl App {
                 .get_or_insert_with(|| Instant::now() + debounce);
         }
 
-        if !self
-            .filesystem_refresh_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        let Some(deadline) = self.filesystem_refresh_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
             return;
         }
 

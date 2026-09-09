@@ -176,7 +176,7 @@ fn is_likely_network_path(path: &Path) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        return path.starts_with("/Volumes");
+        path.starts_with("/Volumes")
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {

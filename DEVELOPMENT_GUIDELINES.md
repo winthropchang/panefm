@@ -329,24 +329,24 @@ fn windows_reveal_uses_explorer_select() {
 - 外部命令 builder 測試
 - 狀態切換前後的測試
 
-### 9.2 提交前測試與代碼品質強制門禁（Commit 前必備條件）
+### 9.2 提交前測試與代碼品質強制門禁（Commit / Push 前必備條件）
 
-在進行任何 `git commit` 或 `git push` 前，**絕對必須在本地終端機完整執行並通過以下三項檢驗，未通過者嚴禁提交**：
+在進行任何 `git commit` 或 `git push` 前，**絕對必須在本地終端機完整執行並通過以下一鍵式強制驗證指令，未通過者嚴禁提交或推送**：
 
-1. **單元與整合測試全數通過（強制）**：
-   ```bash
-   cargo test --all-targets
-   ```
-   - 必須確保「0 failed」，所有測試 100% 通過。
-2. **Clippy 零警告把關（強制）**：
-   ```bash
-   cargo clippy --all-targets -- -D warnings
-   ```
-   - 專案採零容忍政策，警告視同錯誤，必須 0 warning。
-3. **代碼排版合規（強制）**：
-   ```bash
-   cargo fmt --check
-   ```
+```bash
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets
+```
+
+> [!CAUTION]
+> **嚴禁分開執行或遺漏 Clippy**：
+> 1. **`cargo test` 不等於代碼無警告**：`cargo test` 僅編譯測試並執行斷言，**不會**進行 Clippy 程式碼品質與風格檢查。
+> 2. **CI 採零容忍政策 (`-D warnings`)**：任何 Clippy warning 在 CI 虛擬機上一律被視為編譯錯誤（Exit code 101）並中斷部署。
+> 3. **必須一鍵串聯執行**：使用 `&&` 串聯能確保任一關卡失敗時立刻中斷，絕不容許只跑 `cargo test` 就誤以為品質合格。
+
+檢驗標準包含：
+1. **代碼排版合規（強制）**：`cargo fmt --check` 必須 0 diff。
+2. **Clippy 零警告把關（強制）**：`cargo clippy --all-targets -- -D warnings` 必須 0 warning。
+3. **單元與整合測試全數通過（強制）**：`cargo test --all-targets` 必須確保「0 failed」，所有測試 100% 通過。
 
 > [!IMPORTANT]
 > **外部依賴工具環境要求**：
@@ -354,6 +354,19 @@ fn windows_reveal_uses_explorer_select() {
 > 開發者本地環境與 CI 虛擬機皆必須安裝此 4 項工具，否則相關功能之整合測試會直接報錯中斷：
 > - Windows 本機安裝：`winget install sharkdp.fd BurntSushi.ripgrep.MSVC junegunn.fzf ajeetdsouza.zoxide`
 > - CI 虛擬機：由 `.github/workflows/ci.yml` 透過 `install-action` 自動安裝。
+
+### 9.3 Git Pre-Push 自動化防禦機制（物理防呆）
+
+為了杜絕人為疏失或忘記手動執行上述驗證命令，專案內建了 Git Pre-Push Hook：
+
+1. **腳本位置**：[`.githooks/pre-push`](file:///Users/otto/Documents/terminal-file-manager/.githooks/pre-push)
+2. **啟動方式（本機一次性設定）**：
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+   （或複製至本地 `.git/hooks/pre-push` 並給予執行權限 `chmod +x .git/hooks/pre-push`）
+3. **攔截機制**：
+   每當執行 `git push` 時，Git 會自動在背景依序執行 `fmt`、`clippy`、`test`。若有任何錯誤或警告，將直接**阻擋並中止推送（Abort push）**，從工具層面徹底保障遠端 CI 100% 成功。
 
 ## 10. 程式結構規則
 
@@ -391,10 +404,9 @@ fn windows_reveal_uses_explorer_select() {
 
 每次完工與 **Commit 之前**，必須逐一確認：
 
-- [ ] `cargo fmt --check` 通過，排版乾淨
-- [ ] `cargo clippy --all-targets -- -D warnings` 通過，零 warning
-- [ ] `cargo test --all-targets` **全數通過（0 failed，本地未全過絕對嚴禁 commit）**
+- [ ] **執行一鍵強制驗證通過**：`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets`（0 diff, 0 warning, 0 failed）
 - [ ] 本地環境具備 `fd`, `rg`, `fzf`, `zoxide` 以確保整合測試有效執行
+- [ ] 已啟用 Git Pre-Push Hook（`git config core.hooksPath .githooks`）以落實自動攔截
 - [ ] 新功能有測試
 - [ ] 修 bug 有回歸測試
 - [ ] **測試代碼已完全拆分並存放於 `tests/` 目錄中，核心程式碼檔案內零殘留 `mod tests`**
@@ -434,11 +446,9 @@ fn windows_reveal_uses_explorer_select() {
 每次進行版本定版與發布時，必須嚴格按照以下流程執行：
 
 1. **本地完整驗證**：
-   確保工作目錄乾淨，並執行完整檢查（嚴禁跳過任何一項）：
+   確保工作目錄乾淨，並執行一鍵強制驗證指令（嚴禁分開執行或跳過 Clippy）：
    ```bash
-   cargo fmt --check
-   cargo clippy --all-targets -- -D warnings
-   cargo test --all-targets
+   cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets
    ```
 2. **更新版本號**：
    - 編輯 `Cargo.toml` 中的 `version = "X.Y.Z"`。

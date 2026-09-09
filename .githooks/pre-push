@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -e
+
+# ==============================================================================
+# PaneFM Git Pre-Push Hook
+# 在推送前強制檢查代碼格式、Clippy 零警告政策與全數單元/整合測試。
+# ==============================================================================
+
+echo "=========================================================="
+echo " [PaneFM Quality Gate] 正在執行 Git Pre-Push 自動驗證..."
+echo "=========================================================="
+
+echo ">> 1/3 檢查代碼排版 (cargo fmt --check)..."
+if ! cargo fmt --check; then
+    echo "❌ 代碼排版不符合規範！請先在本地執行 'cargo fmt' 後再推送。"
+    exit 1
+fi
+
+echo ">> 2/3 檢查代碼品質 (cargo clippy --all-targets -- -D warnings)..."
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo "❌ Clippy 檢查發現警告或錯誤！本專案採零容忍政策 (-D warnings)，請修正後再推送。"
+    exit 1
+fi
+
+echo ">> 3/3 執行所有測試 (cargo test --all-targets)..."
+if ! cargo test --all-targets; then
+    echo "❌ 測試執行失敗！必須確保 0 failed 才能推送。"
+    exit 1
+fi
+
+echo "=========================================================="
+echo " ✅ 所有代碼品質與測試檢驗全數通過，允許推送！"
+echo "=========================================================="
+exit 0
