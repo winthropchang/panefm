@@ -43,6 +43,7 @@ impl App {
                 .clone()
                 .split_leaf(self.focused_pane, direction, placement, new_id);
         self.focused_pane = new_id;
+        self.renumber_panes();
         self.status = match (direction, placement) {
             (SplitDirection::Horizontal, SplitPlacement::Before) => String::from("split up"),
             (SplitDirection::Horizontal, SplitPlacement::After) => String::from("split down"),
@@ -50,6 +51,190 @@ impl App {
             (SplitDirection::Vertical, SplitPlacement::After) => String::from("split right"),
         };
         Ok(())
+    }
+
+    /// 依畫面幾何位置（先上下、再左右）將所有 panel 動態重新編號為 1..=N。
+    pub(crate) fn renumber_panes(&mut self) {
+        if self.panes.is_empty() {
+            return;
+        }
+
+        // 1. 在標準化虛擬畫布上計算每個 pane 的矩形區域
+        let normalized_area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 10000,
+            height: 10000,
+        };
+        let mut pane_rects = std::collections::BTreeMap::new();
+        self.layout.render_rects(normalized_area, &mut pane_rects);
+
+        // 2. 依照「先上下、再左右」幾何順序排序所有目前的 pane id
+        let mut sorted_ids: Vec<usize> = self.panes.keys().copied().collect();
+        sorted_ids.sort_by(|&id_a, &id_b| {
+            let rect_a = pane_rects.get(&id_a);
+            let rect_b = pane_rects.get(&id_b);
+            match (rect_a, rect_b) {
+                (Some(ra), Some(rb)) => pane_spatial_cmp(ra, rb),
+                _ => id_a.cmp(&id_b),
+            }
+        });
+
+        // 3. 建立舊 id -> 新 id (1..=N) 的對應表
+        let id_map: std::collections::HashMap<usize, usize> = sorted_ids
+            .iter()
+            .enumerate()
+            .map(|(index, &old_id)| (old_id, index + 1))
+            .collect();
+
+        // 若編號完全未變動（例如原本就是 1..N 且順序相同），重設 next_pane_id 並提早返回
+        if id_map.iter().all(|(old_id, new_id)| old_id == new_id) {
+            self.next_pane_id = self.panes.len() + 1;
+            return;
+        }
+
+        // 4. 更新 layout 樹中的所有 leaf id
+        self.layout.remap_pane_ids(&id_map);
+
+        // 5. 重建 self.panes
+        let old_panes = std::mem::take(&mut self.panes);
+        let mut new_panes = std::collections::BTreeMap::new();
+        for (old_id, pane) in old_panes {
+            if let Some(&new_id) = id_map.get(&old_id) {
+                new_panes.insert(new_id, pane);
+            }
+        }
+        self.panes = new_panes;
+
+        // 6. 更新 focused_pane
+        if let Some(&new_focus) = id_map.get(&self.focused_pane) {
+            self.focused_pane = new_focus;
+        } else if let Some(&first) = self.panes.keys().next() {
+            self.focused_pane = first;
+        }
+
+        // 7. 更新 next_pane_id
+        self.next_pane_id = self.panes.len() + 1;
+
+        // 8. 同步更新所有相依的狀態
+        self.remap_dependent_pane_ids(&id_map);
+    }
+
+    /// 將所有依附於 pane_id 的內部狀態、背景工作與暫時面板同步更新至新編號。
+    pub(crate) fn remap_dependent_pane_ids(&mut self, map: &std::collections::HashMap<usize, usize>) {
+        // 重映射 directory_size_jobs
+        let old_size_jobs = std::mem::take(&mut self.directory_size_jobs);
+        let mut new_size_jobs = std::collections::BTreeMap::new();
+        for (old_id, job) in old_size_jobs {
+            let new_id = map.get(&old_id).copied().unwrap_or(old_id);
+            new_size_jobs.insert(new_id, job);
+        }
+        self.directory_size_jobs = new_size_jobs;
+
+        // 重映射 directory_load_jobs
+        let old_load_jobs = std::mem::take(&mut self.directory_load_jobs);
+        let mut new_load_jobs = std::collections::BTreeMap::new();
+        for (old_id, job) in old_load_jobs {
+            let new_id = map.get(&old_id).copied().unwrap_or(old_id);
+            new_load_jobs.insert(new_id, job);
+        }
+        self.directory_load_jobs = new_load_jobs;
+
+        // 重映射 visual_selection
+        if let Some(vs) = &mut self.visual_selection {
+            if let Some(&new_id) = map.get(&vs.pane_id) {
+                vs.pane_id = new_id;
+            }
+        }
+
+        // 重映射 filter
+        if let Some(f) = &mut self.filter {
+            if let Some(&new_id) = map.get(&f.pane_id) {
+                f.pane_id = new_id;
+            }
+        }
+
+        // 重映射 preview_search
+        if let Some(ps) = &mut self.preview_search {
+            if let Some(&new_id) = map.get(&ps.pane_id) {
+                ps.pane_id = new_id;
+            }
+        }
+
+        // 重映射 list_find
+        if let Some(lf) = &mut self.list_find {
+            if let Some(&new_id) = map.get(&lf.pane_id) {
+                lf.pane_id = new_id;
+            }
+        }
+
+        // 重映射 global_search
+        if let Some(gs) = &mut self.global_search {
+            if let Some(&new_id) = map.get(&gs.pane_id) {
+                gs.pane_id = new_id;
+            }
+        }
+
+        // 重映射 pending_fzf_jump
+        if let Some(req) = &mut self.pending_fzf_jump {
+            if let Some(&new_id) = map.get(&req.pane_id) {
+                req.pane_id = new_id;
+            }
+        }
+
+        // 重映射 help_return
+        if let Some(hr) = &mut self.help_return {
+            match hr {
+                HelpReturnState::PreviewFocus(pid) => {
+                    if let Some(&new_id) = map.get(pid) {
+                        *pid = new_id;
+                    }
+                }
+                HelpReturnState::Filter(f) => {
+                    if let Some(&new_id) = map.get(&f.pane_id) {
+                        f.pane_id = new_id;
+                    }
+                }
+                HelpReturnState::PreviewSearch(ps) => {
+                    if let Some(&new_id) = map.get(&ps.pane_id) {
+                        ps.pane_id = new_id;
+                    }
+                }
+                HelpReturnState::ListFind(lf) => {
+                    if let Some(&new_id) = map.get(&lf.pane_id) {
+                        lf.pane_id = new_id;
+                    }
+                }
+                HelpReturnState::GlobalSearch(gs) => {
+                    if let Some(&new_id) = map.get(&gs.pane_id) {
+                        gs.pane_id = new_id;
+                    }
+                }
+                HelpReturnState::VisualSelection(vs) => {
+                    if let Some(&new_id) = map.get(&vs.pane_id) {
+                        vs.pane_id = new_id;
+                    }
+                }
+                HelpReturnState::Pending(action) => {
+                    remap_pending_action_pane_id(action, map);
+                }
+                HelpReturnState::CommandMode(_) | HelpReturnState::PendingBookmark(_) => {}
+            }
+        }
+
+        // 重映射 pending_action
+        if let Some(action) = &mut self.pending_action {
+            remap_pending_action_pane_id(action, map);
+        }
+
+        // 重映射 task_log 中正在執行的任務之 pane_id
+        for record in &mut self.task_log {
+            if record.state == TaskState::Running {
+                if let Some(&new_id) = map.get(&record.pane_id) {
+                    record.pane_id = new_id;
+                }
+            }
+        }
     }
 
     /// 依照目前布局順序取得所有 pane id。
@@ -112,6 +297,7 @@ impl App {
                     self.global_search = None;
                 }
                 self.focused_pane = fallback;
+                self.renumber_panes();
                 self.status = format!("closed panel {old_focus}");
             }
         }
@@ -129,6 +315,7 @@ impl App {
         {
             self.global_search = None;
         }
+        self.renumber_panes();
         self.status = String::from("kept only focused panel");
     }
 
@@ -1670,5 +1857,54 @@ impl App {
             self.cancel_directory_size_scan(pane_id);
         }
         Ok(())
+    }
+}
+
+pub(crate) fn remap_pending_action_pane_id(
+    action: &mut PendingAction,
+    map: &std::collections::HashMap<usize, usize>,
+) {
+    match action {
+        PendingAction::ConfirmDelete { pane_id, .. }
+        | PendingAction::ConfirmPasteOverwrite { pane_id, .. }
+        | PendingAction::SortPicker { pane_id }
+        | PendingAction::GoPicker { pane_id }
+        | PendingAction::WindowPicker { pane_id }
+        | PendingAction::WindowResize { pane_id }
+        | PendingAction::LineModePicker { pane_id }
+        | PendingAction::YankPicker { pane_id }
+        | PendingAction::ThemeCommandPicker { pane_id }
+        | PendingAction::TrashPanel { pane_id, .. }
+        | PendingAction::HelpPanel { pane_id, .. }
+        | PendingAction::TaskPanel { pane_id, .. }
+        | PendingAction::BookmarkPicker { pane_id }
+        | PendingAction::BookmarkList { pane_id, .. }
+        | PendingAction::ZoxideList { pane_id, .. }
+        | PendingAction::ToolPanel { pane_id, .. }
+        | PendingAction::CopyPicker { pane_id, .. }
+        | PendingAction::OpenPicker { pane_id, .. }
+        | PendingAction::Rename { pane_id, .. }
+        | PendingAction::CreateEntry { pane_id, .. }
+        | PendingAction::RegexRename { pane_id, .. } => {
+            if let Some(&new_id) = map.get(pane_id) {
+                *pane_id = new_id;
+            }
+        }
+        PendingAction::ConfirmTrashAction { action, .. } => match action {
+            TrashConfirmAction::RestoreFromPanel { pane_id, .. }
+            | TrashConfirmAction::DeleteFromPanel { pane_id, .. } => {
+                if let Some(&new_id) = map.get(pane_id) {
+                    *pane_id = new_id;
+                }
+            }
+        },
+        PendingAction::DiffMatrix(state) => {
+            for pid in &mut state.panel_ids {
+                if let Some(&new_id) = map.get(pid) {
+                    *pid = new_id;
+                }
+            }
+        }
+        PendingAction::ThemePicker { .. } => {}
     }
 }

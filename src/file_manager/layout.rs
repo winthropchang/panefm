@@ -178,6 +178,22 @@ impl LayoutNode {
         }
     }
 
+    /// 遞迴將整棵布局樹中所有 leaf 的 pane id 依對應表替換。
+    pub fn remap_pane_ids(&mut self, map: &std::collections::HashMap<usize, usize>) {
+        match self {
+            LayoutNode::Leaf { pane_id } => {
+                if let Some(&new_id) = map.get(pane_id) {
+                    *pane_id = new_id;
+                }
+            }
+            LayoutNode::Split { children, .. } => {
+                for child in children {
+                    child.remap_pane_ids(map);
+                }
+            }
+        }
+    }
+
     /// 檢查樹中是否包含指定 pane id。
     pub fn contains_pane(&self, target: usize) -> bool {
         match self {
@@ -457,6 +473,38 @@ pub fn calculate_split_rects(area: Rect, direction: SplitDirection, weights: &[u
     rects
 }
 
+/// 依照「先上下（直欄優先），再左右」幾何空間順序比較兩個矩形。
+///
+/// 排序規則：
+/// 1. 若兩矩形水平有重疊（處於同一直欄或水平重疊區間），以垂直 Y 座標由小到大排序（由上至下）。
+/// 2. 若水平完全無重疊（一者完全在另一者左側），以水平 X 座標由小到大排序（由左至右）。
+/// 3. 若同處一處，依序以 X、Y、寬度、高度比較。
+pub fn pane_spatial_cmp(r1: &Rect, r2: &Rect) -> std::cmp::Ordering {
+    let overlap_start = r1.x.max(r2.x);
+    let overlap_end = (r1.x.saturating_add(r1.width)).min(r2.x.saturating_add(r2.width));
+    let horizontal_overlap = overlap_end > overlap_start;
+
+    if horizontal_overlap {
+        if r1.y != r2.y {
+            return r1.y.cmp(&r2.y);
+        }
+        if r1.x != r2.x {
+            return r1.x.cmp(&r2.x);
+        }
+    } else {
+        if r1.x != r2.x {
+            return r1.x.cmp(&r2.x);
+        }
+        if r1.y != r2.y {
+            return r1.y.cmp(&r2.y);
+        }
+    }
+
+    r1.width
+        .cmp(&r2.width)
+        .then_with(|| r1.height.cmp(&r2.height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LayoutNode, SplitDirection, SplitPlacement};
@@ -512,5 +560,78 @@ mod tests {
         };
 
         assert_eq!(layout.close_pane(2), Some(LayoutNode::Leaf { pane_id: 1 }));
+    }
+
+    #[test]
+    /// 驗證 remap_pane_ids 能正確批次遞迴替換整棵樹的 pane id。
+    fn remap_pane_ids_updates_all_leaves() {
+        let mut layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            children: vec![
+                LayoutNode::Leaf { pane_id: 10 },
+                LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    children: vec![
+                        LayoutNode::Leaf { pane_id: 20 },
+                        LayoutNode::Leaf { pane_id: 30 },
+                    ],
+                    weights: vec![100, 100],
+                },
+            ],
+            weights: vec![100, 100],
+        };
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(10, 1);
+        map.insert(20, 2);
+        map.insert(30, 3);
+        layout.remap_pane_ids(&map);
+
+        let mut ids = Vec::new();
+        layout.pane_ids(&mut ids);
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    /// 驗證 pane_spatial_cmp 符合「先上下（直欄優先），再左右」的所有排列規範。
+    fn pane_spatial_cmp_orders_by_column_major() {
+        use ratatui::layout::Rect;
+        use super::pane_spatial_cmp;
+
+        // 1. 左右分割：左側 1，右側 2
+        let left = Rect { x: 0, y: 0, width: 50, height: 100 };
+        let right = Rect { x: 50, y: 0, width: 50, height: 100 };
+        assert_eq!(pane_spatial_cmp(&left, &right), std::cmp::Ordering::Less);
+        assert_eq!(pane_spatial_cmp(&right, &left), std::cmp::Ordering::Greater);
+
+        // 2. 上下分割：上方 1，下方 2
+        let top = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let bottom = Rect { x: 0, y: 50, width: 100, height: 50 };
+        assert_eq!(pane_spatial_cmp(&top, &bottom), std::cmp::Ordering::Less);
+
+        // 3. 2x2 格狀視窗：左上 1、左下 2、右上 3、右下 4
+        let tl = Rect { x: 0, y: 0, width: 50, height: 50 };
+        let bl = Rect { x: 0, y: 50, width: 50, height: 50 };
+        let tr = Rect { x: 50, y: 0, width: 50, height: 50 };
+        let br = Rect { x: 50, y: 50, width: 50, height: 50 };
+        let mut grid = vec![br, tl, tr, bl];
+        grid.sort_by(pane_spatial_cmp);
+        assert_eq!(grid, vec![tl, bl, tr, br]);
+
+        // 4. 左單欄 + 右雙欄：左側 1、右上 2、右下 3
+        let left_col = Rect { x: 0, y: 0, width: 50, height: 100 };
+        let right_top = Rect { x: 50, y: 0, width: 50, height: 50 };
+        let right_bottom = Rect { x: 50, y: 50, width: 50, height: 50 };
+        let mut layout4 = vec![right_bottom, left_col, right_top];
+        layout4.sort_by(pane_spatial_cmp);
+        assert_eq!(layout4, vec![left_col, right_top, right_bottom]);
+
+        // 5. 左雙欄 + 右單欄：左上 1、左下 2、右側 3
+        let left_top = Rect { x: 0, y: 0, width: 50, height: 50 };
+        let left_bottom = Rect { x: 0, y: 50, width: 50, height: 50 };
+        let right_col = Rect { x: 50, y: 0, width: 50, height: 100 };
+        let mut layout5 = vec![right_col, left_bottom, left_top];
+        layout5.sort_by(pane_spatial_cmp);
+        assert_eq!(layout5, vec![left_top, left_bottom, right_col]);
     }
 }

@@ -1020,8 +1020,20 @@ impl App {
                         entries,
                         is_first_chunk,
                     }) => {
-                        if let Some(pane) = self.panes.get_mut(&event.pane_id)
-                            && pane.cwd == event.cwd
+                        let target_pane_id = if self
+                            .panes
+                            .get(&event.pane_id)
+                            .is_some_and(|p| p.cwd == event.cwd)
+                        {
+                            Some(event.pane_id)
+                        } else {
+                            self.panes
+                                .iter()
+                                .find(|(_, p)| p.cwd == event.cwd)
+                                .map(|(&id, _)| id)
+                        };
+                        if let Some(target_id) = target_pane_id
+                            && let Some(pane) = self.panes.get_mut(&target_id)
                         {
                             if is_first_chunk {
                                 pane.replace_entries_presorted(
@@ -1413,7 +1425,16 @@ impl App {
                             self.finish_task(task_id, TaskState::Failed, self.status.clone());
                             return;
                         }
-                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        let target_pane_id = if self.panes.contains_key(&pane_id) {
+                            Some(pane_id)
+                        } else {
+                            archive_path.parent().and_then(|parent| {
+                                self.panes.iter().find(|(_, p)| p.cwd == parent).map(|(&id, _)| id)
+                            })
+                        };
+                        if let Some(target_id) = target_pane_id
+                            && let Some(pane) = self.panes.get_mut(&target_id)
+                        {
                             pane.select_path(&archive_path);
                         }
                         let archive_name = archive_path
@@ -1447,10 +1468,19 @@ impl App {
                             self.finish_task(task_id, TaskState::Failed, self.status.clone());
                             return;
                         }
-                        if let Some(first) = extracted.first()
-                            && let Some(pane) = self.panes.get_mut(&pane_id)
-                        {
-                            pane.select_path(&first.output_path);
+                        if let Some(first) = extracted.first() {
+                            let target_pane_id = if self.panes.contains_key(&pane_id) {
+                                Some(pane_id)
+                            } else {
+                                first.output_path.parent().and_then(|parent| {
+                                    self.panes.iter().find(|(_, p)| p.cwd == parent).map(|(&id, _)| id)
+                                })
+                            };
+                            if let Some(target_id) = target_pane_id
+                                && let Some(pane) = self.panes.get_mut(&target_id)
+                            {
+                                pane.select_path(&first.output_path);
+                            }
                         }
                         self.status = extraction_status_label(&extracted, skipped);
                         self.finish_task(task_id, TaskState::Done, self.status.clone());

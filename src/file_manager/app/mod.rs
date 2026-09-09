@@ -51,7 +51,7 @@ use super::{
     diff::{DiffJobEvent, DiffMatrixState, launch_content_diff_spec, spawn_background_diff},
     filesystem_watcher::FilesystemWatcher,
     fuzzy::{fuzzy_matched_indices, fuzzy_matched_indices_by_fields},
-    layout::{LayoutNode, SplitDirection, SplitPlacement},
+    layout::{LayoutNode, SplitDirection, SplitPlacement, pane_spatial_cmp},
     open::{
         LaunchSpec, OpenAction, OpenPickerAction, OpenPickerOption, OpenTarget,
         build_custom_launch_spec, build_launch_spec, build_terminal_launch_spec,

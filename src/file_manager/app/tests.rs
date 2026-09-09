@@ -4867,15 +4867,15 @@ fn app_w_leader_splits_in_four_directions() {
         .expect("open w leader");
     app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
         .expect("split left");
-    assert_eq!(app.ordered_pane_ids(), vec![2, 1]);
-    assert_eq!(app.focused_pane, 2);
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
+    assert_eq!(app.focused_pane, 1);
     assert_eq!(app.status, "split left");
 
     app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
         .expect("open w leader");
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         .expect("split down");
-    assert_eq!(app.focused_pane, 3);
+    assert_eq!(app.focused_pane, 2);
     assert_eq!(app.status, "split down");
 
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -4883,8 +4883,8 @@ fn app_w_leader_splits_in_four_directions() {
         .expect("open w leader");
     app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
         .expect("split up");
-    assert_eq!(app.ordered_pane_ids(), vec![2, 1]);
-    assert_eq!(app.focused_pane, 2);
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
+    assert_eq!(app.focused_pane, 1);
     assert_eq!(app.status, "split up");
 
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
@@ -6219,17 +6219,17 @@ fn app_preview_mode_is_scoped_to_its_own_pane() {
     app.split_current(SplitDirection::Horizontal)
         .expect("split third panel");
     app.open_preview_focus();
-    assert_eq!(app.focused_pane, 3);
+    assert_eq!(app.focused_pane, 2);
     assert!(app.panes.get(&1).expect("panel 1").is_preview_active());
     assert!(app.panes.get(&2).expect("panel 2").is_preview_active());
     assert!(app.panes.get(&3).expect("panel 3").is_preview_active());
 
-    app.focus_pane_by_id(2);
+    app.focus_pane_by_id(3);
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-        .expect("close only panel 2 preview");
+        .expect("close only panel 3 preview");
     assert!(app.panes.get(&1).expect("panel 1").is_preview_active());
-    assert!(!app.panes.get(&2).expect("panel 2").is_preview_active());
-    assert!(app.panes.get(&3).expect("panel 3").is_preview_active());
+    assert!(app.panes.get(&2).expect("panel 2").is_preview_active());
+    assert!(!app.panes.get(&3).expect("panel 3").is_preview_active());
 }
 
 #[test]
@@ -9804,3 +9804,70 @@ fn test_gt_flow_copy_cd_then_gt_esc_p_pastes() {
         app.command_buffer
     );
 }
+
+#[test]
+/// 驗證 pane 動態重編號（先上下再左右，Column-Major 空間順序）：
+/// 1. 左右分割：左側為 1，右側為 2。
+/// 2. 上下分割：上方為 1，下方為 2。
+/// 3. 2x2 格狀視窗：左上為 1、左下為 2、右上為 3、右下為 4。
+/// 4. 左單欄 + 右雙欄：左側為 1、右上為 2、右下為 3。
+/// 5. 左雙欄 + 右單欄：左上為 1、左下為 2、右側為 3。
+/// 6. 中途關閉 pane 時動態重算，維持 1..=N 連續無斷號。
+fn app_dynamic_pane_renumbering_scenarios() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    assert_eq!(app.ordered_pane_ids(), vec![1]);
+
+    // 情境 1：左右分割 -> 左側 1，右側 2
+    app.split_current(SplitDirection::Vertical).expect("split vertical");
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
+    assert_eq!(app.focused_pane, 2);
+
+    // 關閉右側回到單一 pane
+    app.close_current_pane();
+    assert_eq!(app.ordered_pane_ids(), vec![1]);
+    assert_eq!(app.focused_pane, 1);
+
+    // 情境 2：上下分割 -> 上方 1，下方 2
+    app.split_current(SplitDirection::Horizontal).expect("split horizontal");
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2]);
+    assert_eq!(app.focused_pane, 2);
+
+    // 回到單一 pane
+    app.only_current_pane();
+    assert_eq!(app.ordered_pane_ids(), vec![1]);
+
+    // 情境 4：左單欄 + 右雙欄 -> 左側為 1、右上為 2、右下為 3
+    app.split_current(SplitDirection::Vertical).expect("split vertical");
+    app.split_current(SplitDirection::Horizontal).expect("split right horizontally");
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3]);
+    assert_eq!(app.focused_pane, 3);
+
+    // 回到單一 pane
+    app.only_current_pane();
+    assert_eq!(app.ordered_pane_ids(), vec![1]);
+
+    // 情境 5：左雙欄 + 右單欄 -> 左上為 1、左下為 2、右側為 3
+    app.split_current(SplitDirection::Vertical).expect("split vertical");
+    app.focus_pane_by_id(1);
+    app.split_current(SplitDirection::Horizontal).expect("split left horizontally");
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3]);
+    assert_eq!(app.focused_pane, 2);
+
+    // 情境 3：2x2 格狀視窗 -> 左上 1、左下為 2、右上為 3、右下為 4
+    app.focus_pane_by_id(3);
+    app.split_current(SplitDirection::Horizontal).expect("split right horizontally");
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3, 4]);
+    assert_eq!(app.focused_pane, 4);
+
+    // 情境 6：中途關閉 pane，維持 1..=N 連續重編號
+    app.focus_pane_by_id(2);
+    app.close_current_pane();
+    assert_eq!(app.ordered_pane_ids(), vec![1, 2, 3]);
+    assert_eq!(app.panes.len(), 3);
+    assert!(app.panes.contains_key(&1));
+    assert!(app.panes.contains_key(&2));
+    assert!(app.panes.contains_key(&3));
+    assert!(!app.panes.contains_key(&4));
+}
+
