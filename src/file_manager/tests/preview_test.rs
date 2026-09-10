@@ -96,19 +96,19 @@ fn preview_handles_alpha_transparency() {
 }
 
 #[test]
-/// 驗證大於 128 KiB 的非圖片檔案會顯示完整的「檔案詳細資訊卡片」，絕不顯示舊的 preview skipped 字樣。
+/// 驗證大於 2 MiB 的非圖片檔案會顯示完整的「檔案詳細資訊卡片」，絕不顯示舊的 preview skipped 字樣。
 ///
 /// 驗證內容：
-/// 1. 建立 200 KiB 的大型文字檔案。
+/// 1. 建立超過 2 MiB 的大型文字檔案。
 /// 2. 呼叫 `preview_file_content` 產生預覽行。
 /// 3. 驗證預覽內容包含 path、type、size、modified、permissions、notice 與 hint。
-/// 4. 驗證預覽內容絕不包含 "preview skipped for files larger than 128 KiB"。
+/// 4. 驗證預覽內容絕不包含 "preview skipped"。
 ///
 /// 保護目的：徹底解決先前大檔案只顯示無用 skipped 提示的問題，提供使用者完整有價值的檔案屬性資訊。
 fn preview_large_file_shows_rich_details_card() {
     let dir = tempdir().expect("tempdir");
     let large_file = dir.path().join("large_log.txt");
-    let content = "a".repeat(200 * 1024);
+    let content = "a".repeat(2 * 1024 * 1024 + 1024);
     fs::write(&large_file, content).expect("write large file");
 
     let mut cache = None;
@@ -117,15 +117,12 @@ fn preview_large_file_shows_rich_details_card() {
 
     assert!(text.iter().any(|l| l.starts_with("path: ")));
     assert!(text.iter().any(|l| l.contains("type: Plain Text Document")));
-    assert!(
-        text.iter()
-            .any(|l| l.contains("size: 200.0 KiB (204,800 bytes)"))
-    );
+    assert!(text.iter().any(|l| l.starts_with("size: 2.00 MiB")));
     assert!(text.iter().any(|l| l.starts_with("modified: ")));
     assert!(text.iter().any(|l| l.starts_with("permissions: ")));
     assert!(
         text.iter()
-            .any(|l| l.contains("notice: file size exceeds 128 KiB text preview limit"))
+            .any(|l| l.contains("notice: file size exceeds 2 MiB text preview limit"))
     );
     assert!(
         text.iter()
@@ -134,11 +131,38 @@ fn preview_large_file_shows_rich_details_card() {
 
     // 嚴格保證絕不出現舊的簡陋提示
     assert!(
-        !text
-            .iter()
-            .any(|l| l.contains("preview skipped for files larger than 128 KiB")),
+        !text.iter().any(|l| l.contains("preview skipped")),
         "不可再出現舊的 preview skipped 訊息"
     );
+}
+
+#[test]
+/// 驗證超過先前 128 KiB 限制但小於 2 MiB 的程式碼檔案（如 200 KiB 原始碼）可正常呈現代碼預覽，不再被卡片阻擋。
+/// 保護目的：解決典型專案大原始碼（如 4000 行之 pane.rs）無法預覽的問題。
+fn preview_file_between_128k_and_2m_renders_code_preview() {
+    let dir = tempdir().expect("tempdir");
+    let large_code_file = dir.path().join("large_module.rs");
+    let mut code = String::new();
+    // 建立約 200 KiB 的 Rust 程式碼（約 5000 行）
+    for i in 1..=5000 {
+        code.push_str(&format!("fn helper_{i}() -> usize {{ {i} }}\n"));
+    }
+    assert!(code.len() > 128 * 1024, "測試檔案必須超過舊的 128 KiB 上限");
+    assert!(code.len() < 2 * 1024 * 1024, "測試檔案必須在 2 MiB 限制內");
+    fs::write(&large_code_file, &code).expect("write large code file");
+
+    let mut cache = None;
+    let lines = preview_file_content(&large_code_file, 20, 80, 24, &mut cache, &mut None);
+    let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+
+    // 驗證輸出的是程式碼帶行號，而非詳細屬性卡片
+    assert!(
+        !text
+            .iter()
+            .any(|l| l.starts_with("notice: file size exceeds"))
+    );
+    assert!(text.iter().any(|l| l.contains("fn helper_1()")));
+    assert_eq!(lines.len(), 20);
 }
 
 #[test]
@@ -442,4 +466,209 @@ fn large_image_triggers_async_loader_and_renders_on_completion() {
         retries += 1;
     }
     panic!("背景圖片解碼超時未完成");
+}
+
+#[test]
+/// 驗證 Rust 原始碼在代碼預覽時能正確產生語法高亮 Span 與暗色行號。
+/// 保護目的：確保程式碼預覽告別單色黑白文字，呈現層次豐富的關鍵字、字串與行號色彩。
+fn preview_code_renders_syntax_highlighted_spans_for_rust() {
+    let dir = tempdir().expect("tempdir");
+    let rust_file = dir.path().join("demo.rs");
+    let code = "fn main() {\n    let greeting = \"hello world\";\n}\n";
+    fs::write(&rust_file, code).expect("write rust file");
+
+    let lines = highlight_code_preview(&rust_file, code, 10, None);
+    assert_eq!(lines.len(), 3);
+
+    // 驗證第 1 行包含行號與語法著色 Span
+    let line1 = &lines[0];
+    assert!(line1.spans.len() >= 2, "第 1 行應至少包含行號與關鍵字 Span");
+
+    // 行號 Span 驗證：前景色應為暗灰 (110, 115, 128)
+    let line_num_span = &line1.spans[0];
+    assert_eq!(line_num_span.content.as_ref(), "  1 ");
+    assert_eq!(
+        line_num_span.style.fg,
+        Some(Color::Rgb(110, 115, 128)),
+        "行號必須使用低飽和度暗灰色"
+    );
+
+    // 關鍵字 "fn" 應該被著色（前景色為 RGB 色彩，非預設空樣式）
+    let has_colored_kw = line1
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref().contains("fn") && span.style.fg.is_some());
+    assert!(has_colored_kw, "Rust 關鍵字 fn 必須帶有語法高亮色彩");
+
+    // 驗證第 2 行中的字串字面量有高亮
+    let line2 = &lines[1];
+    let has_colored_str = line2
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref().contains("hello world") && span.style.fg.is_some());
+    assert!(has_colored_str, "字串字面量必須帶有語法高亮色彩");
+
+    // 驗證轉為純文字時維持正確格式
+    assert_eq!(line1.to_string(), "  1 fn main() {");
+    assert_eq!(line2.to_string(), "  2     let greeting = \"hello world\";");
+}
+
+#[test]
+/// 驗證 JSON 檔案在代碼預覽時能正確識別語法並為鍵值與數值著色。
+/// 保護目的：確保常見設定檔（JSON/TOML）具備良好的可讀性。
+fn preview_code_renders_syntax_highlighted_spans_for_json() {
+    let dir = tempdir().expect("tempdir");
+    let json_file = dir.path().join("config.json");
+    let json_content = "{\n  \"port\": 8080,\n  \"enabled\": true\n}\n";
+    fs::write(&json_file, json_content).expect("write json file");
+
+    let lines = highlight_code_preview(&json_file, json_content, 10, None);
+    assert_eq!(lines.len(), 4);
+
+    let line2 = &lines[1];
+    let has_colored_num = line2
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref().contains("8080") && span.style.fg.is_some());
+    assert!(has_colored_num, "JSON 數值 8080 必須具備高亮色彩");
+}
+
+#[test]
+/// 驗證未支援的副檔名或純文字檔案能安全回退至暗色行號與原文字串，不發生崩潰。
+/// 保護目的：確保語法高亮在面對任意未知檔案時具備 100% 穩定性。
+fn preview_code_renders_plain_text_with_safe_fallback() {
+    let dir = tempdir().expect("tempdir");
+    let txt_file = dir.path().join("unknown.custom_ext_123");
+    let content = "alpha\nbeta\n";
+    fs::write(&txt_file, content).expect("write txt file");
+
+    let lines = highlight_code_preview(&txt_file, content, 10, None);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].to_string(), "  1 alpha");
+    assert_eq!(lines[1].to_string(), "  2 beta");
+}
+
+#[test]
+/// 驗證 TOML 設定檔（如 Cargo.toml）在代碼預覽時能正確產生語法高亮 Span。
+/// 保護目的：確保 TOML 標題、鍵名、字串、數值、布林值與註解皆有對應的高亮著色。
+fn preview_code_renders_syntax_highlighted_spans_for_toml() {
+    let dir = tempdir().expect("tempdir");
+    let toml_file = dir.path().join("Cargo.toml");
+    let toml_content =
+        "[package]\nname = \"panefm\"\nversion = \"0.1.12\"\nenabled = true\n# comment\n";
+    fs::write(&toml_file, toml_content).expect("write toml file");
+
+    let lines = highlight_code_preview(&toml_file, toml_content, 10, None);
+    assert_eq!(lines.len(), 5);
+
+    // 第 1 行：[package] 區段標題高亮
+    let line1 = &lines[0];
+    let has_header = line1
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref() == "package" && s.style.fg.is_some());
+    assert!(has_header, "TOML 區段標題 [package] 必須帶有色彩");
+
+    // 第 2 行：name = "panefm" 鍵與字串高亮
+    let line2 = &lines[1];
+    let has_key = line2
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref() == "name" && s.style.fg.is_some());
+    let has_str = line2
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("panefm") && s.style.fg.is_some());
+    assert!(has_key, "TOML 鍵名必須高亮");
+    assert!(has_str, "TOML 字串必須高亮");
+
+    // 第 4 行：enabled = true 布林值高亮
+    let line4 = &lines[3];
+    let has_bool = line4
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref() == "true" && s.style.fg.is_some());
+    assert!(has_bool, "TOML 布林值必須高亮");
+
+    // 第 5 行：# comment 註解高亮
+    let line5 = &lines[4];
+    let has_comment = line5
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("# comment") && s.style.fg.is_some());
+    assert!(has_comment, "TOML 註解必須高亮");
+}
+
+#[test]
+/// 驗證單行 TOML 分詞高亮函式針對各種標記（鍵、等號、字串、數值、內嵌表、陣列）的解析表現。
+fn test_highlight_toml_line_tokens() {
+    // 陣列表標題
+    let spans = highlight_toml_line("[[bin]]");
+    assert_eq!(spans.len(), 3);
+    assert_eq!(spans[0].content.as_ref(), "[[");
+    assert_eq!(spans[1].content.as_ref(), "bin");
+    assert_eq!(spans[2].content.as_ref(), "]]");
+
+    // 純註解行
+    let spans = highlight_toml_line("# a comment");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].content.as_ref(), "# a comment");
+
+    // 內嵌結構行
+    let spans = highlight_toml_line("dependencies = { serde = \"1.0\", ratatui = \"0.29\" }");
+    let content: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(
+        content,
+        "dependencies = { serde = \"1.0\", ratatui = \"0.29\" }"
+    );
+    let has_serde_key = spans
+        .iter()
+        .any(|s| s.content.as_ref() == "serde" && s.style.fg.is_some());
+    assert!(has_serde_key, "內嵌表鍵名 serde 應高亮");
+}
+
+#[test]
+/// 驗證 highlight_code_preview_slice 能正確對指定區間渲染正確行號與語法色彩。
+fn test_highlight_code_preview_slice() {
+    let code = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n";
+    let lines = highlight_code_preview_slice(Path::new("test.rs"), code, 2, 2, 100, None);
+    assert_eq!(lines.len(), 2);
+    // 第 1 條輸出應該對應第 3 行 (gamma)
+    let line1 = &lines[0];
+    let line1_str = line1.to_string();
+    assert!(
+        line1_str.contains("  3 fn gamma()"),
+        "第 3 行應正確顯示行號與函式內容: {line1_str}"
+    );
+    let has_fn_kw = line1
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("fn") && s.style.fg.is_some());
+    assert!(has_fn_kw, "切片渲染中關鍵字 fn 應有色彩");
+
+    // 第 2 條輸出應該對應第 4 行 (delta)
+    let line2 = &lines[1];
+    let line2_str = line2.to_string();
+    assert!(
+        line2_str.contains("  4 fn delta()"),
+        "第 4 行應正確顯示行號與函式內容: {line2_str}"
+    );
+}
+
+#[test]
+/// 驗證 preview_file_slice 能從磁碟檔案直接提取特定區間並輸出切片。
+fn test_preview_file_slice_from_disk() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("config.toml");
+    fs::write(
+        &file_path,
+        "name = \"app\"\nversion = \"1.0.0\"\nactive = true\n",
+    )
+    .expect("write toml");
+
+    let lines = preview_file_slice(&file_path, 1, 2, 3);
+    assert_eq!(lines.len(), 2);
+    let line1 = &lines[0];
+    let line1_str = line1.to_string();
+    assert!(line1_str.contains(" 2 version = \"1.0.0\""));
 }

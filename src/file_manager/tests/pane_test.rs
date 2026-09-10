@@ -1498,3 +1498,235 @@ fn cow_and_fallback_copy_file_and_directory_in_pane() {
     assert!(discovered > 0);
     assert!(copied > 0);
 }
+
+#[test]
+/// 驗證 PaneState 預覽捲動具備快取機制，j/k 捲動時重複讀取切片不會重複讀檔與語法解析。
+/// 保護目的：避免大檔案或長程式碼預覽在 j/k 快速捲動時產生卡頓。
+fn pane_state_preview_scrolling_uses_cache_without_lag() {
+    let dir = tempdir().expect("tempdir");
+    let test_file = dir.path().join("main.rs");
+    let mut code = String::new();
+    for i in 1..=60 {
+        code.push_str(&format!("// line {}\nlet var_{} = {};\n", i, i, i));
+    }
+    fs::write(&test_file, &code).expect("write rust file");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(80, 10);
+
+    // 1. 初次載入預覽
+    let lines_initial = pane.preview_lines(10, Theme::default());
+    assert_eq!(lines_initial.len(), 10);
+    assert!(
+        pane.preview_content_cache.lock().unwrap().is_some(),
+        "預覽內容應寫入快取"
+    );
+
+    // 2. 向下捲動 5 行（模擬鍵盤按下 5 次 j）
+    pane.scroll_preview_down(5);
+    let lines_scrolled = pane.preview_lines(10, Theme::default());
+    assert_eq!(lines_scrolled.len(), 10);
+    assert!(pane.preview_has_more_below());
+
+    // 驗證捲動後的行內容確實位移
+    assert_ne!(lines_initial[0].to_string(), lines_scrolled[0].to_string());
+
+    // 3. 向上捲動 2 行（模擬鍵盤按下 2 次 k）
+    pane.scroll_preview_up(2);
+    assert_eq!(pane.preview_scroll, 3);
+}
+
+#[test]
+/// 驗證預覽模式下使用 `/` 搜尋過濾關鍵字時，所有未命中與命中行的語法高亮色彩皆完整保留，不會退化為黑白單色。
+/// 保護目的：確保搜尋標記覆蓋在語法樹之上，而非抹除原有的語法著色與行號色彩。
+fn pane_state_preview_search_preserves_syntax_highlighting_colors() {
+    let dir = tempdir().expect("tempdir");
+    let test_file = dir.path().join("main.rs");
+    let code = "fn main() {\n    let greeting = \"hello world\";\n}\n";
+    fs::write(&test_file, code).expect("write rust file");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(80, 10);
+
+    // 1. 無搜尋時的初始預覽，確認有彩色 span
+    let initial_lines = pane.preview_lines(10, Theme::default());
+    assert_eq!(initial_lines.len(), 3);
+    let line1_has_kw = initial_lines[0]
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("fn") && s.style.fg.is_some());
+    assert!(line1_has_kw, "初始狀態 fn 必須帶有語法色彩");
+
+    // 2. 模擬使用者按下 `/` 並輸入 "world"
+    pane.set_preview_search_query("world");
+    let searched_lines = pane.preview_lines(10, Theme::default());
+    assert_eq!(searched_lines.len(), 3);
+
+    // 第 1 行並未命中 "world"，但關鍵字 "fn" 必須依然維持語法高亮色彩！
+    let line1_searched_has_kw = searched_lines[0]
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("fn") && s.style.fg.is_some());
+    assert!(
+        line1_searched_has_kw,
+        "使用 / 搜尋時，未命中行（第 1 行 fn）的語法色彩不可消失"
+    );
+
+    // 第 2 行命中 "world"：
+    // - 搜尋關鍵字 "world" 應帶有 match 高亮樣式
+    // - 前方的 "let" 關鍵字必須依然保持語法色彩！
+    let line2 = &searched_lines[1];
+    let line2_has_let_kw = line2
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("let") && s.style.fg.is_some());
+    assert!(
+        line2_has_let_kw,
+        "使用 / 搜尋時，命中行（第 2 行 let）的語法色彩不可消失"
+    );
+
+    let line2_has_match = line2.spans.iter().any(|s| {
+        s.content.as_ref() == "world"
+            && (s.style.bg.is_some() || s.style.fg == Some(Theme::default().preview_match_fg))
+    });
+    assert!(line2_has_match, "搜尋關鍵字 world 必須具備命中高亮樣式");
+
+    // 3. 取消搜尋後，色彩依然正常
+    pane.clear_preview_search();
+    let cleared_lines = pane.preview_lines(10, Theme::default());
+    let cleared_has_kw = cleared_lines[0]
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("fn") && s.style.fg.is_some());
+    assert!(cleared_has_kw, "取消搜尋後語法色彩依然維持");
+}
+
+#[test]
+/// 驗證超過 1000 行的大型原始碼檔案在首次開啟預覽時採用漸進式載入（優先高亮前段），
+/// 能在幾毫秒內極速呈現畫面，絕不阻塞主執行緒造成卡頓。
+fn pane_state_large_file_over_1000_lines_previews_instantly_without_lag() {
+    let dir = tempdir().expect("tempdir");
+    let test_file = dir.path().join("big_file.rs");
+    let mut code = String::new();
+    for i in 1..=1500 {
+        code.push_str(&format!("fn function_{i}() -> usize {{ {i} }}\n"));
+    }
+    fs::write(&test_file, &code).expect("write big file");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(20);
+    pane.set_preview_viewport_size(80, 20);
+
+    // 預熱全域靜態語法庫（單次 process 生命週期只會載入一次），避免將語法引擎反序列化時間算入首屏切片時間
+    let syntax = crate::file_manager::preview::SYNTAX_SET
+        .find_syntax_by_extension("rs")
+        .unwrap();
+    let theme = &crate::file_manager::preview::THEME_SET.themes["base16-ocean.dark"];
+    let mut h = syntect::easy::HighlightLines::new(syntax, theme);
+    let _ = h.highlight_line(
+        "fn warmup() {}\n",
+        &crate::file_manager::preview::SYNTAX_SET,
+    );
+
+    // 1. 初次載入預覽：首屏 20 行必須極速返回（低於 100ms，release 模式通常 < 5ms）
+    let t0 = std::time::Instant::now();
+    let lines = pane.preview_lines(20, Theme::default());
+    let elapsed = t0.elapsed();
+
+    assert_eq!(lines.len(), 20);
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "首次預覽大檔案應在極短時間內返回首屏，實際耗時: {:?}",
+        elapsed
+    );
+
+    // 2. 驗證總行數已知且捲動上下界正確
+    let guard = pane.preview_content_cache.lock().unwrap();
+    let cache = guard.as_ref().expect("cache should exist");
+    assert_eq!(cache.total_lines, 1500, "總行數應正確識別為 1500 行");
+    drop(guard);
+
+    assert_eq!(pane.max_preview_scroll(), 1480);
+    assert!(pane.preview_has_more_below());
+
+    // 3. 等待背景執行緒完成全文高亮
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if let Some(c) = guard.as_ref()
+            && c.is_complete
+        {
+            assert_eq!(c.lines.len(), 1500);
+            break;
+        }
+    }
+}
+
+#[test]
+/// 驗證在 5000 行以上的大型檔案中，於第一行按下 G 跳至最後一行時零停頓（< 50ms），
+/// 絕不重新同步解析幾千行語法。
+fn pane_state_jump_to_bottom_with_g_on_large_file_is_instant() {
+    let dir = tempdir().expect("tempdir");
+    let test_file = dir.path().join("file_5000.rs");
+    let mut code = String::new();
+    for i in 1..=5000 {
+        code.push_str(&format!("fn function_{i}() -> usize {{ {i} }}\n"));
+    }
+    fs::write(&test_file, &code).expect("write 5000 lines file");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(20);
+    pane.set_preview_viewport_size(80, 20);
+
+    // 預熱語法庫
+    let syntax = crate::file_manager::preview::SYNTAX_SET
+        .find_syntax_by_extension("rs")
+        .unwrap();
+    let theme = &crate::file_manager::preview::THEME_SET.themes["base16-ocean.dark"];
+    let mut h = syntect::easy::HighlightLines::new(syntax, theme);
+    let _ = h.highlight_line(
+        "fn warmup() {}\n",
+        &crate::file_manager::preview::SYNTAX_SET,
+    );
+
+    // 初次載入預覽（首屏）
+    let _ = pane.preview_lines(20, Theme::default());
+
+    // 模擬使用者在第一行立即按下 G 跳到最後一行
+    let t0 = std::time::Instant::now();
+    pane.scroll_preview_bottom();
+    let lines = pane.preview_lines(20, Theme::default());
+    let elapsed = t0.elapsed();
+    println!(
+        "Time to jump to bottom and render last 20 lines: {:?}",
+        elapsed
+    );
+
+    assert_eq!(lines.len(), 20);
+    assert_eq!(pane.preview_scroll, 4980);
+    // 驗證跳到底部時間必須極短（< 50ms）
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "按下 G 跳至末尾應極速返回，實際耗時: {:?}",
+        elapsed
+    );
+
+    // 驗證末尾行行號為 5000 且程式碼關鍵字帶有語法色彩
+    let last_line = &lines[19];
+    let line_str = last_line.to_string();
+    assert!(
+        line_str.contains("5000"),
+        "末尾行應包含行號 5000，實際為: {line_str}"
+    );
+    assert!(
+        line_str.contains("function_5000"),
+        "末尾行應包含函式名稱，實際為: {line_str}"
+    );
+    let has_colored_kw = last_line
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref().contains("fn") && s.style.fg.is_some());
+    assert!(has_colored_kw, "末尾行切片渲染應包含 fn 關鍵字語法顏色");
+}

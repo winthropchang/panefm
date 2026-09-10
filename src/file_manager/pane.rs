@@ -134,6 +134,9 @@ pub(crate) struct PaneState {
     /// 圖片預覽快取，避免每幀重新讀檔與解碼。
     preview_image_cache:
         std::sync::Arc<std::sync::Mutex<Option<super::preview::ImagePreviewCache>>>,
+    /// 程式碼與檔案內容預覽快取，避免 j/k 捲動與每幀重複讀檔與語法解析。
+    preview_content_cache:
+        std::sync::Arc<std::sync::Mutex<Option<super::preview::PreviewContentCache>>>,
     /// 背景非同步圖片解碼任務。
     preview_image_loader: std::sync::Arc<std::sync::Mutex<Option<super::preview::ImageLoader>>>,
     /// 目前 preview 內搜尋使用的查詢字串。
@@ -295,6 +298,7 @@ impl PaneState {
             preview_viewport_width: 80,
             preview_viewport_height: 4,
             preview_image_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            preview_content_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             preview_image_loader: std::sync::Arc::new(std::sync::Mutex::new(None)),
             preview_search_query: None,
             preview_current_match: None,
@@ -810,10 +814,80 @@ impl PaneState {
                 .collect();
         }
 
-        let needed_lines = self.preview_scroll + max_lines;
-        self.raw_preview_content_lines_limited(needed_lines)
+        let Some(entry) = self.selected_entry() else {
+            return vec![Line::from("empty directory")];
+        };
+
+        let ext = entry.path.extension().and_then(|e| e.to_str());
+        let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
+        let is_archive = !entry.is_dir && super::preview::is_archive_file(&entry.path).is_some();
+
+        // 目錄、圖片、壓縮包維持原有快速分流
+        if entry.is_dir || is_image || is_archive {
+            let needed_lines = self.preview_scroll + max_lines;
+            return self
+                .raw_preview_content_lines_limited(needed_lines)
+                .into_iter()
+                .skip(self.preview_scroll)
+                .take(max_lines)
+                .collect();
+        }
+
+        let start_line = self.preview_scroll;
+        let end_line = start_line + max_lines;
+
+        // 檢查快取
+        if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.as_ref()
+            && cache.path == entry.path
+            && cache.modified == Some(entry.modified)
+            && cache.viewport_width == self.preview_viewport_width
+        {
+            // 若快取已涵蓋可見區間，或全文已經由背景執行緒解析完畢
+            if cache.lines.len() >= end_line || cache.is_complete {
+                return cache
+                    .lines
+                    .iter()
+                    .skip(start_line)
+                    .take(max_lines)
+                    .cloned()
+                    .collect();
+            }
+
+            // 快取存在但目標區間超出目前快取行數（例如剛打開檔案即按下 G 跳至第 5000 行）：
+            // 立即以 < 1ms 切片渲染可見行，絕不阻塞主 UI 執行緒！
+            return super::preview::preview_file_slice(
+                &entry.path,
+                start_line,
+                max_lines,
+                cache.total_lines,
+            );
+        }
+
+        // 快取尚未建立（首次開啟）：先載入首屏 40 行，並在背景啟動全文高亮
+        let initial_lines = self.raw_preview_content_lines_limited(end_line.min(40));
+        if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.as_ref()
+            && cache.path == entry.path
+        {
+            if start_line < initial_lines.len() {
+                return initial_lines
+                    .into_iter()
+                    .skip(start_line)
+                    .take(max_lines)
+                    .collect();
+            }
+            return super::preview::preview_file_slice(
+                &entry.path,
+                start_line,
+                max_lines,
+                cache.total_lines,
+            );
+        }
+
+        initial_lines
             .into_iter()
-            .skip(self.preview_scroll)
+            .skip(start_line)
             .take(max_lines)
             .collect()
     }
@@ -899,6 +973,12 @@ impl PaneState {
         }
 
         let viewport_height = self.preview_viewport_height.max(1);
+        if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.as_ref()
+        {
+            return self.preview_scroll + viewport_height < cache.total_lines;
+        }
+
         let needed_lines = self.preview_scroll + viewport_height + 1;
         let total_loaded_lines = self.raw_preview_content_lines_limited(needed_lines).len();
         total_loaded_lines > self.preview_scroll + viewport_height
@@ -906,7 +986,20 @@ impl PaneState {
 
     /// 回傳完整 preview 內容最多可以向下捲到哪一列。
     fn max_preview_scroll(&self) -> usize {
-        let total_lines = self.raw_preview_content_lines().len();
+        let total_lines = if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.as_ref()
+        {
+            cache.total_lines
+        } else {
+            let _ = self.raw_preview_content_lines_limited(40);
+            if let Ok(guard) = self.preview_content_cache.lock()
+                && let Some(cache) = guard.as_ref()
+            {
+                cache.total_lines
+            } else {
+                1
+            }
+        };
         total_lines.saturating_sub(self.preview_viewport_height.max(1))
     }
 
@@ -1108,30 +1201,98 @@ impl PaneState {
     ///
     /// 回傳：`Vec<Line<'static>>`，未套用搜尋高亮的 preview 原始內容。
     fn raw_preview_content_lines_limited(&self, max_lines: usize) -> Vec<Line<'static>> {
-        match self.selected_entry() {
-            Some(entry) if entry.is_dir => {
-                super::preview::preview_directory(entry, max_lines, self.preview_viewport_width)
-            }
-            Some(entry) => {
-                let mut fallback_cache = None;
-                let mut cache_guard = self.preview_image_cache.lock().ok();
-                let cache_ref = cache_guard.as_deref_mut().unwrap_or(&mut fallback_cache);
+        let Some(entry) = self.selected_entry() else {
+            return vec![Line::from("empty directory")];
+        };
 
-                let mut fallback_loader = None;
-                let mut loader_guard = self.preview_image_loader.lock().ok();
-                let loader_ref = loader_guard.as_deref_mut().unwrap_or(&mut fallback_loader);
+        let ext = entry.path.extension().and_then(|e| e.to_str());
+        let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
 
-                super::preview::preview_file_content(
-                    &entry.path,
-                    max_lines,
-                    self.preview_viewport_width,
-                    self.preview_viewport_height,
-                    cache_ref,
-                    loader_ref,
-                )
-            }
-            None => vec![Line::from("empty directory")],
+        if !is_image
+            && let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.as_ref()
+            && cache.path == entry.path
+            && cache.modified == Some(entry.modified)
+            && cache.viewport_width == self.preview_viewport_width
+            && (cache.lines.len() >= max_lines || cache.is_complete)
+        {
+            let mut lines = cache.lines.clone();
+            lines.truncate(max_lines);
+            return lines;
         }
+
+        let (lines, total_lines) = if entry.is_dir {
+            let lines =
+                super::preview::preview_directory(entry, usize::MAX, self.preview_viewport_width);
+            let count = lines.len();
+            (lines, count)
+        } else {
+            let mut fallback_cache = None;
+            let mut cache_guard = self.preview_image_cache.lock().ok();
+            let cache_ref = cache_guard.as_deref_mut().unwrap_or(&mut fallback_cache);
+
+            let mut fallback_loader = None;
+            let mut loader_guard = self.preview_image_loader.lock().ok();
+            let loader_ref = loader_guard.as_deref_mut().unwrap_or(&mut fallback_loader);
+
+            let request_lines = if is_image {
+                max_lines
+            } else {
+                max_lines.max(40)
+            };
+            super::preview::preview_file_content_detailed(
+                &entry.path,
+                request_lines,
+                self.preview_viewport_width,
+                self.preview_viewport_height,
+                cache_ref,
+                loader_ref,
+            )
+        };
+
+        if !is_image {
+            let is_complete = lines.len() >= total_lines;
+            if let Ok(mut guard) = self.preview_content_cache.lock() {
+                *guard = Some(super::preview::PreviewContentCache {
+                    path: entry.path.clone(),
+                    modified: Some(entry.modified),
+                    viewport_width: self.preview_viewport_width,
+                    total_lines,
+                    lines: lines.clone(),
+                    is_complete,
+                });
+            }
+
+            if !is_complete {
+                let bg_path = entry.path.clone();
+                let bg_modified = Some(entry.modified);
+                let bg_cache = self.preview_content_cache.clone();
+                std::thread::spawn(move || {
+                    if let Ok(bytes) = std::fs::read(&bg_path)
+                        && let Ok(contents) = String::from_utf8(bytes)
+                    {
+                        let full_lines = super::preview::highlight_code_preview(
+                            &bg_path,
+                            &contents,
+                            usize::MAX,
+                            None,
+                        );
+                        if let Ok(mut guard) = bg_cache.lock()
+                            && let Some(cache) = guard.as_mut()
+                            && cache.path == bg_path
+                            && cache.modified == bg_modified
+                        {
+                            cache.lines = full_lines;
+                            cache.is_complete = true;
+                        }
+                    }
+                });
+            }
+        }
+
+        let mut output = lines;
+        output.truncate(max_lines);
+        output
     }
 
     /// 當列表或 viewport 發生變化時，把 preview 捲動位置壓回合法範圍。
@@ -2418,7 +2579,7 @@ fn read_search_snippet(
                 None
             };
             Some(highlight_preview_line(
-                numbered,
+                Line::from(numbered),
                 &query.to_lowercase(),
                 theme,
                 line_number == current_match_line,
@@ -2449,10 +2610,10 @@ fn highlight_preview_matches(
         .map(|(index, line)| {
             let text = line.to_string();
             if !is_preview_searchable_line(&text) {
-                return Line::from(text);
+                return line;
             }
             highlight_preview_line(
-                text,
+                line,
                 &lower_query,
                 theme,
                 current_match
@@ -2510,28 +2671,51 @@ fn is_preview_searchable_line(text: &str) -> bool {
             .is_some_and(char::is_whitespace)
 }
 
-/// 將單一 preview 文字行轉成帶高亮的 `Line`。
+/// 將單一 preview `Line` 套用搜尋高亮，並完整保留原本的語法高亮色彩與樣式。
 fn highlight_preview_line(
-    text: String,
+    line: Line<'static>,
     lower_query: &str,
     theme: Theme,
     is_current_line: bool,
     current_match_start: Option<usize>,
 ) -> Line<'static> {
+    let text = line.to_string();
     let lower_text = text.to_lowercase();
+
     if !lower_text.contains(lower_query) {
         return if is_current_line {
-            Line::styled(text, theme.preview_current_line_style())
+            let styled_spans: Vec<_> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let style = span.style.bg(theme.preview_current_line_bg);
+                    Span::styled(span.content, style)
+                })
+                .collect();
+            let mut res = Line::from(styled_spans);
+            res.alignment = line.alignment;
+            res
         } else {
-            Line::from(text)
+            line
         };
     }
 
-    let line_style = if is_current_line {
-        theme.preview_current_line_style()
-    } else {
-        Style::default()
-    };
+    let mut match_ranges = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor <= lower_text.len() {
+        let Some(found) = lower_text
+            .get(cursor..)
+            .and_then(|segment| segment.find(lower_query))
+        else {
+            break;
+        };
+        let start = cursor + found;
+        let end = start.saturating_add(lower_query.len());
+        match_ranges.push((start, end));
+        cursor = start.saturating_add(lower_query.len().max(1));
+    }
+
     let match_style = if is_current_line {
         Style::default()
             .bg(theme.preview_current_line_bg)
@@ -2544,44 +2728,80 @@ fn highlight_preview_line(
         .bg(theme.preview_match_bg)
         .fg(theme.preview_match_fg)
         .add_modifier(Modifier::BOLD);
-    let mut spans = Vec::new();
-    let mut cursor = 0usize;
 
-    while cursor <= lower_text.len() {
-        let Some(found) = lower_text
-            .get(cursor..)
-            .and_then(|segment| segment.find(lower_query))
-        else {
-            break;
+    let mut new_spans = Vec::new();
+    let mut span_global_offset = 0usize;
+
+    for span in line.spans {
+        let span_len = span.content.len();
+        let span_start = span_global_offset;
+        let span_end = span_global_offset + span_len;
+        span_global_offset = span_end;
+
+        let base_style = if is_current_line {
+            span.style.bg(theme.preview_current_line_bg)
+        } else {
+            span.style
         };
-        let start = cursor + found;
-        let end = start.saturating_add(lower_query.len());
 
-        if let Some(head) = text.get(cursor..start)
-            && !head.is_empty()
+        // 篩選出與目前 span 重疊之搜尋命中區段
+        let overlapping: Vec<(usize, usize, usize)> = match_ranges
+            .iter()
+            .copied()
+            .filter(|&(m_start, m_end)| m_start < span_end && m_end > span_start)
+            .map(|(m_start, m_end)| {
+                let l_start = m_start.max(span_start) - span_start;
+                let l_end = m_end.min(span_end) - span_start;
+                (l_start, l_end, m_start)
+            })
+            .collect();
+
+        if overlapping.is_empty() {
+            new_spans.push(Span::styled(span.content, base_style));
+            continue;
+        }
+
+        let span_str = span.content.as_ref();
+        let mut local_cursor = 0usize;
+
+        for (l_start, l_end, global_m_start) in overlapping {
+            if l_start > local_cursor
+                && span_str.is_char_boundary(local_cursor)
+                && span_str.is_char_boundary(l_start)
+                && let Some(head) = span_str.get(local_cursor..l_start)
+                && !head.is_empty()
+            {
+                new_spans.push(Span::styled(head.to_string(), base_style));
+            }
+
+            if span_str.is_char_boundary(l_start)
+                && span_str.is_char_boundary(l_end)
+                && let Some(body) = span_str.get(l_start..l_end)
+                && !body.is_empty()
+            {
+                let style = if current_match_start == Some(global_m_start) {
+                    current_match_style
+                } else {
+                    match_style
+                };
+                new_spans.push(Span::styled(body.to_string(), style));
+            }
+
+            local_cursor = l_end;
+        }
+
+        if local_cursor < span_len
+            && span_str.is_char_boundary(local_cursor)
+            && let Some(tail) = span_str.get(local_cursor..)
+            && !tail.is_empty()
         {
-            spans.push(Span::styled(head.to_string(), line_style));
+            new_spans.push(Span::styled(tail.to_string(), base_style));
         }
-
-        if let Some(body) = text.get(start..end) {
-            let style = if current_match_start == Some(start) {
-                current_match_style
-            } else {
-                match_style
-            };
-            spans.push(Span::styled(body.to_string(), style));
-        }
-
-        cursor = end;
     }
 
-    if let Some(tail) = text.get(cursor..)
-        && !tail.is_empty()
-    {
-        spans.push(Span::styled(tail.to_string(), line_style));
-    }
-
-    Line::from(spans)
+    let mut res = Line::from(new_spans);
+    res.alignment = line.alignment;
+    res
 }
 
 /// 將單一路徑複製到目標資料夾，支援檔案與整個資料夾樹。

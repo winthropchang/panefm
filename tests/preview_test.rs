@@ -163,3 +163,47 @@ fn integration_directory_and_archive_preview_helpers() {
         "bundle.zip  •  48 entries  •  1.42 MiB uncompressed"
     );
 }
+
+#[test]
+/// 驗證外部呼叫者可直接呼叫 `highlight_code_preview` 為各類語言產生語法著色與暗色行號。
+/// 保護目的：確保語法高亮模組作為公開 API 的簽章與行為保持長久穩定。
+fn integration_code_preview_syntax_highlighting() {
+    use panefm::file_manager::preview::highlight_code_preview;
+
+    let path = Path::new("main.py");
+    let python_code = "def hello():\n    print('world')\n";
+    let lines = highlight_code_preview(path, python_code, 10, None);
+
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].spans.len() >= 2);
+    assert_eq!(lines[0].spans[0].content.as_ref(), "  1 ");
+    assert!(lines[0].spans[0].style.fg.is_some());
+    assert_eq!(lines[0].to_string(), "  1 def hello():");
+    assert_eq!(lines[1].to_string(), "  2     print('world')");
+}
+
+#[test]
+/// 驗證 TOML 檔案（如 Cargo.toml、Config.toml）透過公開 API 可享有客製化語法高亮著色。
+/// 保護目的：確保 TOML 專用解析器在整合情境下運作正常。
+fn integration_toml_code_preview_syntax_highlighting() {
+    use panefm::file_manager::preview::highlight_code_preview;
+
+    let path = Path::new("Cargo.toml");
+    let toml_code = "[package]\nname = \"panefm\"\nversion = \"0.1.12\"\n";
+    let lines = highlight_code_preview(path, toml_code, 10, None);
+
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].to_string(), "  1 [package]");
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "package" && s.style.fg.is_some())
+    );
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "name" && s.style.fg.is_some())
+    );
+}

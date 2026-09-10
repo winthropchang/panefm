@@ -6,16 +6,26 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 use image::GenericImageView;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 use super::entry::FileEntry;
+
+/// 全域延遲初始化的語法庫與主題庫，只有在首次預覽程式碼時載入，平日操作 0 延遲。
+pub(crate) static SYNTAX_SET: std::sync::LazyLock<SyntaxSet> =
+    std::sync::LazyLock::new(SyntaxSet::load_defaults_newlines);
+
+pub(crate) static THEME_SET: std::sync::LazyLock<ThemeSet> =
+    std::sync::LazyLock::new(ThemeSet::load_defaults);
 
 /// 支援終端 Halfblock 預覽的單一圖片大小上限（30 MiB）。
 pub(crate) const MAX_IMAGE_PREVIEW_SIZE: u64 = 30 * 1024 * 1024;
 
-/// 一般文字檔案直接載入內容預覽的大小上限（128 KiB）。
-pub(crate) const MAX_TEXT_PREVIEW_SIZE: u64 = 128 * 1024;
+/// 一般文字檔案直接載入內容預覽的大小上限（2 MiB）。
+pub(crate) const MAX_TEXT_PREVIEW_SIZE: u64 = 2 * 1024 * 1024;
 
 /// 圖片預覽快取，避免每一幀重新讀取磁碟與解碼像素。
 #[derive(Clone, Debug)]
@@ -26,6 +36,17 @@ pub struct ImagePreviewCache {
     pub max_rows: usize,
     pub dimensions: Option<(u32, u32)>,
     pub lines: Vec<Line<'static>>,
+}
+
+/// 快取檔案與程式碼預覽行清單，避免每幀或 j/k 捲動時重複讀檔與語法解析。
+#[derive(Clone, Debug)]
+pub(crate) struct PreviewContentCache {
+    pub(crate) path: PathBuf,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) viewport_width: usize,
+    pub(crate) total_lines: usize,
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) is_complete: bool,
 }
 
 /// 圖片解碼成功時回傳的縮圖列與原圖解析度。
@@ -763,17 +784,357 @@ pub fn format_image_loading_preview(max_lines: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// 產生檔案預覽行清單（結合文字顯示、圖片 Halfblock 與大檔案/二進位詳細資訊卡片）。
-pub(crate) fn preview_file_content(
+/// 將 syntect 語法著色風格轉換為 ratatui 終端樣式。
+pub(crate) fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
+    let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+    let mut ratatui_style = Style::default().fg(fg);
+    if style.font_style.contains(FontStyle::BOLD) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
+    }
+    ratatui_style
+}
+
+/// 為單一行 TOML 內容產生語法高亮 Span 清單。
+pub fn highlight_toml_line(line: &str) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    let mut spans = Vec::new();
+    if !indent.is_empty() {
+        spans.push(Span::raw(indent.to_string()));
+    }
+
+    if trimmed.is_empty() {
+        return spans;
+    }
+
+    // 1. 純註解行
+    if trimmed.starts_with('#') {
+        spans.push(Span::styled(
+            trimmed.to_string(),
+            Style::default()
+                .fg(Color::Rgb(101, 115, 126))
+                .add_modifier(Modifier::ITALIC),
+        ));
+        return spans;
+    }
+
+    // 2. 表格標題：[[section]] 或 [section]
+    if (trimmed.starts_with("[[") && trimmed.contains("]]"))
+        || (trimmed.starts_with('[') && trimmed.contains(']'))
+    {
+        let is_double = trimmed.starts_with("[[");
+        let open_bracket = if is_double { "[[" } else { "[" };
+        let close_bracket = if is_double { "]]" } else { "]" };
+
+        let punct_style = Style::default().fg(Color::Rgb(192, 197, 206));
+        let header_style = Style::default()
+            .fg(Color::Rgb(235, 203, 139))
+            .add_modifier(Modifier::BOLD);
+
+        if let Some(open_pos) = trimmed.find(open_bracket) {
+            let after_open = &trimmed[open_pos + open_bracket.len()..];
+            if let Some(close_pos) = after_open.find(close_bracket) {
+                let section_name = &after_open[..close_pos];
+                let rest = &after_open[close_pos + close_bracket.len()..];
+
+                spans.push(Span::styled(open_bracket.to_string(), punct_style));
+                spans.push(Span::styled(section_name.to_string(), header_style));
+                spans.push(Span::styled(close_bracket.to_string(), punct_style));
+
+                if !rest.is_empty() {
+                    if rest.trim_start().starts_with('#') {
+                        spans.push(Span::styled(
+                            rest.to_string(),
+                            Style::default()
+                                .fg(Color::Rgb(101, 115, 126))
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    } else {
+                        spans.push(Span::raw(rest.to_string()));
+                    }
+                }
+                return spans;
+            }
+        }
+    }
+
+    // 3. 一般鍵值行或內嵌結構：逐字元分詞解析
+    let mut chars = trimmed.char_indices().peekable();
+    let mut last_idx = 0;
+    let mut in_key = true;
+
+    let key_style = Style::default().fg(Color::Rgb(180, 142, 173));
+    let str_style = Style::default().fg(Color::Rgb(163, 190, 140));
+    let num_style = Style::default().fg(Color::Rgb(208, 135, 112));
+    let bool_style = Style::default()
+        .fg(Color::Rgb(180, 142, 173))
+        .add_modifier(Modifier::BOLD);
+    let punct_style = Style::default().fg(Color::Rgb(192, 197, 206));
+    let comment_style = Style::default()
+        .fg(Color::Rgb(101, 115, 126))
+        .add_modifier(Modifier::ITALIC);
+
+    while let Some(&(idx, ch)) = chars.peek() {
+        if ch == '#' {
+            let comment_text = &trimmed[idx..];
+            spans.push(Span::styled(comment_text.to_string(), comment_style));
+            return spans;
+        }
+
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            chars.next();
+            let start = idx;
+            let mut escaped = false;
+            while let Some(&(_, c)) = chars.peek() {
+                chars.next();
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' && quote == '"' {
+                    escaped = true;
+                } else if c == quote {
+                    break;
+                }
+            }
+            let end = chars.peek().map(|&(i, _)| i).unwrap_or(trimmed.len());
+            spans.push(Span::styled(trimmed[start..end].to_string(), str_style));
+            last_idx = end;
+            in_key = false;
+            continue;
+        }
+
+        if ch == '=' {
+            spans.push(Span::styled("=", punct_style));
+            chars.next();
+            in_key = false;
+            last_idx = chars.peek().map(|&(i, _)| i).unwrap_or(trimmed.len());
+            continue;
+        }
+
+        if ch == '{' || ch == '}' || ch == '[' || ch == ']' || ch == ',' {
+            spans.push(Span::styled(ch.to_string(), punct_style));
+            chars.next();
+            last_idx = chars.peek().map(|&(i, _)| i).unwrap_or(trimmed.len());
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            chars.next();
+            let start = idx;
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let end = chars.peek().map(|&(i, _)| i).unwrap_or(trimmed.len());
+            spans.push(Span::raw(trimmed[start..end].to_string()));
+            last_idx = end;
+            continue;
+        }
+
+        let start = idx;
+        while let Some(&(_, c)) = chars.peek() {
+            if c.is_whitespace()
+                || c == '='
+                || c == '#'
+                || c == '"'
+                || c == '\''
+                || c == '{'
+                || c == '}'
+                || c == '['
+                || c == ']'
+                || c == ','
+            {
+                break;
+            }
+            chars.next();
+        }
+        let end = chars.peek().map(|&(i, _)| i).unwrap_or(trimmed.len());
+        let word = &trimmed[start..end];
+
+        if in_key {
+            spans.push(Span::styled(word.to_string(), key_style));
+        } else if word == "true" || word == "false" {
+            spans.push(Span::styled(word.to_string(), bool_style));
+        } else if word.chars().all(|c| {
+            c.is_ascii_digit()
+                || c == '.'
+                || c == '-'
+                || c == '+'
+                || c == '_'
+                || c == 'e'
+                || c == 'E'
+                || c == 'x'
+                || c == 'o'
+                || c == 'b'
+        }) && word.chars().any(|c| c.is_ascii_digit())
+        {
+            spans.push(Span::styled(word.to_string(), num_style));
+        } else {
+            spans.push(Span::styled(
+                word.to_string(),
+                Style::default().fg(Color::Rgb(192, 197, 206)),
+            ));
+        }
+        last_idx = end;
+    }
+
+    if last_idx < trimmed.len() {
+        spans.push(Span::raw(trimmed[last_idx..].to_string()));
+    }
+
+    spans
+}
+
+/// 將程式碼特定區間（例如捲動到第 5000 行時的 20 行）直接轉換為帶有色彩與正確全域行號的預覽行清單。
+pub fn highlight_code_preview_slice(
+    path: &Path,
+    contents: &str,
+    start_line: usize,
+    count: usize,
+    total_lines: usize,
+    theme_name: Option<&str>,
+) -> Vec<Line<'static>> {
+    let content_lines: Vec<&str> = contents.lines().skip(start_line).take(count).collect();
+    if content_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let is_toml = ext == "toml"
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".toml") || n == "Cargo.lock")
+            .unwrap_or(false);
+
+    let num_width = total_lines.to_string().len().max(3);
+    let line_num_style = Style::default().fg(Color::Rgb(110, 115, 128));
+
+    if is_toml {
+        let mut lines = Vec::new();
+        for (index, line) in content_lines.into_iter().enumerate() {
+            let line_num = start_line + index + 1;
+            let line_num_str = format!("{:>width$} ", line_num, width = num_width);
+            let line_num_span = Span::styled(line_num_str, line_num_style);
+
+            let mut spans = vec![line_num_span];
+            spans.extend(highlight_toml_line(line));
+            lines.push(Line::from(spans));
+        }
+        return lines;
+    }
+
+    let syntax = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| SYNTAX_SET.find_syntax_by_extension(ext))
+        .or_else(|| SYNTAX_SET.find_syntax_for_file(path).ok().flatten())
+        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+
+    let theme_key = theme_name.unwrap_or("base16-ocean.dark");
+    let theme = THEME_SET
+        .themes
+        .get(theme_key)
+        .or_else(|| THEME_SET.themes.get("base16-ocean.dark"))
+        .or_else(|| THEME_SET.themes.values().next())
+        .expect("syntect themes must contain at least one default theme");
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut lines = Vec::new();
+
+    for (index, line) in content_lines.into_iter().enumerate() {
+        let line_num = start_line + index + 1;
+        let line_num_str = format!("{:>width$} ", line_num, width = num_width);
+        let line_num_span = Span::styled(line_num_str, line_num_style);
+
+        let line_with_newline = if line.ends_with('\n') {
+            std::borrow::Cow::Borrowed(line)
+        } else {
+            std::borrow::Cow::Owned(format!("{line}\n"))
+        };
+
+        match highlighter.highlight_line(&line_with_newline, &SYNTAX_SET) {
+            Ok(ranges) => {
+                let mut spans = vec![line_num_span];
+                for (style, text) in ranges {
+                    let trimmed = text.trim_end_matches(['\r', '\n']);
+                    if !trimmed.is_empty() {
+                        spans.push(Span::styled(
+                            trimmed.to_string(),
+                            syntect_style_to_ratatui(style),
+                        ));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+            Err(_) => {
+                lines.push(Line::from(vec![line_num_span, Span::raw(line.to_string())]));
+            }
+        }
+    }
+
+    lines
+}
+
+/// 將程式碼或文字內容依據副檔名與語法定義轉換為帶有色彩與自適應暗色行號的預覽行清單。
+pub fn highlight_code_preview(
+    path: &Path,
+    contents: &str,
+    max_lines: usize,
+    theme_name: Option<&str>,
+) -> Vec<Line<'static>> {
+    let total_lines = contents.lines().count().max(1);
+    if contents.lines().next().is_none() {
+        return vec![Line::from("[empty file]")];
+    }
+    highlight_code_preview_slice(path, contents, 0, max_lines, total_lines, theme_name)
+}
+
+/// 產生檔案指定行區間之預覽內容切片（用於跳頁、按 G 等快速捲動時避免全檔同步解析阻塞）。
+pub(crate) fn preview_file_slice(
+    path: &Path,
+    start_line: usize,
+    count: usize,
+    total_lines: usize,
+) -> Vec<Line<'static>> {
+    let Ok(bytes) = fs::read(path) else {
+        return vec![Line::from("unable to read file contents")];
+    };
+    match String::from_utf8(bytes) {
+        Ok(contents) => {
+            highlight_code_preview_slice(path, &contents, start_line, count, total_lines, None)
+        }
+        Err(_) => vec![Line::from("binary or non-utf8 file")],
+    }
+}
+
+/// 產生檔案預覽行清單與檔案總行數（結合文字顯示、圖片 Halfblock 與大檔案/二進位詳細資訊卡片）。
+pub(crate) fn preview_file_content_detailed(
     path: &Path,
     max_lines: usize,
     viewport_width: usize,
     viewport_height: usize,
     image_cache: &mut Option<ImagePreviewCache>,
     image_loader: &mut Option<ImageLoader>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let Ok(metadata) = fs::metadata(path) else {
-        return vec![Line::from("unable to read metadata")];
+        return (vec![Line::from("unable to read metadata")], 1);
     };
 
     let extension = path
@@ -784,11 +1145,13 @@ pub(crate) fn preview_file_content(
     // 1. 圖片檔案分流
     if is_image_extension(extension.as_deref()) {
         if metadata.len() > MAX_IMAGE_PREVIEW_SIZE {
-            return format_file_details_preview(
+            let lines = format_file_details_preview(
                 path,
                 &metadata,
                 Some("image exceeds 30 MiB preview limit"),
             );
+            let total = lines.len();
+            return (lines, total);
         }
 
         let mtime = metadata.modified().ok();
@@ -803,8 +1166,9 @@ pub(crate) fn preview_file_content(
             && cache.max_rows == target_rows
         {
             let mut lines = cache.lines.clone();
+            let total = lines.len();
             lines.truncate(max_lines);
-            return lines;
+            return (lines, total);
         }
 
         // 檢查背景非同步載入器
@@ -825,20 +1189,25 @@ pub(crate) fn preview_file_content(
                             lines: rendered.clone(),
                         });
                         *image_loader = None;
+                        let total = rendered.len();
                         let mut lines = rendered;
                         lines.truncate(max_lines);
-                        return lines;
+                        return (lines, total);
                     }
                     Ok(Err(_)) => {
                         *image_loader = None;
-                        return format_file_details_preview(
+                        let lines = format_file_details_preview(
                             path,
                             &metadata,
                             Some("image format unsupported or decode failed"),
                         );
+                        let total = lines.len();
+                        return (lines, total);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        return format_image_loading_preview(max_lines);
+                        let lines = format_image_loading_preview(max_lines);
+                        let total = lines.len();
+                        return (lines, total);
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         *image_loader = None;
@@ -867,14 +1236,16 @@ pub(crate) fn preview_file_content(
                     dimensions: Some(dims),
                     lines: rendered.clone(),
                 });
+                let total = rendered.len();
                 let mut lines = rendered;
                 lines.truncate(max_lines);
-                return lines;
+                return (lines, total);
             } else if let Some(summary) = detect_legacy_image_summary(&bytes, extension.as_deref())
             {
+                let total = summary.len();
                 let mut lines = summary;
                 lines.truncate(max_lines);
-                return lines;
+                return (lines, total);
             }
         }
 
@@ -897,53 +1268,72 @@ pub(crate) fn preview_file_content(
             receiver: rx,
         });
 
-        return format_image_loading_preview(max_lines);
+        let lines = format_image_loading_preview(max_lines);
+        let total = lines.len();
+        return (lines, total);
     }
 
     // 2. 壓縮封裝檔案分流（免解壓內部檔案樹預覽）
     if let Some(kind) = is_archive_file(path)
         && let Some(archive_lines) = preview_archive_content(path, kind, max_lines, viewport_width)
     {
-        return archive_lines;
+        let total = archive_lines.len();
+        return (archive_lines, total);
     }
 
-    // 3. 非圖片大檔案：超過 128 KiB 時顯示結構化詳細資訊卡片
+    // 3. 非圖片大檔案：超過 2 MiB 時顯示結構化詳細資訊卡片
     if metadata.len() > MAX_TEXT_PREVIEW_SIZE {
-        return format_file_details_preview(
+        let lines = format_file_details_preview(
             path,
             &metadata,
-            Some("file size exceeds 128 KiB text preview limit"),
+            Some("file size exceeds 2 MiB text preview limit"),
         );
+        let total = lines.len();
+        return (lines, total);
     }
 
-    // 3. 小於等於 128 KiB 的檔案：嘗試讀取並以純文字行號預覽
+    // 4. 小於等於 2 MiB 的檔案：嘗試讀取並以語法高亮預覽
     let Ok(bytes) = fs::read(path) else {
-        return format_file_details_preview(path, &metadata, Some("unable to read file contents"));
+        let lines =
+            format_file_details_preview(path, &metadata, Some("unable to read file contents"));
+        let total = lines.len();
+        return (lines, total);
     };
 
     match String::from_utf8(bytes) {
         Ok(contents) => {
-            let content_lines: Vec<&str> = contents.lines().collect();
-            if content_lines.is_empty() {
-                return vec![Line::from("[empty file]")];
-            }
-
-            let mut lines = Vec::new();
-            let truncated = content_lines.len() > max_lines;
-            for (index, line) in content_lines.into_iter().take(max_lines).enumerate() {
-                lines.push(Line::from(format!("{:>3} {}", index + 1, line)));
-            }
-
-            if truncated && !lines.is_empty() {
-                let last_index = lines.len() - 1;
-                lines[last_index] = Line::from("...");
-            }
-
-            lines.truncate(max_lines);
-            lines
+            let total_lines = contents.lines().count().max(1);
+            let lines = highlight_code_preview(path, &contents, max_lines, None);
+            (lines, total_lines)
         }
-        Err(_) => format_file_details_preview(path, &metadata, Some("binary or non-utf8 file")),
+        Err(_) => {
+            let lines =
+                format_file_details_preview(path, &metadata, Some("binary or non-utf8 file"));
+            let total = lines.len();
+            (lines, total)
+        }
     }
+}
+
+/// 產生檔案預覽行清單（結合文字顯示、圖片 Halfblock 與大檔案/二進位詳細資訊卡片）。
+#[allow(dead_code)]
+pub(crate) fn preview_file_content(
+    path: &Path,
+    max_lines: usize,
+    viewport_width: usize,
+    viewport_height: usize,
+    image_cache: &mut Option<ImagePreviewCache>,
+    image_loader: &mut Option<ImageLoader>,
+) -> Vec<Line<'static>> {
+    preview_file_content_detailed(
+        path,
+        max_lines,
+        viewport_width,
+        viewport_height,
+        image_cache,
+        image_loader,
+    )
+    .0
 }
 
 /// 針對部分測試中只寫入檔頭 bytes 的 mock 檔案提供降級解析。
