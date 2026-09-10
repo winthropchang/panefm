@@ -292,6 +292,49 @@ impl Theme {
     pub fn success_style(self) -> Style {
         Style::default().fg(self.executable)
     }
+
+    /// 產生 Pane 視窗代號膠囊徽章（Badge）的樣式。
+    ///
+    /// 參數：
+    /// - `self: Theme`，目前使用中的主題色盤。
+    /// - `focused: bool`，該 pane 是否為目前聚焦視窗。
+    ///
+    /// 回傳：`Style`，膠囊徽章的實心底色、高對比文字顏色與粗體設定。
+    pub fn pane_badge_style(self, focused: bool) -> Style {
+        if focused {
+            let bg = self.focus_border;
+            Style::default()
+                .bg(bg)
+                .fg(contrast_badge_fg(bg))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            let bg = self.accent;
+            Style::default()
+                .bg(bg)
+                .fg(contrast_badge_fg(bg))
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+}
+
+/// 根據背景顏色計算最佳對比度之文字前景色（深黑或純白）。
+///
+/// 採用 ITU-R BT.709 相對亮度感知公式，確保在任何主題色盤下皆具備極佳視認性。
+fn contrast_badge_fg(bg: Color) -> Color {
+    match bg {
+        Color::Rgb(r, g, b) => {
+            let lum = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+            if lum > 135.0 {
+                Color::Rgb(16, 16, 20)
+            } else {
+                Color::Rgb(245, 245, 250)
+            }
+        }
+        Color::Black | Color::DarkGray | Color::Blue | Color::Indexed(_) => {
+            Color::Rgb(245, 245, 250)
+        }
+        _ => Color::Rgb(16, 16, 20),
+    }
 }
 
 /// 將主題預設值轉成對應的實際色盤。

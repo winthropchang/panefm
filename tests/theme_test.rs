@@ -45,3 +45,31 @@ fn legacy_theme_names_remain_compatible() {
     );
     assert_eq!(ThemePreset::from_name("ocean"), Some(ThemePreset::Nord));
 }
+
+#[test]
+/// 驗證所有主題的焦點與非焦點 Pane 膠囊徽章均具備粗體設定與清晰底色。
+/// 保護目的：避免更換或調整主題色盤後，造成視窗編號無法凸顯或文字對比度不足。
+fn theme_pane_badge_style_has_high_contrast() {
+    use ratatui::style::Modifier;
+
+    for preset in ThemePreset::ALL {
+        let theme = Theme::from(preset);
+        let focused_badge = theme.pane_badge_style(true);
+        let unfocused_badge = theme.pane_badge_style(false);
+
+        assert!(
+            focused_badge.add_modifier.contains(Modifier::BOLD),
+            "focused badge must be bold for {:?}",
+            preset
+        );
+        assert!(
+            unfocused_badge.add_modifier.contains(Modifier::BOLD),
+            "unfocused badge must be bold for {:?}",
+            preset
+        );
+        assert!(focused_badge.bg.is_some());
+        assert!(unfocused_badge.bg.is_some());
+        assert!(focused_badge.fg.is_some());
+        assert!(unfocused_badge.fg.is_some());
+    }
+}

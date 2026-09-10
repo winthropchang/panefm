@@ -1,9 +1,9 @@
 use super::{
     FileCategory, IconStyle, SearchListState, TaskPanelLine, entry_icon, file_category,
     format_diff_path_column, format_pane_title, format_permissions_detail, format_size_short,
-    format_sort_detail, regex_rename_status_style, render_entry_line, search_empty_message,
-    search_list_selected_index, task_panel_display_lines, top_right_input_rect,
-    truncate_text_to_display_width, visible_list_window_range,
+    format_sort_detail, regex_rename_status_style, render_entry_line, render_pane_title_line,
+    search_empty_message, search_list_selected_index, task_panel_display_lines,
+    top_right_input_rect, truncate_text_to_display_width, visible_list_window_range,
 };
 use ratatui::layout::Rect;
 use std::path::Path;
@@ -390,7 +390,7 @@ fn size_detail_marks_partial_directory_size_until_scan_completes() {
 }
 
 #[test]
-/// 驗證 pane 標題會把固定 pane 編號顯示在最前面，方便對照快捷鍵切換。
+/// 驗證 pane 標題會把固定 pane 編號以膠囊形式顯示在最前面，方便對照快捷鍵切換。
 /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
 fn format_pane_title_keeps_stable_pane_id_prefix() {
     let title = format_pane_title(
@@ -405,7 +405,7 @@ fn format_pane_title_keeps_stable_pane_id_prefix() {
 
     assert_eq!(
         title,
-        "panel #3 /tmp/demo [filter] [mark: 2] [help] [sort: natural]"
+        " 3  /tmp/demo [filter] [mark: 2] [help] [sort: natural]"
     );
 }
 
@@ -425,7 +425,7 @@ fn format_pane_title_keeps_full_path_when_it_fits() {
 
     assert_eq!(
         title,
-        "panel #2 /Users/otto/Documents/terminal-file-manager [sort: natural]"
+        " 2  /Users/otto/Documents/terminal-file-manager [sort: natural]"
     );
 }
 
@@ -444,7 +444,7 @@ fn format_pane_title_compacts_long_path_for_narrow_panes() {
     );
 
     assert!(title.chars().count() <= 32);
-    assert!(title.starts_with("panel #12"));
+    assert!(title.starts_with(" 12 "));
     assert!(title.contains("natural"));
     assert!(title.contains("path"));
     assert!(!title.contains("happy-path/dev"));
@@ -477,7 +477,21 @@ fn format_pane_title_prefers_last_directory_tail() {
 fn format_pane_title_supports_linemode_status() {
     let title = format_pane_title(5, Path::new("/tmp/demo"), "", "", "", "linemode: size", 80);
 
-    assert_eq!(title, "panel #5 /tmp/demo [linemode: size]");
+    assert_eq!(title, " 5  /tmp/demo [linemode: size]");
+}
+
+#[test]
+/// 驗證 render_pane_title_line 產生的標題 Line 包含高亮實心膠囊徽章與正確樣式。
+/// 保護目的：避免主題或樣式重構後，造成視窗編號無法凸顯或文字對比不足。
+fn render_pane_title_line_creates_styled_badge_spans() {
+    let theme = Theme::default_theme();
+    let focused_line = render_pane_title_line(" 1 ", "/tmp", "[mtime]", true, theme);
+    assert_eq!(focused_line.spans[0].content, " 1 ");
+    assert_eq!(focused_line.spans[0].style, theme.pane_badge_style(true));
+
+    let unfocused_line = render_pane_title_line(" 2 ", "/tmp", "[mtime]", false, theme);
+    assert_eq!(unfocused_line.spans[0].content, " 2 ");
+    assert_eq!(unfocused_line.spans[0].style, theme.pane_badge_style(false));
 }
 
 #[test]

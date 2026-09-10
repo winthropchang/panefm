@@ -237,7 +237,7 @@ pub(crate) fn render_pane(
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
     };
-    let title = format_pane_title(
+    let (badge, path_text, suffix) = format_pane_title_parts(
         pane_id,
         pane.cwd.as_path(),
         filter_suffix,
@@ -246,6 +246,7 @@ pub(crate) fn render_pane(
         &pane.title_mode_label(),
         area.width.saturating_sub(3) as usize,
     );
+    let title = render_pane_title_line(&badge, &path_text, &suffix, focused, theme);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -679,8 +680,8 @@ fn regex_rename_status_style(theme: Theme, status: &str) -> Style {
     }
 }
 
-/// 組合 pane 標題列文字，讓 pane 編號固定顯示在最前面，方便搭配數字切換。
-fn format_pane_title(
+/// 組合 pane 標題列文字三元素：(膠囊徽章字串, 壓縮或完整路徑, 狀態後綴)。
+pub(crate) fn format_pane_title_parts(
     pane_id: usize,
     cwd: &Path,
     filter_suffix: &str,
@@ -688,8 +689,8 @@ fn format_pane_title(
     panel_suffix: &str,
     mode_label: &str,
     max_width: usize,
-) -> String {
-    let prefix = format!("panel #{pane_id}");
+) -> (String, String, String) {
+    let prefix = format!(" {pane_id} ");
     let full_path = cwd.display().to_string();
     let status_suffix =
         normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
@@ -711,7 +712,7 @@ fn format_pane_title(
     for suffix in suffix_candidates {
         let full_title = join_title_parts(&prefix, &full_path, &suffix);
         if full_title.chars().count() <= max_width {
-            return full_title;
+            return (prefix, full_path, suffix);
         }
 
         let separator_width = title_separator_width(true, !suffix.is_empty());
@@ -720,7 +721,7 @@ fn format_pane_title(
         let compact_path = compact_path_for_title(&full_path, path_width);
         let compact_title = join_title_parts(&prefix, &compact_path, &suffix);
         if compact_title.chars().count() <= max_width {
-            return compact_title;
+            return (prefix, compact_path, suffix);
         }
     }
 
@@ -728,11 +729,63 @@ fn format_pane_title(
         .saturating_sub(prefix.chars().count())
         .saturating_sub(1)
         .max(1);
-    join_title_parts(
-        &prefix,
-        &compact_path_for_title(&full_path, fallback_path_width),
-        "",
+    (
+        prefix,
+        compact_path_for_title(&full_path, fallback_path_width),
+        String::new(),
     )
+}
+
+/// 組合 pane 標題列文字，讓 pane 編號以膠囊標記固定顯示在最前面，方便搭配數字切換。
+#[allow(dead_code)]
+pub(crate) fn format_pane_title(
+    pane_id: usize,
+    cwd: &Path,
+    filter_suffix: &str,
+    mark_suffix: &str,
+    panel_suffix: &str,
+    mode_label: &str,
+    max_width: usize,
+) -> String {
+    let (prefix, path, suffix) = format_pane_title_parts(
+        pane_id,
+        cwd,
+        filter_suffix,
+        mark_suffix,
+        panel_suffix,
+        mode_label,
+        max_width,
+    );
+    join_title_parts(&prefix, &path, &suffix)
+}
+
+/// 建立帶有獨立樣式之 Pane 標題列 Line 物件（支援方案 A 實心膠囊徽章與路徑分段上色）。
+pub(crate) fn render_pane_title_line(
+    badge: &str,
+    path: &str,
+    suffix: &str,
+    focused: bool,
+    theme: Theme,
+) -> Line<'static> {
+    let badge_style = theme.pane_badge_style(focused);
+    let path_style = if focused {
+        theme.focused_border_style()
+    } else {
+        theme.muted_style()
+    };
+    let suffix_style = theme.muted_style();
+
+    let mut spans = vec![Span::styled(badge.to_string(), badge_style)];
+    if !path.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(path.to_string(), path_style));
+    }
+    if !suffix.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(suffix.to_string(), suffix_style));
+    }
+
+    Line::from(spans)
 }
 
 /// 將多個標題狀態片段去掉前後空白後重新用單一空格組合，避免出現多餘空隙。
