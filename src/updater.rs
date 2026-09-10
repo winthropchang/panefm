@@ -96,11 +96,9 @@ where
                     has_launch_args = true;
                 }
             }
-            Some(other) if !other.starts_with('-') => {
-                if launch_args.target_path.is_none() {
-                    launch_args.target_path = Some(PathBuf::from(other));
-                    has_launch_args = true;
-                }
+            Some(other) if !other.starts_with('-') && launch_args.target_path.is_none() => {
+                launch_args.target_path = Some(PathBuf::from(other));
+                has_launch_args = true;
             }
             _ => {}
         }
