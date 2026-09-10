@@ -3063,7 +3063,7 @@ pub(crate) fn render_diff_matrix(
                 let row = &state.rows[row_idx];
 
                 let cursor_str = if is_selected { "> " } else { "  " };
-                let icon = if row.is_dir { "📁 " } else { "📄 " };
+                let icon = if row.is_dir { " " } else { " " };
                 let path_str = row.relative_path.to_string_lossy();
 
                 let size_str = if row.is_dir {

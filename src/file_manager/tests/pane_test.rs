@@ -1114,10 +1114,9 @@ fn pane_state_directory_preview_shows_summary_and_children() {
         .map(|line| line.to_string())
         .collect();
 
-    assert!(preview.iter().any(|line| line.contains("path: ")));
-    assert!(preview.iter().any(|line| line.contains("items: 2")));
-    assert!(preview.iter().any(|line| line == "contents:"));
     assert!(preview.iter().any(|line| line.contains("alpha.txt")));
+    assert!(preview.iter().any(|line| line.contains("beta.txt")));
+    assert!(preview.iter().any(|line| line.contains("")));
 }
 
 #[test]

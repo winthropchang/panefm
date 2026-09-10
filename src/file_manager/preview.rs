@@ -364,78 +364,311 @@ pub(crate) fn format_file_details_preview(
     lines
 }
 
-/// 為資料夾產生結構化摘要內容，包含路徑、項目數、時間、權限與子項目清單。
-pub(crate) fn preview_directory(entry: &FileEntry, max_lines: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(format!("path: {}", entry.path.display())),
-        Line::from(format!("items: {}", count_directory_items(&entry.path))),
-    ];
-
-    if let Ok(metadata) = fs::metadata(&entry.path) {
-        lines.push(Line::from(format!(
-            "modified: {}",
-            format_system_time(metadata.modified())
-        )));
-        lines.push(Line::from(format!(
-            "permissions: {}",
-            format_permissions(&metadata)
-        )));
+/// 在預覽區將檔名靠左、大小靠右格式化，若寬度不足則維持最少 2 個空格。
+pub(crate) fn format_preview_item_line(
+    icon: &str,
+    name: &str,
+    size_str: Option<&str>,
+    viewport_width: usize,
+) -> Line<'static> {
+    let prefix = format!("{icon} {name}");
+    if let Some(size) = size_str {
+        let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+        let size_width = size.len();
+        let target_width = viewport_width.max(20);
+        if target_width > prefix_width + size_width + 2 {
+            let padding = target_width - prefix_width - size_width - 1;
+            Line::from(format!("{prefix}{}{size}", " ".repeat(padding)))
+        } else {
+            Line::from(format!("{prefix}  {size}"))
+        }
+    } else {
+        Line::from(prefix)
     }
+}
 
-    if max_lines <= lines.len() {
-        lines.truncate(max_lines);
-        return lines;
-    }
-
-    let remaining = max_lines.saturating_sub(lines.len()).min(50);
-    if remaining == 0 {
-        return lines;
-    }
-
-    match fs::read_dir(&entry.path) {
-        Ok(read_dir) => {
-            let mut child_names = Vec::new();
-            for child in read_dir.flatten() {
-                child_names.push(child.file_name().to_string_lossy().to_string());
-                if child_names.len() >= remaining {
-                    break;
-                }
-            }
-
-            if child_names.is_empty() {
-                lines.push(Line::from("empty directory"));
+/// 快速計算目錄內的子目錄與檔案數量（過濾 .DS_Store 與 .localized，最多計算 200 筆）。
+pub fn quick_directory_counts(path: &Path) -> (usize, usize) {
+    let Ok(read_dir) = fs::read_dir(path) else {
+        return (0, 0);
+    };
+    let mut dirs = 0;
+    let mut files = 0;
+    for entry in read_dir.flatten().take(200) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".DS_Store" || name == ".localized" {
+            continue;
+        }
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                dirs += 1;
             } else {
-                lines.push(Line::from("contents:"));
-                for name in child_names
-                    .into_iter()
-                    .take(max_lines.saturating_sub(lines.len()))
-                {
-                    lines.push(Line::from(format!("  {name}")));
-                }
+                files += 1;
             }
         }
-        Err(_) => lines.push(Line::from("unable to read directory contents")),
+    }
+    (dirs, files)
+}
+
+/// 格式化目錄預覽頂部標題（方案 A：極簡單排）。
+/// 範例：`Desktop  •  9 items (4 dirs, 5 files)  •  2026-09-09 22:47`
+pub fn format_directory_title(
+    name: &str,
+    total: usize,
+    dirs: usize,
+    files: usize,
+    mtime: Option<SystemTime>,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(name.to_string());
+
+    if total == 0 {
+        parts.push("0 items".to_string());
+    } else if dirs > 0 && files > 0 {
+        parts.push(format!("{total} items ({dirs} dirs, {files} files)"));
+    } else if dirs > 0 {
+        parts.push(format!("{dirs} dirs"));
+    } else {
+        parts.push(format!("{files} files"));
     }
 
-    lines.truncate(max_lines);
+    if let Some(time) = mtime {
+        let time_str = format_system_time_short(Some(time));
+        if time_str != "unknown" {
+            parts.push(time_str);
+        }
+    }
+
+    parts.join("  •  ")
+}
+
+/// 依照名稱與是否為目錄，取得與檔案列表完全一致的 Nerd Font 特殊字元圖示。
+pub fn preview_item_icon(name: &str, is_dir: bool) -> &'static str {
+    if is_dir || name.ends_with('/') {
+        return "";
+    }
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" => "",
+        "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "tgz" | "zst" => "",
+        "rs" | "toml" | "json" | "yaml" | "yml" | "py" | "js" | "ts" | "jsx" | "tsx" | "html"
+        | "css" | "scss" | "c" | "cpp" | "h" | "hpp" | "go" | "java" | "sh" | "bash" | "zsh"
+        | "sql" | "md" | "markdown" => "",
+        "exe" | "com" | "bat" | "cmd" | "ps1" | "bin" => "",
+        _ => "",
+    }
+}
+
+/// 為資料夾產生精進版「目錄偷窺」預覽內容（方案 A：100% 滿版無冗餘，目錄置頂帶 ，檔案帶特殊字元圖示與大小）。
+pub(crate) fn preview_directory(
+    entry: &FileEntry,
+    max_lines: usize,
+    viewport_width: usize,
+) -> Vec<Line<'static>> {
+    let Ok(read_dir) = fs::read_dir(&entry.path) else {
+        return vec![Line::from("unable to read directory contents")];
+    };
+
+    let mut dir_items = Vec::new();
+    let mut file_items = Vec::new();
+
+    for child in read_dir.flatten().take(200) {
+        let name = child.file_name().to_string_lossy().to_string();
+        if name == ".DS_Store" || name == ".localized" {
+            continue;
+        }
+        let is_dir = child.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
+            dir_items.push(name);
+        } else {
+            let size = child.metadata().map(|m| m.len()).unwrap_or(0);
+            file_items.push((name, size));
+        }
+    }
+
+    if dir_items.is_empty() && file_items.is_empty() {
+        return vec![Line::from("[empty directory]")];
+    }
+
+    dir_items.sort_by_key(|a| a.to_lowercase());
+    file_items.sort_by_key(|(a, _)| a.to_lowercase());
+
+    let mut lines = Vec::new();
+    for dir_name in dir_items {
+        if lines.len() >= max_lines {
+            break;
+        }
+        lines.push(format_preview_item_line(
+            "",
+            &format!("{dir_name}/"),
+            None,
+            viewport_width,
+        ));
+    }
+
+    for (file_name, size) in file_items {
+        if lines.len() >= max_lines {
+            break;
+        }
+        let icon = preview_item_icon(&file_name, false);
+        let size_str = format_size_compact(size);
+        lines.push(format_preview_item_line(
+            icon,
+            &file_name,
+            Some(&size_str),
+            viewport_width,
+        ));
+    }
+
     lines
 }
 
-/// 計算指定目錄內的子項目數量（超過 64 時顯示 `64+`）。
-fn count_directory_items(path: &Path) -> String {
-    let Ok(read_dir) = fs::read_dir(path) else {
-        return String::from("0");
-    };
-    let mut count = 0;
-    for entry in read_dir {
-        if entry.is_ok() {
-            count += 1;
-            if count > 64 {
-                return String::from("64+");
+/// 判斷檔案是否為支援內部預覽之壓縮檔案。
+pub fn is_archive_file(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        Some("tar.gz")
+    } else if name.ends_with(".zip") {
+        Some("zip")
+    } else if name.ends_with(".tar") {
+        Some("tar")
+    } else {
+        None
+    }
+}
+
+/// 快速計算壓縮包條目數與總未壓縮大小（最多掃描 300 筆）。
+pub fn quick_archive_counts(path: &Path, kind: &str) -> Option<(usize, u64)> {
+    let file = fs::File::open(path).ok()?;
+    if kind == "zip" {
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let count = archive.len();
+        let mut total: u64 = 0;
+        for i in 0..count.min(300) {
+            if let Ok(entry) = archive.by_index(i) {
+                total = total.saturating_add(entry.size());
             }
         }
+        Some((count, total))
+    } else if kind == "tar.gz" {
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut tar = tar::Archive::new(gz);
+        let entries = tar.entries().ok()?;
+        let mut count = 0;
+        let mut total: u64 = 0;
+        for entry in entries.take(300).flatten() {
+            count += 1;
+            total = total.saturating_add(entry.size());
+        }
+        Some((count, total))
+    } else if kind == "tar" {
+        let mut tar = tar::Archive::new(file);
+        let entries = tar.entries().ok()?;
+        let mut count = 0;
+        let mut total: u64 = 0;
+        for entry in entries.take(300).flatten() {
+            count += 1;
+            total = total.saturating_add(entry.size());
+        }
+        Some((count, total))
+    } else {
+        None
     }
-    count.to_string()
+}
+
+/// 格式化壓縮檔預覽標題。
+/// 範例：`bundle.zip  •  48 entries  •  1.42 MiB uncompressed`
+pub fn format_archive_title(name: &str, entry_count: usize, total_uncompressed: u64) -> String {
+    let size_str = format_size_compact(total_uncompressed);
+    format!("{name}  •  {entry_count} entries  •  {size_str} uncompressed")
+}
+
+/// 預覽壓縮包內部條目清單（支援 .zip、.tar.gz、.tgz、.tar）。
+pub fn preview_archive_content(
+    path: &Path,
+    kind: &str,
+    max_lines: usize,
+    viewport_width: usize,
+) -> Option<Vec<Line<'static>>> {
+    let file = fs::File::open(path).ok()?;
+    let mut items = Vec::new();
+
+    if kind == "zip" {
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let len = archive.len();
+        for i in 0..len.min(300) {
+            if let Ok(entry) = archive.by_index(i) {
+                let name = entry.name().to_string();
+                let size = entry.size();
+                let is_dir = entry.is_dir() || name.ends_with('/');
+                items.push((name, is_dir, size));
+            }
+        }
+    } else if kind == "tar.gz" {
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut tar = tar::Archive::new(gz);
+        let entries = tar.entries().ok()?;
+        for entry in entries.take(300).flatten() {
+            let name = entry
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let size = entry.size();
+            let is_dir = entry.header().entry_type().is_dir() || name.ends_with('/');
+            items.push((name, is_dir, size));
+        }
+    } else if kind == "tar" {
+        let mut tar = tar::Archive::new(file);
+        let entries = tar.entries().ok()?;
+        for entry in entries.take(300).flatten() {
+            let name = entry
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let size = entry.size();
+            let is_dir = entry.header().entry_type().is_dir() || name.ends_with('/');
+            items.push((name, is_dir, size));
+        }
+    } else {
+        return None;
+    }
+
+    if items.is_empty() {
+        return Some(vec![Line::from("[empty archive]")]);
+    }
+
+    let mut lines = Vec::new();
+    for (name, is_dir, size) in items.into_iter().take(max_lines) {
+        let icon = preview_item_icon(&name, is_dir);
+        if is_dir {
+            let display_name = if name.ends_with('/') {
+                name
+            } else {
+                format!("{name}/")
+            };
+            lines.push(format_preview_item_line(
+                icon,
+                &display_name,
+                None,
+                viewport_width,
+            ));
+        } else {
+            let size_str = format_size_compact(size);
+            lines.push(format_preview_item_line(
+                icon,
+                &name,
+                Some(&size_str),
+                viewport_width,
+            ));
+        }
+    }
+
+    Some(lines)
 }
 
 /// 將圖片資料渲染成 ANSI 24-bit TrueColor Halfblock（`▀` / `▄`）列，並回傳原圖尺寸。
@@ -667,7 +900,14 @@ pub(crate) fn preview_file_content(
         return format_image_loading_preview(max_lines);
     }
 
-    // 2. 非圖片大檔案：超過 128 KiB 時顯示結構化詳細資訊卡片
+    // 2. 壓縮封裝檔案分流（免解壓內部檔案樹預覽）
+    if let Some(kind) = is_archive_file(path)
+        && let Some(archive_lines) = preview_archive_content(path, kind, max_lines, viewport_width)
+    {
+        return archive_lines;
+    }
+
+    // 3. 非圖片大檔案：超過 128 KiB 時顯示結構化詳細資訊卡片
     if metadata.len() > MAX_TEXT_PREVIEW_SIZE {
         return format_file_details_preview(
             path,

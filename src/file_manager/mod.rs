@@ -68,12 +68,16 @@ use self::osc7::sync_terminal_working_directory;
 /// - 成功時代表 TUI 已正常執行並完成關閉流程。
 /// - 失敗時代表初始化、事件迴圈或還原 terminal 時出現錯誤。
 pub(crate) fn run() -> Result<()> {
+    run_with_options(crate::updater::LaunchArgs::default())
+}
+
+pub(crate) fn run_with_options(args: crate::updater::LaunchArgs) -> Result<()> {
     if let Some(result) = maybe_run_internal_command() {
         return result;
     }
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal);
+    let result = run_app(&mut terminal, &args);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -118,8 +122,27 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 /// 回傳：`Result<()>`。
 /// - 成功時代表使用者正常離開應用程式。
 /// - 失敗時代表設定檔載入、事件讀取或畫面更新過程出錯。
-fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    args: &crate::updater::LaunchArgs,
+) -> Result<()> {
+    let cwd = if let Some(ref target) = args.target_path {
+        if target.is_dir() {
+            target.canonicalize().unwrap_or_else(|_| target.clone())
+        } else if let Some(parent) = target.parent() {
+            if parent.is_dir() {
+                parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf())
+            } else {
+                std::env::current_dir()?
+            }
+        } else {
+            std::env::current_dir()?
+        }
+    } else {
+        std::env::current_dir()?
+    };
     let app_dir = platform::executable_dir().unwrap_or_else(|| cwd.clone());
     let _ = crate::config::ensure_default_config_file(&app_dir);
     let loaded_config = load_config(&app_dir)?;
@@ -211,6 +234,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     }
 
     app.prepare_for_shutdown()?;
+    if let Some(ref cwd_file) = args.cwd_file
+        && let Some(active_cwd) = app.active_pane_cwd()
+    {
+        let _ = std::fs::write(cwd_file, active_cwd.display().to_string());
+    }
     Ok(())
 }
 

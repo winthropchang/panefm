@@ -24,6 +24,17 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
+use std::path::PathBuf;
+
+/// 啟動應用程式時的附加參數。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchArgs {
+    /// 離開應用程式時，將最後停留之工作目錄寫入此檔案路徑（用於 Shell wrapper cd-on-quit）。
+    pub cwd_file: Option<PathBuf>,
+    /// 啟動時欲聚焦之初始目錄路徑。
+    pub target_path: Option<PathBuf>,
+}
+
 /// 命令列呼叫之動作列舉。
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliCommand {
@@ -35,20 +46,70 @@ pub enum CliCommand {
     Update,
     /// 啟動 TUI 檔案管理器本體。
     RunApp,
+    /// 啟動 TUI 檔案管理器本體並帶有自訂參數。
+    Run(LaunchArgs),
 }
 
-/// 解析第一個命令列參數為對應的 `CliCommand`。
-///
-/// 參數：
-/// - `arg`: 第一個命令列參數（`std::env::args_os().nth(1)`）。
-///
-/// 回傳：`CliCommand`。
+/// 解析單一命令列參數為對應的 `CliCommand`（相容層）。
 pub fn parse_cli_command(arg: Option<&std::ffi::OsStr>) -> CliCommand {
     match arg.and_then(std::ffi::OsStr::to_str) {
         Some("--version" | "-V") => CliCommand::Version,
         Some("--help" | "-h") => CliCommand::Help,
         Some("update") => CliCommand::Update,
         _ => CliCommand::RunApp,
+    }
+}
+
+/// 解析多個命令列參數為對應的 `CliCommand`。
+///
+/// 支援旗標：
+/// - `--version`, `-V`: 顯示版本
+/// - `--help`, `-h`: 顯示說明
+/// - `update`: 執行自我更新
+/// - `--cwd-file <PATH>` / `--cwd-file=<PATH>`: 退出時記錄目錄
+/// - `[PATH]`: 啟動初始目錄
+pub fn parse_cli_args<I, T>(args: I) -> CliCommand
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<std::ffi::OsStr>,
+{
+    let mut args_iter = args.into_iter();
+    let mut launch_args = LaunchArgs::default();
+    let mut has_launch_args = false;
+
+    while let Some(arg) = args_iter.next() {
+        let arg_str = arg.as_ref().to_str();
+        match arg_str {
+            Some("--version" | "-V") => return CliCommand::Version,
+            Some("--help" | "-h") => return CliCommand::Help,
+            Some("update") => return CliCommand::Update,
+            Some("--cwd-file") => {
+                if let Some(path_arg) = args_iter.next() {
+                    launch_args.cwd_file = Some(PathBuf::from(path_arg.as_ref()));
+                    has_launch_args = true;
+                }
+            }
+            Some(flag) if flag.starts_with("--cwd-file=") => {
+                let path_str = &flag["--cwd-file=".len()..];
+                if !path_str.is_empty() {
+                    launch_args.cwd_file = Some(PathBuf::from(path_str));
+                    has_launch_args = true;
+                }
+            }
+            Some(other) if !other.starts_with('-') => {
+                if launch_args.target_path.is_none() {
+                    launch_args.target_path = Some(PathBuf::from(other));
+                    has_launch_args = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if has_launch_args {
+        CliCommand::Run(launch_args)
+    } else {
+        CliCommand::RunApp
     }
 }
 

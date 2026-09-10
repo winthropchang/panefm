@@ -130,3 +130,36 @@ fn integration_image_extension_matching() {
     assert!(!is_image_extension(Some("pdf")));
     assert!(!is_image_extension(None));
 }
+
+#[test]
+/// 驗證目錄偷窺預覽（方案 A）格式化函數能正確產生單排標題與區分目錄及檔案。
+///
+/// 驗證內容：
+/// 1. 測試 `format_directory_title` 產生簡潔邊框標題。
+/// 2. 測試 `is_archive_file` 能識別 zip 與 tar.gz 檔案。
+/// 3. 測試 `format_archive_title` 格式化壓縮檔標題。
+///
+/// 保護目的：確保預覽標題與壓縮檔辨識之公開 API 結構穩定。
+fn integration_directory_and_archive_preview_helpers() {
+    use panefm::file_manager::preview::{
+        format_archive_title, format_directory_title, is_archive_file,
+    };
+
+    let title = format_directory_title("Desktop", 9, 4, 5, None);
+    assert_eq!(title, "Desktop  •  9 items (4 dirs, 5 files)");
+
+    let empty_title = format_directory_title("Empty", 0, 0, 0, None);
+    assert_eq!(empty_title, "Empty  •  0 items");
+
+    assert_eq!(is_archive_file(Path::new("project.zip")), Some("zip"));
+    assert_eq!(is_archive_file(Path::new("archive.tar.gz")), Some("tar.gz"));
+    assert_eq!(is_archive_file(Path::new("archive.tgz")), Some("tar.gz"));
+    assert_eq!(is_archive_file(Path::new("backup.tar")), Some("tar"));
+    assert_eq!(is_archive_file(Path::new("document.pdf")), None);
+
+    let arc_title = format_archive_title("bundle.zip", 48, 1_488_977);
+    assert_eq!(
+        arc_title,
+        "bundle.zip  •  48 entries  •  1.42 MiB uncompressed"
+    );
+}

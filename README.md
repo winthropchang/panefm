@@ -27,7 +27,7 @@ PaneFM 以 **8 大核心系統** 為基石，提供從極速導航、多視窗�
 
 | 🪟 多視窗佈局 | ⚡ Vim 導航跳轉 | 📦 安全檔案操作 | 🔍 全域搜尋預覽 |
 |:---|:---|:---|:---|
-| • 自由水平/垂直分割<br>• 1~9 視窗秒切<br>• 原生終端分頁同步 | • `h/j/k/l` & 數字 Count<br>• `g` 快速跳轉目錄<br>• `fzf` / `zoxide` / `List Find` | • 視覺多選 (`v`) / 安全貼上<br>• CoW 零空間瞬間複製<br>• 交易式 Undo / 垃圾桶 | • `fd` 檔名串流搜尋<br>• `rg` 內容全文檢索<br>• `Tab` 語法高亮與彩色圖片預覽 |
+| • 自由水平/垂直分割<br>• 1~9 視窗秒切<br>• 原生終端分頁同步 | • `h/j/k/l` & 數字 Count<br>• `g` 快速跳轉目錄<br>• `fzf` / `zoxide` / `List Find` | • 視覺多選 (`v`) / 安全貼上<br>• CoW 零空間瞬間複製<br>• 交易式 Undo / 垃圾桶 | • `fd` 檔名串流搜尋<br>• `rg` 內容全文檢索<br>• `Tab` 萬能預覽（圖片/目錄/壓縮包） |
 
 | ⚖️ 目錄差異矩陣 | 🔖 智慧書籤歷史 | 🎨 主題外觀視圖 | 📊 任務與說明 |
 |:---|:---|:---|:---|
@@ -76,11 +76,12 @@ PaneFM 以 **8 大核心系統** 為基石，提供從極速導航、多視窗�
 
 * **`s` Filename Search**：整合 `fd` 進行全域檔名串流即時搜尋。
 * **`S` Content Search**：整合 `ripgrep (rg)` 進行全文內容檢索，右側支援即時內容比對與高亮。
-* **`Tab` 萬能預覽系統（文字語法高亮、ANSI TrueColor 圖片縮圖與元資訊卡片）**：
+* **`Tab` 萬能預覽系統（文字語法高亮、ANSI 圖片、目錄偷窺與壓縮包內部檢視）**：
   * **文字檔案**：依副檔名自動套用語法高亮，支援 `j`/`k` 平滑捲動瀏覽與 `/` 預覽內關鍵字搜尋。
   * **彩色圖片縮圖（TrueColor Halfblock）**：直接於終端機內以 Unicode 半區塊（`▀`/`▄`）與 24-bit TrueColor 渲染高解析度彩色縮圖（支援 PNG, JPG, WebP, GIF, BMP, ICO）。
-  * **極簡單行標題與秒級 Sniffing**：邊框頂部極簡整合成單行顯示解析度、格式、大小與修改時間（如 `1920 × 1080 (PNG)  •  2.4 MiB  •  2026-09-11 00:20`），按下 `Tab` 瞬間由檔案 header 嗅探維度，大圖由背景 thread 非同步解碼，預覽畫布 100% 滿版呈現縮圖。
-  * **大檔案與目錄資訊卡片**：超出預覽門檻之巨型檔案或資料夾，自動呈現結構化詳細屬性卡片。
+  * **目錄快速偷窺（Directory Peeking）**：對資料夾按 `Tab`，頂部邊框即時顯示統計摘要（如 `Desktop  •  9 items (4 dirs, 5 files)  •  2026-09-09 22:47`），預覽區 100% 滿版排列子項目，資料夾置頂帶 `` 與 `/`，檔案在後帶與列表完全一致之特殊字元圖示（``、``、``、``、``）與右側對齊大小，自動過濾 `.DS_Store` 等系統雜訊。
+  * **壓縮包免解壓預覽（Archive Preview）**：對 `.zip`、`.tar.gz`、`.tgz`、`.tar` 按 `Tab`，無須解壓縮即可秒級列出內部完整檔案清單與未壓縮容量。
+  * **大檔案與未支援檔案卡片**：超出預覽門檻之巨型檔案，自動呈現結構化詳細屬性卡片。
 
 ### 5. ⚖️ N-Way 目錄差異比對矩陣（Diff Matrix - `Alt+d` / `:diff`）
 
@@ -144,7 +145,7 @@ PaneFM 以 **8 大核心系統** 為基石，提供從極速導航、多視窗�
 | | `wW` / `wH` | 快速開啟 `:width ` / `:height ` 精準調整指定寬度（欄數）與高度（列數） |
 | | `w=` / `:equal` | 一鍵將所有分割視窗重新均等平分（Equalize） |
 | | `Alt+d` / `wd` | 開啟多視窗 **N-Way Diff 矩陣比對** |
-| **預覽與輔助**| `Tab` | 開啟/關閉檔案預覽（文字語法高亮、ANSI TrueColor 圖片縮圖、`j/k` 捲動、`/` 搜尋） |
+| **預覽與輔助**| `Tab` | 開啟/關閉檔案預覽（文字高亮、TrueColor 圖片、目錄偷窺、壓縮包檢視） |
 | | `t` / `,` / `m` | 主題切換（即時預覽） / 排序選單 / 搬移與欄位選單（`m 1..9` 跨視窗移動、`mp` 指令） |
 | | `T` | 開啟背景任務管理面板 |
 | | `?` / `F1` | 當前面板情境速查（Cheatsheet） / 全局完整說明字典 |
@@ -223,6 +224,61 @@ cargo build --release
 * **Windows**：`target\release\panefm.exe`
 
 將其加入系統 `PATH` 後，即可在任何終端中輸入 `panefm` 啟動！
+
+---
+
+### 4. 🐚 Shell 整合：退出自動切換目錄（cd-on-quit）
+
+如同 `yazi` 或 `ranger`，您可以在 Shell 設定檔中加入包裝函式（Shell Wrapper）。在 PaneFM 內穿梭於多層目錄後按 `q` 退出時，外部 Shell 會自動 `cd` 至最後停留的目錄：
+
+#### 🍏 macOS / Linux (`~/.zshrc` 或 `~/.bashrc`)
+
+```bash
+function panefm() {
+    local tmp="$(mktemp -t "panefm-cwd.XXXXXX")"
+    command panefm --cwd-file="$tmp" "$@"
+    local cwd
+    if [ -f "$tmp" ]; then
+        cwd="$(cat "$tmp")"
+        rm -f "$tmp"
+        if [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+            cd "$cwd" || exit
+        fi
+    fi
+}
+```
+
+#### 🐟 Fish Shell (`~/.config/fish/functions/panefm.fish`)
+
+```fish
+function panefm
+    set tmp (mktemp -t "panefm-cwd.XXXXXX")
+    command panefm --cwd-file="$tmp" $argv
+    if test -f "$tmp"
+        set cwd (cat "$tmp")
+        rm -f "$tmp"
+        if test -n "$cwd" -a "$cwd" != "$PWD"
+            cd "$cwd"
+        end
+    end
+end
+```
+
+#### 🪟 Windows PowerShell (`$PROFILE`)
+
+```powershell
+function panefm {
+    $tmp = [System.IO.Path]::GetTempFileName()
+    & panefm.exe --cwd-file $tmp $args
+    if (Test-Path $tmp) {
+        $cwd = Get-Content $tmp -Raw
+        Remove-Item $tmp -Force
+        if ($cwd -and (Test-Path $cwd)) {
+            Set-Location $cwd
+        }
+    }
+}
+```
 
 ---
 

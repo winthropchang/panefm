@@ -1009,8 +1009,42 @@ impl PaneState {
     }
 
     /// 依照目前選取的 entry 與 pane 狀態建立 preview 標題。
+    /// 若為目錄或壓縮檔案，直接在邊框顯示單排精煉資訊。
     /// 若為圖片檔案，直接在邊框顯示單排精煉資訊：`1920 × 25000 (PNG)  •  13.85 MiB  •  2026-01-01 08:59`。
     pub(crate) fn preview_title_for_entry(&self, entry: &FileEntry) -> String {
+        if entry.is_dir {
+            let (dir_count, file_count) = super::preview::quick_directory_counts(&entry.path);
+            let total = dir_count + file_count;
+            let mut title = super::preview::format_directory_title(
+                &entry.name,
+                total,
+                dir_count,
+                file_count,
+                Some(entry.modified),
+            );
+            if self.has_preview_scroll() {
+                title.push_str("  ^");
+            }
+            if self.preview_has_more_below() {
+                title.push_str("  v");
+            }
+            return title;
+        }
+
+        if let Some(kind) = super::preview::is_archive_file(&entry.path)
+            && let Some((count, uncompressed)) =
+                super::preview::quick_archive_counts(&entry.path, kind)
+        {
+            let mut title = super::preview::format_archive_title(&entry.name, count, uncompressed);
+            if self.has_preview_scroll() {
+                title.push_str("  ^");
+            }
+            if self.preview_has_more_below() {
+                title.push_str("  v");
+            }
+            return title;
+        }
+
         let ext = entry.path.extension().and_then(|e| e.to_str());
         if !entry.is_dir && super::preview::is_image_extension(ext) {
             let dimensions = if let Ok(guard) = self.preview_image_cache.lock() {
@@ -1075,7 +1109,9 @@ impl PaneState {
     /// 回傳：`Vec<Line<'static>>`，未套用搜尋高亮的 preview 原始內容。
     fn raw_preview_content_lines_limited(&self, max_lines: usize) -> Vec<Line<'static>> {
         match self.selected_entry() {
-            Some(entry) if entry.is_dir => super::preview::preview_directory(entry, max_lines),
+            Some(entry) if entry.is_dir => {
+                super::preview::preview_directory(entry, max_lines, self.preview_viewport_width)
+            }
             Some(entry) => {
                 let mut fallback_cache = None;
                 let mut cache_guard = self.preview_image_cache.lock().ok();

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -199,15 +199,16 @@ fn preview_image_cache_avoids_redundant_decode() {
 /// 驗證目錄預覽包含結構化路徑、項目數、修改時間與權限資訊。
 ///
 /// 驗證內容：
-/// 1. 建立目錄並加入兩個子檔案。
-/// 2. 呼叫 `preview_directory` 產生目錄預覽。
-/// 3. 驗證輸出同時相容於舊有的 path、items、contents 結構，並擴充時間與權限。
+/// 1. 建立目錄並加入子資料夾與子檔案。
+/// 2. 呼叫 `preview_directory` 產生精進版「目錄偷窺」預覽（方案 A）。
+/// 3. 驗證輸出 100% 滿版陳列子項目，資料夾帶 ，檔案帶  等特殊字元圖示與右側容量。
 ///
-/// 保護目的：保持既有目錄預覽測試相容性，同時為使用者呈現更完整的目錄資訊卡片。
+/// 保護目的：確保目錄偷窺預覽符合方案 A 之極簡直覺設計，不浪費畫面空間。
 fn preview_directory_shows_metadata_and_contents() {
     let dir = tempdir().expect("tempdir");
     let sub = dir.path().join("subfolder");
     fs::create_dir(&sub).expect("create dir");
+    fs::create_dir(sub.join("child_folder")).expect("create child dir");
     fs::write(sub.join("file1.txt"), "hello").expect("write 1");
     fs::write(sub.join("file2.txt"), "world").expect("write 2");
 
@@ -224,16 +225,117 @@ fn preview_directory_shows_metadata_and_contents() {
         unix_mode: None,
     };
 
-    let lines = preview_directory(&entry, 20);
+    let (dirs, files) = quick_directory_counts(&sub);
+    assert_eq!(dirs, 1);
+    assert_eq!(files, 2);
+
+    let title =
+        format_directory_title("subfolder", dirs + files, dirs, files, Some(entry.modified));
+    assert!(title.contains("subfolder"));
+    assert!(title.contains("3 items (1 dirs, 2 files)"));
+
+    let lines = preview_directory(&entry, 20, 60);
     let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
 
-    assert!(text.iter().any(|l| l.contains("path: ")));
-    assert!(text.iter().any(|l| l.contains("items: 2")));
-    assert!(text.iter().any(|l| l.contains("modified: ")));
-    assert!(text.iter().any(|l| l.contains("permissions: ")));
-    assert!(text.iter().any(|l| l == "contents:"));
-    assert!(text.iter().any(|l| l.contains("file1.txt")));
-    assert!(text.iter().any(|l| l.contains("file2.txt")));
+    assert!(text.iter().any(|l| l.contains(" child_folder/")));
+    assert!(text.iter().any(|l| l.contains(" file1.txt")));
+    assert!(text.iter().any(|l| l.contains(" file2.txt")));
+}
+
+#[test]
+/// 驗證空目錄能正確顯示 `[empty directory]` 提示標籤。
+/// 保護目的：避免空目錄預覽時呈現空白無回應或拋出錯誤。
+fn preview_directory_empty_shows_empty_tag() {
+    let dir = tempdir().expect("tempdir");
+    let empty_sub = dir.path().join("empty_folder");
+    fs::create_dir(&empty_sub).expect("create empty dir");
+
+    let entry = FileEntry {
+        name: "empty_folder".to_string(),
+        path: empty_sub,
+        is_dir: true,
+        size: 0,
+        directory_size: None,
+        directory_size_complete: false,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+        created: std::time::SystemTime::UNIX_EPOCH,
+        readonly: false,
+        unix_mode: None,
+    };
+
+    let lines = preview_directory(&entry, 20, 60);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].to_string(), "[empty directory]");
+}
+
+#[test]
+/// 驗證 ZIP 壓縮檔能免解壓直接解析內部目錄結構、檔案名稱與未壓縮大小。
+/// 保護目的：保障壓縮檔內部預覽能高速讀取 central directory，不浪費磁碟空間解壓縮。
+fn preview_zip_archive_shows_internal_entries() {
+    let dir = tempdir().expect("tempdir");
+    let zip_path = dir.path().join("test.zip");
+
+    {
+        let file = fs::File::create(&zip_path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        zip.add_directory("nested/", options).expect("zip dir");
+        zip.start_file("nested/hello.rs", options)
+            .expect("zip file 1");
+        zip.write_all(b"fn main() {}").expect("write zip 1");
+        zip.start_file("readme.md", options).expect("zip file 2");
+        zip.write_all(b"# Test Archive").expect("write zip 2");
+        zip.finish().expect("finish zip");
+    }
+
+    assert_eq!(is_archive_file(&zip_path), Some("zip"));
+    let (count, uncompressed) =
+        quick_archive_counts(&zip_path, "zip").expect("quick archive counts");
+    assert_eq!(count, 3);
+    assert!(uncompressed > 0);
+
+    let title = format_archive_title("test.zip", count, uncompressed);
+    assert!(title.contains("test.zip"));
+    assert!(title.contains("3 entries"));
+
+    let lines = preview_archive_content(&zip_path, "zip", 20, 60).expect("preview archive");
+    let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    assert!(text.iter().any(|l| l.contains(" nested/")));
+    assert!(text.iter().any(|l| l.contains(" nested/hello.rs")));
+    assert!(text.iter().any(|l| l.contains(" readme.md")));
+}
+
+#[test]
+/// 驗證 TAR.GZ 壓縮檔能透過 Gzip 串流解析 tar headers 並預覽內部檔案。
+/// 保護目的：確保 tar.gz 與 tgz 檔案格式正確支援免解壓檢視。
+fn preview_tar_gz_archive_shows_internal_entries() {
+    let dir = tempdir().expect("tempdir");
+    let tar_gz_path = dir.path().join("archive.tar.gz");
+
+    {
+        let file = fs::File::create(&tar_gz_path).expect("create tar.gz");
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(12);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "inner.txt", b"hello world\n".as_slice())
+            .expect("append tar");
+        tar.finish().expect("finish tar");
+    }
+
+    assert_eq!(is_archive_file(&tar_gz_path), Some("tar.gz"));
+    let (count, uncompressed) = quick_archive_counts(&tar_gz_path, "tar.gz").expect("counts");
+    assert_eq!(count, 1);
+    assert_eq!(uncompressed, 12);
+
+    let lines = preview_archive_content(&tar_gz_path, "tar.gz", 20, 60).expect("preview tar.gz");
+    let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    assert!(text.iter().any(|l| l.contains(" inner.txt")));
 }
 
 #[test]
