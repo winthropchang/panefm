@@ -254,6 +254,8 @@ pub(crate) fn render_pane(
 
     if preview_focused {
         let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
+        let preview_content_width = area.width.saturating_sub(2).max(1) as usize;
+        pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
         let (preview_title, preview_lines) = match panel_state {
             Some(PaneListState::Search(search_state))
                 if !search_state.results.is_empty() && search_state.preview_query.is_some() =>
@@ -276,29 +278,14 @@ pub(crate) fn render_pane(
             _ => {
                 let default_preview_title = pane
                     .selected_entry()
-                    .map(|entry| {
-                        let mut title = format!("Preview: {}", entry.name);
-                        title.push_str("  [preview]");
-                        if let Some(query) = pane.preview_search_query() {
-                            title.push_str(&format!("  [/{}]", query));
-                        }
-                        if pane.has_preview_scroll() {
-                            title.push_str("  ^");
-                        }
-                        if pane.preview_has_more_below() {
-                            title.push_str("  v");
-                        }
-                        title
-                    })
+                    .map(|entry| pane.preview_title_for_entry(entry))
                     .unwrap_or_else(|| "Preview".to_string());
-                pane.set_preview_viewport_height(preview_viewport_height);
                 (
                     default_preview_title,
                     pane.preview_lines(preview_viewport_height, theme),
                 )
             }
         };
-        let preview_content_width = area.width.saturating_sub(2) as usize;
         let preview_lines =
             pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
         let preview = Paragraph::new(preview_lines).block(

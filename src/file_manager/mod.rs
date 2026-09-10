@@ -21,6 +21,7 @@ pub(crate) mod operation_history;
 pub(crate) mod osc7;
 pub(crate) mod pane;
 pub(crate) mod platform;
+pub mod preview;
 pub(crate) mod rg;
 pub(crate) mod search;
 pub(crate) mod smb;

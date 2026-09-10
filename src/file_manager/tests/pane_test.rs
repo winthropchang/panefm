@@ -1161,14 +1161,52 @@ fn pane_state_image_preview_shows_format_and_dimensions() {
     fs::write(dir.path().join("wallpaper.png"), png_bytes).expect("png");
 
     let pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
-    let preview: Vec<String> = pane
-        .preview_lines(8, Theme::default())
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect();
+    let entry = pane.selected_entry().expect("entry");
+    let title = pane.preview_title_for_entry(entry);
 
-    assert!(preview.iter().any(|line| line == "format: png image"));
-    assert!(preview.iter().any(|line| line == "dimensions: 640 x 480"));
+    assert!(title.contains("640 × 480") || title.contains("640 x 480"));
+    assert!(title.contains("PNG"));
+}
+
+#[test]
+/// 驗證真實圖片檔案在 Pane preview_lines 下會渲染出 Halfblock 縮圖與色彩，且標題顯示格式與尺寸。
+///
+/// 驗證內容：
+/// 1. 建立真實有效的 PNG 圖片檔案。
+/// 2. 建立包含該圖片的 PaneState 並呼叫 preview_title_for_entry 與 preview_lines。
+/// 3. 驗證標題包含 format 與 dimensions，且內容包含 ▀ 字元的 Halfblock 縮圖行。
+///
+/// 保護目的：確保使用者在 PaneFM 檔案列表中對圖片按下 Tab 時能真正看到彩色縮圖。
+fn pane_state_image_preview_renders_halfblocks_for_real_images() {
+    let dir = tempdir().expect("tempdir");
+    let mut img = image::RgbaImage::new(8, 8);
+    for y in 0..8 {
+        for x in 0..8 {
+            img.put_pixel(x, y, image::Rgba([200_u8, 100_u8, 50_u8, 255_u8]));
+        }
+    }
+    let mut bytes = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )
+    .expect("write png");
+    fs::write(dir.path().join("photo.png"), bytes).expect("photo");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_size(40, 12);
+    let entry = pane.selected_entry().expect("entry");
+    let title = pane.preview_title_for_entry(entry);
+    assert!(title.contains("8 × 8") || title.contains("8 x 8"));
+    assert!(title.contains("PNG"));
+
+    let preview_lines = pane.preview_lines(12, Theme::default());
+    assert!(
+        preview_lines
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.content.as_ref() == "▀")),
+        "預覽行必須包含 Halfblock ▀ 字元"
+    );
 }
 
 #[test]
