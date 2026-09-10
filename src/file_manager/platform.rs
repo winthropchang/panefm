@@ -50,6 +50,54 @@ pub(crate) fn executable_dir() -> Option<std::path::PathBuf> {
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
+/// 判斷指定路徑是否位於網路共享（如 SMB / UNC、Windows 網路磁碟機或 macOS `/Volumes`）。
+///
+/// 網路共享上的檔案操作極易受 SMB 快取欺騙、Server-Side Copy Offload 失敗或 0-byte 假死影響，
+/// 傳輸引擎應以本函式分流，改用可靠的分塊串流讀寫與伺服器落盤確認。
+pub(crate) fn is_network_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.starts_with(r"\\")
+        || text.starts_with("//")
+        || text == "/Volumes"
+        || text.starts_with("/Volumes/")
+        || text.starts_with(r"/Volumes\")
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+            let prefix_str = prefix.as_os_str().to_string_lossy();
+            if prefix_str.len() == 2 && prefix_str.ends_with(':') {
+                let root_str = format!("{}\\", prefix_str);
+                let wide: Vec<u16> = std::ffi::OsStr::new(&root_str)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+                }
+                const DRIVE_REMOTE: u32 = 4;
+                unsafe {
+                    if GetDriveTypeW(wide.as_ptr()) == DRIVE_REMOTE {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 pub(crate) fn new_terminal_spec_for_platform(
     path: &Path,
     platform: PlatformKind,

@@ -1159,15 +1159,39 @@ impl App {
             self.status = format!("filesystem watcher failed: {}", watch_errors.join(" | "));
         }
         if !changed.is_empty() {
-            self.pending_watched_directories.extend(changed);
-            let debounce = if self.file_job_receivers.is_empty() {
-                self.config.watcher.debounce
-            } else {
-                Duration::from_millis(400)
-            };
-            // 第一個事件設定 deadline，後續同批事件只合併路徑而不無限延後刷新。
-            self.filesystem_refresh_deadline
-                .get_or_insert_with(|| Instant::now() + debounce);
+            // 如果目前有背景檔案傳輸或寫入進行中，且變更的目錄包含正在寫入的忙碌路徑，
+            // 這些事件純粹是我們自己的傳輸執行緒寫入分塊造成的檔案系統事件。
+            // 不應在傳輸中途每 400ms 反覆 reload 該目錄，避免網路芳鄰（SMB）大量產生
+            // read_dir 造成介面卡頓、進度跳動或畫面閃爍。傳輸完成後 FileJobEvent 會自動觸發全量 reload。
+            let changed_to_process: BTreeSet<PathBuf> =
+                if self.active_file_job_busy_paths.is_empty() {
+                    changed
+                } else {
+                    changed
+                        .into_iter()
+                        .filter(|dir| {
+                            !self.active_file_job_busy_paths.values().any(|busy_paths| {
+                                busy_paths.iter().any(|busy| {
+                                    busy == dir
+                                        || busy.starts_with(dir)
+                                        || busy.parent() == Some(dir.as_path())
+                                })
+                            })
+                        })
+                        .collect()
+                };
+
+            if !changed_to_process.is_empty() {
+                self.pending_watched_directories.extend(changed_to_process);
+                let debounce = if self.file_job_receivers.is_empty() {
+                    self.config.watcher.debounce
+                } else {
+                    Duration::from_millis(400)
+                };
+                // 第一個事件設定 deadline，後續同批事件只合併路徑而不無限延後刷新。
+                self.filesystem_refresh_deadline
+                    .get_or_insert_with(|| Instant::now() + debounce);
+            }
         }
 
         let Some(deadline) = self.filesystem_refresh_deadline else {
@@ -1222,9 +1246,6 @@ impl App {
             if !self.panes.values().any(|pane| &pane.cwd == dir) {
                 self.directory_entry_cache.remove(dir);
             }
-        }
-        if !directories.is_empty() {
-            self.full_redraw_requested = true;
         }
         Ok(())
     }
@@ -1339,12 +1360,11 @@ impl App {
                     }
                 }
             }
-            if let Some(target_dir) = refresh_target {
-                if let Err(error) = self.reload_panes_in_tree(&target_dir) {
-                    self.status =
-                        format!("background paste started; destination refresh failed: {error}");
-                }
-                self.full_redraw_requested = true;
+            if let Some(target_dir) = refresh_target
+                && let Err(error) = self.reload_panes_in_tree(&target_dir)
+            {
+                self.status =
+                    format!("background paste started; destination refresh failed: {error}");
             }
             if !completed {
                 self.file_job_receivers.insert(task_id, receiver);

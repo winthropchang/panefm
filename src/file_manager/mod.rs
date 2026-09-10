@@ -134,11 +134,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         // 留下舊 cell 的情況，平常交給 ratatui diff rendering 降低閃爍。
         app.poll_background_tasks();
         let full_redraw_requested = app.take_full_redraw_request();
-        let mut in_synchronized_update = false;
         if full_redraw_requested {
-            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-            in_synchronized_update = true;
-            terminal.clear()?;
+            presented_frame = None;
         }
         terminal.autoresize()?;
         terminal.current_buffer_mut().reset();
@@ -154,9 +151,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                     previous_buffer != &buffer || *previous_cursor != cursor_position
                 });
         if frame_changed {
-            if !in_synchronized_update {
-                let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-            }
+            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
             terminal.apply_buffer_with_cursor(cursor_position)?;
             presented_frame = Some((buffer, cursor_position));
             sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;

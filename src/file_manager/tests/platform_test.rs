@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{
     PlatformKind, default_windows_shell, new_terminal_spec_for_platform_with_env,
@@ -227,4 +227,24 @@ fn executable_dir_returns_valid_path_in_test_environment() {
     assert!(dir.is_some());
     let dir = dir.unwrap();
     assert!(dir.exists());
+}
+
+#[test]
+/// 驗證 is_network_path 能正確辨識 UNC 與網路磁碟/掛載點。
+fn is_network_path_detects_unc_and_remote_volumes() {
+    assert!(super::is_network_path(Path::new(
+        r"\\server\share\file.zip"
+    )));
+    assert!(super::is_network_path(Path::new("//server/share/file.zip")));
+    #[cfg(target_os = "macos")]
+    {
+        assert!(super::is_network_path(Path::new(
+            "/Volumes/Shared/file.zip"
+        )));
+        assert!(!super::is_network_path(Path::new("/Users/otto/file.zip")));
+    }
+    #[cfg(windows)]
+    {
+        assert!(!super::is_network_path(Path::new(r"C:\Windows\System32")));
+    }
 }

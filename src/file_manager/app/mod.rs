@@ -2298,11 +2298,7 @@ pub(crate) fn entries_should_run_in_background(
 /// 回傳：`bool`；Windows UNC 與 macOS `/Volumes/...` 回傳 `true`。Windows 映射磁碟
 /// 無法只靠路徑可靠辨識，但大型來源仍會由大小門檻轉入背景。
 pub(crate) fn is_probably_network_or_external_path(path: &Path) -> bool {
-    let display = path.to_string_lossy();
-    is_unc_path(&display)
-        || display == "/Volumes"
-        || display.starts_with("/Volumes/")
-        || display.starts_with("/Volumes\\")
+    crate::file_manager::platform::is_network_path(path)
 }
 
 /// 在 worker 執行完整 paste 批次，不接觸 App 或任何可變 UI 狀態。

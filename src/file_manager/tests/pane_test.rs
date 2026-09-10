@@ -427,6 +427,33 @@ fn unsupported_native_copy_falls_back_to_verified_streaming_copy() {
 }
 
 #[test]
+/// 模擬原生 copy（如 Windows CopyFileExW 在 macOS SMB）宣稱完成但目的檔只有 0-byte。
+/// 驗證檔案引擎會自動辨識大小不符（UnexpectedEof）、清理 0-byte 殘留，並無縫切換到串流複製。
+fn native_copy_zero_byte_mismatch_triggers_stream_fallback() {
+    let dir = tempdir().expect("tempdir");
+    let source = dir.path().join("source.zip");
+    let target = dir.path().join("target.zip");
+    let payload = vec![0x42; 512 * 1024];
+    fs::write(&source, &payload).expect("source");
+    let mut reported = 0u64;
+
+    copy_file_with_native_fallback(
+        &source,
+        &target,
+        &mut |increment| reported = reported.saturating_add(increment),
+        |_, target| {
+            // 模擬只建立 0-byte 檔案卻回傳全部寫入大小的 Win32 SMB bug
+            File::create(target).expect("0-byte partial target");
+            Ok(payload.len() as u64)
+        },
+    )
+    .expect("stream fallback for 0-byte mismatch");
+
+    assert_eq!(reported, payload.len() as u64);
+    assert_eq!(fs::read(&target).expect("target bytes"), payload);
+}
+
+#[test]
 #[cfg(unix)]
 /// 驗證 macOS 上的 os error 102 (EOPNOTSUPP, Operation not supported on socket)
 /// 能正確觸發串流 fallback。

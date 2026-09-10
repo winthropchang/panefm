@@ -8162,6 +8162,52 @@ fn watcher_reload_synchronizes_cache() {
 }
 
 #[test]
+/// 驗證 watcher 觸發重新整理時，不會要求全螢幕 terminal.clear()，由 ratatui diff 機制平滑繪製避免閃爍。
+fn watcher_reload_does_not_request_full_terminal_clear() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    fs::write(dir.path().join("external.txt"), "content").expect("write");
+    let mut set = BTreeSet::new();
+    set.insert(dir.path().to_path_buf());
+
+    app.reload_watched_directories(&set).expect("reload");
+
+    assert!(
+        !app.take_full_redraw_request(),
+        "watcher 刷新不應請求 full_redraw（避免觸發 terminal.clear 產生黑畫面閃爍）"
+    );
+}
+
+#[test]
+/// 驗證當背景有檔案傳輸時，active_file_job_busy_paths 能正確識別忙碌目錄，避免 watcher 在傳輸期間反覆重刷。
+fn active_file_job_busy_paths_identifies_busy_parent_directory() {
+    let dir = tempdir().expect("tempdir");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    let target_file = dir.path().join("archive.zip");
+
+    let task_id = app.push_task(
+        1,
+        "paste",
+        "copy file".into(),
+        "dest".into(),
+        vec![],
+        Some("dest".into()),
+    );
+    app.active_file_job_busy_paths
+        .insert(task_id, vec![target_file.clone()]);
+
+    let is_busy = app.active_file_job_busy_paths.values().any(|busy_paths| {
+        busy_paths.iter().any(|busy| {
+            busy == dir.path() || busy.starts_with(dir.path()) || busy.parent() == Some(dir.path())
+        })
+    });
+    assert!(
+        is_busy,
+        "傳輸目標所在目錄必須被識別為忙碌中，避免傳輸分塊寫入觸發反覆刷新"
+    );
+}
+
+#[test]
 /// 驗證大型目錄以串流載入時，首批清單到達後游標即可立刻以 j/k 移動，不需等待全量掃描結束。
 /// 保護目的：確保使用者在幾萬個檔案的目錄中，畫面在毫秒級反應，游標絕不被背景 I/O 凍結。
 fn streaming_directory_load_allows_cursor_movement_before_completion() {

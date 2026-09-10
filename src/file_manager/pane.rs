@@ -34,6 +34,7 @@ use super::{
     cow::{clone_file_cow, is_cow_unsupported_error},
     entry::FileEntry,
     fuzzy::fuzzy_matched_indices,
+    platform::is_network_path,
     search::GlobalSearchEntry,
     trash::TrashStore,
     undo_backup::{create_unique_undo_backup_path, is_internal_temporary_name},
@@ -3157,6 +3158,9 @@ fn copy_file_and_verify(source_path: &Path, staged_path: &Path) -> io::Result<()
     match clone_file_cow(source_path, staged_path) {
         Ok(()) => Ok(()),
         Err(error) if is_cow_unsupported_error(&error) => {
+            if is_network_path(source_path) || is_network_path(staged_path) {
+                return copy_file_streaming_with_progress(source_path, staged_path, &mut |_| {});
+            }
             match copy_file_and_verify_with(source_path, staged_path, |source, target| {
                 fs::copy(source, target)
             }) {
@@ -3199,6 +3203,13 @@ where
             // 跨磁區、跨網路芳鄰（SMB）或不支援檔案系統時，平滑進入進度輪詢或串流
         }
         Err(error) => return Err(error),
+    }
+
+    // 跨網路芳鄰（SMB/UNC/網路磁碟機）時，Windows CopyFileExW 或 macOS copyfile
+    // 常因伺服器不支援 Server-Side Copy Offload 或擴展屬性而留下 0-byte 假死，
+    // 或受客戶端 redirector 快取欺騙。因此網路路徑一律直走分塊串流複製與 sync_all 落盤！
+    if is_network_path(source_path) || is_network_path(target_path) {
+        return copy_file_streaming_with_progress(source_path, target_path, progress);
     }
 
     // 小檔案直接在既有 file worker 執行，避免每一筆檔案再建立一條監看 thread。
@@ -3340,14 +3351,26 @@ where
     }
 
     match native_copy(source_path, target_path) {
-        Ok(copied_size) if copied_size == expected_size => {
-            progress(expected_size);
-            Ok(())
+        Ok(copied_size) => {
+            // 原生 copy 宣稱完成後，重新開啟目標執行 sync_all，迫使 OS 沖刷 dirty buffer
+            if let Ok(target_file) = fs::OpenOptions::new().write(true).open(target_path) {
+                let _ = target_file.sync_all();
+            }
+            let stored_size = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+            if copied_size == expected_size && stored_size == expected_size {
+                progress(expected_size);
+                Ok(())
+            } else {
+                let error = io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "incomplete native copy: expected {expected_size} bytes, copied {copied_size}, stored {stored_size}"
+                    ),
+                );
+                remove_partial_file_for_fallback(target_path, &error)?;
+                copy_file_streaming_with_progress(source_path, target_path, progress)
+            }
         }
-        Ok(copied_size) => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("incomplete native copy: expected {expected_size} bytes, copied {copied_size}"),
-        )),
         Err(error) if native_copy_supports_stream_fallback(&error) => {
             remove_partial_file_for_fallback(target_path, &error)?;
             copy_file_streaming_with_progress(source_path, target_path, progress)
@@ -3365,7 +3388,7 @@ where
 /// 參數：`error: &io::Error`，原生 copy 回傳的錯誤。
 /// 回傳：`bool`，只有可安全降級的 unsupported 類型回傳 `true`。
 fn native_copy_supports_stream_fallback(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::Unsupported {
+    if error.kind() == io::ErrorKind::Unsupported || error.kind() == io::ErrorKind::UnexpectedEof {
         return true;
     }
 
@@ -3442,6 +3465,7 @@ where
         progress(read as u64);
     }
     target.flush()?;
+    target.get_ref().sync_all()?;
     drop(target);
 
     let source_size_after_copy = fs::metadata(source_path)?.len();
@@ -3519,6 +3543,9 @@ where
             }
         }
     })?;
+    if let Ok(target_file) = fs::OpenOptions::new().write(true).open(target_path) {
+        let _ = target_file.sync_all();
+    }
     let stored_size = fs::metadata(target_path)?.len();
     if copied_size != expected_size || stored_size != expected_size {
         return Err(io::Error::new(
@@ -3577,6 +3604,9 @@ where
     }
 
     let copied_size = platform_copy(source_path, staged_path)?;
+    if let Ok(target_file) = fs::OpenOptions::new().write(true).open(staged_path) {
+        let _ = target_file.sync_all();
+    }
     let stored_size = fs::metadata(staged_path)?.len();
     if copied_size != expected_size || stored_size != expected_size {
         return Err(io::Error::new(
@@ -3770,7 +3800,9 @@ where
         target_dir,
         progress,
         |source_path, target_path, expected_size, file_progress| {
-            if expected_size < PROGRESSIVE_NATIVE_COPY_THRESHOLD_BYTES {
+            if is_network_path(source_path) || is_network_path(target_path) {
+                copy_file_streaming_with_progress(source_path, target_path, file_progress)
+            } else if expected_size < PROGRESSIVE_NATIVE_COPY_THRESHOLD_BYTES {
                 copy_file_with_native_fallback_known_size(
                     source_path,
                     target_path,

@@ -169,20 +169,7 @@ impl FilesystemWatcher {
 /// 回傳：`bool`；Windows UNC 與 macOS `/Volumes` 掛載位置回傳 `true`。其他平台暫時
 /// 回傳 `false`，未來支援 Linux 時可只在此擴充 mount 判斷，不必修改 watcher 主流程。
 fn is_likely_network_path(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        let text = path.to_string_lossy();
-        text.starts_with(r"\\") || text.starts_with("//")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        path.starts_with("/Volumes")
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        let _ = path;
-        false
-    }
+    crate::file_manager::platform::is_network_path(path)
 }
 
 /// 判斷 notify 事件是否會改變檔案列表可見內容或 metadata。
