@@ -70,11 +70,10 @@ where
     I: IntoIterator<Item = T>,
     T: AsRef<std::ffi::OsStr>,
 {
-    let mut args_iter = args.into_iter();
     let mut launch_args = LaunchArgs::default();
     let mut has_launch_args = false;
 
-    while let Some(arg) = args_iter.next() {
+    for arg in args {
         let arg_str = arg.as_ref().to_str();
         match arg_str {
             Some("--version" | "-V") => return CliCommand::Version,
