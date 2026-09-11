@@ -25,7 +25,6 @@ fn main() -> Result<()> {
                  COMMANDS:\n    \
                      update                  檢查 GitHub 最新版本並自動更新當前執行檔\n\n\
                  OPTIONS:\n    \
-                     --cwd-file <PATH>       在退出時將最後停留的目錄路徑寫入指定檔案 (用於 Shell cd-on-quit)\n    \
                      -h, --help              顯示此說明訊息\n    \
                      -V, --version           顯示目前版本號"
             );

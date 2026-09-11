@@ -29,8 +29,6 @@ use std::path::PathBuf;
 /// 啟動應用程式時的附加參數。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchArgs {
-    /// 離開應用程式時，將最後停留之工作目錄寫入此檔案路徑（用於 Shell wrapper cd-on-quit）。
-    pub cwd_file: Option<PathBuf>,
     /// 啟動時欲聚焦之初始目錄路徑。
     pub target_path: Option<PathBuf>,
 }
@@ -66,7 +64,6 @@ pub fn parse_cli_command(arg: Option<&std::ffi::OsStr>) -> CliCommand {
 /// - `--version`, `-V`: 顯示版本
 /// - `--help`, `-h`: 顯示說明
 /// - `update`: 執行自我更新
-/// - `--cwd-file <PATH>` / `--cwd-file=<PATH>`: 退出時記錄目錄
 /// - `[PATH]`: 啟動初始目錄
 pub fn parse_cli_args<I, T>(args: I) -> CliCommand
 where
@@ -83,19 +80,6 @@ where
             Some("--version" | "-V") => return CliCommand::Version,
             Some("--help" | "-h") => return CliCommand::Help,
             Some("update") => return CliCommand::Update,
-            Some("--cwd-file") => {
-                if let Some(path_arg) = args_iter.next() {
-                    launch_args.cwd_file = Some(PathBuf::from(path_arg.as_ref()));
-                    has_launch_args = true;
-                }
-            }
-            Some(flag) if flag.starts_with("--cwd-file=") => {
-                let path_str = &flag["--cwd-file=".len()..];
-                if !path_str.is_empty() {
-                    launch_args.cwd_file = Some(PathBuf::from(path_str));
-                    has_launch_args = true;
-                }
-            }
             Some(other) if !other.starts_with('-') && launch_args.target_path.is_none() => {
                 launch_args.target_path = Some(PathBuf::from(other));
                 has_launch_args = true;

@@ -133,7 +133,7 @@ fn run_app(
     args: &crate::updater::LaunchArgs,
 ) -> Result<()> {
     let cwd = if let Some(ref target) = args.target_path {
-        if target.is_dir() {
+        let raw = if target.is_dir() {
             target.canonicalize().unwrap_or_else(|_| target.clone())
         } else if let Some(parent) = target.parent() {
             if parent.is_dir() {
@@ -145,7 +145,8 @@ fn run_app(
             }
         } else {
             std::env::current_dir()?
-        }
+        };
+        platform::simplify_path(&raw)
     } else {
         std::env::current_dir()?
     };
@@ -240,11 +241,6 @@ fn run_app(
     }
 
     app.prepare_for_shutdown()?;
-    if let Some(ref cwd_file) = args.cwd_file
-        && let Some(active_cwd) = app.active_pane_cwd()
-    {
-        let _ = std::fs::write(cwd_file, active_cwd.display().to_string());
-    }
     Ok(())
 }
 

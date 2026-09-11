@@ -50,6 +50,28 @@ pub(crate) fn executable_dir() -> Option<std::path::PathBuf> {
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
+/// 將可能帶有 Windows 擴展長度前綴（`\\?\` 或 `\\?\UNC\`）的正規化路徑轉回乾淨的通用路徑。
+///
+/// Windows 的 `canonicalize()` 會自動加入 `\\?\` 前綴，但 PowerShell（如 `Set-Location`、`Test-Path`）
+/// 以及許多終端工具無法直接識別 `\\?\`，甚至會拋出「路徑不存在」錯誤。
+pub(crate) fn simplify_path(path: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            std::path::PathBuf::from(format!(r"\\{stripped}"))
+        } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            std::path::PathBuf::from(stripped)
+        } else {
+            path.to_path_buf()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// 判斷指定路徑是否位於網路共享（如 SMB / UNC、Windows 網路磁碟機或 macOS `/Volumes`）。
 ///
 /// 網路共享上的檔案操作極易受 SMB 快取欺騙、Server-Side Copy Offload 失敗或 0-byte 假死影響，

@@ -248,3 +248,46 @@ fn is_network_path_detects_unc_and_remote_volumes() {
         assert!(!super::is_network_path(Path::new(r"C:\Windows\System32")));
     }
 }
+
+#[test]
+/// 驗證 simplify_path 能正確去除 Windows \\?\ 與 \\?\UNC\ 擴展前綴。
+/// 保護目的：確保傳入 PowerShell 或終端命令的路徑符合標準格式，避免 Set-Location / Test-Path 報錯。
+fn simplify_path_strips_windows_extended_prefixes() {
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            super::simplify_path(Path::new(r"\\?\C:\Users\otto\Documents")),
+            PathBuf::from(r"C:\Users\otto\Documents")
+        );
+        assert_eq!(
+            super::simplify_path(Path::new(r"\\?\UNC\server\share\folder")),
+            PathBuf::from(r"\\server\share\folder")
+        );
+        assert_eq!(
+            super::simplify_path(Path::new(r"D:\normal\path")),
+            PathBuf::from(r"D:\normal\path")
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(
+            super::simplify_path(Path::new("/tmp/normal/path")),
+            PathBuf::from("/tmp/normal/path")
+        );
+    }
+}
+
+#[test]
+/// 驗證 simplify_path 寫入暫存檔後，內容能被 Windows 原生路徑解析器完整識別。
+fn simplify_path_written_to_file_is_clean_and_usable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd_file = dir.path().join("cwd.txt");
+    let complex_path = Path::new(r"\\?\D:\pngyu");
+    let clean = super::simplify_path(complex_path);
+    std::fs::write(&cwd_file, clean.display().to_string()).expect("write");
+    let content = std::fs::read_to_string(&cwd_file).expect("read");
+    #[cfg(windows)]
+    assert_eq!(content, r"D:\pngyu");
+    #[cfg(not(windows))]
+    assert_eq!(content, r"\\?\D:\pngyu");
+}

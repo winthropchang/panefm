@@ -48,25 +48,14 @@ fn cli_command_parsing_recognizes_all_variants() {
 }
 
 #[test]
-/// 驗證多參數 CLI 解析器 `parse_cli_args` 能正確辨識 `--cwd-file`、路徑參數與旗標。
-/// 保護目的：確保 Shell wrapper 能透過 `--cwd-file` 穩定傳遞暫存檔，且支援以特定目錄啟動。
+/// 驗證多參數 CLI 解析器 `parse_cli_args` 能正確辨識路徑參數與旗標。
+/// 保護目的：確保支援以特定目錄啟動，且優先處理說明與版本旗標。
 fn cli_args_parsing_recognizes_flags_and_paths() {
-    // 驗證分離式 --cwd-file <PATH>
-    let res = parse_cli_args(["--cwd-file", "/tmp/cwd.txt"]);
+    // 驗證啟動目標目錄
+    let res = parse_cli_args(["/Users/otto/Documents"]);
     assert_eq!(
         res,
         CliCommand::Run(LaunchArgs {
-            cwd_file: Some(PathBuf::from("/tmp/cwd.txt")),
-            target_path: None,
-        })
-    );
-
-    // 驗證等號式 --cwd-file=<PATH> 與啟動目標目錄
-    let res = parse_cli_args(["--cwd-file=/tmp/custom.txt", "/Users/otto/Documents"]);
-    assert_eq!(
-        res,
-        CliCommand::Run(LaunchArgs {
-            cwd_file: Some(PathBuf::from("/tmp/custom.txt")),
             target_path: Some(PathBuf::from("/Users/otto/Documents")),
         })
     );
@@ -76,7 +65,7 @@ fn cli_args_parsing_recognizes_flags_and_paths() {
 
     // 驗證全域說明與版本旗標優先
     assert_eq!(
-        parse_cli_args(["--cwd-file", "/tmp/x", "-V"]),
+        parse_cli_args(["/Users/otto/Documents", "-V"]),
         CliCommand::Version
     );
     assert_eq!(parse_cli_args(["--help"]), CliCommand::Help);

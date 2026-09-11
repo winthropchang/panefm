@@ -227,62 +227,7 @@ cargo build --release
 
 將其加入系統 `PATH` 後，即可在任何終端中輸入 `panefm` 啟動！
 
----
 
-### 4. 🐚 Shell 整合：退出自動切換目錄（cd-on-quit）
-
-如同 `yazi` 或 `ranger`，您可以在 Shell 設定檔中加入包裝函式（Shell Wrapper）。在 PaneFM 內穿梭於多層目錄後按 `q` 退出時，外部 Shell 會自動 `cd` 至最後停留的目錄：
-
-#### 🍏 macOS / Linux (`~/.zshrc` 或 `~/.bashrc`)
-
-```bash
-function panefm() {
-    local tmp="$(mktemp -t "panefm-cwd.XXXXXX")"
-    command panefm --cwd-file="$tmp" "$@"
-    local cwd
-    if [ -f "$tmp" ]; then
-        cwd="$(cat "$tmp")"
-        rm -f "$tmp"
-        if [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
-            cd "$cwd" || exit
-        fi
-    fi
-}
-```
-
-#### 🐟 Fish Shell (`~/.config/fish/functions/panefm.fish`)
-
-```fish
-function panefm
-    set tmp (mktemp -t "panefm-cwd.XXXXXX")
-    command panefm --cwd-file="$tmp" $argv
-    if test -f "$tmp"
-        set cwd (cat "$tmp")
-        rm -f "$tmp"
-        if test -n "$cwd" -a "$cwd" != "$PWD"
-            cd "$cwd"
-        end
-    end
-end
-```
-
-#### 🪟 Windows PowerShell (`$PROFILE`)
-
-```powershell
-function panefm {
-    $tmp = [System.IO.Path]::GetTempFileName()
-    & panefm.exe --cwd-file $tmp $args
-    if (Test-Path $tmp) {
-        $cwd = Get-Content $tmp -Raw
-        Remove-Item $tmp -Force
-        if ($cwd -and (Test-Path $cwd)) {
-            Set-Location $cwd
-        }
-    }
-}
-```
-
----
 
 ## ⚙️ 外掛擴充與自訂動作 (`plugins.toml`)
 
