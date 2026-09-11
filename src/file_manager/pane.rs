@@ -3417,7 +3417,7 @@ where
         Ok(copied_size) => {
             // 原生 copy 宣稱完成後，重新開啟目標執行 sync_all，迫使 OS 沖刷 dirty buffer
             if let Ok(target_file) = fs::OpenOptions::new().write(true).open(target_path) {
-                let _ = target_file.sync_all();
+                let _ = sync_target_file(&target_file);
             }
             let stored_size = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
             if copied_size == expected_size && stored_size == expected_size {
@@ -3491,6 +3491,35 @@ fn remove_partial_file_for_fallback(
     })
 }
 
+/// 嘗試將檔案內容沖刷至儲存媒體（落盤）。
+///
+/// 若底層檔案系統或遠端網路磁碟（如 macOS smbfs / NFS / FAT32 / FUSE）
+/// 不支援硬體級快取沖刷（例如 macOS 的 `fcntl(F_FULLFSYNC)` 回傳 `ENOTSUP` os error 45），
+/// 則平滑忽略該項不支援錯誤，因為檔案資料已透過 `write` 與 `flush` 完整傳輸並由系統與伺服器管理。
+pub(crate) fn sync_target_file(file: &File) -> io::Result<()> {
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if is_sync_unsupported_error(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// 判斷 `sync_all` 回傳的錯誤是否屬於檔案系統或網路協定不支援硬體級落盤的非致命錯誤。
+pub(crate) fn is_sync_unsupported_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    match error.raw_os_error() {
+        #[cfg(unix)]
+        // EPERM = 1, EINVAL = 22, ENOSYS = 38 (Linux) / 78 (macOS), ENOTSUP = 45 (macOS) / 95 (Linux), EOPNOTSUPP = 102 (macOS) / 95 (Linux)
+        Some(1) | Some(22) | Some(38) | Some(45) | Some(78) | Some(95) | Some(102) => true,
+        #[cfg(windows)]
+        // ERROR_INVALID_FUNCTION = 1, ERROR_NOT_SUPPORTED = 50, ERROR_CALL_NOT_IMPLEMENTED = 120
+        Some(1) | Some(50) | Some(120) => true,
+        _ => false,
+    }
+}
+
 /// 使用固定大小 buffer 跨平台串流複製單一檔案並即時回報進度。
 ///
 /// 這是 SMB 不支援平台原生 copy 時的可靠 fallback，不是本機預設路徑。目的檔使用
@@ -3528,7 +3557,7 @@ where
         progress(read as u64);
     }
     target.flush()?;
-    target.get_ref().sync_all()?;
+    sync_target_file(target.get_ref())?;
     drop(target);
 
     let source_size_after_copy = fs::metadata(source_path)?.len();
@@ -3607,7 +3636,7 @@ where
         }
     })?;
     if let Ok(target_file) = fs::OpenOptions::new().write(true).open(target_path) {
-        let _ = target_file.sync_all();
+        let _ = sync_target_file(&target_file);
     }
     let stored_size = fs::metadata(target_path)?.len();
     if copied_size != expected_size || stored_size != expected_size {
@@ -3668,7 +3697,7 @@ where
 
     let copied_size = platform_copy(source_path, staged_path)?;
     if let Ok(target_file) = fs::OpenOptions::new().write(true).open(staged_path) {
-        let _ = target_file.sync_all();
+        let _ = sync_target_file(&target_file);
     }
     let stored_size = fs::metadata(staged_path)?.len();
     if copied_size != expected_size || stored_size != expected_size {

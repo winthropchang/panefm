@@ -16,8 +16,9 @@ use super::{
     copy_dir_recursive, copy_dir_recursive_with_progress, copy_file_and_verify,
     copy_file_and_verify_with, copy_file_native_with_progress,
     copy_file_native_with_progress_using, copy_file_with_native_fallback,
-    copy_path_direct_with_cleanup, copy_path_transactional_with, natural_cmp, read_dir_entries,
-    read_dir_entries_with_cancellation, stream_dir_entries_with_cancellation,
+    copy_path_direct_with_cleanup, copy_path_transactional_with, is_sync_unsupported_error,
+    natural_cmp, read_dir_entries, read_dir_entries_with_cancellation,
+    stream_dir_entries_with_cancellation, sync_target_file,
 };
 use crate::file_manager::entry::FileEntry;
 use crate::file_manager::search::GlobalSearchEntry;
@@ -1729,4 +1730,52 @@ fn pane_state_jump_to_bottom_with_g_on_large_file_is_instant() {
         .iter()
         .any(|s| s.content.as_ref().contains("fn") && s.style.fg.is_some());
     assert!(has_colored_kw, "末尾行切片渲染應包含 fn 關鍵字語法顏色");
+}
+
+#[test]
+/// 驗證落盤錯誤判斷函式能精確辨識 macOS SMB / NFS / 虛擬檔案系統常見的非致命不支援錯誤，
+/// 特別是 macOS smbfs 的 ENOTSUP (os error 45) 與 EOPNOTSUPP (os error 102)。
+fn sync_unsupported_error_detects_network_and_virtual_fs_errors() {
+    let unsupported_err = io::Error::new(io::ErrorKind::Unsupported, "not supported");
+    assert!(is_sync_unsupported_error(&unsupported_err));
+
+    #[cfg(unix)]
+    {
+        // macOS ENOTSUP = 45, EOPNOTSUPP = 102
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(45)));
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(
+            102
+        )));
+        // Linux ENOTSUP / EOPNOTSUPP = 95
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(95)));
+        // EINVAL = 22, ENOSYS = 78/38, EPERM = 1
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(22)));
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(38)));
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(78)));
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(1)));
+    }
+
+    #[cfg(windows)]
+    {
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(1)));
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(50)));
+        assert!(is_sync_unsupported_error(&io::Error::from_raw_os_error(
+            120
+        )));
+    }
+
+    let perm_err = io::Error::new(io::ErrorKind::PermissionDenied, "permission denied");
+    assert!(!is_sync_unsupported_error(&perm_err));
+
+    let not_found_err = io::Error::new(io::ErrorKind::NotFound, "not found");
+    assert!(!is_sync_unsupported_error(&not_found_err));
+}
+
+#[test]
+/// 驗證 sync_target_file 在常態檔案能正常完成 flush / sync 操作。
+fn sync_target_file_succeeds_on_real_file() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("sync_test.txt");
+    let file = File::create(&file_path).expect("create file");
+    assert!(sync_target_file(&file).is_ok());
 }
