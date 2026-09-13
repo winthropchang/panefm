@@ -576,6 +576,10 @@ pub(crate) enum PendingAction {
         previews: Vec<RegexRenamePreview>,
     },
     DiffMatrix(DiffMatrixState),
+    EasyMotion {
+        pane_id: usize,
+        labels: Vec<(char, usize)>,
+    },
 }
 
 /// 表示整個應用程式的核心狀態。
@@ -1211,6 +1215,13 @@ impl App {
                     None
                 };
                 let preview_active = pane.is_preview_active();
+                let easymotion_labels = match &self.pending_action {
+                    Some(PendingAction::EasyMotion {
+                        pane_id: action_pane_id,
+                        labels,
+                    }) if *action_pane_id == pane_id => Some(labels.as_slice()),
+                    _ => None,
+                };
                 let pane_cursor = render_pane(
                     frame,
                     rect,
@@ -1236,6 +1247,7 @@ impl App {
                         .is_some_and(|search| search.pane_id == pane_id),
                     self.text_input_cursor,
                     &active_job_badges,
+                    easymotion_labels,
                 );
                 if cursor_position.is_none() {
                     cursor_position = pane_cursor;
@@ -1481,7 +1493,8 @@ impl App {
             | Some(PendingAction::ToolPanel { .. })
             | Some(PendingAction::CopyPicker { .. })
             | Some(PendingAction::OpenPicker { .. })
-            | Some(PendingAction::RegexRename { .. }) => {}
+            | Some(PendingAction::RegexRename { .. })
+            | Some(PendingAction::EasyMotion { .. }) => {}
             Some(PendingAction::Rename { .. }) | Some(PendingAction::CreateEntry { .. }) => {}
             None => {}
         }
@@ -3488,6 +3501,18 @@ impl App {
                         },
                     ]);
                 }
+                PendingAction::EasyMotion { .. } => {
+                    hints.extend_from_slice(&[
+                        StatusShortcutHint {
+                            key: "key",
+                            label: "jump",
+                        },
+                        StatusShortcutHint {
+                            key: "Esc/q",
+                            label: "cancel",
+                        },
+                    ]);
+                }
                 PendingAction::ConfirmDelete { .. }
                 | PendingAction::ConfirmPasteOverwrite { .. }
                 | PendingAction::ConfirmTrashAction { .. } => {
@@ -3549,6 +3574,10 @@ impl App {
         {
             hints.extend_from_slice(&[
                 StatusShortcutHint {
+                    key: "[/]",
+                    label: "prev/next file",
+                },
+                StatusShortcutHint {
                     key: "j/k",
                     label: "scroll",
                 },
@@ -3557,12 +3586,8 @@ impl App {
                     label: "page scroll",
                 },
                 StatusShortcutHint {
-                    key: "Tab",
-                    label: "close preview",
-                },
-                StatusShortcutHint {
-                    key: "q",
-                    label: "close preview",
+                    key: "Tab/q",
+                    label: "close",
                 },
             ]);
             return hints;

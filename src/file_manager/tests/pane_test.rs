@@ -1779,3 +1779,196 @@ fn sync_target_file_succeeds_on_real_file() {
     let file = File::create(&file_path).expect("create file");
     assert!(sync_target_file(&file).is_ok());
 }
+
+#[test]
+/// 驗證鄰近預覽背景預熱功能：
+/// 當 Pane 載入目前檔案預覽時，背景執行緒會自動預先快取鄰近檔案，
+/// 讓使用者切換至鄰近檔案時達到 0ms 記憶體快取命中。
+fn pane_state_prefetches_adjacent_previews_into_cache() {
+    let dir = tempdir().expect("tempdir");
+    let file_a = dir.path().join("a.rs");
+    let file_b = dir.path().join("b.rs");
+    let file_c = dir.path().join("c.rs");
+
+    fs::write(&file_a, "fn a() { println!(\"A\"); }\n").expect("write a");
+    fs::write(&file_b, "fn b() { println!(\"B\"); }\n").expect("write b");
+    fs::write(&file_c, "fn c() { println!(\"C\"); }\n").expect("write c");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(80, 10);
+
+    // 游標移動至中間項目 b.rs
+    pane.move_to_visible_index(1);
+    let selected_name = pane.selected_entry().map(|e| e.name.clone());
+    assert_eq!(selected_name.as_deref(), Some("b.rs"));
+
+    // 載入 b.rs 預覽，觸發鄰近預熱
+    let _ = pane.preview_lines(10, Theme::default());
+
+    // 等待背景預熱執行緒完成（通常 < 50ms）
+    let mut a_cached = false;
+    let mut c_cached = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard
+            .get(
+                &file_a,
+                Some(fs::metadata(&file_a).unwrap().modified().unwrap()),
+                pane.preview_viewport_width,
+            )
+            .is_some()
+        {
+            a_cached = true;
+        }
+        if guard
+            .get(
+                &file_c,
+                Some(fs::metadata(&file_c).unwrap().modified().unwrap()),
+                pane.preview_viewport_width,
+            )
+            .is_some()
+        {
+            c_cached = true;
+        }
+        if a_cached && c_cached {
+            break;
+        }
+    }
+
+    assert!(a_cached, "鄰近項目 a.rs 應被背景預熱至快取");
+    assert!(c_cached, "鄰近項目 c.rs 應被背景預熱至快取");
+}
+
+#[test]
+/// 驗證清單模式預熱會將當前選取項目 (include_current = true) 一併預熱進入快取，
+/// 且重複觸發會被 in_flight 機制過濾防重。
+fn pane_state_prefetches_current_and_adjacent_in_list_mode() {
+    let dir = tempdir().expect("tempdir");
+    let file_x = dir.path().join("x.rs");
+    let file_y = dir.path().join("y.rs");
+    let file_z = dir.path().join("z.rs");
+
+    fs::write(&file_x, "fn x() {}\n").expect("write x");
+    fs::write(&file_y, "fn y() {}\n").expect("write y");
+    fs::write(&file_z, "fn z() {}\n").expect("write z");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_size(80, 10);
+
+    // 停留在 y.rs
+    pane.move_to_visible_index(1);
+
+    // 觸發清單模式預熱 (include_current = true)
+    pane.prefetch_current_and_adjacent_previews(true);
+
+    // 驗證 in_flight 或已在快取中
+    {
+        let guard = pane.preview_content_cache.lock().unwrap();
+        assert!(guard.is_in_flight_or_cached(
+            &file_y,
+            Some(fs::metadata(&file_y).unwrap().modified().unwrap()),
+            80
+        ));
+    }
+
+    // 等待背景預熱完成
+    let mut y_cached = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard
+            .get(
+                &file_y,
+                Some(fs::metadata(&file_y).unwrap().modified().unwrap()),
+                pane.preview_viewport_width,
+            )
+            .is_some()
+        {
+            y_cached = true;
+            break;
+        }
+    }
+    assert!(y_cached, "當前選取項目 y.rs 應在清單模式下被預熱至快取");
+}
+
+#[test]
+/// 驗證鄰近預覽背景預熱 (Speculative Prefetching) 在預熱短小檔案後，
+/// 絕不會污染當前選取較大檔案的 max_preview_scroll，且進入 preview 模式後游標與捲動皆可立即流暢操作。
+fn test_adjacent_prefetch_does_not_corrupt_active_preview_max_scroll() {
+    let dir = tempdir().expect("tempdir");
+    let file_big = dir.path().join("a_big.md");
+    let file_small = dir.path().join("b_small.toml");
+
+    // a_big 有 500 行，b_small 只有 10 行
+    let big_content = (1..=500).map(|i| format!("Line {i}\n")).collect::<String>();
+    let small_content = (1..=10)
+        .map(|i| format!("Config {i}\n"))
+        .collect::<String>();
+
+    fs::write(&file_big, big_content).expect("write big");
+    fs::write(&file_small, small_content).expect("write small");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_size(80, 20);
+
+    // 游標停留在 a_big.md (index 0)
+    pane.move_to_visible_index(0);
+    assert_eq!(pane.selected_entry().unwrap().name, "a_big.md");
+
+    // 在清單模式下觸發預熱（會依序將 a_big.md 與相鄰的 b_small.toml 預熱進快取）
+    pane.prefetch_current_and_adjacent_previews(true);
+
+    // 等待背景預熱完成
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard.contains(&file_big, None, 80) && guard.contains(&file_small, None, 80) {
+            break;
+        }
+    }
+
+    // 按下 Tab 進入 preview 模式
+    assert!(pane.toggle_preview_active());
+
+    // 核心驗證 1：max_preview_scroll 必須精準反映 a_big.md 的 500 行 (500 - 20 = 480)，
+    // 絕不能被相鄰預熱的 b_small.toml (10 行 -> saturating_sub 變 0) 鎖死！
+    let max_scroll = pane.max_preview_scroll();
+    assert_eq!(
+        max_scroll, 480,
+        "max_preview_scroll 必須為 a_big.md 的 480，而非相鄰檔案的 0"
+    );
+    assert!(
+        pane.preview_has_more_below(),
+        "preview_has_more_below 應回傳 true"
+    );
+
+    // 核心驗證 2：向下捲動 5 行，游標與捲動位置必須立即反映，絕不卡死在 0
+    pane.scroll_preview_down(5);
+    assert_eq!(
+        pane.preview_scroll, 5,
+        "向下捲動 5 行後 preview_scroll 應為 5"
+    );
+
+    // 核心驗證 3：向下翻半頁
+    pane.page_preview_down();
+    assert_eq!(
+        pane.preview_scroll, 15,
+        "向下翻半頁後 preview_scroll 應為 15"
+    );
+
+    // 核心驗證 4：捲動至最底部
+    pane.scroll_preview_bottom();
+    assert_eq!(
+        pane.preview_scroll, 480,
+        "捲動至最底部後 preview_scroll 應為 480"
+    );
+
+    // 核心驗證 5：捲動回最上方
+    pane.scroll_preview_top();
+    assert_eq!(
+        pane.preview_scroll, 0,
+        "捲動至最上方後 preview_scroll 應為 0"
+    );
+}

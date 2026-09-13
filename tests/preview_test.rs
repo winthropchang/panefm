@@ -207,3 +207,26 @@ fn integration_toml_code_preview_syntax_highlighting() {
             .any(|s| s.content.as_ref() == "name" && s.style.fg.is_some())
     );
 }
+
+#[test]
+/// 驗證 Markdown 檔案透過公開 API 可享有專屬低延遲語法高亮著色（標題、代碼塊、清單、行內標記）。
+/// 保護目的：確保 Markdown 專用高頻預覽解析器在黑箱整合情境下運作正常。
+fn integration_markdown_code_preview_syntax_highlighting() {
+    use panefm::file_manager::preview::highlight_code_preview;
+
+    let path = Path::new("README.md");
+    let md_content = "# PaneFM\n\n- [x] High performance\n`code` block\n";
+    let lines = highlight_code_preview(path, md_content, 10, None);
+
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0].to_string(), "  1 # PaneFM");
+    assert!(lines[0].spans.iter().any(|s| s.content.as_ref() == "#"));
+    assert_eq!(lines[2].to_string(), "  3 - [x] High performance");
+    assert!(lines[2].spans.iter().any(|s| s.content.as_ref() == "[x] "));
+    assert!(
+        lines[3]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "`code`")
+    );
+}

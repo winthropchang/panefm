@@ -205,6 +205,7 @@ pub(crate) fn render_pane(
     list_find_editing: bool,
     text_input_cursor: usize,
     active_job_badges: &std::collections::HashMap<std::path::PathBuf, String>,
+    easymotion_labels: Option<&[(char, usize)]>,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
@@ -252,10 +253,11 @@ pub(crate) fn render_pane(
         .borders(Borders::ALL)
         .border_style(border_style);
 
+    let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
+    let preview_content_width = area.width.saturating_sub(2).max(1) as usize;
+    pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
+
     if preview_focused {
-        let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
-        let preview_content_width = area.width.saturating_sub(2).max(1) as usize;
-        pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
         let (preview_title, preview_lines) = match panel_state {
             Some(PaneListState::Search(search_state))
                 if !search_state.results.is_empty() && search_state.preview_query.is_some() =>
@@ -296,6 +298,11 @@ pub(crate) fn render_pane(
         );
         frame.render_widget(preview, area);
         return None;
+    }
+
+    // 在清單模式下，若 Pane 處於焦點且非特殊面板，背景預熱當前選取項目與相鄰項目
+    if focused && panel_state.is_none() {
+        pane.prefetch_current_and_adjacent_previews(true);
     }
 
     let content_width = area.width.saturating_sub(4) as usize;
@@ -443,6 +450,12 @@ pub(crate) fn render_pane(
                 .map(|(index, entry)| {
                     let visible_index = view_start + index;
                     let active_job_badge = active_job_badges.get(&entry.path).map(|s| s.as_str());
+                    let jump_label = easymotion_labels.and_then(|labels| {
+                        labels
+                            .iter()
+                            .find(|(_, idx)| *idx == visible_index)
+                            .map(|(ch, _)| *ch)
+                    });
                     ListItem::new(render_entry_line(
                         entry,
                         pane.is_marked(entry),
@@ -462,6 +475,7 @@ pub(crate) fn render_pane(
                         pane.list_find_query(),
                         find_match_position.filter(|_| visible_index == pane.selected),
                         active_job_badge,
+                        jump_label,
                     ))
                 })
                 .collect()
@@ -2234,7 +2248,7 @@ fn truncate_text_to_display_width(text: &str, max_width: usize) -> String {
 
 /// 根據目前排序模式，產生單一列表列的顯示內容。
 #[allow(clippy::too_many_arguments)]
-fn render_entry_line(
+pub(crate) fn render_entry_line(
     entry: &super::entry::FileEntry,
     marked: bool,
     mark_column_active: bool,
@@ -2247,15 +2261,27 @@ fn render_entry_line(
     list_find_query: Option<&str>,
     list_find_position: Option<(usize, usize)>,
     active_job_badge: Option<&str>,
+    jump_label: Option<char>,
 ) -> Line<'static> {
-    let marker = if mark_column_active {
+    let (marker, jump_span) = if let Some(ch) = jump_label {
+        let tag = format!("[{ch}] ");
+        let style = Style::default()
+            .fg(ratatui::style::Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        ("", Some(Span::styled(tag, style)))
+    } else if mark_column_active {
         if marked || visual_selected {
-            "[*] "
+            ("[*] ", None)
         } else {
-            "    "
+            ("    ", None)
         }
     } else {
-        ""
+        ("", None)
+    };
+    let base_entry_style = if jump_label.is_some() {
+        theme.muted_style()
+    } else {
+        entry_style(entry, theme)
     };
     let icon = if icons_enabled {
         format!("{} ", entry_icon(entry, icon_style))
@@ -2265,7 +2291,11 @@ fn render_entry_line(
     let mut display_name = entry.display_name();
     let badge = list_find_position.map(|(current, total)| format!("[{current}/{total}]"));
     let detail = format_sort_detail(entry, detail_kind);
-    let marker_width = UnicodeWidthStr::width(marker);
+    let marker_width = if jump_label.is_some() {
+        4
+    } else {
+        UnicodeWidthStr::width(marker)
+    };
     let icon_width = UnicodeWidthStr::width(icon.as_str());
     let badge_width = badge
         .as_ref()
@@ -2284,17 +2314,19 @@ fn render_entry_line(
 
     if detail.is_empty() || width < fixed_width {
         let mut spans = Vec::new();
-        if !marker.is_empty() {
+        if let Some(j_span) = jump_span {
+            spans.push(j_span);
+        } else if !marker.is_empty() {
             spans.push(Span::raw(marker.to_string()));
         }
         if !icon.is_empty() {
-            spans.push(Span::styled(icon, entry_style(entry, theme)));
+            spans.push(Span::styled(icon, base_entry_style));
         }
         spans.extend(highlight_name_spans(
             &display_name,
             list_find_query,
             theme,
-            entry_style(entry, theme),
+            base_entry_style,
         ));
         if let Some(job_badge) = active_job_badge {
             spans.push(Span::raw(" ".to_string()));
@@ -2333,17 +2365,19 @@ fn render_entry_line(
     let spacer_len = width.saturating_sub(used_width).max(1);
 
     let mut spans = Vec::new();
-    if !marker.is_empty() {
+    if let Some(j_span) = jump_span {
+        spans.push(j_span);
+    } else if !marker.is_empty() {
         spans.push(Span::raw(marker.to_string()));
     }
     if !icon.is_empty() {
-        spans.push(Span::styled(icon, entry_style(entry, theme)));
+        spans.push(Span::styled(icon, base_entry_style));
     }
     spans.extend(highlight_name_spans(
         &display_name,
         list_find_query,
         theme,
-        entry_style(entry, theme),
+        base_entry_style,
     ));
     if let Some(job_badge) = active_job_badge {
         spans.push(Span::raw(" ".to_string()));

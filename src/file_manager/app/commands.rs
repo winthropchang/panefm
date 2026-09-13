@@ -225,6 +225,7 @@ impl App {
             "compress" => self.compress_selected_entries()?,
             "extract" => self.extract_selected_archives()?,
             "jump" => self.open_fzf_jump(),
+            "easymotion" => self.open_easymotion(),
             "open" => self.open_selected_with_default()?,
             "open-picker" => self.open_selected_with_picker()?,
             "copy-picker" => self.open_copy_picker()?,

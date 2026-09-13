@@ -48,6 +48,7 @@ fn render_entry_line_displays_active_job_badge() {
         None,
         None,
         Some("[copying 99%]"),
+        None,
     );
     let text = line
         .spans
@@ -57,6 +58,36 @@ fn render_entry_line_displays_active_job_badge() {
     assert!(
         text.contains("[copying 99%]"),
         "列表列必須包含工作進度標籤: {text}"
+    );
+}
+
+#[test]
+/// 驗證 EasyMotion 模式下列表列會以醒目的 [k] 字母標籤顯示。
+fn render_entry_line_displays_easymotion_jump_label() {
+    let entry = test_entry("main.rs", false);
+    let line = render_entry_line(
+        &entry,
+        false,
+        false,
+        false,
+        SortDetailKind::None,
+        60,
+        Theme::from(crate::theme::ThemePreset::Dracula),
+        true,
+        IconStyle::NerdFont,
+        None,
+        None,
+        None,
+        Some('k'),
+    );
+    let text = line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        text.contains("[k]"),
+        "列表列在 EasyMotion 模式下必須包含跳轉字母標籤 [k]: {text}"
     );
 }
 
@@ -87,6 +118,7 @@ fn render_entry_line_keeps_details_visible_after_wide_chinese_name() {
             theme,
             false,
             IconStyle::Ascii,
+            None,
             None,
             None,
             None,

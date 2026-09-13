@@ -9478,6 +9478,186 @@ fn q_exits_file_preview_mode() {
 }
 
 #[test]
+/// 驗證檔案預覽模式支援 PageDown, PageUp, Home, End 導航鍵。
+fn pagedown_pageup_home_end_in_preview_mode() {
+    let dir = tempdir().expect("tempdir");
+    let content = (1..=200).map(|i| format!("Line {i}\n")).collect::<String>();
+    fs::write(dir.path().join("doc.txt"), content).expect("file");
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+
+    if let Some(pane) = app.panes.get_mut(&1) {
+        pane.set_preview_viewport_size(80, 20);
+    }
+
+    app.open_preview_focus();
+    assert!(app.panes.get(&1).expect("pane").is_preview_active());
+
+    // PageDown 向下翻整頁 (20 行)
+    app.handle_preview_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        .expect("pagedown");
+    assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 20);
+    assert_eq!(app.status, "preview: page down");
+
+    // PageUp 向上翻整頁 (20 行)
+    app.handle_preview_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+        .expect("pageup");
+    assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+    assert_eq!(app.status, "preview: page up");
+
+    // End 跳到最底部 (200 - 20 = 180)
+    app.handle_preview_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .expect("end");
+    assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 180);
+    assert_eq!(app.status, "preview: bottom");
+
+    // Home 跳到最上方 (0)
+    app.handle_preview_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .expect("home");
+    assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+    assert_eq!(app.status, "preview: top");
+}
+
+#[test]
+/// 完整的端到端 (E2E) 使用者旅程測試：
+/// 模擬清單模式背景預熱 -> 按 Tab 進入預覽 -> 立即用 j/Down/PageDown 捲動 -> 用 [/] 切換檔案 -> 按 Tab 退出。
+/// 此測試防範「加入新功能或背景非同步導致游標與捲動卡死」的迴歸問題。
+fn test_user_journey_prefetch_tab_preview_and_scroll_responsiveness() {
+    let dir = tempdir().expect("tempdir");
+    let file_guide = dir.path().join("01_guide.md");
+    let file_short = dir.path().join("02_short.toml");
+    let file_code = dir.path().join("03_code.rs");
+
+    // 01_guide: 400 行
+    let guide_content = (1..=400)
+        .map(|i| format!("# Guide line {i}\n"))
+        .collect::<String>();
+    // 02_short: 15 行
+    let short_content = (1..=15)
+        .map(|i| format!("key_{i} = \"val\"\n"))
+        .collect::<String>();
+    // 03_code: 100 行
+    let code_content = (1..=100)
+        .map(|i| format!("fn line_{i}() {{}}\n"))
+        .collect::<String>();
+
+    fs::write(&file_guide, guide_content).expect("write guide");
+    fs::write(&file_short, short_content).expect("write short");
+    fs::write(&file_code, code_content).expect("write code");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    if let Some(pane) = app.panes.get_mut(&1) {
+        pane.set_preview_viewport_size(80, 25);
+        // 游標停在 01_guide.md
+        pane.move_to_visible_index(0);
+        assert_eq!(pane.selected_entry().unwrap().name, "01_guide.md");
+        // 觸發清單模式下的背景投機性預熱
+        pane.prefetch_current_and_adjacent_previews(true);
+    }
+
+    // 等待背景預熱執行緒跑完（包括當前項與相鄰短檔案）
+    let file_guide_clone = file_guide.clone();
+    let file_short_clone = file_short.clone();
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let pane = app.panes.get(&1).unwrap();
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard.contains(&file_guide_clone, None, 80)
+            && guard.contains(&file_short_clone, None, 80)
+        {
+            break;
+        }
+    }
+
+    // 步驟 1：使用者按下 Tab 鍵開啟右側預覽視窗
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .expect("tab enters preview");
+    assert!(
+        app.panes.get(&1).unwrap().is_preview_active(),
+        "預覽模式必須處於開啟狀態"
+    );
+
+    // 步驟 2：使用者立即按下 j 鍵向下捲動
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+        .expect("j scroll");
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        1,
+        "按下 j 後必須立即向下移動至第 1 行"
+    );
+
+    // 步驟 3：使用者按下方向鍵 Down 繼續向下捲動
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .expect("Down scroll");
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        2,
+        "按下 Down 後必須移動至第 2 行"
+    );
+
+    // 步驟 4：使用者按下 PageDown 翻頁
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        .expect("PageDown");
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        27,
+        "PageDown 應向下翻 25 行 (2 + 25 = 27)"
+    );
+
+    // 步驟 5：使用者按下 ] 鍵在預覽中切換到下一個檔案 (02_short.toml)
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE))
+        .expect("] next file");
+    assert_eq!(
+        app.panes.get(&1).unwrap().selected_entry().unwrap().name,
+        "02_short.toml"
+    );
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        0,
+        "切換檔案後 preview_scroll 必須重設為 0"
+    );
+
+    // 步驟 6：在 15 行的 short.toml 嘗試捲動（viewport 為 25，max_scroll 為 0）
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+        .expect("j on short file");
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        0,
+        "短檔案不應溢出捲動"
+    );
+
+    // 步驟 7：使用者按下 [ 鍵切換回 01_guide.md
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE))
+        .expect("[ prev file");
+    assert_eq!(
+        app.panes.get(&1).unwrap().selected_entry().unwrap().name,
+        "01_guide.md"
+    );
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        0,
+        "切換回 guide 後 preview_scroll 必須為 0"
+    );
+
+    // 步驟 8：切換回 guide 後再次捲動，驗證捲動依舊立即可用
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+        .expect("j after switch back");
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        1,
+        "切換回大檔案後 j 依然能正常捲動"
+    );
+
+    // 步驟 9：使用者按下 Tab 鍵退出預覽模式回到檔案列表
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .expect("tab exits preview");
+    assert!(
+        !app.panes.get(&1).unwrap().is_preview_active(),
+        "Tab 必須關閉預覽回到 normal mode"
+    );
+    assert_eq!(app.status, "normal mode");
+}
+
+#[test]
 /// 驗證視覺選取模式 (Visual Selection) 按 `q` 可以直接取消。
 fn q_cancels_visual_selection() {
     let dir = tempdir().expect("tempdir");
@@ -9948,4 +10128,314 @@ fn focus_pane_by_id_noop_when_already_focused() {
     app.focus_pane_by_id(1);
     assert_eq!(app.focused_pane, 1);
     assert_eq!(app.status, "preserve status");
+}
+
+#[test]
+/// 驗證按下 e 鍵能正確進入 EasyMotion 模式，並為可見行分配按鍵標籤。
+fn easymotion_press_e_opens_mode_and_press_key_jumps_instantly() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("file_0.txt"), "0").expect("write");
+    fs::write(dir.path().join("file_1.txt"), "1").expect("write");
+    fs::write(dir.path().join("file_2.txt"), "2").expect("write");
+    fs::write(dir.path().join("file_3.txt"), "3").expect("write");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    if let Some(pane) = app.panes.get_mut(&app.focused_pane) {
+        pane.set_list_viewport_height(10);
+    }
+
+    // 初始游標停在第 0 行
+    assert_eq!(app.panes.get(&app.focused_pane).unwrap().selected, 0);
+
+    // 1. 按下 e 進入 EasyMotion 模式
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        .expect("handle e");
+
+    let (target_char, target_idx) = match &app.pending_action {
+        Some(PendingAction::EasyMotion { pane_id, labels }) => {
+            assert_eq!(*pane_id, app.focused_pane);
+            assert!(labels.len() >= 4, "4 個檔案應皆被分配標籤");
+            // 取得第 2 個項目（index 2）的標籤字元
+            let (ch, idx) = labels[2];
+            assert_eq!(idx, 2);
+            (ch, idx)
+        }
+        other => panic!("預期 PendingAction::EasyMotion，實際為: {:?}", other),
+    };
+
+    assert!(app.status.contains("EASYMOTION"));
+
+    // 2. 按下對應字母，游標應瞬間跳轉至 index 2 並自動退出 EasyMotion 回到 normal 模式
+    app.handle_key(KeyEvent::new(
+        KeyCode::Char(target_char),
+        KeyModifiers::NONE,
+    ))
+    .expect("handle jump char");
+
+    assert!(app.pending_action.is_none(), "跳轉後應自動回到 normal 模式");
+    assert_eq!(
+        app.panes.get(&app.focused_pane).unwrap().selected,
+        target_idx,
+        "游標應瞬間跳至目標 index"
+    );
+    assert!(app.status.contains("jumped to"));
+}
+
+#[test]
+/// 驗證 EasyMotion 模式下按下 Esc 或 q 可以原位取消並退出。
+fn easymotion_cancels_on_esc_or_q() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("file_0.txt"), "0").expect("write");
+    fs::write(dir.path().join("file_1.txt"), "1").expect("write");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    if let Some(pane) = app.panes.get_mut(&app.focused_pane) {
+        pane.set_list_viewport_height(10);
+    }
+
+    // 按下 e 進入
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        .expect("handle e");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::EasyMotion { .. })
+    ));
+
+    // 按下 Esc 取消
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("handle esc");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "easymotion cancelled");
+
+    // 再次按 e 進入，用 q 取消
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        .expect("handle e");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::EasyMotion { .. })
+    ));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("handle q");
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.status, "easymotion cancelled");
+}
+
+#[test]
+/// 驗證 :easymotion 命令亦可開啟跳轉模式。
+fn easymotion_command_activates_mode() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("file_0.txt"), "0").expect("write");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    if let Some(pane) = app.panes.get_mut(&app.focused_pane) {
+        pane.set_list_viewport_height(10);
+    }
+
+    app.execute_command("easymotion").expect("exec easymotion");
+    assert!(matches!(
+        app.pending_action,
+        Some(PendingAction::EasyMotion { .. })
+    ));
+}
+
+#[test]
+/// 驗證在預覽模式下按下 `]` 與 `[` 可以上下切換檔案，且自動重設捲動位置為 0。
+fn preview_mode_bracket_keys_navigate_files() {
+    let dir = tempdir().expect("tempdir");
+    let file_a = dir.path().join("a.txt");
+    let file_b = dir.path().join("b.txt");
+    let file_c = dir.path().join("c.txt");
+    fs::write(
+        &file_a,
+        "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+    )
+    .expect("write a");
+    fs::write(&file_b, "content b\n").expect("write b");
+    fs::write(&file_c, "content c\n").expect("write c");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    if let Some(pane) = app.panes.get_mut(&app.focused_pane) {
+        pane.set_preview_viewport_height(4);
+    }
+    app.open_preview_focus();
+    assert!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .is_preview_active()
+    );
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "a.txt"
+    );
+
+    // 捲動當前檔案內容
+    app.current_pane_mut().unwrap().scroll_preview_down(2);
+    assert_eq!(app.panes.get(&app.focused_pane).unwrap().preview_scroll, 2);
+
+    // 按下 `]` 切換到下一個檔案 b.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE))
+        .expect("handle ]");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "b.txt"
+    );
+    assert_eq!(app.panes.get(&app.focused_pane).unwrap().preview_scroll, 0);
+    assert!(app.status.contains("b.txt"));
+
+    // 再按 `]` 切換到 c.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE))
+        .expect("handle ]");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "c.txt"
+    );
+
+    // 在末尾再按 `]`，維持在 c.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE))
+        .expect("handle ]");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "c.txt"
+    );
+
+    // 按下 `[` 切換回 b.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE))
+        .expect("handle [");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "b.txt"
+    );
+
+    // 按下 `[` 切換回 a.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE))
+        .expect("handle [");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "a.txt"
+    );
+
+    // 在頂部再按 `[`，維持在 a.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE))
+        .expect("handle [");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "a.txt"
+    );
+
+    // 測試數字前綴：2] 跳過 2 個檔案直接到 c.txt
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .expect("handle 2");
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE))
+        .expect("handle ]");
+    assert_eq!(
+        app.panes
+            .get(&app.focused_pane)
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name,
+        "c.txt"
+    );
+}
+
+#[test]
+fn test_preview_scroll_preserved_across_background_directory_load_and_watcher_reload() {
+    let dir = tempdir().expect("tempdir");
+    let test_file = dir.path().join("large.rs");
+    let mut file_content = String::new();
+    for i in 1..=100 {
+        file_content.push_str(&format!("fn line_{i}() {{ println!(\"{i}\"); }}\n"));
+    }
+    fs::write(&test_file, file_content).expect("write large.rs");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    let pane = app.panes.get_mut(&1).unwrap();
+    pane.set_preview_viewport_size(80, 10);
+
+    // 開啟預覽模式 (Tab)
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .expect("tab preview");
+    assert!(app.panes[&1].is_preview_active());
+
+    // 按下 j 捲動 15 行
+    for _ in 0..15 {
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("scroll down");
+    }
+    assert_eq!(app.panes[&1].preview_scroll, 15);
+
+    // 模擬背景目錄載入 Batch 到達
+    let entries = app.panes[&1].entries.clone();
+    app.panes
+        .get_mut(&1)
+        .unwrap()
+        .extend_entries(entries.clone());
+    assert_eq!(
+        app.panes[&1].preview_scroll, 15,
+        "Batch 到達時 preview_scroll 不得重設為 0"
+    );
+
+    // 模擬背景目錄載入 Complete 到達
+    app.panes
+        .get_mut(&1)
+        .unwrap()
+        .replace_entries_presorted(entries, None);
+    assert_eq!(
+        app.panes[&1].preview_scroll, 15,
+        "Complete 到達時 preview_scroll 不得重設為 0"
+    );
+
+    // 模擬 watcher 觸發目錄 reload
+    app.panes.get_mut(&1).unwrap().reload().expect("reload");
+    assert_eq!(
+        app.panes[&1].preview_scroll, 15,
+        "Watcher reload 時 preview_scroll 不得重設為 0"
+    );
+
+    // 模擬背景語法高亮完成 update_complete
+    let full_lines = vec![ratatui::text::Line::from("test"); 100];
+    if let Ok(mut guard) = app.panes[&1].preview_content_cache.lock() {
+        guard.update_complete(&test_file, None, full_lines);
+    }
+    assert_eq!(
+        app.panes[&1].preview_scroll, 15,
+        "語法高亮完成時 preview_scroll 仍必須維持在 15"
+    );
 }

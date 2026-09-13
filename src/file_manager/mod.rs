@@ -76,10 +76,9 @@ pub(crate) fn run_with_options(args: crate::updater::LaunchArgs) -> Result<()> {
         return result;
     }
 
-    // 在背景執行緒預載 syntect 語法庫與主題庫，消除首次開啟程式碼預覽時的冷啟動延遲
+    // 在背景執行緒預載 syntect 語法庫與主題庫並預熱常用語法，消除首次開啟程式碼預覽時的冷啟動延遲
     std::thread::spawn(|| {
-        let _ = &*crate::file_manager::preview::SYNTAX_SET;
-        let _ = &*crate::file_manager::preview::THEME_SET;
+        crate::file_manager::preview::preheat_syntect_common_syntaxes();
     });
 
     let mut terminal = setup_terminal()?;

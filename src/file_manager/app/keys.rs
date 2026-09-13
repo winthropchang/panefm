@@ -657,6 +657,13 @@ impl App {
                 self.pending_y = false;
                 true
             }
+            _ if key_matches_plain_letter(&key, 'e') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_easymotion();
+                true
+            }
             _ if key_matches_plain_letter(&key, 's') => {
                 self.clear_pending_count();
                 self.open_global_search()?;
@@ -887,6 +894,42 @@ impl App {
             self.pending_g = false;
             return Ok(true);
         }
+        if key.code == KeyCode::Char(']') {
+            let count = self.take_count_or_one();
+            let (current_name, current_pos, total) = {
+                let pane = self.current_pane_mut()?;
+                pane.move_down_by(count);
+                let name = pane
+                    .selected_entry()
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                let total = pane.visible_indices.len();
+                let current_pos = pane.selected + 1;
+                (name, current_pos, total)
+            };
+            self.clear_preview_search_if_active();
+            self.pending_g = false;
+            self.status = format!("preview: {current_name} ({current_pos}/{total})");
+            return Ok(true);
+        }
+        if key.code == KeyCode::Char('[') {
+            let count = self.take_count_or_one();
+            let (current_name, current_pos, total) = {
+                let pane = self.current_pane_mut()?;
+                pane.move_up_by(count);
+                let name = pane
+                    .selected_entry()
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                let total = pane.visible_indices.len();
+                let current_pos = pane.selected + 1;
+                (name, current_pos, total)
+            };
+            self.clear_preview_search_if_active();
+            self.pending_g = false;
+            self.status = format!("preview: {current_name} ({current_pos}/{total})");
+            return Ok(true);
+        }
 
         match key.code {
             KeyCode::Esc => {
@@ -992,6 +1035,30 @@ impl App {
                 self.current_pane_mut()?.full_page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
+            }
+            KeyCode::PageDown => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.full_page_preview_down();
+                self.pending_g = false;
+                self.status = String::from("preview: page down");
+            }
+            KeyCode::PageUp => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.full_page_preview_up();
+                self.pending_g = false;
+                self.status = String::from("preview: page up");
+            }
+            KeyCode::Home => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.scroll_preview_top();
+                self.pending_g = false;
+                self.status = String::from("preview: top");
+            }
+            KeyCode::End => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.scroll_preview_bottom();
+                self.pending_g = false;
+                self.status = String::from("preview: bottom");
             }
             _ => {
                 self.clear_pending_count();
@@ -1802,6 +1869,33 @@ impl App {
         }
 
         match action {
+            PendingAction::EasyMotion { pane_id, labels } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q')
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::NONE =>
+                {
+                    self.status = String::from("easymotion cancelled");
+                }
+                _ if key_matches_plain_letter(&key, 'e') => {
+                    self.status = String::from("easymotion cancelled");
+                }
+                KeyCode::Char(c) => {
+                    if let Some(&(_, target_visible_idx)) = labels.iter().find(|(ch, _)| *ch == c) {
+                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                            pane.move_to_visible_index(target_visible_idx);
+                            let entry_name = pane
+                                .selected_entry()
+                                .map(|e| e.name.clone())
+                                .unwrap_or_default();
+                            self.status = format!("jumped to {}", entry_name);
+                        }
+                    } else {
+                        self.status = format!("easymotion: no match for '{}'", c);
+                    }
+                }
+                _ => {
+                    self.status = String::from("easymotion cancelled");
+                }
+            },
             PendingAction::ToolPanel {
                 pane_id,
                 mut selected,
