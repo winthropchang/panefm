@@ -126,6 +126,10 @@ pub(crate) struct PaneState {
     /// 這個開關必須跟著 `PaneState` 保存，不能放在 `App` 的全域欄位；否則在第二個
     /// panel 打開 preview 時，第一個 panel 的 preview 會被同一個全域值覆蓋。
     pub(crate) preview_active: bool,
+    /// 雙欄預覽是否已開啟（若開啟且寬度足夠，畫面呈現左清單、右預覽）。
+    pub(crate) preview_open: bool,
+    /// 雙欄預覽開啟時，焦點是否正處於右側預覽（true 為預覽操作，false 為清單操作）。
+    pub(crate) preview_focused: bool,
     /// 目前 preview 在內容中的捲動偏移量。
     pub(crate) preview_scroll: usize,
     /// 目前 preview 區實際可顯示的欄位寬度與列數，供縮圖縮放與捲動邏輯計算上下界。
@@ -294,6 +298,8 @@ impl PaneState {
             line_mode: None,
             random_seed,
             preview_active: false,
+            preview_open: false,
+            preview_focused: false,
             preview_scroll: 0,
             preview_viewport_width: 80,
             preview_viewport_height: 4,
@@ -313,39 +319,66 @@ impl PaneState {
         Ok(pane)
     }
 
-    /// 判斷目前 panel 是否正在顯示放大的 preview。
-    ///
-    /// 參數：無。
-    ///
-    /// 回傳：`bool`；`true` 代表 preview 已取代這個 panel 的檔案列表，`false`
-    /// 代表顯示一般列表。每個 `PaneState` 都有自己的值，因此切換 panel 不會互相影響。
-    pub(crate) fn is_preview_active(&self) -> bool {
-        self.preview_active
+    /// 判斷目前 panel 是否開啟了雙欄即時預覽。
+    pub(crate) fn is_preview_open(&self) -> bool {
+        self.preview_open
     }
 
-    /// 明確設定目前 panel 的 preview 顯示狀態。
-    ///
-    /// 參數：
-    /// - `active: bool`，`true` 表示打開 preview，`false` 表示回到一般列表。
-    ///
-    /// 回傳：`()`；只更新目前 `PaneState`，不會修改其他 panel。
+    /// 明確設定目前 panel 的雙欄即時預覽開啟狀態。
+    pub(crate) fn set_preview_open(&mut self, open: bool) {
+        self.preview_open = open;
+        if !open {
+            self.preview_focused = false;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+    }
+
+    /// 切換目前 panel 的雙欄即時預覽開啟狀態。
+    pub(crate) fn toggle_preview_open(&mut self) -> bool {
+        self.preview_open = !self.preview_open;
+        if self.preview_open {
+            self.preview_scroll = 0;
+            self.preview_search_query = None;
+            self.preview_current_match = None;
+            self.preview_focused = false;
+        } else {
+            self.preview_focused = false;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+        self.preview_open
+    }
+
+    /// 判斷當前焦點是否正處於右側預覽（可進行滾動、跳頁與預覽搜尋）。
+    pub(crate) fn is_preview_focused(&self) -> bool {
+        self.preview_open && self.preview_focused
+    }
+
+    /// 設定焦點是否切入右側預覽視窗。
+    pub(crate) fn set_preview_focused(&mut self, focused: bool) {
+        if self.preview_open {
+            self.preview_focused = focused;
+        } else {
+            self.preview_focused = false;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+    }
+
+    /// 判斷目前 panel 是否正在接收預覽操作按鍵（等同於 is_preview_focused）。
+    pub(crate) fn is_preview_active(&self) -> bool {
+        self.preview_open && self.preview_focused
+    }
+
+    /// 明確設定目前 panel 的 preview 操作狀態。
     pub(crate) fn set_preview_active(&mut self, active: bool) {
+        self.preview_open = active;
+        self.preview_focused = active;
         self.preview_active = active;
     }
 
     /// 切換目前 panel 的 preview 顯示狀態，並回傳切換後的結果。
-    ///
-    /// 參數：無。
-    ///
-    /// 回傳：`bool`；`true` 代表切換後已打開 preview，`false` 代表切換後已關閉。
+    #[allow(dead_code)]
     pub(crate) fn toggle_preview_active(&mut self) -> bool {
-        self.preview_active = !self.preview_active;
-        if self.preview_active {
-            self.preview_scroll = 0;
-            self.preview_search_query = None;
-            self.preview_current_match = None;
-        }
-        self.preview_active
+        self.toggle_preview_open()
     }
 
     /// 重新掃描目前目錄，並同步更新列表與游標位置。
@@ -771,7 +804,7 @@ impl PaneState {
         selected_path: Option<&Path>,
     ) {
         let previous_preview_scroll = self.preview_scroll;
-        let preview_active = self.preview_active;
+        let preview_active = self.preview_open;
         let preview_path = if preview_active {
             self.selected_entry().map(|entry| entry.path.clone())
         } else {
@@ -799,7 +832,7 @@ impl PaneState {
         selected_path: Option<&Path>,
     ) {
         let previous_preview_scroll = self.preview_scroll;
-        let preview_active = self.preview_active;
+        let preview_active = self.preview_open;
         let preview_path = if preview_active {
             self.selected_entry().map(|entry| entry.path.clone())
         } else {
@@ -822,7 +855,7 @@ impl PaneState {
     /// 增量追加載入中的目錄項目，並在保留目前可見游標索引的前提下即時更新畫面。
     pub(crate) fn extend_entries(&mut self, new_entries: Vec<FileEntry>) {
         let previous_preview_scroll = self.preview_scroll;
-        let preview_active = self.preview_active;
+        let preview_active = self.preview_open;
         let preview_path = if preview_active {
             self.selected_entry().map(|entry| entry.path.clone())
         } else {

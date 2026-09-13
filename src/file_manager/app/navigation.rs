@@ -1718,11 +1718,11 @@ impl App {
             self.status = String::from("panel no longer exists");
             return;
         };
-        let preview_active = pane.toggle_preview_active();
+        let preview_open = pane.toggle_preview_open();
         self.pending_g = false;
         self.pending_y = false;
-        self.status = if preview_active {
-            String::from("preview mode")
+        self.status = if preview_open {
+            String::from("preview enabled (press 'l' to focus preview, 'Tab' to close)")
         } else {
             String::from("normal mode")
         };

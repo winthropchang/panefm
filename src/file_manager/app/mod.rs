@@ -3586,8 +3586,36 @@ impl App {
                     label: "page scroll",
                 },
                 StatusShortcutHint {
-                    key: "Tab/q",
+                    key: "h",
+                    label: "list",
+                },
+                StatusShortcutHint {
+                    key: "Tab",
                     label: "close",
+                },
+            ]);
+            return hints;
+        }
+
+        if let Some(pane) = self.panes.get(&self.focused_pane)
+            && pane.is_preview_open()
+        {
+            hints.extend_from_slice(&[
+                StatusShortcutHint {
+                    key: "j/k",
+                    label: "move",
+                },
+                StatusShortcutHint {
+                    key: "l",
+                    label: "preview",
+                },
+                StatusShortcutHint {
+                    key: "Tab",
+                    label: "close preview",
+                },
+                StatusShortcutHint {
+                    key: "q",
+                    label: "quit",
                 },
             ]);
             return hints;

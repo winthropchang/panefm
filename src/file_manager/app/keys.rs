@@ -498,6 +498,18 @@ impl App {
             _ if key_matches_plain_letter(&key, 'l') => {
                 self.clear_pending_count();
                 let pane_id = self.focused_pane;
+                if let Some(pane) = self.panes.get_mut(&pane_id)
+                    && pane.is_preview_open()
+                {
+                    let is_dir = pane.selected_entry().map(|e| e.is_dir).unwrap_or(false);
+                    if !is_dir {
+                        pane.set_preview_focused(true);
+                        self.status = String::from("preview focused (press 'h' to return to list)");
+                        self.pending_g = false;
+                        self.pending_y = false;
+                        return Ok(true);
+                    }
+                }
                 if let Some(entry) = self.panes.get(&pane_id).and_then(|p| p.selected_entry())
                     && entry.is_dir
                     && let Some((task_id, title, progress)) =
@@ -857,7 +869,7 @@ impl App {
                 self.pending_g = false;
                 return Ok(true);
             }
-            self.current_pane_mut()?.set_preview_active(false);
+            self.current_pane_mut()?.set_preview_open(false);
             self.reset_pending_motion_state();
             self.status = String::from("normal mode");
             return Ok(true);
@@ -938,9 +950,9 @@ impl App {
                     self.pending_g = false;
                     return Ok(true);
                 }
-                self.current_pane_mut()?.set_preview_active(false);
+                self.current_pane_mut()?.set_preview_focused(false);
                 self.reset_pending_motion_state();
-                self.status = String::from("normal mode");
+                self.status = String::from("file list (preview open)");
             }
             _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
                 if self.clear_preview_search_if_active() {
@@ -948,9 +960,9 @@ impl App {
                     self.pending_g = false;
                     return Ok(true);
                 }
-                self.current_pane_mut()?.set_preview_active(false);
+                self.current_pane_mut()?.set_preview_focused(false);
                 self.reset_pending_motion_state();
-                self.status = String::from("normal mode");
+                self.status = String::from("file list (preview open)");
             }
             KeyCode::Char('/') => {
                 self.clear_pending_count();

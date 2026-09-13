@@ -209,11 +209,6 @@ pub(crate) fn render_pane(
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
-    let border_style = if focused {
-        theme.focused_border_style()
-    } else {
-        theme.muted_style()
-    };
 
     let filter_suffix = if pane.has_active_filter() {
         "  [filter]"
@@ -238,26 +233,34 @@ pub(crate) fn render_pane(
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
     };
-    let (badge, path_text, suffix) = format_pane_title_parts(
-        pane_id,
-        pane.cwd.as_path(),
-        filter_suffix,
-        &mark_suffix,
-        panel_suffix,
-        &pane.title_mode_label(),
-        area.width.saturating_sub(3) as usize,
-    );
-    let title = render_pane_title_line(&badge, &path_text, &suffix, focused, theme);
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
 
-    let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
-    let preview_content_width = area.width.saturating_sub(2).max(1) as usize;
-    pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
+    let is_side_by_side = pane.is_preview_open() && panel_state.is_none() && area.width >= 60;
+    let (list_area, preview_area) = if is_side_by_side {
+        let list_w = (area.width * 38 / 100).max(22);
+        let prev_w = area.width.saturating_sub(list_w);
+        (
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: list_w,
+                height: area.height,
+            },
+            Some(Rect {
+                x: area.x + list_w,
+                y: area.y,
+                width: prev_w,
+                height: area.height,
+            }),
+        )
+    } else {
+        (area, None)
+    };
 
-    if preview_focused {
+    if preview_area.is_none() && (preview_focused || pane.is_preview_focused()) {
+        let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
+        let preview_content_width = area.width.saturating_sub(2).max(1) as usize;
+        pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
+
         let (preview_title, preview_lines) = match panel_state {
             Some(PaneListState::Search(search_state))
                 if !search_state.results.is_empty() && search_state.preview_query.is_some() =>
@@ -290,14 +293,45 @@ pub(crate) fn render_pane(
         };
         let preview_lines =
             pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
+        let preview_border_style = if focused {
+            theme.focused_border_style()
+        } else {
+            theme.muted_style()
+        };
         let preview = Paragraph::new(preview_lines).block(
             Block::default()
                 .title(preview_title)
                 .borders(Borders::ALL)
-                .border_style(border_style),
+                .border_style(preview_border_style),
         );
         frame.render_widget(preview, area);
         return None;
+    }
+
+    if let Some(prev_rect) = preview_area {
+        let preview_viewport_height = prev_rect.height.saturating_sub(2).max(1) as usize;
+        let preview_content_width = prev_rect.width.saturating_sub(2).max(1) as usize;
+        pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
+
+        let default_preview_title = pane
+            .selected_entry()
+            .map(|entry| pane.preview_title_for_entry(entry))
+            .unwrap_or_else(|| "Preview".to_string());
+        let preview_lines = pane.preview_lines(preview_viewport_height, theme);
+        let preview_lines =
+            pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
+        let preview_border_style = if focused && pane.is_preview_focused() {
+            theme.focused_border_style()
+        } else {
+            theme.muted_style()
+        };
+        let preview = Paragraph::new(preview_lines).block(
+            Block::default()
+                .title(default_preview_title)
+                .borders(Borders::ALL)
+                .border_style(preview_border_style),
+        );
+        frame.render_widget(preview, prev_rect);
     }
 
     // 在清單模式下，若 Pane 處於焦點且非特殊面板，背景預熱當前選取項目與相鄰項目
@@ -305,8 +339,29 @@ pub(crate) fn render_pane(
         pane.prefetch_current_and_adjacent_previews(true);
     }
 
-    let content_width = area.width.saturating_sub(4) as usize;
-    let list_viewport_height = area.height.saturating_sub(2).max(1) as usize;
+    let list_focused = focused && !pane.is_preview_focused();
+    let (badge, path_text, suffix) = format_pane_title_parts(
+        pane_id,
+        pane.cwd.as_path(),
+        filter_suffix,
+        &mark_suffix,
+        panel_suffix,
+        &pane.title_mode_label(),
+        list_area.width.saturating_sub(3) as usize,
+    );
+    let title = render_pane_title_line(&badge, &path_text, &suffix, list_focused, theme);
+    let list_border_style = if list_focused {
+        theme.focused_border_style()
+    } else {
+        theme.muted_style()
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(list_border_style);
+
+    let content_width = list_area.width.saturating_sub(4) as usize;
+    let list_viewport_height = list_area.height.saturating_sub(2).max(1) as usize;
     pane.set_list_viewport_height(list_viewport_height);
     // 一般檔案列表只建立目前 viewport 內的 widget。大型目錄可能有數萬筆項目，
     // 若每一幀仍替畫面外項目配置空白 ListItem，單次 j/k 也會產生 O(n) 配置並卡住。
@@ -516,7 +571,7 @@ pub(crate) fn render_pane(
             }
             _ => {}
         }
-        frame.render_stateful_widget(list, area, &mut list_state);
+        frame.render_stateful_widget(list, list_area, &mut list_state);
     } else {
         if let Some(window_start) = normal_list_window_start {
             // 傳給 ratatui 的 items 已是局部 viewport，因此 selected 也必須轉成局部索引。
@@ -524,20 +579,20 @@ pub(crate) fn render_pane(
             // 因虛擬化而改變語意。
             let mut viewport_state = ListState::default();
             viewport_state.select(Some(pane.selected.saturating_sub(window_start)));
-            frame.render_stateful_widget(list, area, &mut viewport_state);
+            frame.render_stateful_widget(list, list_area, &mut viewport_state);
             pane.list_state.select(Some(pane.selected));
             *pane.list_state.offset_mut() = window_start;
         } else {
-            frame.render_stateful_widget(list, area, &mut pane.list_state);
+            frame.render_stateful_widget(list, list_area, &mut pane.list_state);
         }
     }
 
     let mut editor_cursor = None;
     if let Some(state) = editor_state {
-        editor_cursor = render_inline_editor(frame, area, pane, theme, state);
+        editor_cursor = render_inline_editor(frame, list_area, pane, theme, state);
     }
     if let Some(state) = picker_state {
-        render_inline_picker(frame, area, pane, theme, state);
+        render_inline_picker(frame, list_area, pane, theme, state);
     }
 
     let panel_cursor = match panel_state {
@@ -548,7 +603,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             "Trash Search",
             search,
@@ -562,7 +617,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             if custom_title.is_some() {
                 "Cheatsheet Search"
@@ -579,7 +634,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             "Task Search",
             search,
@@ -587,7 +642,7 @@ pub(crate) fn render_pane(
         )),
         _ if list_find_editing => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             "Find next",
             list_find_buffer.unwrap_or_default(),
@@ -596,7 +651,11 @@ pub(crate) fn render_pane(
         _ => None,
     };
 
-    editor_cursor.or(panel_cursor)
+    if focused && pane.is_preview_focused() {
+        None
+    } else {
+        editor_cursor.or(panel_cursor)
+    }
 }
 
 /// 回傳搜尋列表在尚未收到任何結果時應顯示的提示文字。
