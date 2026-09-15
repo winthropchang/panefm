@@ -2,8 +2,9 @@ use super::{
     FileCategory, IconStyle, SearchListState, TaskPanelLine, entry_icon, file_category,
     format_diff_path_column, format_pane_title, format_permissions_detail, format_size_short,
     format_sort_detail, regex_rename_status_style, render_entry_line, render_pane_title_line,
-    search_empty_message, search_list_selected_index, task_panel_display_lines,
-    top_right_input_rect, truncate_text_to_display_width, visible_list_window_range,
+    render_update_badge, search_empty_message, search_list_selected_index,
+    task_panel_display_lines, top_right_input_rect, truncate_text_to_display_width,
+    visible_list_window_range,
 };
 use ratatui::layout::Rect;
 use std::path::Path;
@@ -641,4 +642,54 @@ fn scrolled_input_handles_overflow_and_cursor_tracking() {
     assert!(text_mid.starts_with(":<"));
     assert!(text_mid.ends_with('>'));
     assert!(view_mid.cursor_col < 25);
+}
+
+#[test]
+/// 驗證更新提示膠囊徽章在不同寬度下的自適應文字與高對比黃底紅字配色。
+/// 保護目的：確保提示能於不同 pane 寬度優雅縮放，且配色固定為黃底紅字（易於一眼辨識）。
+fn render_update_badge_adapts_to_widths_and_styles() {
+    use ratatui::style::{Color, Modifier};
+
+    // 1. 完整版（寬度 >= 55）
+    let badge_full = render_update_badge("0.1.15", false, 60).expect("full badge");
+    let full_text: String = badge_full
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(full_text.contains("新版 v0.1.15 可用！按 :update 升級"));
+
+    // 檢查高對比配色：黃底 (255, 220, 0)、紅字 (180, 0, 0)、粗體
+    let span = &badge_full.spans[0];
+    assert_eq!(span.style.bg, Some(Color::Rgb(255, 220, 0)));
+    assert_eq!(span.style.fg, Some(Color::Rgb(180, 0, 0)));
+    assert!(span.style.add_modifier.contains(Modifier::BOLD));
+
+    // 2. 中等版（35 <= 寬度 < 55）
+    let badge_mid = render_update_badge("0.1.15", false, 40).expect("mid badge");
+    let mid_text: String = badge_mid.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(mid_text.contains("v0.1.15 :update"));
+
+    // 3. 精簡版（20 <= 寬度 < 35）
+    let badge_compact = render_update_badge("0.1.15", false, 25).expect("compact badge");
+    let compact_text: String = badge_compact
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(compact_text.contains("v0.1.15"));
+    assert!(!compact_text.contains(":update"));
+
+    // 4. 超窄寬度（寬度 < 20）：自動隱藏避免破版
+    assert!(render_update_badge("0.1.15", false, 15).is_none());
+
+    // 5. 更新中狀態（is_updating = true）
+    let badge_updating = render_update_badge("0.1.15", true, 30).expect("updating badge");
+    let updating_text: String = badge_updating
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(updating_text.contains("升級中"));
+    assert!(render_update_badge("0.1.15", true, 10).is_none());
 }

@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Local};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -206,6 +206,7 @@ pub(crate) fn render_pane(
     text_input_cursor: usize,
     active_job_badges: &std::collections::HashMap<std::path::PathBuf, String>,
     easymotion_labels: Option<&[(char, usize)]>,
+    update_badge: Option<(&str, bool)>,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
@@ -355,10 +356,17 @@ pub(crate) fn render_pane(
     } else {
         theme.muted_style()
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(list_border_style);
+
+    if let Some((latest_ver, is_updating)) = update_badge
+        && focused
+        && let Some(badge_line) = render_update_badge(latest_ver, is_updating, list_area.width)
+    {
+        block = block.title(badge_line.alignment(Alignment::Right));
+    }
 
     let content_width = list_area.width.saturating_sub(4) as usize;
     let list_viewport_height = list_area.height.saturating_sub(2).max(1) as usize;
@@ -846,6 +854,47 @@ pub(crate) fn render_pane_title_line(
     }
 
     Line::from(spans)
+}
+
+/// 建立頂部更新提示膠囊徽章（高對比黃底紅字）。
+pub(crate) fn render_update_badge(
+    latest_version: &str,
+    is_updating: bool,
+    available_width: u16,
+) -> Option<Line<'static>> {
+    let badge_style = Style::default()
+        .fg(ratatui::style::Color::Rgb(180, 0, 0))
+        .bg(ratatui::style::Color::Rgb(255, 220, 0))
+        .add_modifier(Modifier::BOLD);
+
+    if is_updating {
+        if available_width >= 20 {
+            return Some(Line::from(vec![Span::styled(
+                " [ ⏳ 升級中... ] ".to_string(),
+                badge_style,
+            )]));
+        }
+        return None;
+    }
+
+    if available_width >= 55 {
+        Some(Line::from(vec![Span::styled(
+            format!(" [ 🚀 新版 v{latest_version} 可用！按 :update 升級 ] "),
+            badge_style,
+        )]))
+    } else if available_width >= 35 {
+        Some(Line::from(vec![Span::styled(
+            format!(" [ 🚀 v{latest_version} :update ] "),
+            badge_style,
+        )]))
+    } else if available_width >= 20 {
+        Some(Line::from(vec![Span::styled(
+            format!(" [ 🚀 v{latest_version} ] "),
+            badge_style,
+        )]))
+    } else {
+        None
+    }
 }
 
 /// 將多個標題狀態片段去掉前後空白後重新用單一空格組合，避免出現多餘空隙。

@@ -267,6 +267,14 @@ pub(crate) struct QueuedLaunch {
     pub(crate) launch: LaunchSpec,
 }
 
+/// 描述目前已知可升級的新版本資訊（用於渲染頂部黃底紅字徽章）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpdateBadgeInfo {
+    pub(crate) latest_version: String,
+    pub(crate) download_url: String,
+    pub(crate) asset_name: String,
+}
+
 /// 描述一次 UNC 網路路徑背景跳轉的完成訊息。
 ///
 /// worker 會在主執行緒之外複製並載入 [`PaneState`]；主迴圈收到結果後，只有在
@@ -658,6 +666,14 @@ pub(crate) struct App {
     pub(crate) full_redraw_requested: bool,
     /// 記錄最近一次 render 時 panels 所分配到的區域（不含頂部 tabs 與底部 status/hint）。
     pub(crate) latest_pane_area: Option<Rect>,
+    /// 描述目前已知可升級的新版本資訊（用於渲染頂部黃底紅字徽章）。
+    pub(crate) update_badge_info: Option<UpdateBadgeInfo>,
+    /// 背景版本檢查接收端。
+    pub(crate) update_check_rx: Option<Receiver<crate::updater::UpdateCheckResult>>,
+    /// 內部就地升級工作接收端：回傳 `Ok(version)` 或 `Err(error_message)`。
+    pub(crate) in_app_update_rx: Option<Receiver<Result<String, String>>>,
+    /// 目前是否正在下載與安裝更新。
+    pub(crate) in_app_updating: bool,
 }
 
 /// 記錄 F1 help 關閉後應回復到哪一種互動上下文。
@@ -804,6 +820,43 @@ impl App {
             startup_status = format!("{startup_status}; {warning}");
         }
 
+        let (update_badge_info, update_check_rx) = {
+            let cache = crate::updater::load_update_cache(None);
+            let current_version = env!("CARGO_PKG_VERSION");
+            let badge_info = cache.as_ref().and_then(|c| {
+                if crate::updater::is_newer_version(&c.latest_version, current_version) {
+                    Some(UpdateBadgeInfo {
+                        latest_version: c.latest_version.clone(),
+                        download_url: c.download_url.clone(),
+                        asset_name: c.asset_name.clone(),
+                    })
+                } else {
+                    None
+                }
+            });
+
+            #[cfg(not(test))]
+            let rx = {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if crate::updater::should_check_remote(
+                    cache.as_ref(),
+                    now_secs,
+                    crate::updater::DEFAULT_CHECK_INTERVAL_SECS,
+                ) {
+                    Some(crate::updater::spawn_background_update_check(5, None))
+                } else {
+                    None
+                }
+            };
+            #[cfg(test)]
+            let rx = None;
+
+            (badge_info, rx)
+        };
+
         let app = Self {
             config,
             config_source,
@@ -858,6 +911,10 @@ impl App {
             filesystem_refresh_deadline: None,
             full_redraw_requested: false,
             latest_pane_area: None,
+            update_badge_info,
+            update_check_rx,
+            in_app_update_rx: None,
+            in_app_updating: false,
         };
         if recovered_interrupted_tasks > 0 {
             save_task_history(&app.task_history_path, &app.task_log)?;
@@ -1222,6 +1279,17 @@ impl App {
                     }) if *action_pane_id == pane_id => Some(labels.as_slice()),
                     _ => None,
                 };
+                let update_badge = if pane_id == self.focused_pane {
+                    if self.in_app_updating {
+                        Some(("...", true))
+                    } else {
+                        self.update_badge_info
+                            .as_ref()
+                            .map(|info| (info.latest_version.as_str(), false))
+                    }
+                } else {
+                    None
+                };
                 let pane_cursor = render_pane(
                     frame,
                     rect,
@@ -1248,6 +1316,7 @@ impl App {
                     self.text_input_cursor,
                     &active_job_badges,
                     easymotion_labels,
+                    update_badge,
                 );
                 if cursor_position.is_none() {
                     cursor_position = pane_cursor;
@@ -4218,6 +4287,12 @@ pub(crate) fn help_entries(query: &str) -> Vec<HelpEntry> {
             "",
             "顯示 fd、fzf、rg、zoxide 是否已安裝並可從系統 PATH 使用",
             HelpAction::Command("status"),
+        ),
+        help_entry(
+            ":update",
+            "",
+            "檢查 GitHub 最新版本並原地自動下載替換執行檔",
+            HelpAction::Command("update"),
         ),
         help_entry(
             ":trash undo",

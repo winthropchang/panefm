@@ -8,8 +8,10 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use panefm::updater::{
-    CliCommand, LaunchArgs, UpdateCheckResult, UpdateError, match_platform_asset, parse_cli_args,
-    parse_cli_command, parse_latest_release,
+    CliCommand, LaunchArgs, UpdateCheckResult, UpdateError, UpdateStateCache,
+    default_update_cache_path, is_newer_version, load_update_cache, match_platform_asset,
+    parse_cli_args, parse_cli_command, parse_latest_release, save_update_cache,
+    should_check_remote,
 };
 
 #[test]
@@ -237,4 +239,129 @@ fn update_error_display_formatting_is_friendly_and_actionable() {
     let platform_msg = platform_err.to_string();
     assert!(platform_msg.contains("solaris sparc"));
     assert!(platform_msg.contains("尚未提供自動更新資產"));
+}
+
+#[test]
+/// 驗證 `is_newer_version` 能正確依據 SemVer 判斷最新版本是否更新於當前版本。
+/// 保護目的：確保新版能被識別，相同版本或舊版不會觸發更新徽章或重複安裝。
+fn is_newer_version_comparison_logic() {
+    // 新版本大於當前版本
+    assert!(is_newer_version("0.1.15", "0.1.14"));
+    assert!(is_newer_version("v0.1.15", "0.1.14"));
+    assert!(is_newer_version("1.0.0", "0.9.9"));
+    assert!(is_newer_version("v1.0.0", "v0.9.9"));
+
+    // 相同版本或當前版本較新
+    assert!(!is_newer_version("0.1.14", "0.1.14"));
+    assert!(!is_newer_version("v0.1.14", "0.1.14"));
+    assert!(!is_newer_version("0.1.13", "0.1.14"));
+    assert!(!is_newer_version("v0.1.13", "v0.1.14"));
+
+    // 非法字串安全回傳 false，絕不 panic
+    assert!(!is_newer_version("invalid", "0.1.14"));
+    assert!(!is_newer_version("0.1.15", "invalid"));
+    assert!(!is_newer_version("", ""));
+}
+
+#[test]
+/// 驗證 `should_check_remote` 具備 24 小時冷卻期控制。
+/// 保護目的：避免每次開機或頻繁重啟皆連線 GitHub API 導致 403 Rate Limit。
+fn should_check_remote_cooldown_rules() {
+    let now = 1_000_000u64;
+    let interval = 86400u64; // 24 小時
+
+    // 無本機快取：必須發起檢查
+    assert!(should_check_remote(None, now, interval));
+
+    // 快取時間距今未滿 24 小時：不檢查
+    let fresh_cache = UpdateStateCache {
+        last_check_timestamp: now - 3600, // 1 小時前
+        latest_version: "0.1.14".to_string(),
+        asset_name: String::new(),
+        download_url: String::new(),
+    };
+    assert!(!should_check_remote(Some(&fresh_cache), now, interval));
+
+    // 快取時間恰好滿 24 小時：發起檢查
+    let exact_cache = UpdateStateCache {
+        last_check_timestamp: now - 86400,
+        latest_version: "0.1.14".to_string(),
+        asset_name: String::new(),
+        download_url: String::new(),
+    };
+    assert!(should_check_remote(Some(&exact_cache), now, interval));
+
+    // 快取時間超過 24 小時：發起檢查
+    let old_cache = UpdateStateCache {
+        last_check_timestamp: now - 100_000,
+        latest_version: "0.1.14".to_string(),
+        asset_name: String::new(),
+        download_url: String::new(),
+    };
+    assert!(should_check_remote(Some(&old_cache), now, interval));
+
+    // 時間倒流（系統時間被調回過去）：安全防禦不崩潰
+    let future_cache = UpdateStateCache {
+        last_check_timestamp: now + 3600,
+        latest_version: "0.1.14".to_string(),
+        asset_name: String::new(),
+        download_url: String::new(),
+    };
+    assert!(!should_check_remote(Some(&future_cache), now, interval));
+}
+
+#[test]
+/// 驗證本地更新狀態快取存取（save/load）的完整性。
+/// 保護目的：確保快取寫入與讀取時 JSON 序列化欄位無損、結構正確。
+fn update_cache_save_and_load_roundtrip() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let cache_file = temp_dir.path().join(".panefm_update.json");
+
+    let cache = UpdateStateCache {
+        last_check_timestamp: 1_700_000_000,
+        latest_version: "0.1.15".to_string(),
+        asset_name: "panefm-macos-arm64".to_string(),
+        download_url:
+            "https://github.com/winthropchang/panefm/releases/download/v0.1.15/panefm-macos-arm64"
+                .to_string(),
+    };
+
+    // 儲存快取
+    let saved_path = save_update_cache(&cache, Some(&cache_file)).expect("save cache");
+    assert_eq!(saved_path, cache_file);
+    assert!(cache_file.exists());
+
+    // 載入快取
+    let loaded = load_update_cache(Some(&cache_file)).expect("load cache");
+    assert_eq!(loaded.last_check_timestamp, 1_700_000_000);
+    assert_eq!(loaded.latest_version, "0.1.15");
+    assert_eq!(loaded.asset_name, "panefm-macos-arm64");
+    assert_eq!(
+        loaded.download_url,
+        "https://github.com/winthropchang/panefm/releases/download/v0.1.15/panefm-macos-arm64"
+    );
+}
+
+#[test]
+/// 驗證快取檔案毀損或不存在時能優雅處理，回傳 None 而不崩潰。
+/// 保護目的：使用者或外部工具損壞 .panefm_update.json 時仍能正常啟動。
+fn update_cache_corrupt_or_missing_handling() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let missing_file = temp_dir.path().join("non_existent.json");
+    assert!(load_update_cache(Some(&missing_file)).is_none());
+
+    let corrupt_file = temp_dir.path().join(".panefm_update.json");
+    std::fs::write(&corrupt_file, "{ broken json ...").expect("write broken json");
+    assert!(load_update_cache(Some(&corrupt_file)).is_none());
+}
+
+#[test]
+/// 驗證預設快取路徑符合 `.panefm_update.json` 命名。
+/// 保護目的：確保快取命名統一且放置於執行檔旁。
+fn default_update_cache_path_format() {
+    let path = default_update_cache_path();
+    assert_eq!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(".panefm_update.json")
+    );
 }
