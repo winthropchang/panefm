@@ -132,6 +132,8 @@ pub(crate) struct PaneState {
     pub(crate) preview_focused: bool,
     /// 目前 preview 在內容中的捲動偏移量。
     pub(crate) preview_scroll: usize,
+    /// 目前 preview 游標所在行號（0-indexed）。
+    pub(crate) preview_cursor: usize,
     /// 目前 preview 區實際可顯示的欄位寬度與列數，供縮圖縮放與捲動邏輯計算上下界。
     pub(crate) preview_viewport_width: usize,
     pub(crate) preview_viewport_height: usize,
@@ -303,6 +305,7 @@ impl PaneState {
             preview_open: false,
             preview_focused: false,
             preview_scroll: 0,
+            preview_cursor: 0,
             preview_viewport_width: 80,
             preview_viewport_height: 4,
             preview_image_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -363,6 +366,7 @@ impl PaneState {
         self.preview_open = !self.preview_open;
         if self.preview_open {
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
             self.preview_search_query = None;
             self.preview_current_match = None;
             self.preview_focused = false;
@@ -468,6 +472,7 @@ impl PaneState {
             self.selected = new_selected;
             self.list_state.select(Some(self.selected));
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
         }
     }
 
@@ -488,6 +493,7 @@ impl PaneState {
             self.selected = new_selected;
             self.list_state.select(Some(self.selected));
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
         }
     }
 
@@ -505,6 +511,7 @@ impl PaneState {
             self.selected = 0;
             self.list_state.select(Some(self.selected));
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
         }
     }
 
@@ -523,6 +530,7 @@ impl PaneState {
             self.selected = target;
             self.list_state.select(Some(self.selected));
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
         }
     }
 
@@ -588,6 +596,7 @@ impl PaneState {
             self.selected = target;
             self.list_state.select(Some(self.selected));
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
         }
     }
 
@@ -829,6 +838,7 @@ impl PaneState {
         selected_path: Option<&Path>,
     ) {
         let previous_preview_scroll = self.preview_scroll;
+        let previous_preview_cursor = self.preview_cursor;
         let preview_active = self.preview_open;
         let preview_path = if preview_active {
             self.selected_entry().map(|entry| entry.path.clone())
@@ -845,6 +855,7 @@ impl PaneState {
             self.select_path(path);
             if self.selected_entry().map(|e| &e.path) == Some(path) {
                 self.preview_scroll = previous_preview_scroll;
+                self.preview_cursor = previous_preview_cursor;
                 self.clamp_preview_scroll();
             }
         }
@@ -857,6 +868,7 @@ impl PaneState {
         selected_path: Option<&Path>,
     ) {
         let previous_preview_scroll = self.preview_scroll;
+        let previous_preview_cursor = self.preview_cursor;
         let preview_active = self.preview_open;
         let preview_path = if preview_active {
             self.selected_entry().map(|entry| entry.path.clone())
@@ -872,6 +884,7 @@ impl PaneState {
             self.select_path(path);
             if self.selected_entry().map(|e| &e.path) == Some(path) {
                 self.preview_scroll = previous_preview_scroll;
+                self.preview_cursor = previous_preview_cursor;
                 self.clamp_preview_scroll();
             }
         }
@@ -880,6 +893,7 @@ impl PaneState {
     /// 增量追加載入中的目錄項目，並在保留目前可見游標索引的前提下即時更新畫面。
     pub(crate) fn extend_entries(&mut self, new_entries: Vec<FileEntry>) {
         let previous_preview_scroll = self.preview_scroll;
+        let previous_preview_cursor = self.preview_cursor;
         let preview_active = self.preview_open;
         let preview_path = if preview_active {
             self.selected_entry().map(|entry| entry.path.clone())
@@ -893,6 +907,7 @@ impl PaneState {
             self.select_path(path);
             if self.selected_entry().map(|e| &e.path) == Some(path) {
                 self.preview_scroll = previous_preview_scroll;
+                self.preview_cursor = previous_preview_cursor;
                 self.clamp_preview_scroll();
             }
         }
@@ -953,12 +968,16 @@ impl PaneState {
         // 目錄、圖片、壓縮包維持原有快速分流
         if entry.is_dir || is_image || is_archive {
             let needed_lines = self.preview_scroll + max_lines;
-            return self
+            let lines = self
                 .raw_preview_content_lines_limited(needed_lines)
                 .into_iter()
                 .skip(self.preview_scroll)
                 .take(max_lines)
                 .collect();
+            if is_image {
+                return lines;
+            }
+            return self.apply_preview_cursor_highlight(lines, theme);
         }
 
         let start_line = self.preview_scroll;
@@ -1024,7 +1043,7 @@ impl PaneState {
         };
 
         self.prefetch_adjacent_previews();
-        result_lines
+        self.apply_preview_cursor_highlight(result_lines, theme)
     }
 
     /// 更新 preview 區目前實際可顯示的欄位寬度與高度。
@@ -1041,25 +1060,113 @@ impl PaneState {
         }
     }
 
+    /// 回傳目前 preview 內容的總行數。
+    pub(crate) fn preview_total_lines(&self) -> usize {
+        let Some(entry) = self.selected_entry() else {
+            return 0;
+        };
+
+        let ext = entry.path.extension().and_then(|e| e.to_str());
+        let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
+        if is_image {
+            if let Ok(guard) = self.preview_image_cache.lock()
+                && let Some(c) = guard.as_ref()
+                && c.path == entry.path
+            {
+                return c.lines.len();
+            }
+            return 0;
+        }
+
+        if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.get(
+                &entry.path,
+                Some(entry.modified),
+                self.preview_viewport_width,
+            )
+        {
+            cache.total_lines
+        } else {
+            let _ = self.raw_preview_content_lines_limited(40);
+            if let Ok(guard) = self.preview_content_cache.lock()
+                && let Some(cache) = guard.get(
+                    &entry.path,
+                    Some(entry.modified),
+                    self.preview_viewport_width,
+                )
+            {
+                cache.total_lines
+            } else {
+                1
+            }
+        }
+    }
+
     /// 將 preview 向下捲動指定列數。
     pub(crate) fn scroll_preview_down(&mut self, lines: usize) {
         let max_scroll = self.max_preview_scroll();
-        self.preview_scroll = (self.preview_scroll + lines).min(max_scroll);
+        let total = self.preview_total_lines();
+        if self.preview_scroll < max_scroll {
+            let new_scroll = (self.preview_scroll + lines).min(max_scroll);
+            let delta = new_scroll - self.preview_scroll;
+            self.preview_scroll = new_scroll;
+            let remaining = lines.saturating_sub(delta);
+            self.preview_cursor = (self.preview_scroll + remaining).min(total.saturating_sub(1));
+        } else {
+            self.preview_cursor = (self.preview_cursor + lines).min(total.saturating_sub(1));
+        }
     }
 
     /// 將 preview 向上捲動指定列數。
     pub(crate) fn scroll_preview_up(&mut self, lines: usize) {
-        self.preview_scroll = self.preview_scroll.saturating_sub(lines);
+        if self.preview_cursor > self.preview_scroll {
+            let in_view_delta = self.preview_cursor - self.preview_scroll;
+            if lines <= in_view_delta {
+                self.preview_cursor -= lines;
+                return;
+            }
+            self.preview_cursor = self.preview_scroll;
+            let remaining = lines - in_view_delta;
+            self.preview_scroll = self.preview_scroll.saturating_sub(remaining);
+            self.preview_cursor = self.preview_scroll;
+        } else {
+            self.preview_scroll = self.preview_scroll.saturating_sub(lines);
+            self.preview_cursor = self.preview_scroll;
+        }
     }
 
     /// 將 preview 捲到最上方。
     pub(crate) fn scroll_preview_top(&mut self) {
         self.preview_scroll = 0;
+        self.preview_cursor = 0;
     }
 
     /// 將 preview 捲到最下方。
     pub(crate) fn scroll_preview_bottom(&mut self) {
         self.preview_scroll = self.max_preview_scroll();
+        let total = self.preview_total_lines();
+        self.preview_cursor = total.saturating_sub(1);
+    }
+
+    /// 將 preview 游標跳至指定行號（1-indexed）。
+    pub(crate) fn move_preview_cursor_to_line(&mut self, line_1_indexed: usize) {
+        let total = self.preview_total_lines();
+        if total == 0 {
+            self.preview_cursor = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        let target_0_indexed = line_1_indexed
+            .saturating_sub(1)
+            .min(total.saturating_sub(1));
+        self.preview_cursor = target_0_indexed;
+        let viewport_height = self.preview_viewport_height.max(1);
+        if self.preview_cursor < self.preview_scroll {
+            self.preview_scroll = self.preview_cursor;
+        } else if self.preview_cursor >= self.preview_scroll + viewport_height {
+            self.preview_scroll = self.preview_cursor.saturating_sub(viewport_height - 1);
+        }
+        self.clamp_preview_scroll();
     }
 
     /// 依照目前 viewport 高度向下翻半頁。
@@ -1107,82 +1214,38 @@ impl PaneState {
             return self.preview_scroll < self.max_preview_scroll();
         }
 
-        let Some(entry) = self.selected_entry() else {
-            return false;
-        };
-
-        let ext = entry.path.extension().and_then(|e| e.to_str());
-        let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
-        if is_image {
-            let viewport_height = self.preview_viewport_height.max(1);
-            if let Ok(guard) = self.preview_image_cache.lock()
-                && let Some(c) = guard.as_ref()
-                && c.path == entry.path
-            {
-                return self.preview_scroll + viewport_height < c.lines.len();
-            }
-            return false;
-        }
-
         let viewport_height = self.preview_viewport_height.max(1);
-        if let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.get(
-                &entry.path,
-                Some(entry.modified),
-                self.preview_viewport_width,
-            )
-        {
-            return self.preview_scroll + viewport_height < cache.total_lines;
-        }
-
-        let needed_lines = self.preview_scroll + viewport_height + 1;
-        let total_loaded_lines = self.raw_preview_content_lines_limited(needed_lines).len();
-        total_loaded_lines > self.preview_scroll + viewport_height
+        let total = self.preview_total_lines();
+        self.preview_scroll + viewport_height < total
     }
 
     /// 回傳完整 preview 內容最多可以向下捲到哪一列。
     fn max_preview_scroll(&self) -> usize {
-        let Some(entry) = self.selected_entry() else {
-            return 0;
-        };
+        self.preview_total_lines()
+            .saturating_sub(self.preview_viewport_height.max(1))
+    }
 
-        let ext = entry.path.extension().and_then(|e| e.to_str());
-        let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
-        if is_image {
-            if let Ok(guard) = self.preview_image_cache.lock()
-                && let Some(c) = guard.as_ref()
-                && c.path == entry.path
-            {
-                return c
-                    .lines
-                    .len()
-                    .saturating_sub(self.preview_viewport_height.max(1));
-            }
-            return 0;
-        }
+    /// 為目前可見預覽行套用游標所在行的高亮（背景色與行號強調）。
+    fn apply_preview_cursor_highlight(
+        &self,
+        lines: Vec<Line<'static>>,
+        theme: Theme,
+    ) -> Vec<Line<'static>> {
+        let start_line = self.preview_scroll;
+        let cursor_line = self.preview_cursor;
 
-        let total_lines = if let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.get(
-                &entry.path,
-                Some(entry.modified),
-                self.preview_viewport_width,
-            ) {
-            cache.total_lines
-        } else {
-            let _ = self.raw_preview_content_lines_limited(40);
-            if let Ok(guard) = self.preview_content_cache.lock()
-                && let Some(cache) = guard.get(
-                    &entry.path,
-                    Some(entry.modified),
-                    self.preview_viewport_width,
-                )
-            {
-                cache.total_lines
-            } else {
-                1
-            }
-        };
-        total_lines.saturating_sub(self.preview_viewport_height.max(1))
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(offset, line)| {
+                let global_idx = start_line + offset;
+                if global_idx == cursor_line {
+                    highlight_cursor_line(line, theme)
+                } else {
+                    line
+                }
+            })
+            .collect()
     }
 
     /// 產生目前選取項目的完整 preview 內容，供捲動切片與上下界計算使用。
@@ -1560,9 +1623,15 @@ impl PaneState {
         }
     }
 
-    /// 當列表或 viewport 發生變化時，把 preview 捲動位置壓回合法範圍。
+    /// 當列表或 viewport 發生變化時，把 preview 捲動位置與游標壓回合法範圍。
     fn clamp_preview_scroll(&mut self) {
         self.preview_scroll = self.preview_scroll.min(self.max_preview_scroll());
+        let total = self.preview_total_lines();
+        if total > 0 {
+            self.preview_cursor = self.preview_cursor.min(total.saturating_sub(1));
+        } else {
+            self.preview_cursor = 0;
+        }
     }
 
     /// 對 preview 內容套用搜尋條件，並跳到第一個命中的結果。
@@ -1576,10 +1645,12 @@ impl PaneState {
 
         if self.preview_search_query.is_some() {
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
             self.preview_current_match = None;
             self.jump_to_preview_match(true);
         } else {
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
             self.preview_current_match = None;
         }
     }
@@ -2952,6 +3023,29 @@ fn is_preview_searchable_line(text: &str) -> bool {
             .is_some_and(char::is_whitespace)
 }
 
+/// 將預覽中游標所在行套用高亮：首個數字行號套用 accent 粗體，其餘 span 套用 preview_current_line_bg。
+fn highlight_cursor_line(line: Line<'static>, theme: Theme) -> Line<'static> {
+    if line.spans.is_empty() {
+        return Line::from(vec![Span::styled(" ", theme.preview_current_line_style())]);
+    }
+    let styled_spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .enumerate()
+        .map(|(span_idx, span)| {
+            let mut style = span.style.bg(theme.preview_current_line_bg);
+            let trimmed = span.content.trim();
+            if span_idx == 0 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+            }
+            Span::styled(span.content, style)
+        })
+        .collect();
+    let mut res = Line::from(styled_spans);
+    res.alignment = line.alignment;
+    res
+}
+
 /// 將單一 preview `Line` 套用搜尋高亮，並完整保留原本的語法高亮色彩與樣式。
 fn highlight_preview_line(
     line: Line<'static>,
@@ -2968,8 +3062,16 @@ fn highlight_preview_line(
             let styled_spans: Vec<_> = line
                 .spans
                 .into_iter()
-                .map(|span| {
-                    let style = span.style.bg(theme.preview_current_line_bg);
+                .enumerate()
+                .map(|(span_idx, span)| {
+                    let mut style = span.style.bg(theme.preview_current_line_bg);
+                    let trimmed = span.content.trim();
+                    if span_idx == 0
+                        && !trimmed.is_empty()
+                        && trimmed.chars().all(|c| c.is_ascii_digit())
+                    {
+                        style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+                    }
                     Span::styled(span.content, style)
                 })
                 .collect();
@@ -3013,14 +3115,19 @@ fn highlight_preview_line(
     let mut new_spans = Vec::new();
     let mut span_global_offset = 0usize;
 
-    for span in line.spans {
+    for (span_idx, span) in line.spans.into_iter().enumerate() {
         let span_len = span.content.len();
         let span_start = span_global_offset;
         let span_end = span_global_offset + span_len;
         span_global_offset = span_end;
 
         let base_style = if is_current_line {
-            span.style.bg(theme.preview_current_line_bg)
+            let mut style = span.style.bg(theme.preview_current_line_bg);
+            let trimmed = span.content.trim();
+            if span_idx == 0 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+            }
+            style
         } else {
             span.style
         };

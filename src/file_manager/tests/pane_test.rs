@@ -23,6 +23,7 @@ use super::{
 use crate::file_manager::entry::FileEntry;
 use crate::file_manager::search::GlobalSearchEntry;
 use crate::theme::Theme;
+use ratatui::style::Modifier;
 
 #[test]
 /// 驗證 pane 重新載入目錄時，資料夾會排在檔案前面。
@@ -1348,6 +1349,128 @@ fn pane_state_search_preview_marks_current_match_line() {
             .iter()
             .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
     }));
+}
+
+#[test]
+/// 驗證一般檔案 preview 會依據 preview_cursor 將游標所在行標示高亮與粗體行號。
+/// 保護目的：確保 preview mode 游標移動時，使用者能明確識別目前聚焦在檔案哪一行。
+fn pane_state_preview_lines_highlights_cursor_line() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("source.rs");
+    fs::write(
+        &path,
+        "fn main() {\n    let a = 10;\n    let b = 20;\n    println!(\"{}\", a + b);\n}\n",
+    )
+    .expect("write source.rs");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(5);
+    pane.set_preview_viewport_size(60, 5);
+
+    let theme = Theme::default();
+
+    // 1. 預設游標在第 0 行（行號 1）
+    let lines = pane.preview_lines(5, theme);
+    assert_eq!(lines.len(), 5);
+
+    // 第 0 行應有 preview_current_line_bg，且行號 span 應為 accent 色與 BOLD 樣式
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    let first_line_num_span = &lines[0].spans[0];
+    assert_eq!(first_line_num_span.style.fg, Some(theme.accent));
+    assert!(
+        first_line_num_span
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+
+    // 第 1 行不應有 preview_current_line_bg，行號亦非 accent
+    assert!(
+        !lines[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    assert_ne!(lines[1].spans[0].style.fg, Some(theme.accent));
+
+    // 2. 游標移動到第 2 行（行號 3）
+    pane.move_preview_cursor_to_line(3);
+    assert_eq!(pane.preview_cursor, 2);
+
+    let lines_after = pane.preview_lines(5, theme);
+    // 第 0 行不再是焦點
+    assert!(
+        !lines_after[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    // 第 2 行（行號 3）成為焦點
+    assert!(
+        lines_after[2]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    let target_line_num_span = &lines_after[2].spans[0];
+    assert_eq!(target_line_num_span.style.fg, Some(theme.accent));
+    assert!(
+        target_line_num_span
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+}
+
+#[test]
+/// 驗證短檔案在未達捲動門檻時，preview_cursor 仍可自由向下與向上移動。
+/// 保護目的：避免短檔案因 max_scroll 為 0 而使游標永遠鎖死在第一行。
+fn pane_state_short_file_preview_cursor_moves_freely() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("short.txt");
+    fs::write(&path, "one\ntwo\nthree\n").expect("write short.txt");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(60, 10);
+
+    let theme = Theme::default();
+
+    // 初始游標在第 0 行
+    assert_eq!(pane.preview_cursor, 0);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 向下移動 1 行
+    pane.scroll_preview_down(1);
+    assert_eq!(pane.preview_cursor, 1);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 再次向下移動 1 行
+    pane.scroll_preview_down(1);
+    assert_eq!(pane.preview_cursor, 2);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 再往下不能超出總行數（3 行，最大 cursor 為 2）
+    pane.scroll_preview_down(1);
+    assert_eq!(pane.preview_cursor, 2);
+
+    // 向上移動 1 行
+    pane.scroll_preview_up(1);
+    assert_eq!(pane.preview_cursor, 1);
+
+    // 驗證當前行有高亮
+    let lines = pane.preview_lines(10, theme);
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
 }
 
 #[test]

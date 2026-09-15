@@ -895,12 +895,15 @@ impl App {
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'G') {
-            if let Some(count) = self.take_pending_count() {
-                self.current_pane_mut()?
-                    .scroll_preview_down(count.saturating_sub(1));
-                self.status = format!("preview: moved {count}");
+            let pending = self.take_pending_count();
+            let pane = self.current_pane_mut()?;
+            if let Some(count) = pending {
+                pane.move_preview_cursor_to_line(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
+                self.status = format!("preview: line {line_no}/{total}");
             } else {
-                self.current_pane_mut()?.scroll_preview_bottom();
+                pane.scroll_preview_bottom();
                 self.status = String::from("preview: bottom");
             }
             self.pending_g = false;
@@ -981,37 +984,52 @@ impl App {
             }
             KeyCode::Down => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_down(count);
+                let pane = self.current_pane_mut()?;
+                pane.scroll_preview_down(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             _ if key_matches_plain_letter(&key, 'j') => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_down(count);
+                let pane = self.current_pane_mut()?;
+                pane.scroll_preview_down(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             KeyCode::Up => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_up(count);
+                let pane = self.current_pane_mut()?;
+                pane.scroll_preview_up(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             _ if key_matches_plain_letter(&key, 'k') => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_up(count);
+                let pane = self.current_pane_mut()?;
+                pane.scroll_preview_up(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             _ if key_matches_plain_letter(&key, 'g') => {
                 let pending_line = self.pending_count;
                 if self.pending_g {
-                    if let Some(count) = self.take_pending_count() {
-                        self.current_pane_mut()?
-                            .scroll_preview_down(count.saturating_sub(1));
-                        self.status = format!("preview: moved {count}");
+                    let pending = self.take_pending_count();
+                    let pane = self.current_pane_mut()?;
+                    if let Some(count) = pending {
+                        pane.move_preview_cursor_to_line(count);
+                        let line_no = pane.preview_cursor + 1;
+                        let total = pane.preview_total_lines().max(1);
+                        self.status = format!("preview: line {line_no}/{total}");
                     } else {
-                        self.current_pane_mut()?.scroll_preview_top();
+                        pane.scroll_preview_top();
                         self.status = String::from("preview: top");
                     }
                     self.pending_g = false;
