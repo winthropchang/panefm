@@ -341,12 +341,17 @@ pub(crate) fn render_pane(
     }
 
     let list_focused = focused && !pane.is_preview_focused();
+    let vcs_suffix = pane
+        .vcs_header_label()
+        .map(|l| format!("[{l}]"))
+        .unwrap_or_default();
     let (badge, path_text, suffix) = format_pane_title_parts(
         pane_id,
         pane.cwd.as_path(),
         filter_suffix,
         &mark_suffix,
         panel_suffix,
+        &vcs_suffix,
         &pane.title_mode_label(),
         list_area.width.saturating_sub(3) as usize,
     );
@@ -519,6 +524,7 @@ pub(crate) fn render_pane(
                             .find(|(_, idx)| *idx == visible_index)
                             .map(|(ch, _)| *ch)
                     });
+                    let vcs_status = pane.vcs_status_for_path(&entry.path);
                     ListItem::new(render_entry_line(
                         entry,
                         pane.is_marked(entry),
@@ -539,6 +545,7 @@ pub(crate) fn render_pane(
                         find_match_position.filter(|_| visible_index == pane.selected),
                         active_job_badge,
                         jump_label,
+                        vcs_status,
                     ))
                 })
                 .collect()
@@ -749,19 +756,21 @@ fn regex_rename_status_style(theme: Theme, status: &str) -> Style {
 }
 
 /// 組合 pane 標題列文字三元素：(膠囊徽章字串, 壓縮或完整路徑, 狀態後綴)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn format_pane_title_parts(
     pane_id: usize,
     cwd: &Path,
     filter_suffix: &str,
     mark_suffix: &str,
     panel_suffix: &str,
+    vcs_suffix: &str,
     mode_label: &str,
     max_width: usize,
 ) -> (String, String, String) {
     let prefix = format!(" {pane_id} ");
     let full_path = cwd.display().to_string();
     let status_suffix =
-        normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
+        normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix, vcs_suffix]);
     let suffix_candidates = [
         if status_suffix.is_empty() {
             format!("[{mode_label}]")
@@ -805,13 +814,14 @@ pub(crate) fn format_pane_title_parts(
 }
 
 /// 組合 pane 標題列文字，讓 pane 編號以膠囊標記固定顯示在最前面，方便搭配數字切換。
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn format_pane_title(
     pane_id: usize,
     cwd: &Path,
     filter_suffix: &str,
     mark_suffix: &str,
     panel_suffix: &str,
+    vcs_suffix: &str,
     mode_label: &str,
     max_width: usize,
 ) -> String {
@@ -821,6 +831,7 @@ pub(crate) fn format_pane_title(
         filter_suffix,
         mark_suffix,
         panel_suffix,
+        vcs_suffix,
         mode_label,
         max_width,
     );
@@ -2370,6 +2381,7 @@ pub(crate) fn render_entry_line(
     list_find_position: Option<(usize, usize)>,
     active_job_badge: Option<&str>,
     jump_label: Option<char>,
+    vcs_status: Option<super::vcs::VcsFileStatus>,
 ) -> Line<'static> {
     let (marker, jump_span) = if let Some(ch) = jump_label {
         let tag = format!("[{ch}] ");
@@ -2385,6 +2397,15 @@ pub(crate) fn render_entry_line(
         }
     } else {
         ("", None)
+    };
+    let (vcs_span, vcs_width) = if let Some(status) = vcs_status {
+        let text = format!("{} ", status.badge_char());
+        let style = Style::default()
+            .fg(status.color(&theme))
+            .add_modifier(Modifier::BOLD);
+        (Some(Span::styled(text, style)), 2usize)
+    } else {
+        (None, 0usize)
     };
     let base_entry_style = if jump_label.is_some() {
         theme.muted_style()
@@ -2414,6 +2435,7 @@ pub(crate) fn render_entry_line(
         .unwrap_or(0);
     let detail_width = UnicodeWidthStr::width(detail.as_str());
     let fixed_width = marker_width
+        .saturating_add(vcs_width)
         .saturating_add(icon_width)
         .saturating_add(job_badge_width)
         .saturating_add(badge_width)
@@ -2426,6 +2448,9 @@ pub(crate) fn render_entry_line(
             spans.push(j_span);
         } else if !marker.is_empty() {
             spans.push(Span::raw(marker.to_string()));
+        }
+        if let Some(v_span) = vcs_span {
+            spans.push(v_span);
         }
         if !icon.is_empty() {
             spans.push(Span::styled(icon, base_entry_style));
@@ -2465,6 +2490,7 @@ pub(crate) fn render_entry_line(
     display_name = truncate_text_to_display_width(&display_name, available_name_width);
     let name_width = UnicodeWidthStr::width(display_name.as_str());
     let used_width = marker_width
+        .saturating_add(vcs_width)
         .saturating_add(icon_width)
         .saturating_add(name_width)
         .saturating_add(job_badge_width)
@@ -2477,6 +2503,9 @@ pub(crate) fn render_entry_line(
         spans.push(j_span);
     } else if !marker.is_empty() {
         spans.push(Span::raw(marker.to_string()));
+    }
+    if let Some(v_span) = vcs_span {
+        spans.push(v_span);
     }
     if !icon.is_empty() {
         spans.push(Span::styled(icon, base_entry_style));

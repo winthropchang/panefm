@@ -972,6 +972,21 @@ impl App {
         });
     }
 
+    /// 輪詢非同步背景 VCS（Git / SVN）狀態查詢結果，並更新對應 pane。
+    pub(crate) fn poll_vcs_status(&mut self) {
+        while let Some(response) = self.vcs_manager.try_recv_response() {
+            if let Some(pane) = self.panes.get_mut(&response.pane_id)
+                && (pane.cwd == response.directory
+                    || response
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| pane.cwd.starts_with(&info.repo_root)))
+            {
+                pane.set_vcs_info(response.info);
+            }
+        }
+    }
+
     /// 非阻塞接收背景 global search 的增量結果，並更新目前搜尋 panel 與 task。
     ///
     /// 參數：無；資料由 `global_search_rx` channel 取得。
@@ -987,6 +1002,7 @@ impl App {
         self.poll_diff_job();
         self.poll_update_check();
         self.poll_in_app_update();
+        self.poll_vcs_status();
 
         let Some(receiver) = &self.global_search_rx else {
             return;
@@ -1103,6 +1119,7 @@ impl App {
     ) {
         self.cancel_directory_size_scan(pane_id);
         self.cancel_directory_load(pane_id);
+        self.vcs_manager.request_query(pane_id, cwd.clone());
         let (sort_mode, random_seed) = self
             .panes
             .get(&pane_id)
@@ -1416,8 +1433,14 @@ impl App {
             }
         }
         for dir in directories {
+            self.vcs_manager.invalidate(Some(dir.clone()));
             if !self.panes.values().any(|pane| &pane.cwd == dir) {
                 self.directory_entry_cache.remove(dir);
+            }
+        }
+        for pane_id in &affected_panes {
+            if let Some(pane) = self.panes.get(pane_id) {
+                self.vcs_manager.request_query(*pane_id, pane.cwd.clone());
             }
         }
         Ok(())

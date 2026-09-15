@@ -389,6 +389,7 @@ impl App {
         };
         self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
         self.zoxide_tracker.track(&current_cwd);
+        self.vcs_manager.request_query(pane_id, current_cwd);
         Ok(())
     }
 
@@ -418,6 +419,7 @@ impl App {
         };
         self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
         self.zoxide_tracker.track(&current_cwd);
+        self.vcs_manager.request_query(pane_id, current_cwd);
         Ok(())
     }
 

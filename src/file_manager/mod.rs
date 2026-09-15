@@ -30,6 +30,7 @@ pub(crate) mod tools;
 pub(crate) mod trash;
 pub(crate) mod ui;
 pub mod undo_backup;
+pub(crate) mod vcs;
 pub(crate) mod zoxide;
 
 use std::io::{self, BufRead, BufReader, Stdout, Write};

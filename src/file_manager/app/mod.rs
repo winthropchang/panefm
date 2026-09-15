@@ -674,6 +674,8 @@ pub(crate) struct App {
     pub(crate) in_app_update_rx: Option<Receiver<Result<String, String>>>,
     /// 目前是否正在下載與安裝更新。
     pub(crate) in_app_updating: bool,
+    /// 版本控制（Git 與 SVN）背景管理與查詢 worker。
+    pub(crate) vcs_manager: super::vcs::VcsManager,
 }
 
 /// 記錄 F1 help 關閉後應回復到哪一種互動上下文。
@@ -768,7 +770,7 @@ impl App {
             .map_err(|error| io::Error::other(error.to_string()))?;
         let zoxide_tracker = ZoxideTracker::new();
         zoxide_tracker.track(&cwd);
-        let mut pane = PaneState::new(cwd)?;
+        let mut pane = PaneState::new(cwd.clone())?;
         apply_config_to_pane(&config, &mut pane);
         let mut panes = BTreeMap::new();
         panes.insert(1, pane);
@@ -857,6 +859,9 @@ impl App {
             (badge_info, rx)
         };
 
+        let vcs_manager = super::vcs::VcsManager::new();
+        vcs_manager.request_query(1, cwd.clone());
+
         let app = Self {
             config,
             config_source,
@@ -915,6 +920,7 @@ impl App {
             update_check_rx,
             in_app_update_rx: None,
             in_app_updating: false,
+            vcs_manager,
         };
         if recovered_interrupted_tasks > 0 {
             save_task_history(&app.task_history_path, &app.task_log)?;

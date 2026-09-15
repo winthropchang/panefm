@@ -155,6 +155,8 @@ pub(crate) struct PaneState {
     filter_cache: Option<FilterCache>,
     /// 每次 entries 順序或內容變動都遞增，避免沿用失效的 filter cache。
     entry_revision: u64,
+    /// 目前 pane 所在目錄的版本控制（Git / SVN）資訊與檔案狀態。
+    pub(crate) vcs_info: Option<std::sync::Arc<super::vcs::VcsRepoInfo>>,
 }
 
 /// 描述列表過濾目前使用的比對模式。
@@ -314,9 +316,32 @@ impl PaneState {
             marked_paths: BTreeSet::new(),
             filter_cache: None,
             entry_revision: 0,
+            vcs_info: None,
         };
         pane.reload()?;
         Ok(pane)
+    }
+
+    /// 設定此 Pane 目前目錄的 VCS 資訊。
+    pub(crate) fn set_vcs_info(&mut self, info: Option<std::sync::Arc<super::vcs::VcsRepoInfo>>) {
+        self.vcs_info = info;
+    }
+
+    /// 取得指定路徑在當前 VCS 下的檔案狀態。
+    pub(crate) fn vcs_status_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<super::vcs::VcsFileStatus> {
+        self.vcs_info
+            .as_ref()
+            .and_then(|info| info.status_for_path(path))
+    }
+
+    /// 取得當前目錄的 VCS 標籤（如 `git:main` 或 `svn:trunk:r42`）。
+    pub(crate) fn vcs_header_label(&self) -> Option<String> {
+        self.vcs_info
+            .as_ref()
+            .map(|info| info.format_header_label())
     }
 
     /// 判斷目前 panel 是否開啟了雙欄即時預覽。

@@ -50,6 +50,7 @@ fn render_entry_line_displays_active_job_badge() {
         None,
         Some("[copying 99%]"),
         None,
+        None,
     );
     let text = line
         .spans
@@ -80,6 +81,7 @@ fn render_entry_line_displays_easymotion_jump_label() {
         None,
         None,
         Some('k'),
+        None,
     );
     let text = line
         .spans
@@ -90,6 +92,47 @@ fn render_entry_line_displays_easymotion_jump_label() {
         text.contains("[k]"),
         "列表列在 EasyMotion 模式下必須包含跳轉字母標籤 [k]: {text}"
     );
+}
+
+#[test]
+/// 驗證 VCS 檔案狀態標籤（如 M、A、? 等）能正確渲染並帶有相應樣式。
+fn render_entry_line_displays_vcs_status_badge() {
+    use crate::file_manager::vcs::VcsFileStatus;
+    let entry = test_entry("src/main.rs", false);
+    let theme = Theme::from(crate::theme::ThemePreset::Dracula);
+
+    let line = render_entry_line(
+        &entry,
+        false,
+        false,
+        false,
+        SortDetailKind::None,
+        60,
+        theme,
+        true,
+        IconStyle::NerdFont,
+        None,
+        None,
+        None,
+        None,
+        Some(VcsFileStatus::Modified),
+    );
+    let text = line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        text.contains("M "),
+        "列表列在有 VCS 變更狀態時必須包含對應狀態標籤: {text}"
+    );
+    // 確認包含 M 的 Span 帶有黃色前景色
+    let vcs_span = line
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "M ")
+        .expect("必須存在 M  span");
+    assert_eq!(vcs_span.style.fg, Some(ratatui::style::Color::Yellow));
 }
 
 #[test]
@@ -119,6 +162,7 @@ fn render_entry_line_keeps_details_visible_after_wide_chinese_name() {
             theme,
             false,
             IconStyle::Ascii,
+            None,
             None,
             None,
             None,
@@ -432,6 +476,7 @@ fn format_pane_title_keeps_stable_pane_id_prefix() {
         "  [filter]",
         "  [mark: 2]",
         "  [help]",
+        "",
         "sort: natural",
         80,
     );
@@ -452,6 +497,7 @@ fn format_pane_title_keeps_full_path_when_it_fits() {
         "",
         "",
         "",
+        "",
         "sort: natural",
         120,
     );
@@ -469,6 +515,7 @@ fn format_pane_title_compacts_long_path_for_narrow_panes() {
     let title = format_pane_title(
         12,
         Path::new("/Users/otto/GitHub/cocos-tutorial-happy-path/dev/library/very/deep/path"),
+        "",
         "",
         "",
         "",
@@ -494,6 +541,7 @@ fn format_pane_title_prefers_last_directory_tail() {
         "",
         "",
         "",
+        "",
         "sort: natural",
         40,
     );
@@ -508,9 +556,35 @@ fn format_pane_title_prefers_last_directory_tail() {
 /// 驗證 linemode 開啟後，pane 標題尾端會顯示目前啟用的 linemode。
 /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
 fn format_pane_title_supports_linemode_status() {
-    let title = format_pane_title(5, Path::new("/tmp/demo"), "", "", "", "linemode: size", 80);
+    let title = format_pane_title(
+        5,
+        Path::new("/tmp/demo"),
+        "",
+        "",
+        "",
+        "",
+        "linemode: size",
+        80,
+    );
 
     assert_eq!(title, " 5  /tmp/demo [linemode: size]");
+}
+
+#[test]
+/// 驗證 VCS 分支或版本號尾綴會顯示在 pane 標題列。
+fn format_pane_title_supports_vcs_suffix() {
+    let title = format_pane_title(
+        1,
+        Path::new("/workspace/project"),
+        "",
+        "",
+        "",
+        " [git:main]",
+        "sort: natural",
+        80,
+    );
+
+    assert_eq!(title, " 1  /workspace/project [git:main] [sort: natural]");
 }
 
 #[test]
