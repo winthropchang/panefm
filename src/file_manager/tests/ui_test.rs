@@ -2,8 +2,9 @@ use super::{
     FileCategory, IconStyle, SearchListState, TaskPanelLine, entry_icon, file_category,
     format_diff_path_column, format_pane_title, format_permissions_detail, format_size_short,
     format_sort_detail, regex_rename_status_style, render_entry_line, render_pane_title_line,
-    search_empty_message, search_list_selected_index, task_panel_display_lines,
-    top_right_input_rect, truncate_text_to_display_width, visible_list_window_range,
+    render_update_badge, search_empty_message, search_list_selected_index,
+    task_panel_display_lines, top_right_input_rect, truncate_text_to_display_width,
+    visible_list_window_range,
 };
 use ratatui::layout::Rect;
 use std::path::Path;
@@ -48,6 +49,8 @@ fn render_entry_line_displays_active_job_badge() {
         None,
         None,
         Some("[copying 99%]"),
+        None,
+        None,
     );
     let text = line
         .spans
@@ -58,6 +61,78 @@ fn render_entry_line_displays_active_job_badge() {
         text.contains("[copying 99%]"),
         "列表列必須包含工作進度標籤: {text}"
     );
+}
+
+#[test]
+/// 驗證 EasyMotion 模式下列表列會以醒目的 [k] 字母標籤顯示。
+fn render_entry_line_displays_easymotion_jump_label() {
+    let entry = test_entry("main.rs", false);
+    let line = render_entry_line(
+        &entry,
+        false,
+        false,
+        false,
+        SortDetailKind::None,
+        60,
+        Theme::from(crate::theme::ThemePreset::Dracula),
+        true,
+        IconStyle::NerdFont,
+        None,
+        None,
+        None,
+        Some('k'),
+        None,
+    );
+    let text = line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        text.contains("[k]"),
+        "列表列在 EasyMotion 模式下必須包含跳轉字母標籤 [k]: {text}"
+    );
+}
+
+#[test]
+/// 驗證 VCS 檔案狀態標籤（如 M、A、? 等）能正確渲染並帶有相應樣式。
+fn render_entry_line_displays_vcs_status_badge() {
+    use crate::file_manager::vcs::VcsFileStatus;
+    let entry = test_entry("src/main.rs", false);
+    let theme = Theme::from(crate::theme::ThemePreset::Dracula);
+
+    let line = render_entry_line(
+        &entry,
+        false,
+        false,
+        false,
+        SortDetailKind::None,
+        60,
+        theme,
+        true,
+        IconStyle::NerdFont,
+        None,
+        None,
+        None,
+        None,
+        Some(VcsFileStatus::Modified),
+    );
+    let text = line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        text.contains("M "),
+        "列表列在有 VCS 變更狀態時必須包含對應狀態標籤: {text}"
+    );
+    // 確認包含 M 的 Span 帶有黃色前景色
+    let vcs_span = line
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "M ")
+        .expect("必須存在 M  span");
+    assert_eq!(vcs_span.style.fg, Some(ratatui::style::Color::Yellow));
 }
 
 #[test]
@@ -87,6 +162,8 @@ fn render_entry_line_keeps_details_visible_after_wide_chinese_name() {
             theme,
             false,
             IconStyle::Ascii,
+            None,
+            None,
             None,
             None,
             None,
@@ -399,6 +476,7 @@ fn format_pane_title_keeps_stable_pane_id_prefix() {
         "  [filter]",
         "  [mark: 2]",
         "  [help]",
+        "",
         "sort: natural",
         80,
     );
@@ -419,6 +497,7 @@ fn format_pane_title_keeps_full_path_when_it_fits() {
         "",
         "",
         "",
+        "",
         "sort: natural",
         120,
     );
@@ -436,6 +515,7 @@ fn format_pane_title_compacts_long_path_for_narrow_panes() {
     let title = format_pane_title(
         12,
         Path::new("/Users/otto/GitHub/cocos-tutorial-happy-path/dev/library/very/deep/path"),
+        "",
         "",
         "",
         "",
@@ -461,6 +541,7 @@ fn format_pane_title_prefers_last_directory_tail() {
         "",
         "",
         "",
+        "",
         "sort: natural",
         40,
     );
@@ -475,9 +556,35 @@ fn format_pane_title_prefers_last_directory_tail() {
 /// 驗證 linemode 開啟後，pane 標題尾端會顯示目前啟用的 linemode。
 /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
 fn format_pane_title_supports_linemode_status() {
-    let title = format_pane_title(5, Path::new("/tmp/demo"), "", "", "", "linemode: size", 80);
+    let title = format_pane_title(
+        5,
+        Path::new("/tmp/demo"),
+        "",
+        "",
+        "",
+        "",
+        "linemode: size",
+        80,
+    );
 
     assert_eq!(title, " 5  /tmp/demo [linemode: size]");
+}
+
+#[test]
+/// 驗證 VCS 分支或版本號尾綴會顯示在 pane 標題列。
+fn format_pane_title_supports_vcs_suffix() {
+    let title = format_pane_title(
+        1,
+        Path::new("/workspace/project"),
+        "",
+        "",
+        "",
+        " [git:main]",
+        "sort: natural",
+        80,
+    );
+
+    assert_eq!(title, " 1  /workspace/project [git:main] [sort: natural]");
 }
 
 #[test]
@@ -609,4 +716,54 @@ fn scrolled_input_handles_overflow_and_cursor_tracking() {
     assert!(text_mid.starts_with(":<"));
     assert!(text_mid.ends_with('>'));
     assert!(view_mid.cursor_col < 25);
+}
+
+#[test]
+/// 驗證更新提示膠囊徽章在不同寬度下的自適應文字與高對比黃底紅字配色。
+/// 保護目的：確保提示能於不同 pane 寬度優雅縮放，且配色固定為黃底紅字（易於一眼辨識）。
+fn render_update_badge_adapts_to_widths_and_styles() {
+    use ratatui::style::{Color, Modifier};
+
+    // 1. 完整版（寬度 >= 55）
+    let badge_full = render_update_badge("0.1.15", false, 60).expect("full badge");
+    let full_text: String = badge_full
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(full_text.contains("新版 v0.1.15 可用！按 :update 升級"));
+
+    // 檢查高對比配色：黃底 (255, 220, 0)、紅字 (180, 0, 0)、粗體
+    let span = &badge_full.spans[0];
+    assert_eq!(span.style.bg, Some(Color::Rgb(255, 220, 0)));
+    assert_eq!(span.style.fg, Some(Color::Rgb(180, 0, 0)));
+    assert!(span.style.add_modifier.contains(Modifier::BOLD));
+
+    // 2. 中等版（35 <= 寬度 < 55）
+    let badge_mid = render_update_badge("0.1.15", false, 40).expect("mid badge");
+    let mid_text: String = badge_mid.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(mid_text.contains("v0.1.15 :update"));
+
+    // 3. 精簡版（20 <= 寬度 < 35）
+    let badge_compact = render_update_badge("0.1.15", false, 25).expect("compact badge");
+    let compact_text: String = badge_compact
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(compact_text.contains("v0.1.15"));
+    assert!(!compact_text.contains(":update"));
+
+    // 4. 超窄寬度（寬度 < 20）：自動隱藏避免破版
+    assert!(render_update_badge("0.1.15", false, 15).is_none());
+
+    // 5. 更新中狀態（is_updating = true）
+    let badge_updating = render_update_badge("0.1.15", true, 30).expect("updating badge");
+    let updating_text: String = badge_updating
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(updating_text.contains("升級中"));
+    assert!(render_update_badge("0.1.15", true, 10).is_none());
 }

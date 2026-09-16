@@ -225,6 +225,7 @@ impl App {
             "compress" => self.compress_selected_entries()?,
             "extract" => self.extract_selected_archives()?,
             "jump" => self.open_fzf_jump(),
+            "easymotion" => self.open_easymotion(),
             "open" => self.open_selected_with_default()?,
             "open-picker" => self.open_selected_with_picker()?,
             "copy-picker" => self.open_copy_picker()?,
@@ -271,6 +272,7 @@ impl App {
             "status" => self.open_tool_panel(),
             "help" => self.open_help_panel(),
             "cheatsheet" | "cheat" | "keys" => self.open_cheatsheet_from_current(),
+            "update" => self.trigger_in_app_update(),
             "bookmark list" => self.open_bookmark_list(),
             "zoxide" => self.open_zoxide_list(),
             "trash undo" => self.restore_latest_from_trash()?,
@@ -316,6 +318,7 @@ impl App {
                     String::from("usage: height <+/-rows> (e.g. :height +2 or :height -2)");
             }
             "diff" | "df" | "d" => self.open_diff_matrix(None)?,
+            "vdiff" | "diff-vcs" | "vcs-diff" => self.toggle_preview_diff_mode(),
             "rename-regex" | "reg" => {
                 self.status = String::from("usage: rename-regex <pattern> <replace>");
             }

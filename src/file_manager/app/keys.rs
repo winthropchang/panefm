@@ -441,10 +441,7 @@ impl App {
             }
             _ if key_matches_ctrl_letter(&key, 'd') => {
                 self.clear_pending_count();
-                let step = self.current_pane_mut()?.page_down();
-                self.pending_g = false;
-                self.pending_y = false;
-                self.status = format!("half page down: {step}");
+                self.toggle_preview_diff_mode();
                 true
             }
             _ if key_matches_ctrl_letter(&key, 'u') => {
@@ -498,6 +495,18 @@ impl App {
             _ if key_matches_plain_letter(&key, 'l') => {
                 self.clear_pending_count();
                 let pane_id = self.focused_pane;
+                if let Some(pane) = self.panes.get_mut(&pane_id)
+                    && pane.is_preview_open()
+                {
+                    let is_dir = pane.selected_entry().map(|e| e.is_dir).unwrap_or(false);
+                    if !is_dir {
+                        pane.set_preview_focused(true);
+                        self.status = String::from("preview focused (press 'h' to return to list)");
+                        self.pending_g = false;
+                        self.pending_y = false;
+                        return Ok(true);
+                    }
+                }
                 if let Some(entry) = self.panes.get(&pane_id).and_then(|p| p.selected_entry())
                     && entry.is_dir
                     && let Some((task_id, title, progress)) =
@@ -655,6 +664,13 @@ impl App {
                 self.open_filter_input(FilterMode::Fuzzy);
                 self.pending_g = false;
                 self.pending_y = false;
+                true
+            }
+            _ if key_matches_plain_letter(&key, 'e') => {
+                self.clear_pending_count();
+                self.pending_g = false;
+                self.pending_y = false;
+                self.open_easymotion();
                 true
             }
             _ if key_matches_plain_letter(&key, 's') => {
@@ -850,7 +866,7 @@ impl App {
                 self.pending_g = false;
                 return Ok(true);
             }
-            self.current_pane_mut()?.set_preview_active(false);
+            self.current_pane_mut()?.set_preview_open(false);
             self.reset_pending_motion_state();
             self.status = String::from("normal mode");
             return Ok(true);
@@ -876,15 +892,54 @@ impl App {
             return Ok(true);
         }
         if key_matches_shifted_letter(&key, 'G') {
-            if let Some(count) = self.take_pending_count() {
-                self.current_pane_mut()?
-                    .scroll_preview_down(count.saturating_sub(1));
-                self.status = format!("preview: moved {count}");
+            let pending = self.take_pending_count();
+            let pane = self.current_pane_mut()?;
+            if let Some(count) = pending {
+                pane.move_preview_cursor_to_line(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
+                self.status = format!("preview: line {line_no}/{total}");
             } else {
-                self.current_pane_mut()?.scroll_preview_bottom();
+                pane.scroll_preview_bottom();
                 self.status = String::from("preview: bottom");
             }
             self.pending_g = false;
+            return Ok(true);
+        }
+        if key.code == KeyCode::Char(']') {
+            let count = self.take_count_or_one();
+            let (current_name, current_pos, total) = {
+                let pane = self.current_pane_mut()?;
+                pane.move_down_by(count);
+                let name = pane
+                    .selected_entry()
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                let total = pane.visible_indices.len();
+                let current_pos = pane.selected + 1;
+                (name, current_pos, total)
+            };
+            self.clear_preview_search_if_active();
+            self.pending_g = false;
+            self.status = format!("preview: {current_name} ({current_pos}/{total})");
+            return Ok(true);
+        }
+        if key.code == KeyCode::Char('[') {
+            let count = self.take_count_or_one();
+            let (current_name, current_pos, total) = {
+                let pane = self.current_pane_mut()?;
+                pane.move_up_by(count);
+                let name = pane
+                    .selected_entry()
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                let total = pane.visible_indices.len();
+                let current_pos = pane.selected + 1;
+                (name, current_pos, total)
+            };
+            self.clear_preview_search_if_active();
+            self.pending_g = false;
+            self.status = format!("preview: {current_name} ({current_pos}/{total})");
             return Ok(true);
         }
 
@@ -895,9 +950,9 @@ impl App {
                     self.pending_g = false;
                     return Ok(true);
                 }
-                self.current_pane_mut()?.set_preview_active(false);
+                self.current_pane_mut()?.set_preview_focused(false);
                 self.reset_pending_motion_state();
-                self.status = String::from("normal mode");
+                self.status = String::from("file list (preview open)");
             }
             _ if key_matches_plain_letter(&key, 'q') || key_matches_plain_letter(&key, 'h') => {
                 if self.clear_preview_search_if_active() {
@@ -905,9 +960,9 @@ impl App {
                     self.pending_g = false;
                     return Ok(true);
                 }
-                self.current_pane_mut()?.set_preview_active(false);
+                self.current_pane_mut()?.set_preview_focused(false);
                 self.reset_pending_motion_state();
-                self.status = String::from("normal mode");
+                self.status = String::from("file list (preview open)");
             }
             KeyCode::Char('/') => {
                 self.clear_pending_count();
@@ -926,37 +981,52 @@ impl App {
             }
             KeyCode::Down => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_down(count);
+                let pane = self.current_pane_mut()?;
+                pane.move_preview_cursor_down(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             _ if key_matches_plain_letter(&key, 'j') => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_down(count);
+                let pane = self.current_pane_mut()?;
+                pane.move_preview_cursor_down(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             KeyCode::Up => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_up(count);
+                let pane = self.current_pane_mut()?;
+                pane.move_preview_cursor_up(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             _ if key_matches_plain_letter(&key, 'k') => {
                 let count = self.take_count_or_one();
-                self.current_pane_mut()?.scroll_preview_up(count);
+                let pane = self.current_pane_mut()?;
+                pane.move_preview_cursor_up(count);
+                let line_no = pane.preview_cursor + 1;
+                let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
-                self.status = String::from("preview mode");
+                self.status = format!("preview: line {line_no}/{total}");
             }
             _ if key_matches_plain_letter(&key, 'g') => {
                 let pending_line = self.pending_count;
                 if self.pending_g {
-                    if let Some(count) = self.take_pending_count() {
-                        self.current_pane_mut()?
-                            .scroll_preview_down(count.saturating_sub(1));
-                        self.status = format!("preview: moved {count}");
+                    let pending = self.take_pending_count();
+                    let pane = self.current_pane_mut()?;
+                    if let Some(count) = pending {
+                        pane.move_preview_cursor_to_line(count);
+                        let line_no = pane.preview_cursor + 1;
+                        let total = pane.preview_total_lines().max(1);
+                        self.status = format!("preview: line {line_no}/{total}");
                     } else {
-                        self.current_pane_mut()?.scroll_preview_top();
+                        pane.scroll_preview_top();
                         self.status = String::from("preview: top");
                     }
                     self.pending_g = false;
@@ -971,9 +1041,7 @@ impl App {
             }
             _ if key_matches_ctrl_letter(&key, 'd') => {
                 self.clear_pending_count();
-                self.current_pane_mut()?.page_preview_down();
-                self.pending_g = false;
-                self.status = String::from("preview: half page down");
+                self.toggle_preview_diff_mode();
             }
             _ if key_matches_ctrl_letter(&key, 'u') => {
                 self.clear_pending_count();
@@ -992,6 +1060,30 @@ impl App {
                 self.current_pane_mut()?.full_page_preview_up();
                 self.pending_g = false;
                 self.status = String::from("preview: page up");
+            }
+            KeyCode::PageDown => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.full_page_preview_down();
+                self.pending_g = false;
+                self.status = String::from("preview: page down");
+            }
+            KeyCode::PageUp => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.full_page_preview_up();
+                self.pending_g = false;
+                self.status = String::from("preview: page up");
+            }
+            KeyCode::Home => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.scroll_preview_top();
+                self.pending_g = false;
+                self.status = String::from("preview: top");
+            }
+            KeyCode::End => {
+                self.clear_pending_count();
+                self.current_pane_mut()?.scroll_preview_bottom();
+                self.pending_g = false;
+                self.status = String::from("preview: bottom");
             }
             _ => {
                 self.clear_pending_count();
@@ -1802,6 +1894,33 @@ impl App {
         }
 
         match action {
+            PendingAction::EasyMotion { pane_id, labels } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q')
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::NONE =>
+                {
+                    self.status = String::from("easymotion cancelled");
+                }
+                _ if key_matches_plain_letter(&key, 'e') => {
+                    self.status = String::from("easymotion cancelled");
+                }
+                KeyCode::Char(c) => {
+                    if let Some(&(_, target_visible_idx)) = labels.iter().find(|(ch, _)| *ch == c) {
+                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                            pane.move_to_visible_index(target_visible_idx);
+                            let entry_name = pane
+                                .selected_entry()
+                                .map(|e| e.name.clone())
+                                .unwrap_or_default();
+                            self.status = format!("jumped to {}", entry_name);
+                        }
+                    } else {
+                        self.status = format!("easymotion: no match for '{}'", c);
+                    }
+                }
+                _ => {
+                    self.status = String::from("easymotion cancelled");
+                }
+            },
             PendingAction::ToolPanel {
                 pane_id,
                 mut selected,

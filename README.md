@@ -1,9 +1,9 @@
 # PaneFM (Pane File Manager)
 
 <p align="center">
-  <img src="assets/panefm-icon.png" alt="PaneFM icon" width="160"><br>
-  <b>⚡ 極速、Vim 操控手感、多視窗與 N-Way 差異比對的現代化終端檔案管理器</b><br>
-  <sub>專為追求高效鍵盤流、多目錄並行管理與無縫終端整合的開發者打造</sub>
+  <img src="https://raw.githubusercontent.com/winthropchang/panefm/main/assets/panefm-icon.png" alt="PaneFM icon" width="160"><br>
+  <b>具備 Vim 操控手感、多視窗分割與 N-Way 目錄比對的現代化終端檔案管理器</b><br>
+  <sub>針對多目錄並行管理、鍵盤流操作與終端工作流程整合設計</sub>
 </p>
 
 <p align="center">
@@ -17,344 +17,238 @@
 
 ---
 
-## 🗺️ 全功能架構圖解（Core Architecture）
+## 核心特性 (Features)
 
-PaneFM 以 **8 大核心系統** 為基石，提供從極速導航、多視窗分割、安全檔案交易到深度系統整合的完整體驗：
+- **多視窗佈局 (Multi-Pane Layout)**：支援水平與垂直自由分割（最多 9 個獨立視窗），具備巢狀層級尺寸鎖定、一鍵均等重設 (`w=`) 與連續尺寸微調模式 (`wr`)。
+- **Vim 導航思維 (Vim-Style Navigation)**：支援 `h/j/k/l`、計數前綴（如 `5j`）、`gg/G`、`Ctrl+d/u` 翻頁，以及兩鍵直達畫面任意檔案的 `EasyMotion` 快速跳轉 (`e`)。
+- **左右雙欄即時預覽 (Side-by-Side Live Preview)**：在清單中移動游標即時預覽檔案內容；支援文字程式碼語法高亮、ANSI 彩色縮圖、目錄結構統計與壓縮包檢視，並提供非同步背景預熱機制。
+- **N-Way 目錄差異比對 (Diff Matrix)**：同時對齊與比對 2 至 N 個目錄樹，支援狀態過濾（差異、獨有、相同）與外部比對工具（如 `delta`、`difftastic`）呼叫。
+- **安全檔案操作與復原 (File Operations & Undo)**：支援 macOS APFS / Reflink 檔案系統層級的零空間複製 (Copy-on-Write)、多線程背景傳輸、視覺多選 (`v`)、Regex 批次改名與交易式復原 (`u`)。
+- **終端環境整合 (Terminal Integration)**：內建 OSC 7 目錄廣播，原生終端開新分頁自動同步當前目錄；整合 `fd`（檔名搜尋）、`ripgrep`（內容檢索）、`fzf`（模糊跳轉）與 `zoxide`（歷史目錄）。
+
+---
+
+## 系統架構 (Architecture)
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="PaneFM 核心架構圖" width="100%">
+  <img src="https://raw.githubusercontent.com/winthropchang/panefm/main/assets/architecture.svg" alt="PaneFM 系統架構圖" width="100%">
 </p>
 
 | 🪟 多視窗佈局 | ⚡ Vim 導航跳轉 | 📦 安全檔案操作 | 🔍 全域搜尋預覽 |
 |:---|:---|:---|:---|
-| • 自由水平/垂直分割<br>• 1~9 視窗秒切<br>• 原生終端分頁同步 | • `h/j/k/l` & 數字 Count<br>• `g` 快速跳轉目錄<br>• `fzf` / `zoxide` / `List Find` | • 視覺多選 (`v`) / 安全貼上<br>• CoW 零空間瞬間複製<br>• 交易式 Undo / 垃圾桶 | • `fd` 檔名串流搜尋<br>• `rg` 內容全文檢索<br>• `Tab` 萬能預覽（圖片/目錄/壓縮包） |
+| • 自由水平/垂直分割<br>• 1~9 視窗快速切換<br>• 原生終端分頁同步 | • `h/j/k/l` & 數字前綴<br>• `g` 快速跳轉選單<br>• `fzf` / `zoxide` / `List Find` | • 視覺多選 (`v`) / 安全貼上<br>• CoW 零空間快速複製<br>• 交易式 Undo / 垃圾桶 | • `fd` 檔名串流搜尋<br>• `rg` 內容全文檢索<br>• `Tab` 即時預覽（語法/圖片/目錄） |
 
 | ⚖️ 目錄差異矩陣 | 🔖 智慧書籤歷史 | 🎨 主題外觀視圖 | 📊 任務與說明 |
 |:---|:---|:---|:---|
-| • 2~N 目錄同時對齊<br>• 4 種狀態差異過濾<br>• 呼叫外部比對器 (`delta`) | • 單鍵快捷秒跳書籤<br>• 檔案系統自動監聽<br>• 網路磁碟防卡死取消 | • 10+ 款精美主題<br>• 動態即時預覽切換<br>• 5 種欄位顯示模式 | • 背景 Worker 傳輸不卡 UI<br>• `?` 當前面板情境速查<br>• 統一 `q`/`Esc` 退出 |
+| • 2~N 目錄同時對齊<br>• 4 種狀態差異過濾<br>• 呼叫外部比對器 (`delta`) | • 單鍵快捷跳轉書籤<br>• 檔案系統自動監聽<br>• 網路磁碟防卡死保護 | • 10+ 款精選主題<br>• 動態即時預覽切換<br>• 5 種欄位顯示模式 | • 背景非同步傳輸不阻斷 UI<br>• `?` 當前面板情境速查<br>• 統一 `q`/`Esc` 退出 |
 
 ---
 
-## 🚀 8 大核心系統亮點
+## 安裝方式 (Installation)
 
-### 1. 🪟 多視窗與分割佈局（Multi-Pane Layout）
+### 1. 外部工具相依
 
-* **自由分割與管理**：支援水平分割（`Ctrl+s` / `ws` / `wj` / `wk`）與垂直分割（`Ctrl+v` / `wv` / `wl` / `wh`），可依需求開啟 1~9 個 Panel。
-* **同欄/同列智慧均等分割**：同方向分割時（如連續 `wl` 或 `wj`），系統自動將整欄或整列視窗重新均等劃分（2 個各 50%、3 個各 33%），計算餘數自動分配給最後建立的視窗，無縫杜絕切割縫隙。
-* **巢狀層級尺寸鎖定保護**：當某個欄位或視窗自訂放大調整後，在其內部繼續向下分割（如 `wj`）或關閉子視窗時，外層自訂的欄寬/尺寸受到**嚴格鎖定保護**，絕不會被洗掉或重設。
-* **連續尺寸調整模式（`wr` / `:resize-mode`）**：按下 `wr` 進入專屬連續調整模式（Sticky Resize Mode），直接使用 Vim `h/j/k/l`（或方向鍵）連續微調寬度（±4 欄）與高度（±2 列），按 `=` 即刻重設均等，按 `Esc` / `Enter` 退出。
-* **多視窗同步伸縮（當前視窗權限最高）**：調整尺寸時當前 Panel 具最高優先權；向外擴大時，同級其他所有兄弟視窗同步一起變小；縮小時，其他所有兄弟視窗同步一起放大。
-* **一鍵均等重設（`w=` / `:equal`）**：在視窗選單或命令列隨時一鍵將所有分割視窗重設為平衡均等尺寸。
-* **指令精準調整（`wW` / `wH`）**：支援在命令列輸入 `:width +15` / `:width -10`、`:height +5` / `:height -5`（或透過快捷鍵 `wW` / `wH` 快速開啟預填輸入框）精準指定增減行列數。
-* **互鎖邊界防護**：內建最小安全寬度（10 欄）與高度（3 列）極限保護，防止自己或鄰居被過度擠壓破圖。
-* **獨立工作狀態**：每個 Panel 獨立維護專屬工作目錄、游標位置、選取項目、即時過濾條件與預覽視窗。
-* **100% 原生終端同步**：內建 **OSC 7 目錄廣播**，在 iTerm2、WezTerm、Windows Terminal 等終端按下原生開新分頁快捷鍵時，新分頁會**自動進入目前 Panel 所在目錄**！
-* **跨視窗極速複製與搬移**：按下 **`y 1..9`**（或 `:copy-panel <id>`）可直接將選取/標記檔案瞬間複製到指定視窗；按下 **`m 1..9`**（或 `:move-panel <id>`）直接搬移，具備完全一致的極簡對稱體驗！
-* **一鍵喚醒終端（`wt` / `:terminal`）**：自動識別當前終端環境（WezTerm、Alacritty、iTerm2、Ghostty、Kitty、Windows Terminal），秒開獨立控制台。
+PaneFM 依賴系統 `PATH` 中的外部工具以發揮完整搜尋與跳轉效能：
 
-### 2. ⚡ 極速 Vim 導航與智慧跳轉（Navigation & Jump）
-
-* **純正 Vim 移動**：`h/j/k/l`、`gg/G`、半頁翻滾 `Ctrl+d`/`Ctrl+u`，支援 **數字 Count 前綴**（如 `5j` 向下 5 行、`10k` 向上 10 行）。
-* **快速跳轉選單（`g`）**：`gd`（Documents）、`gk`（Desktop，取 desK）、`gl`（Downloads，取 downLoad）、`gh`（家目錄）、`gt`（直接輸入路徑跳轉）。
-* **四大搜尋跳轉神器**：
-  * `/` **List Find**：在目前目錄即時跳轉檔名，按 `n` / `N` 跳至下一個/上一個。
-  * `f` / `F` **Filter**：即時過濾目前清單（`Tab` 切換一般/模糊過濾）。
-  * `z` **Fzf Jump**：整合 `fzf` 進行目錄樹互動式模糊搜尋。
-  * `Z` **Zoxide Jump**：整合 `zoxide` 學習並秒跳常用歷史目錄。
-
-### 3. 📦 安全檔案操作與復原系統（File Operations & Undo）
-
-* **視覺連續多選（`v` / `V`）**：如同 Vim Visual Mode，快速連續標記多筆檔案；亦支援 `Space` 單選、`A` 全選與 `U` 全不選。
-* **Yank 複製選單（`y`）與安全貼上（`p`）**：`yy` 複製到剪貼簿，`y 1..9` 直接複製至指定視窗（對稱於 `m 1..9` 搬移）；`p` 貼上具備衝突覆蓋防呆提示，`P` 強制覆蓋。
-* **CoW (Copy-on-Write) 零空間瞬間複製**：在 macOS（APFS）或支援 Reflink 的檔案系統上，複製數十 GB 巨型檔案**瞬間完成且零耗硬碟空間**。
-* **交易式安全傳輸與 Undo（`u`）**：多線程並行複製，具備失敗自動清理半殘檔機制；支援多達 20 筆操作歷史的連續撤銷。
-* **批次與命名工具**：`r` 原地改名（支援 Vim 二段式編輯）、`R` / `:reg` **Regex 批次改名預覽面板**、`a` 快速建立（結尾 `/` 自動建目錄）。
-* **全功能垃圾桶（`d` / `gt`）**：安全移至垃圾桶，獨立垃圾桶面板支援一鍵還原或永久刪除。
-* **原生免相依壓縮（`C` / `E`）**：純 Rust 內建 ZIP 壓縮與解壓縮（支援 zip, tar.gz, tar, gz），無須安裝外部工具。
-
-### 4. 🔍 全域即時搜尋與萬能預覽（Global Search & Preview）
-
-* **`s` Filename Search**：整合 `fd` 進行全域檔名串流即時搜尋。
-* **`S` Content Search**：整合 `ripgrep (rg)` 進行全文內容檢索，右側支援即時內容比對與高亮。
-* **`Tab` 萬能預覽系統（文字語法高亮、ANSI 圖片、目錄偷窺與壓縮包內部檢視）**：
-  * **文字與程式碼（純 Rust 語法高亮，支援高達 2 MiB 檔案）**：內建純 Rust `syntect` 引擎與原生 TOML 分詞器，依副檔名自動套用 24-bit TrueColor 語法高亮（支援 Rust, Python, JS/TS, Go, C/C++, JSON, TOML, YAML, Markdown, Shell 等數十種語言），搭配自適應暗色行號。
-  * **大檔案漸進式預覽與切片著色（5000+ 行秒開零停頓）**：首幀僅同步渲染可見行（1~2ms），背景非同步解析補齊；在大檔案中按下 `G` 跳至末尾或跳頁時採用精準視窗切片渲染（Surgical Window Slicing），從第一行跳至第 5,000 行耗時 < 1ms，徹底消除畫面凍結；已解析內容自動進入記憶體快取，`j`/`k` 捲動 0ms 極速滑順。
-  * **預覽內搜尋（`/`）**：支援預覽內關鍵字即時搜尋與 `n`/`N` 跳轉，搜尋命中醒目覆蓋的同時，100% 完整保留原本程式碼的語法色彩與行號樣式。
-  * **彩色圖片縮圖（TrueColor Halfblock）**：直接於終端機內以 Unicode 半區塊（`▀`/`▄`）與 24-bit TrueColor 渲染高解析度彩色縮圖（支援 PNG, JPG, WebP, GIF, BMP, ICO），大圖自動非同步背景解碼。
-  * **目錄快速偷窺（Directory Peeking）**：對資料夾按 `Tab`，頂部邊框即時顯示統計摘要（如 `Desktop  •  9 items (4 dirs, 5 files)  •  2026-09-09 22:47`），預覽區 100% 滿版排列子項目，資料夾置頂帶 `` 與 `/`，檔案在後帶與列表完全一致之特殊字元圖示（``、``、``、``、``）與右側對齊大小，自動過濾 `.DS_Store` 等系統雜訊。
-  * **壓縮包免解壓預覽（Archive Preview）**：對 `.zip`、`.tar.gz`、`.tgz`、`.tar` 按 `Tab`，無須解壓縮即可秒級列出內部完整檔案清單與未壓縮容量。
-  * **大檔案與未支援檔案卡片**：超過 2 MiB 之巨型檔案或二進位檔案，自動呈現結構化詳細屬性卡片。
-
-### 5. ⚖️ N-Way 目錄差異比對矩陣（Diff Matrix - `Alt+d` / `:diff`）
-
-* **多目錄同步比對神器**：同時對齊比對 2 ~ N 個 Panel 的目錄樹與檔案內容。
-* **4 種狀態過濾**：按 `f` 循環切換（全部 ➔ 僅差異 ➔ 僅獨有 ➔ 完全相同）。
-* **智慧過濾與外部整合**：`i` 即時切換 `.gitignore` 排除規則；選取相異檔案按 `Enter` 自動呼叫 `delta`、`difftastic` 或 `vimdiff` 查看詳細雙欄比對。
-
-### 6. 🔖 智慧書籤與歷史管理（Bookmarks & History）
-
-* **單鍵秒跳（`b`）**：`ba` 自動分配代號新增書籤，`b{key}` 按單鍵直接秒跳至對應目錄，`bg` 開啟書籤清單。
-
-### 7. 🎨 豐富佈景主題與自訂視圖（Themes & View）
-
-* **10+ 款高質感主題（`t`）**：內建 Gruvbox, Catppuccin, TokyoNight, Nord, Dracula, Solarized, Monokai 等，**選單即時動態預覽**。
-* **欄位與排序切換**：`,` 排序選單（名稱、大小、時間、副檔名、反向）；`m` 欄位顯示模式（大小、權限、建立時間、修改時間、精簡）。
-
-### 8. 📊 背景非同步任務與智慧說明（Tasks & Help）
-
-* **背景 Worker（`T`）**：大檔案複製、壓縮於背景非同步執行，UI 永不卡頓；隨時檢視進度速率與取消任務。
-* **`?` 情境感知速查表（Context Cheatsheet）**：自動依據您目前所在的畫面，**精準列出當下可用的快捷鍵**！
-* **`~/F1` 全局字典手冊**：完整指令手冊與功能說明，支援關鍵字搜尋。
-* **統一快速離開鍵（`q` / `Esc`）**：在所有面板、預覽、對話框與輸入框 Normal 模式下，按 `q` 均可一鍵快速退出！
-
----
-
-## 💡 10 秒快速上手（口訣與精選鍵位）
-
-> 記住這 6 招，立刻流暢上手：
->
-> 1. **看按鍵**：隨時按 **`?`**（看目前面板可用鍵）或 **`F1`**（看全部）。
-> 2. **退出/返回**：按 **`q`** 或 **`Esc`**。
-> 3. **找檔案**：**`s`**（找檔名）、**`S`**（找內容）、**`/`**（當前目錄找）、**`z`**（模糊跳轉）。
-> 4. **選檔案**：**`Space`**（單選）、**`v`**（連續連選）、**`A`**（全選）、**`U`**（全不選）。
-> 5. **檔案操作**：**`y`**（複製選單：`yy` 剪貼簿、`y 1..9` 跨視窗）、**`x`**（剪下）、**`p`**（貼上）、**`r`**（改名）、**`d`**（刪除）、**`u`**（復原）。
-> 6. **多視窗**：**`Ctrl+v`**（開垂直視窗）、**`1..9`**（切換視窗）。
-
-### 常用快捷鍵速查表
-
-| 類別 | 快捷鍵 | 功能說明 |
-|---|---|---|
-| **移動導航** | `h/j/k/l` | 上一層 / 向下 / 向上 / 進入目錄（支援數字前綴，如 `5j`） |
-| | `gg` / `G` | 跳至頂部 / 跳至底部 |
-| | `Ctrl+d` / `Ctrl+u` | 向下半頁 / 向上半頁 |
-| | `g` | 開啟快速跳轉選單（`gd` 文件、`gk` 桌面 desK、`gl` 下載 downLoad、`gh` 家目錄、`gt` 輸入路徑） |
-| **搜尋過濾** | `s` / `S` | 全域檔名搜尋 (`fd`) / 全文內容檢索 (`rg`) |
-| | `/` | 檔名即時搜尋（`n` / `N` 跳轉下一個/上一個） |
-| | `f` | 即時過濾清單（`Tab` 切換一般/模糊過濾） |
-| | `z` / `Z` | `fzf` 目錄樹模糊跳轉 / `zoxide` 歷史目錄跳轉 |
-| **檔案操作** | `Space` / `v` | 單檔標記 / 進入連續範圍選取模式 |
-| | `A` / `U` | 全選目前目錄所有項目 / 全不選（清空所有標記） |
-| | `y` / `x` / `p` | 複製選單（`yy` 剪貼簿、`y 1..9` 跨視窗複製、`yp` 指令） / 剪下 / 安全貼上（`P` 強制覆蓋） |
-| | `r` / `R` | 原地重新命名 / Regex 批次改名預覽面板 |
-| | `a` | 建立檔案或資料夾（名稱以 `/` 結尾自動建為目錄） |
-| | `d` / `D` | 移至垃圾桶 / 永久刪除 |
-| | `u` | 交易式復原（Undo 上一步複製或移動） |
-| | `C` / `E` | 壓縮為 ZIP / 解壓縮檔案 |
-| **視窗與比對**| `Ctrl+v` / `Ctrl+s` | 垂直分割新視窗 / 水平分割新視窗 |
-| | `1` ~ `9` | 直接切換至指定編號的視窗 |
-| | `w` | 開啟視窗管理選單（`wh/wj/wk/wl` 分割、`wr` 調整、`w=` 均等、`wW/wH` 調整寬高、`wc` 關閉、`wo` 獨佔、`wt` 開新終端） |
-| | `wr` / `:resize-mode` | 進入連續尺寸調整模式（`h/l` 寬度 ±4、`j/k` 高度 ±2、`=` 均等、`Esc/Enter` 退出） |
-| | `wW` / `wH` | 快速開啟 `:width ` / `:height ` 精準調整指定寬度（欄數）與高度（列數） |
-| | `w=` / `:equal` | 一鍵將所有分割視窗重新均等平分（Equalize） |
-| | `Alt+d` / `wd` | 開啟多視窗 **N-Way Diff 矩陣比對** |
-| **預覽與輔助**| `Tab` | 開啟/關閉檔案預覽（文字高亮、TrueColor 圖片、目錄偷窺、壓縮包檢視） |
-| | `t` / `,` / `m` | 主題切換（即時預覽） / 排序選單 / 搬移與欄位選單（`m 1..9` 跨視窗移動、`mp` 指令） |
-| | `T` | 開啟背景任務管理面板 |
-| | `?` / `F1` | 當前面板情境速查（Cheatsheet） / 全局完整說明字典 |
-| | `q` | 離開目前面板 / 退出 PaneFM |
-
----
-
-## 🛠️ 安裝方式
-
-### 1. 必要環境
-
-PaneFM 需要由系統 `PATH` 調用以下外部加速工具：
-
-* **Rust 1.85+**（原始碼編譯需要）
-* **`fd`**（全域檔名搜尋）
-* **`ripgrep`**（執行指令為 `rg`，全域內容檢索）
-* **`fzf`**（模糊跳轉）
-* **`zoxide`**（歷史目錄學習）
+- **`fd`**（全域檔名搜尋）
+- **`ripgrep`**（執行檔為 `rg`，全域內容檢索）
+- **`fzf`**（互動式模糊跳轉）
+- **`zoxide`**（目錄歷史學習）
 
 **macOS (Homebrew)**：
-
 ```bash
 brew install fd fzf ripgrep zoxide
 ```
 
-**Windows (WinGet / Scoop / Chocolatey)**：
-
+**Windows (WinGet)**：
 ```powershell
 winget install sharkdp.fd BurntSushi.ripgrep.MSVC junegunn.fzf ajeetdsouza.zoxide
 ```
 
-> 💡 啟動 PaneFM 後可輸入 `:status` 檢查目前外部工具的安裝狀態。
+> 啟動 PaneFM 後可輸入 `:status` 檢查外部工具的安裝狀態。
 
 ---
 
-### 2. 下載預先編譯版本（GitHub Releases）
+### 2. 下載預先編譯版本
 
-至 [Releases 頁面](https://github.com/winthropchang/panefm/releases) 下載對應作業系統的預先編譯執行檔：
+至 [Releases 頁面](https://github.com/winthropchang/panefm/releases) 下載對應作業系統的執行檔：
 
-* **macOS (Apple Silicon / M 系列)**：`panefm-macos-arm64`
-* **macOS (Intel)**：`panefm-macos-x86_64`
-* **Windows (x64)**：`panefm-windows-x86_64.exe`
+- **macOS (Apple Silicon / ARM64)**：`panefm-macos-arm64`
+- **macOS (Intel / x86_64)**：`panefm-macos-x86_64`
+- **Windows (x64)**：`panefm-windows-x86_64.exe`
 
-#### 🍎 macOS 使用者注意事項（Gatekeeper 隔離解除）
-
-由於 GitHub Releases 的二進位檔案未經 Apple 開發者付費簽名，macOS 下載後會自動加上隔離標記，初次執行可能會跳出 `Apple could not verify "panefm..."` 的阻擋警告。
-
-請在 Terminal 執行以下指令移除隔離標記並加入系統路徑：
-
+#### macOS 隔離標記解除 (Gatekeeper)
+初次由瀏覽器下載執行若遇到系統提示無法驗證開發者，可在終端機執行：
 ```bash
-# 1. 移除 macOS 下載隔離標記（請替換為您下載的檔名）
 xattr -d com.apple.quarantine ./panefm-macos-arm64
-
-# 2. 賦予執行權限
 chmod +x ./panefm-macos-arm64
-
-# 3. 移至系統 PATH（即可隨時輸入 panefm 啟動）
 sudo mv ./panefm-macos-arm64 /usr/local/bin/panefm
 ```
 
-> 💡 **圖形介面解法**：亦可前往 macOS **「系統設定」➔「隱私權與安全性」**，在安全性區塊點擊 **「強制打開（Open Anyway）」**。
-
 ---
 
-### 3. 從原始碼編譯安裝
+### 3. 從原始碼編譯
 
 ```bash
 git clone https://github.com/winthropchang/panefm.git
 cd panefm
 cargo build --release
 ```
-
-編譯完成的執行檔位於：
-
-* **macOS**：`target/release/panefm`
-* **Windows**：`target\release\panefm.exe`
-
-將其加入系統 `PATH` 後，即可在任何終端中輸入 `panefm` 啟動！
-
-
-
-## ⚙️ 外掛擴充與自訂動作 (`plugins.toml`)
-
-PaneFM 支援透過 `plugins.toml` 自由擴充**終端適配器**與 **`Open with` 外部動作**，無須修改原始碼或重新編譯。
-
-詳細設定請參考 [plugins.toml.example](plugins.toml.example)。
-
-### 1. 自訂終端適配器 (`[[terminals]]`)
-
-當按下 **`wt`** 或輸入 **`:terminal`** 時，系統會自動根據當前環境變數或程序樹喚起對應終端：
-
-```toml
-# 範例 1：macOS Kitty 終端（在現有視窗直接開新 Tab）
-[[terminals]]
-name = "kitty"
-match_env = ["KITTY_WINDOW_ID", "KITTY_PID"]
-match_process = ["kitty"]
-mac_command = "kitty @ launch --type=tab --cwd={path}"
-
-# 範例 2：跨平台 Ghostty 終端（開新視窗並定位至當前目錄）
-[[terminals]]
-name = "ghostty"
-match_env = ["GHOSTTY_RESOURCES_DIR"]
-match_process = ["ghostty.exe", "ghostty"]
-mac_command = "open -a Ghostty {path}"
-windows_command = "ghostty.exe --working-directory {path}"
-
-# 範例 3：企業 TrustView 加密保護終端（安全權杖繼承）
-[[terminals]]
-name = "trustview-safe-terminal"
-match_env = ["TRUSTVIEW_SESSION"]
-windows_command = "TrustViewLauncher.exe --cwd {path}"
-```
-
-### 2. 自訂 `Open with` 動作 (`[[actions.open_with]]`)
-
-按下 `O` 或 `Shift+Enter` 即可呼叫自訂動作選單：
-
-```toml
-[[actions.open_with]]
-name = "VS Code"
-scope = "dir"
-mode = "detached"
-mac_command = "open -a 'Visual Studio Code' {path}"
-windows_command = "code {path}"
-
-[[actions.open_with]]
-name = "Git log"
-scope = "both"
-mode = "terminal"
-command = "git -C {parent} log --oneline"
-```
+編譯產生的執行檔位於 `target/release/panefm`（Windows 為 `target\release\panefm.exe`）。
 
 ---
 
-## 📖 設定檔 (`config.toml`)
+## 快速上手 (Quick Start)
 
-PaneFM 支援完整的自訂設定。初次啟動時，若尚未存在設定檔，系統會**自動在執行檔同層或系統設定目錄建立帶有完整預設值與繁體中文詳細註解的 `config.toml`**，讓您立即開箱自訂！
+### 常用核心按鍵
 
-### 設定檔讀取順序
-1. `PANE_FM_CONFIG` 環境變數指定的路徑
-2. 執行檔同層目錄的 `config.toml`
+| 按鍵 | 功能說明 |
+| :--- | :--- |
+| `h` / `j` / `k` / `l` | 上一層目錄 / 向下移動 / 向上移動 / 進入目錄（支援數字前綴，如 `5j`） |
+| `Tab` | 開啟 / 關閉左右雙欄即時預覽 |
+| `v` / `Space` | 連續選取模式 (Visual Mode) / 單項標記 |
+| `y` / `x` / `p` | 複製選單（`yy` 複製、`y 1..9` 跨視窗複製） / 剪下 / 貼上 |
+| `r` / `d` / `u` | 重新命名 / 移至垃圾桶 / 交易式復原 (Undo) |
+| `Ctrl+v` / `Ctrl+s` | 垂直分割新視窗 / 水平分割新視窗 |
+| `1` ~ `9` | 直接切換至指定編號的視窗 |
+| `s` / `S` | 全域檔名搜尋 (`fd`) / 全文內容檢索 (`rg`) |
+| `/` | 當前目錄即時搜尋（按 `n`/`N` 跳轉） |
+| `e` | EasyMotion 標籤直達（螢幕可見檔案兩鍵瞬移） |
+| `?` / `F1` | **情境感知速查表 (Cheatsheet)** / 全局完整說明手冊 |
+| `q` / `Esc` | 關閉當前面板 / 退出程式 |
+
+> **提示**：在任何畫面按下 **`?`** 即可即時查看當下操作模式可用的完整快捷鍵清單。
+
+---
+
+### 左右即時預覽操作 (Live Preview)
+
+```text
+┌─── 左側檔案清單 (38%) ──┬────────────── 右側即時預覽 (62%) ──────────────┐
+│ [1] ~/project          │ Preview: main.rs                       ^ v    │
+│ > 01_guide.md          │ 1  use std::path::Path;                       │
+│   02_config.toml       │ 2  use anyhow::Result;                        │
+│   src/                 │ 3                                             │
+│   Cargo.toml           │ 4  fn main() -> Result<()> {                  │
+│                        │ 5      println!("Hello panefm!");             │
+│                        │ 6      Ok(())                                 │
+│                        │ 7  }                                          │
+└────────────────────────┴───────────────────────────────────────────────┘
+```
+
+1. **開關預覽**：在清單中按 `Tab` 開啟左右雙欄，焦點維持在左側清單。
+2. **即時切換**：在清單中移動 `j`/`k`，右側預覽即時自動更新內容。
+3. **聚焦預覽**：在檔案上按 `l` 進入預覽焦點，此時可使用 `j`/`k` 捲動內容、`Ctrl+d/u` 翻頁、`/` 預覽搜尋、`[`/`]` 切換檔案。
+4. **切回清單**：在預覽焦點中按 `h`、`q` 或 `Esc` 返回左側清單，預覽視窗保持開啟。
+5. **關閉雙欄**：任何時候按 `Tab` 即可徹底關閉預覽，返回全寬清單。
+
+---
+
+<details>
+<summary><b>完整快捷鍵參考表 (Full Keybindings Reference - 點擊展開)</b></summary>
+
+<br>
+
+| 分類 | 按鍵 | 功能說明 |
+| :--- | :--- | :--- |
+| **游標導航** | `h` / `j` / `k` / `l` | 上一層 / 向下 / 向上 / 進入目錄（支援數字前綴如 `10j`） |
+| | `gg` / `G` | 跳至清單頂端 / 跳至清單底端 |
+| | `Ctrl+d` / `Ctrl+u` | 向下半頁 / 向上半頁 |
+| | `e` / `:easymotion` | 啟用 EasyMotion 畫面跳轉模式 |
+| | `g` | 快速跳轉選單（`gd` 文件、`gk` 桌面、`gl` 下載、`gh` 家目錄、`gt` 輸入路徑） |
+| **搜尋過濾** | `s` / `S` | 全域檔名搜尋 (`fd`) / 全域內容檢索 (`rg`) |
+| | `/` | 當前目錄即時搜尋（`n`/`N` 下一個/上一個） |
+| | `f` | 即時過濾清單（`Tab` 切換一般/模糊模式） |
+| | `z` / `Z` | `fzf` 目錄模糊跳轉 / `zoxide` 歷史目錄跳轉 |
+| **檔案操作** | `Space` / `v` | 單檔選取標記 / 連續選取模式 (Visual Mode) |
+| | `A` / `U` | 全選目前目錄所有項目 / 清空所有選取標記 |
+| | `y` / `x` / `p` | 複製選單（`yy` 複製、`y 1..9` 跨視窗複製） / 剪下 / 貼上（`P` 強制覆蓋） |
+| | `m` | 搬移選單（`m 1..9` 跨視窗搬移） / 欄位顯示模式切換 |
+| | `r` / `R` | 原地改名 / Regex 批次改名預覽面板 |
+| | `a` | 建立檔案或目錄（名稱結尾為 `/` 自動建為目錄） |
+| | `d` / `D` | 移至垃圾桶 / 永久刪除 |
+| | `u` | 交易式復原 (Undo 上一步複製或搬移) |
+| | `C` / `E` | 壓縮為 ZIP / 解壓縮檔案 |
+| **視窗佈局** | `Ctrl+v` / `Ctrl+s` | 垂直分割視窗 / 水平分割視窗 |
+| | `1` ~ `9` | 切換至指定編號的視窗 |
+| | `w` | 視窗操作選單（分割、關閉、全螢幕切換等） |
+| | `wr` / `:resize-mode` | 進入連續尺寸微調模式（`h/l` 增減寬度、`j/k` 增減高度、`=` 均等、`Esc` 退出） |
+| | `w=` / `:equal` | 將所有視窗重設為平衡均等尺寸 |
+| | `wW` / `wH` | 精準增減指定視窗欄數與列數 |
+| | `Alt+d` / `wd` | 開啟多視窗 N-Way 目錄差異比對矩陣 (Diff Matrix) |
+| **預覽外觀** | `Tab` | 開啟 / 關閉左右雙欄預覽 |
+| | `[` / `]` | 預覽模式中切換上一個 / 下一個檔案 |
+| | `t` | 主題色彩切換（選單支援即時預覽） |
+| | `,` | 檔案排序選單（名稱、大小、修改時間、建立時間、副檔名） |
+| | `T` | 背景任務管理面板 |
+| | `?` / `F1` | 當前面板情境速查 / 全局完整手冊 |
+| | `q` | 離開當前面板 / 退出程式 |
+
+</details>
+
+---
+
+## 設定與擴充 (Configuration & Plugins)
+
+### 設定檔路徑
+
+PaneFM 在啟動時會依序搜尋以下位置：
+1. `PANE_FM_CONFIG` 環境變數指定之路徑
+2. 執行檔同目錄下的 `config.toml`
 3. 使用者設定目錄：
-   - **macOS / Linux**：`~/.config/panefm/config.toml` 或 `$XDG_CONFIG_HOME/panefm/config.toml`
+   - **macOS / Linux**：`~/.config/panefm/config.toml`
    - **Windows**：`%APPDATA%\panefm\config.toml`
 
-### 常用設定預覽
+若設定檔不存在，首次啟動時系統會自動建立附帶繁體中文註解的預設範本。
+
+### 核心設定範例 (`config.toml`)
+
 ```toml
 [ui]
-# 介面色彩主題（內建 catppuccin-mocha、dracula、tokyo-night、gruvbox、nord 等 10 款）
-# 💡 在介面中按 t 鍵切換主題時，會自動寫回此設定檔永久保存！
+# 介面主題：catppuccin-mocha, tokyo-night, gruvbox, nord, dracula 等 10 款
 theme = "catppuccin-mocha"
 
 [pane]
-# 啟動時是否預設顯示隱藏檔案與目錄（. 開頭）
-show_hidden = false
-
-# 面板啟動時的預設排序方式（"natural"、"modified"、"created"、"size"、"extension"、"random"）
-default_sort = "natural"
-default_sort_reverse = false
-
-# 列表右側欄位預設顯示的資訊類型：
-#   - "mtime"      : 顯示最後修改時間（預設，格式為 MM/DD HH:MM）
-#   - "btime"      : 顯示建立時間 (Birth time)
-#   - "size"       : 顯示檔案容量大小 (B/K/M/G/T)
-#   - "permissions": 顯示權限標記 (rwx / readonly)
-#   - "none"       : 不顯示右側欄位，享受最寬敞純淨的檔名空間
-default_linemode = "mtime"
+show_hidden = false          # 預設是否顯示隱藏檔案
+default_sort = "natural"     # 預設排序：natural, modified, created, size, extension
+default_linemode = "mtime"   # 右側欄位：mtime, btime, size, permissions, none
 
 [navigation]
-fast_move_step = 5      # Shift+J / Shift+K 大步跳躍列數
-panel_page_step = 10    # Ctrl+D / Ctrl+U 翻頁列數
+fast_move_step = 5           # Shift+J / Shift+K 跳躍列數
+panel_page_step = 10         # Ctrl+D / Ctrl+U 翻頁列數
 ```
 
-詳細設定與其他區塊（`[ui.icons]`, `[ui.preview]`, `[search]`, `[watcher]`, `[behavior]`）請參考 [config.toml.example](config.toml.example)。
+詳細設定與進階參數請參閱 [config.toml.example](config.toml.example)。
+
+### 終端與外部動作擴充 (`plugins.toml`)
+
+透過 `plugins.toml` 可自訂終端適配器（`wt` 喚起的終端程式）與 `Open with` 外部自訂動作（`O` 喚起），無須修改原始碼或重新編譯。設定細節請參閱 [plugins.toml.example](plugins.toml.example)。
 
 ---
 
-## 🔄 一鍵自我更新（Self-Update）與 CLI 參數
-
-PaneFM 支援跨 Windows 與 macOS 的全自動自我更新，無需手動前往瀏覽器下載與替換：
+## 更新與指令 (Self-Update & CLI)
 
 ```bash
 # 檢查 GitHub 最新版本並原地自動置換更新
 panefm update
 
-# 查看目前安裝之版本號
-panefm --version    # 或 panefm -V
+# 檢視目前版本
+panefm --version
 
-# 查看命令列說明
-panefm --help       # 或 panefm -h
+# 檢視命令列說明
+panefm --help
 ```
 
-- **自動比對**：透過 GitHub Releases API 進行標準語意化版本（SemVer）比對。
-- **雙平台原生對齊**：自動精準識別 Windows x64、macOS Apple Silicon (ARM64) 與 macOS Intel (x64) 架構，下載正確二進位資產。
-- **安全無副作用**：具備離線超時保護與友善中文診斷；新版本在串流下載並完整驗證前絕不更動現有執行檔。
+---
+
+## Vibe Coding 專案故事
+
+PaneFM 採用 **Vibe Coding** 理念與現代 AI 協作開發，源於對每日命令列工作流程效率與終端操作痛點的真實需求。
+
+透過持續架構迭代、功能打磨與嚴謹的自動化測試防護（**500+ 單元與整合測試**），打造專注、順手且具備高度擴充彈性的終端生產力工具。
 
 ---
 
-## 💖 Vibe Coding 專案故事
+## 授權條款 (License)
 
-PaneFM 是一個以 **Vibe Coding** 方式開發的軟體，也是我嘗試使用 AI 建立自己真正會每天使用之終端生產力工具的專案。
-
-功能方向、操作流程與使用體驗來自真實開發痛點與需求；程式碼則透過與 AI 持續對話、架構設計、實作、嚴格測試（**500+ 自動化測試保護**）逐步打磨而成。希望這款工具能讓每一位熱愛命令列與鍵盤流的開發者感受到極致流暢的操作樂趣！
-
----
-
-## 📄 License
-
-MIT License. 歡迎貢獻、回報 Issue 與提 PR！
+本專案採用 [MIT License](LICENSE) 授權發布。歡迎提交 Issue 與 Pull Request。

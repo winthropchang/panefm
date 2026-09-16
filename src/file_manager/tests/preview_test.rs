@@ -672,3 +672,118 @@ fn test_preview_file_slice_from_disk() {
     let line1_str = line1.to_string();
     assert!(line1_str.contains(" 2 version = \"1.0.0\""));
 }
+
+#[test]
+/// 驗證單行 Markdown 分詞高亮函式針對各種語法元素（標題、代碼塊、引言、Alert、清單、工作清單、表格、inline 代碼與連結）的解析表現。
+fn test_highlight_markdown_line_tokens() {
+    let mut in_code_fence = false;
+
+    // 1. 標題
+    let spans = highlight_markdown_line("# Development Guidelines", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "#");
+    assert!(spans[0].style.fg.is_some());
+    let full_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(full_text, "# Development Guidelines");
+
+    // 2. 二級標題
+    let spans = highlight_markdown_line("## 1. 專案目標", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "##");
+    let full_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(full_text, "## 1. 專案目標");
+
+    // 3. 程式碼區塊標記
+    let spans = highlight_markdown_line("```rust", &mut in_code_fence);
+    assert!(in_code_fence, "進入代碼塊後 in_code_fence 應為 true");
+    assert_eq!(spans[0].content.as_ref(), "```");
+    assert_eq!(spans[1].content.as_ref(), "rust");
+
+    // 4. 程式碼區塊內部
+    let spans = highlight_markdown_line("let x = 42;", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "let x = 42;");
+
+    // 5. 關閉程式碼區塊
+    let spans = highlight_markdown_line("```", &mut in_code_fence);
+    assert!(!in_code_fence, "離開代碼塊後 in_code_fence 應為 false");
+    assert_eq!(spans[0].content.as_ref(), "```");
+
+    // 6. GitHub Alert
+    let spans = highlight_markdown_line("> [!NOTE] Background context", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), ">");
+    assert_eq!(spans[1].content.as_ref(), " ");
+    assert_eq!(spans[2].content.as_ref(), "[!NOTE]");
+
+    // 7. 清單項目與工作清單 (Task lists)
+    let spans = highlight_markdown_line("- [ ] 未完成項目", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "- ");
+    assert_eq!(spans[1].content.as_ref(), "[ ] ");
+
+    let spans = highlight_markdown_line("- [x] 已完成項目", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "- ");
+    assert_eq!(spans[1].content.as_ref(), "[x] ");
+
+    // 8. 數字清單
+    let spans = highlight_markdown_line("1. 第一步", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "1. ");
+
+    // 9. 分隔線
+    let spans = highlight_markdown_line("---", &mut in_code_fence);
+    assert_eq!(spans[0].content.as_ref(), "---");
+
+    // 10. 表格
+    let spans = highlight_markdown_line("| 欄位A | 欄位B |", &mut in_code_fence);
+    assert!(spans.iter().any(|s| s.content.as_ref() == "|"));
+
+    // 11. 行內 inline 標記：`code` 與 **bold** 與 [link](url)
+    let spans = highlight_markdown_line(
+        "這是一段含 `code` 與 **bold** 與 [連結](https://example.com) 的文字",
+        &mut in_code_fence,
+    );
+    let has_code = spans
+        .iter()
+        .any(|s| s.content.as_ref() == "`code`" && s.style.fg.is_some());
+    assert!(has_code, "行內程式碼應被高亮標記");
+    let has_bold = spans.iter().any(|s| s.content.as_ref() == "bold");
+    assert!(has_bold, "粗體文字應被標記");
+    let has_link = spans.iter().any(|s| s.content.as_ref() == "[連結]");
+    assert!(has_link, "連結文字應被標記");
+}
+
+#[test]
+/// 驗證大型 Markdown 文件 (DEVELOPMENT_GUIDELINES.md) 切片與全文高亮達到亞毫秒/低延遲水準，絕不凍結主 UI。
+fn test_markdown_preview_performance_benchmark() {
+    let path = std::path::Path::new("DEVELOPMENT_GUIDELINES.md");
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let total_count = content.lines().count();
+
+        let t_slice = std::time::Instant::now();
+        let lines = highlight_code_preview_slice(path, &content, 0, 40, total_count, None);
+        let slice_dur = t_slice.elapsed();
+        println!(
+            ">>> Dedicated Markdown highlight 40 lines took: {:?}",
+            slice_dur
+        );
+        assert_eq!(lines.len(), 40);
+        // 在 debug 模式下通常 < 3ms，release 模式 < 0.1ms；確保永遠在 50ms 以內，徹底杜絕過去 918ms 的嚴重卡頓
+        assert!(
+            slice_dur.as_millis() < 50,
+            "首屏 40 行渲染耗時過長: {:?}",
+            slice_dur
+        );
+
+        let t_full = std::time::Instant::now();
+        let full_lines =
+            highlight_code_preview_slice(path, &content, 0, usize::MAX, total_count, None);
+        let full_dur = t_full.elapsed();
+        println!(
+            ">>> Dedicated Markdown highlight ALL {} lines took: {:?}",
+            total_count, full_dur
+        );
+        assert_eq!(full_lines.len(), total_count);
+        assert!(
+            full_dur.as_millis() < 100,
+            "全檔 {} 行渲染耗時過長: {:?}",
+            total_count,
+            full_dur
+        );
+    }
+}

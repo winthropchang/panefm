@@ -563,3 +563,26 @@ windows_command = "ghostty.exe --working-directory {path}"
         vec!["ghostty.exe", "ghostty"]
     );
 }
+
+#[test]
+/// 驗證 `[ui.vcs]` 設定能正確控制版本控制功能的啟用與停用。
+fn load_config_parses_ui_vcs_enabled() {
+    let dir = tempdir().expect("tempdir");
+
+    // 1. 預設值為 enabled = true
+    let default_loaded = load_config(dir.path()).expect("load default config");
+    assert!(default_loaded.config.ui.vcs.enabled);
+
+    // 2. 顯式設定 enabled = false
+    fs::write(
+        dir.path().join("config.toml"),
+        r#"
+[ui.vcs]
+enabled = false
+"#,
+    )
+    .expect("write config");
+
+    let loaded = load_config(dir.path()).expect("load config with vcs disabled");
+    assert!(!loaded.config.ui.vcs.enabled);
+}

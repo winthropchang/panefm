@@ -89,6 +89,10 @@ pub(crate) enum TransferProgress {
     BytesCopied(u64),
 }
 
+/// VCS Diff 預覽行快取的執行緒安全容器類型。
+pub(crate) type PreviewDiffCache =
+    Arc<Mutex<Option<(PathBuf, Option<SystemTime>, Vec<Line<'static>>)>>>;
+
 /// 表示單一 pane 的完整瀏覽狀態。
 ///
 /// 每個 pane 都獨立維護自己的目錄、游標與列表狀態，
@@ -126,17 +130,27 @@ pub(crate) struct PaneState {
     /// 這個開關必須跟著 `PaneState` 保存，不能放在 `App` 的全域欄位；否則在第二個
     /// panel 打開 preview 時，第一個 panel 的 preview 會被同一個全域值覆蓋。
     pub(crate) preview_active: bool,
+    /// 雙欄預覽是否已開啟（若開啟且寬度足夠，畫面呈現左清單、右預覽）。
+    pub(crate) preview_open: bool,
+    /// 雙欄預覽開啟時，焦點是否正處於右側預覽（true 為預覽操作，false 為清單操作）。
+    pub(crate) preview_focused: bool,
+    /// 預覽是否處於 VCS Diff 差異模式（true 為顯示 Git/SVN 變更差異，false 為檔案全文）。
+    pub(crate) preview_diff_mode: bool,
+    /// VCS Diff 預覽行快取，避免滾動時反覆調用外部 git/svn 指令。
+    pub(crate) preview_diff_cache: PreviewDiffCache,
     /// 目前 preview 在內容中的捲動偏移量。
     pub(crate) preview_scroll: usize,
+    /// 目前 preview 游標所在行號（0-indexed）。
+    pub(crate) preview_cursor: usize,
     /// 目前 preview 區實際可顯示的欄位寬度與列數，供縮圖縮放與捲動邏輯計算上下界。
     pub(crate) preview_viewport_width: usize,
     pub(crate) preview_viewport_height: usize,
     /// 圖片預覽快取，避免每幀重新讀檔與解碼。
     preview_image_cache:
         std::sync::Arc<std::sync::Mutex<Option<super::preview::ImagePreviewCache>>>,
-    /// 程式碼與檔案內容預覽快取，避免 j/k 捲動與每幀重複讀檔與語法解析。
-    preview_content_cache:
-        std::sync::Arc<std::sync::Mutex<Option<super::preview::PreviewContentCache>>>,
+    /// 程式碼與檔案內容預覽快取，支援多項目 LRU 與鄰近預熱。
+    pub(crate) preview_content_cache:
+        std::sync::Arc<std::sync::Mutex<super::preview::PreviewContentCacheMap>>,
     /// 背景非同步圖片解碼任務。
     preview_image_loader: std::sync::Arc<std::sync::Mutex<Option<super::preview::ImageLoader>>>,
     /// 目前 preview 內搜尋使用的查詢字串。
@@ -151,6 +165,8 @@ pub(crate) struct PaneState {
     filter_cache: Option<FilterCache>,
     /// 每次 entries 順序或內容變動都遞增，避免沿用失效的 filter cache。
     entry_revision: u64,
+    /// 目前 pane 所在目錄的版本控制（Git / SVN）資訊與檔案狀態。
+    pub(crate) vcs_info: Option<std::sync::Arc<super::vcs::VcsRepoInfo>>,
 }
 
 /// 描述列表過濾目前使用的比對模式。
@@ -294,11 +310,18 @@ impl PaneState {
             line_mode: None,
             random_seed,
             preview_active: false,
+            preview_open: false,
+            preview_focused: false,
+            preview_diff_mode: false,
+            preview_diff_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             preview_scroll: 0,
+            preview_cursor: 0,
             preview_viewport_width: 80,
             preview_viewport_height: 4,
             preview_image_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            preview_content_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            preview_content_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                super::preview::PreviewContentCacheMap::new(32),
+            )),
             preview_image_loader: std::sync::Arc::new(std::sync::Mutex::new(None)),
             preview_search_query: None,
             preview_current_match: None,
@@ -306,39 +329,122 @@ impl PaneState {
             marked_paths: BTreeSet::new(),
             filter_cache: None,
             entry_revision: 0,
+            vcs_info: None,
         };
         pane.reload()?;
         Ok(pane)
     }
 
-    /// 判斷目前 panel 是否正在顯示放大的 preview。
-    ///
-    /// 參數：無。
-    ///
-    /// 回傳：`bool`；`true` 代表 preview 已取代這個 panel 的檔案列表，`false`
-    /// 代表顯示一般列表。每個 `PaneState` 都有自己的值，因此切換 panel 不會互相影響。
-    pub(crate) fn is_preview_active(&self) -> bool {
-        self.preview_active
+    /// 設定此 Pane 目前目錄的 VCS 資訊。
+    pub(crate) fn set_vcs_info(&mut self, info: Option<std::sync::Arc<super::vcs::VcsRepoInfo>>) {
+        self.vcs_info = info;
     }
 
-    /// 明確設定目前 panel 的 preview 顯示狀態。
-    ///
-    /// 參數：
-    /// - `active: bool`，`true` 表示打開 preview，`false` 表示回到一般列表。
-    ///
-    /// 回傳：`()`；只更新目前 `PaneState`，不會修改其他 panel。
+    /// 取得指定路徑在當前 VCS 下的檔案狀態。
+    pub(crate) fn vcs_status_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<super::vcs::VcsFileStatus> {
+        self.vcs_info
+            .as_ref()
+            .and_then(|info| info.status_for_path(path))
+    }
+
+    /// 取得當前目錄的 VCS 標籤（如 `git:main` 或 `svn:trunk:r42`）。
+    pub(crate) fn vcs_header_label(&self) -> Option<String> {
+        self.vcs_info
+            .as_ref()
+            .map(|info| info.format_header_label())
+    }
+
+    /// 判斷目前 panel 是否開啟了雙欄即時預覽。
+    pub(crate) fn is_preview_open(&self) -> bool {
+        self.preview_open
+    }
+
+    /// 明確設定目前 panel 的雙欄即時預覽開啟狀態。
+    pub(crate) fn set_preview_open(&mut self, open: bool) {
+        self.preview_open = open;
+        if !open {
+            self.preview_focused = false;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+    }
+
+    /// 切換目前 panel 的雙欄即時預覽開啟狀態。
+    pub(crate) fn toggle_preview_open(&mut self) -> bool {
+        self.preview_open = !self.preview_open;
+        if self.preview_open {
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+            self.preview_diff_mode = false;
+            self.preview_search_query = None;
+            self.preview_current_match = None;
+            self.preview_focused = false;
+        } else {
+            self.preview_focused = false;
+            self.preview_diff_mode = false;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+        self.preview_open
+    }
+
+    /// 切換預覽的 VCS Diff 差異模式。
+    /// 若預覽未開啟，則同時開啟預覽並切換至 diff 模式。
+    /// 若預覽已開啟且處於 diff 模式，則切回全文模式。
+    /// 若預覽已開啟但處於全文模式，則切換至 diff 模式。
+    /// 回傳切換後是否處於 diff 模式。
+    pub(crate) fn toggle_preview_diff_mode(&mut self) -> bool {
+        if !self.preview_open {
+            self.preview_open = true;
+            self.preview_diff_mode = true;
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+            self.preview_search_query = None;
+            self.preview_current_match = None;
+            self.preview_focused = false;
+        } else {
+            self.preview_diff_mode = !self.preview_diff_mode;
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+            self.preview_search_query = None;
+            self.preview_current_match = None;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+        self.preview_diff_mode
+    }
+
+    /// 判斷當前焦點是否正處於右側預覽（可進行滾動、跳頁與預覽搜尋）。
+    pub(crate) fn is_preview_focused(&self) -> bool {
+        self.preview_open && self.preview_focused
+    }
+
+    /// 設定焦點是否切入右側預覽視窗。
+    pub(crate) fn set_preview_focused(&mut self, focused: bool) {
+        if self.preview_open {
+            self.preview_focused = focused;
+        } else {
+            self.preview_focused = false;
+        }
+        self.preview_active = self.preview_open && self.preview_focused;
+    }
+
+    /// 判斷目前 panel 是否正在接收預覽操作按鍵（等同於 is_preview_focused）。
+    pub(crate) fn is_preview_active(&self) -> bool {
+        self.preview_open && self.preview_focused
+    }
+
+    /// 明確設定目前 panel 的 preview 操作狀態。
     pub(crate) fn set_preview_active(&mut self, active: bool) {
+        self.preview_open = active;
+        self.preview_focused = active;
         self.preview_active = active;
     }
 
     /// 切換目前 panel 的 preview 顯示狀態，並回傳切換後的結果。
-    ///
-    /// 參數：無。
-    ///
-    /// 回傳：`bool`；`true` 代表切換後已打開 preview，`false` 代表切換後已關閉。
+    #[allow(dead_code)]
     pub(crate) fn toggle_preview_active(&mut self) -> bool {
-        self.preview_active = !self.preview_active;
-        self.preview_active
+        self.toggle_preview_open()
     }
 
     /// 重新掃描目前目錄，並同步更新列表與游標位置。
@@ -353,6 +459,7 @@ impl PaneState {
         // 外部程式可能在游標前方新增或刪除項目。先記住實際路徑，重新排序後再找回
         // 同一項，避免 watcher 更新列表時游標只依舊索引而跳到另一個檔案。
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        let previous_preview_scroll = self.preview_scroll;
         let cached_directory_sizes = self
             .entries
             .iter()
@@ -376,8 +483,12 @@ impl PaneState {
             .retain(|path| self.entries.iter().any(|entry| &entry.path == path));
         self.sort_entries();
         self.refresh_visible_entries();
-        if let Some(path) = selected_path {
-            self.select_path(&path);
+        if let Some(ref path) = selected_path {
+            self.select_path(path);
+            if self.selected_entry().map(|e| &e.path) == Some(path) {
+                self.preview_scroll = previous_preview_scroll;
+                self.clamp_preview_scroll();
+            }
         }
         Ok(())
     }
@@ -393,9 +504,13 @@ impl PaneState {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = self.selected.saturating_sub(count.max(1));
-        self.list_state.select(Some(self.selected));
-        self.preview_scroll = 0;
+        let new_selected = self.selected.saturating_sub(count.max(1));
+        if self.selected != new_selected {
+            self.selected = new_selected;
+            self.list_state.select(Some(self.selected));
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+        }
     }
 
     /// 將列表選取游標向下移動指定格數。
@@ -409,10 +524,14 @@ impl PaneState {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected =
+        let new_selected =
             (self.selected + count.max(1)).min(self.visible_indices.len().saturating_sub(1));
-        self.list_state.select(Some(self.selected));
-        self.preview_scroll = 0;
+        if self.selected != new_selected {
+            self.selected = new_selected;
+            self.list_state.select(Some(self.selected));
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+        }
     }
 
     /// 將列表選取游標跳到最上方。
@@ -425,9 +544,12 @@ impl PaneState {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = 0;
-        self.list_state.select(Some(self.selected));
-        self.preview_scroll = 0;
+        if self.selected != 0 {
+            self.selected = 0;
+            self.list_state.select(Some(self.selected));
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+        }
     }
 
     /// 將列表選取游標跳到最下方。
@@ -440,9 +562,13 @@ impl PaneState {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = self.visible_indices.len() - 1;
-        self.list_state.select(Some(self.selected));
-        self.preview_scroll = 0;
+        let target = self.visible_indices.len() - 1;
+        if self.selected != target {
+            self.selected = target;
+            self.list_state.select(Some(self.selected));
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+        }
     }
 
     /// 更新列表區目前實際可顯示的列數，供半頁移動等行為使用。
@@ -502,9 +628,13 @@ impl PaneState {
         if self.visible_indices.is_empty() {
             return;
         }
-        self.selected = index.min(self.visible_indices.len().saturating_sub(1));
-        self.list_state.select(Some(self.selected));
-        self.preview_scroll = 0;
+        let target = index.min(self.visible_indices.len().saturating_sub(1));
+        if self.selected != target {
+            self.selected = target;
+            self.list_state.select(Some(self.selected));
+            self.preview_scroll = 0;
+            self.preview_cursor = 0;
+        }
     }
 
     /// 取得目前游標指向的檔案項目。
@@ -706,8 +836,12 @@ impl PaneState {
             BookmarkTarget::LocalPath(_) => BookmarkTarget::LocalPath(self.cwd.clone()),
         };
         self.selected = 0;
+        self.preview_scroll = 0;
         self.filter_query = None;
-        self.replace_entries(Vec::new(), None);
+        self.entries = Vec::new();
+        self.bump_entry_revision();
+        self.sort_entries();
+        self.refresh_visible_entries();
         Some(self.cwd.clone())
     }
 
@@ -740,12 +874,27 @@ impl PaneState {
         entries: Vec<FileEntry>,
         selected_path: Option<&Path>,
     ) {
+        let previous_preview_scroll = self.preview_scroll;
+        let previous_preview_cursor = self.preview_cursor;
+        let preview_active = self.preview_open;
+        let preview_path = if preview_active {
+            self.selected_entry().map(|entry| entry.path.clone())
+        } else {
+            None
+        };
         self.entries = entries;
         self.bump_entry_revision();
         self.sort_entries();
         self.refresh_visible_entries();
         if let Some(path) = selected_path {
             self.select_path(path);
+        } else if let Some(ref path) = preview_path {
+            self.select_path(path);
+            if self.selected_entry().map(|e| &e.path) == Some(path) {
+                self.preview_scroll = previous_preview_scroll;
+                self.preview_cursor = previous_preview_cursor;
+                self.clamp_preview_scroll();
+            }
         }
     }
 
@@ -755,19 +904,50 @@ impl PaneState {
         entries: Vec<FileEntry>,
         selected_path: Option<&Path>,
     ) {
+        let previous_preview_scroll = self.preview_scroll;
+        let previous_preview_cursor = self.preview_cursor;
+        let preview_active = self.preview_open;
+        let preview_path = if preview_active {
+            self.selected_entry().map(|entry| entry.path.clone())
+        } else {
+            None
+        };
         self.entries = entries;
         self.bump_entry_revision();
         self.refresh_visible_entries();
         if let Some(path) = selected_path {
             self.select_path(path);
+        } else if let Some(ref path) = preview_path {
+            self.select_path(path);
+            if self.selected_entry().map(|e| &e.path) == Some(path) {
+                self.preview_scroll = previous_preview_scroll;
+                self.preview_cursor = previous_preview_cursor;
+                self.clamp_preview_scroll();
+            }
         }
     }
 
     /// 增量追加載入中的目錄項目，並在保留目前可見游標索引的前提下即時更新畫面。
     pub(crate) fn extend_entries(&mut self, new_entries: Vec<FileEntry>) {
+        let previous_preview_scroll = self.preview_scroll;
+        let previous_preview_cursor = self.preview_cursor;
+        let preview_active = self.preview_open;
+        let preview_path = if preview_active {
+            self.selected_entry().map(|entry| entry.path.clone())
+        } else {
+            None
+        };
         self.entries.extend(new_entries);
         self.bump_entry_revision();
         self.refresh_visible_entries();
+        if let Some(ref path) = preview_path {
+            self.select_path(path);
+            if self.selected_entry().map(|e| &e.path) == Some(path) {
+                self.preview_scroll = previous_preview_scroll;
+                self.preview_cursor = previous_preview_cursor;
+                self.clamp_preview_scroll();
+            }
+        }
     }
 
     /// 回到目前目錄的上一層。
@@ -805,6 +985,14 @@ impl PaneState {
     /// 回傳：`Vec<Line<'static>>`，可直接交給 `ratatui` 的 Paragraph 渲染。
     pub(crate) fn preview_lines(&self, max_lines: usize, theme: Theme) -> Vec<Line<'static>> {
         let max_lines = max_lines.max(1);
+        let Some(entry) = self.selected_entry() else {
+            return vec![Line::from("empty directory")];
+        };
+
+        if self.preview_diff_mode {
+            return self.preview_diff_lines(entry, max_lines, theme);
+        }
+
         if self.preview_search_query.is_some() {
             return self
                 .preview_content_lines(theme)
@@ -814,10 +1002,6 @@ impl PaneState {
                 .collect();
         }
 
-        let Some(entry) = self.selected_entry() else {
-            return vec![Line::from("empty directory")];
-        };
-
         let ext = entry.path.extension().and_then(|e| e.to_str());
         let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
         let is_archive = !entry.is_dir && super::preview::is_archive_file(&entry.path).is_some();
@@ -825,71 +1009,151 @@ impl PaneState {
         // 目錄、圖片、壓縮包維持原有快速分流
         if entry.is_dir || is_image || is_archive {
             let needed_lines = self.preview_scroll + max_lines;
-            return self
+            let lines = self
                 .raw_preview_content_lines_limited(needed_lines)
                 .into_iter()
                 .skip(self.preview_scroll)
                 .take(max_lines)
                 .collect();
+            if is_image {
+                return lines;
+            }
+            return self.apply_preview_cursor_highlight(lines, theme);
         }
 
         let start_line = self.preview_scroll;
         let end_line = start_line + max_lines;
 
         // 檢查快取
-        if let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.as_ref()
-            && cache.path == entry.path
-            && cache.modified == Some(entry.modified)
-            && cache.viewport_width == self.preview_viewport_width
-        {
+        let result_lines = if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.get(
+                &entry.path,
+                Some(entry.modified),
+                self.preview_viewport_width,
+            ) {
             // 若快取已涵蓋可見區間，或全文已經由背景執行緒解析完畢
             if cache.lines.len() >= end_line || cache.is_complete {
-                return cache
+                cache
                     .lines
                     .iter()
                     .skip(start_line)
                     .take(max_lines)
                     .cloned()
-                    .collect();
+                    .collect()
+            } else {
+                // 快取存在但目標區間超出目前快取行數（例如剛打開檔案即按下 G 跳至第 5000 行）：
+                // 立即以 < 1ms 切片渲染可見行，絕不阻塞主 UI 執行緒！
+                super::preview::preview_file_slice(
+                    &entry.path,
+                    start_line,
+                    max_lines,
+                    cache.total_lines,
+                )
             }
-
-            // 快取存在但目標區間超出目前快取行數（例如剛打開檔案即按下 G 跳至第 5000 行）：
-            // 立即以 < 1ms 切片渲染可見行，絕不阻塞主 UI 執行緒！
-            return super::preview::preview_file_slice(
-                &entry.path,
-                start_line,
-                max_lines,
-                cache.total_lines,
-            );
-        }
-
-        // 快取尚未建立（首次開啟）：先載入首屏 40 行，並在背景啟動全文高亮
-        let initial_lines = self.raw_preview_content_lines_limited(end_line.min(40));
-        if let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.as_ref()
-            && cache.path == entry.path
-        {
-            if start_line < initial_lines.len() {
-                return initial_lines
+        } else {
+            // 快取尚未建立（首次開啟）：先載入首屏 40 行，並在背景啟動全文高亮
+            let initial_lines = self.raw_preview_content_lines_limited(end_line.min(40));
+            if let Ok(guard) = self.preview_content_cache.lock()
+                && let Some(cache) = guard.get(
+                    &entry.path,
+                    Some(entry.modified),
+                    self.preview_viewport_width,
+                )
+            {
+                if start_line < initial_lines.len() {
+                    initial_lines
+                        .into_iter()
+                        .skip(start_line)
+                        .take(max_lines)
+                        .collect()
+                } else {
+                    super::preview::preview_file_slice(
+                        &entry.path,
+                        start_line,
+                        max_lines,
+                        cache.total_lines,
+                    )
+                }
+            } else {
+                initial_lines
                     .into_iter()
                     .skip(start_line)
                     .take(max_lines)
-                    .collect();
+                    .collect()
             }
-            return super::preview::preview_file_slice(
-                &entry.path,
-                start_line,
-                max_lines,
-                cache.total_lines,
-            );
+        };
+
+        self.prefetch_adjacent_previews();
+        self.apply_preview_cursor_highlight(result_lines, theme)
+    }
+
+    /// 取得或載入當前選取檔案的 VCS Diff 行清單（帶快取保護）。
+    fn get_or_load_preview_diff_lines(
+        &self,
+        entry: &FileEntry,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        use ratatui::text::Span;
+
+        if entry.is_dir {
+            return vec![Line::from(Span::styled(
+                "[Directories do not support diff preview - press Ctrl+d for preview]",
+                theme.muted_style(),
+            ))];
         }
 
-        initial_lines
+        if let Ok(guard) = self.preview_diff_cache.lock()
+            && let Some((cached_path, cached_mtime, lines)) = guard.as_ref()
+            && cached_path == &entry.path
+            && *cached_mtime == Some(entry.modified)
+        {
+            return lines.clone();
+        }
+
+        let diff_output = super::vcs::query_vcs_file_diff(&entry.path);
+        let lines = match diff_output {
+            Some(diff) if !diff.trim().is_empty() => {
+                super::vcs::format_diff_lines(&diff, theme)
+            }
+            _ => {
+                vec![Line::from(Span::styled(
+                    "[No VCS modifications detected in Git/SVN]",
+                    theme.muted_style(),
+                ))]
+            }
+        };
+
+        if let Ok(mut guard) = self.preview_diff_cache.lock() {
+            *guard = Some((entry.path.clone(), Some(entry.modified), lines.clone()));
+        }
+
+        lines
+    }
+
+    /// 取得當前選取檔案的 VCS Diff 行清單，支援快取、搜尋高亮、捲動切片與游標所在行高亮。
+    fn preview_diff_lines(
+        &self,
+        entry: &FileEntry,
+        max_lines: usize,
+        theme: Theme,
+    ) -> Vec<Line<'static>> {
+        let all_lines = self.get_or_load_preview_diff_lines(entry, &theme);
+        let all_lines = if let Some(query) = self.preview_search_query.as_deref() {
+            highlight_preview_matches(all_lines, query, theme, self.preview_current_match)
+        } else {
+            all_lines
+        };
+        let visible_lines: Vec<Line<'static>> = all_lines
             .into_iter()
-            .skip(start_line)
+            .skip(self.preview_scroll)
             .take(max_lines)
-            .collect()
+            .collect();
+
+        if self.preview_search_query.is_some() {
+            visible_lines
+        } else {
+            self.apply_preview_cursor_highlight(visible_lines, theme)
+        }
     }
 
     /// 更新 preview 區目前實際可顯示的欄位寬度與高度。
@@ -906,28 +1170,136 @@ impl PaneState {
         }
     }
 
+    /// 回傳目前 preview 內容的總行數。
+    pub(crate) fn preview_total_lines(&self) -> usize {
+        let Some(entry) = self.selected_entry() else {
+            return 0;
+        };
+
+        if self.preview_diff_mode {
+            let default_theme = Theme::default_theme();
+            return self.get_or_load_preview_diff_lines(entry, &default_theme).len();
+        }
+
+        let ext = entry.path.extension().and_then(|e| e.to_str());
+        let is_image = !entry.is_dir && super::preview::is_image_extension(ext);
+        if is_image {
+            if let Ok(guard) = self.preview_image_cache.lock()
+                && let Some(c) = guard.as_ref()
+                && c.path == entry.path
+            {
+                return c.lines.len();
+            }
+            return 0;
+        }
+
+        if let Ok(guard) = self.preview_content_cache.lock()
+            && let Some(cache) = guard.get(
+                &entry.path,
+                Some(entry.modified),
+                self.preview_viewport_width,
+            )
+        {
+            cache.total_lines
+        } else {
+            let _ = self.raw_preview_content_lines_limited(40);
+            if let Ok(guard) = self.preview_content_cache.lock()
+                && let Some(cache) = guard.get(
+                    &entry.path,
+                    Some(entry.modified),
+                    self.preview_viewport_width,
+                )
+            {
+                cache.total_lines
+            } else {
+                1
+            }
+        }
+    }
+
+    /// 確保 preview 游標落在可視區域內；若超出則捲動 preview_scroll。
+    pub(crate) fn ensure_preview_cursor_visible(&mut self) {
+        let total = self.preview_total_lines();
+        if total == 0 {
+            self.preview_cursor = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        self.preview_cursor = self.preview_cursor.min(total.saturating_sub(1));
+        let viewport_height = self.preview_viewport_height.max(1);
+        if self.preview_cursor < self.preview_scroll {
+            self.preview_scroll = self.preview_cursor;
+        } else if self.preview_cursor >= self.preview_scroll + viewport_height {
+            self.preview_scroll = self.preview_cursor.saturating_sub(viewport_height - 1);
+        }
+        self.clamp_preview_scroll();
+    }
+
+    /// 將 preview 游標向下移動指定列數（如像文字編輯器般移動游標，僅在游標超出可視範圍時捲動）。
+    pub(crate) fn move_preview_cursor_down(&mut self, lines: usize) {
+        let total = self.preview_total_lines();
+        if total == 0 {
+            self.preview_cursor = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        self.preview_cursor = (self.preview_cursor + lines).min(total.saturating_sub(1));
+        self.ensure_preview_cursor_visible();
+    }
+
+    /// 將 preview 游標向上移動指定列數（如像文字編輯器般移動游標，僅在游標超出可視範圍時捲動）。
+    pub(crate) fn move_preview_cursor_up(&mut self, lines: usize) {
+        self.preview_cursor = self.preview_cursor.saturating_sub(lines);
+        self.ensure_preview_cursor_visible();
+    }
+
     /// 將 preview 向下捲動指定列數。
     pub(crate) fn scroll_preview_down(&mut self, lines: usize) {
         let max_scroll = self.max_preview_scroll();
+        let total = self.preview_total_lines();
         self.preview_scroll = (self.preview_scroll + lines).min(max_scroll);
+        self.preview_cursor = (self.preview_cursor + lines).min(total.saturating_sub(1));
+        self.ensure_preview_cursor_visible();
     }
 
     /// 將 preview 向上捲動指定列數。
     pub(crate) fn scroll_preview_up(&mut self, lines: usize) {
         self.preview_scroll = self.preview_scroll.saturating_sub(lines);
+        self.preview_cursor = self.preview_cursor.saturating_sub(lines);
+        self.ensure_preview_cursor_visible();
     }
 
     /// 將 preview 捲到最上方。
     pub(crate) fn scroll_preview_top(&mut self) {
         self.preview_scroll = 0;
+        self.preview_cursor = 0;
     }
 
     /// 將 preview 捲到最下方。
     pub(crate) fn scroll_preview_bottom(&mut self) {
         self.preview_scroll = self.max_preview_scroll();
+        let total = self.preview_total_lines();
+        self.preview_cursor = total.saturating_sub(1);
+        self.ensure_preview_cursor_visible();
+    }
+
+    /// 將 preview 游標跳至指定行號（1-indexed）。
+    pub(crate) fn move_preview_cursor_to_line(&mut self, line_1_indexed: usize) {
+        let total = self.preview_total_lines();
+        if total == 0 {
+            self.preview_cursor = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        let target_0_indexed = line_1_indexed
+            .saturating_sub(1)
+            .min(total.saturating_sub(1));
+        self.preview_cursor = target_0_indexed;
+        self.ensure_preview_cursor_visible();
     }
 
     /// 依照目前 viewport 高度向下翻半頁。
+    #[allow(dead_code)]
     pub(crate) fn page_preview_down(&mut self) {
         let step = (self.preview_viewport_height / 2).max(1);
         self.scroll_preview_down(step);
@@ -973,39 +1345,49 @@ impl PaneState {
         }
 
         let viewport_height = self.preview_viewport_height.max(1);
-        if let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.as_ref()
-        {
-            return self.preview_scroll + viewport_height < cache.total_lines;
-        }
-
-        let needed_lines = self.preview_scroll + viewport_height + 1;
-        let total_loaded_lines = self.raw_preview_content_lines_limited(needed_lines).len();
-        total_loaded_lines > self.preview_scroll + viewport_height
+        let total = self.preview_total_lines();
+        self.preview_scroll + viewport_height < total
     }
 
     /// 回傳完整 preview 內容最多可以向下捲到哪一列。
     fn max_preview_scroll(&self) -> usize {
-        let total_lines = if let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.as_ref()
-        {
-            cache.total_lines
-        } else {
-            let _ = self.raw_preview_content_lines_limited(40);
-            if let Ok(guard) = self.preview_content_cache.lock()
-                && let Some(cache) = guard.as_ref()
-            {
-                cache.total_lines
-            } else {
-                1
-            }
-        };
-        total_lines.saturating_sub(self.preview_viewport_height.max(1))
+        self.preview_total_lines()
+            .saturating_sub(self.preview_viewport_height.max(1))
+    }
+
+    /// 為目前可見預覽行套用游標所在行的高亮（背景色與行號強調）。
+    fn apply_preview_cursor_highlight(
+        &self,
+        lines: Vec<Line<'static>>,
+        theme: Theme,
+    ) -> Vec<Line<'static>> {
+        let start_line = self.preview_scroll;
+        let cursor_line = self.preview_cursor;
+
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(offset, line)| {
+                let global_idx = start_line + offset;
+                if global_idx == cursor_line {
+                    highlight_cursor_line(line, theme)
+                } else {
+                    line
+                }
+            })
+            .collect()
     }
 
     /// 產生目前選取項目的完整 preview 內容，供捲動切片與上下界計算使用。
     fn preview_content_lines(&self, theme: Theme) -> Vec<Line<'static>> {
-        let lines = self.raw_preview_content_lines();
+        let lines = if self.preview_diff_mode {
+            let Some(entry) = self.selected_entry() else {
+                return Vec::new();
+            };
+            self.get_or_load_preview_diff_lines(entry, &theme)
+        } else {
+            self.raw_preview_content_lines()
+        };
         if let Some(query) = self.preview_search_query.as_deref() {
             highlight_preview_matches(lines, query, theme, self.preview_current_match)
         } else {
@@ -1015,6 +1397,12 @@ impl PaneState {
 
     /// 產生目前選取項目的完整 preview 原始內容，不套用任何搜尋高亮。
     fn raw_preview_content_lines(&self) -> Vec<Line<'static>> {
+        if self.preview_diff_mode {
+            let Some(entry) = self.selected_entry() else {
+                return Vec::new();
+            };
+            return self.get_or_load_preview_diff_lines(entry, &Theme::default_theme());
+        }
         self.raw_preview_content_lines_limited(usize::MAX)
     }
 
@@ -1105,6 +1493,23 @@ impl PaneState {
     /// 若為目錄或壓縮檔案，直接在邊框顯示單排精煉資訊。
     /// 若為圖片檔案，直接在邊框顯示單排精煉資訊：`1920 × 25000 (PNG)  •  13.85 MiB  •  2026-01-01 08:59`。
     pub(crate) fn preview_title_for_entry(&self, entry: &FileEntry) -> String {
+        if self.preview_diff_mode {
+            let mut title = format!("Preview [diff]: {}  (press Ctrl+d for full)", entry.name);
+            if self.is_preview_focused() {
+                title.push_str("  [preview]");
+            }
+            if let Some(query) = self.preview_search_query() {
+                title.push_str(&format!("  [/{query}]"));
+            }
+            if self.has_preview_scroll() {
+                title.push_str("  ^");
+            }
+            if self.preview_has_more_below() {
+                title.push_str("  v");
+            }
+            return title;
+        }
+
         if entry.is_dir {
             let (dir_count, file_count) = super::preview::quick_directory_counts(&entry.path);
             let total = dir_count + file_count;
@@ -1210,10 +1615,11 @@ impl PaneState {
 
         if !is_image
             && let Ok(guard) = self.preview_content_cache.lock()
-            && let Some(cache) = guard.as_ref()
-            && cache.path == entry.path
-            && cache.modified == Some(entry.modified)
-            && cache.viewport_width == self.preview_viewport_width
+            && let Some(cache) = guard.get(
+                &entry.path,
+                Some(entry.modified),
+                self.preview_viewport_width,
+            )
             && (cache.lines.len() >= max_lines || cache.is_complete)
         {
             let mut lines = cache.lines.clone();
@@ -1253,7 +1659,7 @@ impl PaneState {
         if !is_image {
             let is_complete = lines.len() >= total_lines;
             if let Ok(mut guard) = self.preview_content_cache.lock() {
-                *guard = Some(super::preview::PreviewContentCache {
+                guard.put_current(super::preview::PreviewContentCache {
                     path: entry.path.clone(),
                     modified: Some(entry.modified),
                     viewport_width: self.preview_viewport_width,
@@ -1277,13 +1683,8 @@ impl PaneState {
                             usize::MAX,
                             None,
                         );
-                        if let Ok(mut guard) = bg_cache.lock()
-                            && let Some(cache) = guard.as_mut()
-                            && cache.path == bg_path
-                            && cache.modified == bg_modified
-                        {
-                            cache.lines = full_lines;
-                            cache.is_complete = true;
+                        if let Ok(mut guard) = bg_cache.lock() {
+                            guard.update_complete(&bg_path, bg_modified, full_lines);
                         }
                     }
                 });
@@ -1295,9 +1696,102 @@ impl PaneState {
         output
     }
 
-    /// 當列表或 viewport 發生變化時，把 preview 捲動位置壓回合法範圍。
+    /// 投機性預熱鄰近項目的預覽內容（selected + 1 與 selected - 1）。
+    /// 在背景執行緒中預先完成讀檔與語法高亮，使 j/k 切換時達到 0ms 快取命中。
+    pub(crate) fn prefetch_adjacent_previews(&self) {
+        self.prefetch_current_and_adjacent_previews(false);
+    }
+
+    /// 投機性預熱當前選取項目與鄰近項目的預覽內容。
+    ///
+    /// 參數：
+    /// - `include_current: bool`：若為 true，將當前游標停駐的項目也納入預熱（用於清單模式）。
+    pub(crate) fn prefetch_current_and_adjacent_previews(&self, include_current: bool) {
+        let current_index = self.selected;
+        let viewport_width = self.preview_viewport_width;
+        let visible_count = self.visible_indices.len();
+        if visible_count == 0 {
+            return;
+        }
+
+        let mut candidate_indices = Vec::new();
+        if include_current {
+            candidate_indices.push(current_index);
+        }
+        if current_index + 1 < visible_count {
+            candidate_indices.push(current_index + 1);
+        }
+        if current_index > 0 {
+            candidate_indices.push(current_index - 1);
+        }
+
+        let mut to_prefetch = Vec::new();
+        if let Ok(mut guard) = self.preview_content_cache.lock() {
+            for idx in candidate_indices {
+                if let Some(&entry_index) = self.visible_indices.get(idx)
+                    && let Some(entry) = self.entries.get(entry_index)
+                    && !entry.is_dir
+                {
+                    let ext = entry.path.extension().and_then(|e| e.to_str());
+                    if !super::preview::is_image_extension(ext)
+                        && !guard.is_in_flight_or_cached(
+                            &entry.path,
+                            Some(entry.modified),
+                            viewport_width,
+                        )
+                    {
+                        guard.mark_in_flight(entry.path.clone());
+                        to_prefetch.push((entry.path.clone(), entry.modified));
+                    }
+                }
+            }
+        }
+
+        if !to_prefetch.is_empty() {
+            let bg_cache = self.preview_content_cache.clone();
+            std::thread::spawn(move || {
+                for (path, modified) in to_prefetch {
+                    let mut loaded = false;
+                    if let Ok(metadata) = std::fs::metadata(&path)
+                        && metadata.len() <= super::preview::MAX_TEXT_PREVIEW_SIZE
+                        && let Ok(bytes) = std::fs::read(&path)
+                        && let Ok(contents) = String::from_utf8(bytes)
+                    {
+                        let total_lines = contents.lines().count().max(1);
+                        let is_complete = total_lines <= 2000;
+                        let max_lines = if is_complete { total_lines } else { 200 };
+                        let lines = super::preview::highlight_code_preview(
+                            &path, &contents, max_lines, None,
+                        );
+                        if let Ok(mut guard) = bg_cache.lock() {
+                            guard.put(super::preview::PreviewContentCache {
+                                path: path.clone(),
+                                modified: Some(modified),
+                                viewport_width,
+                                total_lines,
+                                lines,
+                                is_complete,
+                            });
+                            loaded = true;
+                        }
+                    }
+                    if !loaded && let Ok(mut guard) = bg_cache.lock() {
+                        guard.clear_in_flight(&path);
+                    }
+                }
+            });
+        }
+    }
+
+    /// 當列表或 viewport 發生變化時，把 preview 捲動位置與游標壓回合法範圍。
     fn clamp_preview_scroll(&mut self) {
         self.preview_scroll = self.preview_scroll.min(self.max_preview_scroll());
+        let total = self.preview_total_lines();
+        if total > 0 {
+            self.preview_cursor = self.preview_cursor.min(total.saturating_sub(1));
+        } else {
+            self.preview_cursor = 0;
+        }
     }
 
     /// 對 preview 內容套用搜尋條件，並跳到第一個命中的結果。
@@ -1311,10 +1805,12 @@ impl PaneState {
 
         if self.preview_search_query.is_some() {
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
             self.preview_current_match = None;
             self.jump_to_preview_match(true);
         } else {
             self.preview_scroll = 0;
+            self.preview_cursor = 0;
             self.preview_current_match = None;
         }
     }
@@ -1518,6 +2014,7 @@ impl PaneState {
         };
 
         self.preview_current_match = Some(target);
+        self.preview_cursor = line_index;
         self.preview_scroll = line_index.min(self.max_preview_scroll());
         true
     }
@@ -1931,6 +2428,7 @@ impl PaneState {
     ///
     /// 回傳：`()`
     pub(crate) fn select_path(&mut self, path: &Path) {
+        let previous_selected_path = self.selected_entry().map(|entry| entry.path.clone());
         if let Some(index) = self.visible_indices.iter().position(|visible_index| {
             self.entries
                 .get(*visible_index)
@@ -1940,7 +2438,13 @@ impl PaneState {
             self.selected = index;
             self.list_state.select(Some(index));
         }
-        self.preview_scroll = 0;
+        if previous_selected_path.as_deref() != Some(path) {
+            self.preview_scroll = 0;
+            self.preview_search_query = None;
+            self.preview_current_match = None;
+        } else {
+            self.clamp_preview_scroll();
+        }
     }
 
     /// 套用新的 filter 字串與模式，並立即更新可見清單。
@@ -2120,6 +2624,7 @@ impl PaneState {
 
     /// 重新計算目前實際應該顯示的項目與選取位置。
     fn refresh_visible_entries(&mut self) {
+        let previous_selected_path = self.selected_entry().map(|entry| entry.path.clone());
         self.visible_indices = match &self.filter_query {
             Some(query) => {
                 let is_fuzzy = matches!(self.filter_mode, FilterMode::Fuzzy);
@@ -2164,7 +2669,15 @@ impl PaneState {
                 .min(self.visible_indices.len().saturating_sub(1));
             self.list_state.select(Some(self.selected));
         }
-        self.preview_scroll = 0;
+
+        let current_selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        if previous_selected_path != current_selected_path {
+            self.preview_scroll = 0;
+            self.preview_search_query = None;
+            self.preview_current_match = None;
+        } else {
+            self.clamp_preview_scroll();
+        }
     }
 
     /// 依照目前排序模式重排完整項目列表。
@@ -2661,14 +3174,68 @@ fn preview_match_positions(lines: &[Line<'static>], lower_query: &str) -> Vec<(u
 
 /// 判斷這一行是否屬於 preview 中真正可搜尋的內容區。
 fn is_preview_searchable_line(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("Information")
+        || trimmed.starts_with("path:")
+        || trimmed.starts_with("size:")
+        || trimmed.starts_with("modified:")
+        || trimmed.starts_with("[Directories do not support")
+        || trimmed.starts_with("[No VCS modifications detected")
+        || trimmed == "empty directory"
+    {
+        return false;
+    }
+    let trimmed_start = text.trim_start();
+    let digit_count = trimmed_start.chars().take_while(|ch| ch.is_ascii_digit()).count();
 
-    digit_count > 0
-        && trimmed
+    if digit_count > 0
+        && trimmed_start
             .chars()
             .nth(digit_count)
             .is_some_and(char::is_whitespace)
+    {
+        return true;
+    }
+
+    if trimmed_start.starts_with('+')
+        || trimmed_start.starts_with('-')
+        || trimmed_start.starts_with('@')
+        || trimmed_start.starts_with("diff")
+        || trimmed_start.starts_with("index")
+        || trimmed_start.starts_with("Index:")
+        || trimmed_start.starts_with("===")
+        || text.starts_with(' ')
+    {
+        return true;
+    }
+
+    false
+}
+
+/// 將預覽中游標所在行套用高亮：首個數字行號套用 accent 粗體，其餘 span 套用 preview_current_line_bg。
+fn highlight_cursor_line(line: Line<'static>, theme: Theme) -> Line<'static> {
+    if line.spans.is_empty() {
+        return Line::from(vec![Span::styled(" ", theme.preview_current_line_style())]);
+    }
+    let styled_spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .enumerate()
+        .map(|(span_idx, span)| {
+            let mut style = span.style.bg(theme.preview_current_line_bg);
+            let trimmed = span.content.trim();
+            if span_idx == 0 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+            }
+            Span::styled(span.content, style)
+        })
+        .collect();
+    let mut res = Line::from(styled_spans);
+    res.alignment = line.alignment;
+    res
 }
 
 /// 將單一 preview `Line` 套用搜尋高亮，並完整保留原本的語法高亮色彩與樣式。
@@ -2687,8 +3254,16 @@ fn highlight_preview_line(
             let styled_spans: Vec<_> = line
                 .spans
                 .into_iter()
-                .map(|span| {
-                    let style = span.style.bg(theme.preview_current_line_bg);
+                .enumerate()
+                .map(|(span_idx, span)| {
+                    let mut style = span.style.bg(theme.preview_current_line_bg);
+                    let trimmed = span.content.trim();
+                    if span_idx == 0
+                        && !trimmed.is_empty()
+                        && trimmed.chars().all(|c| c.is_ascii_digit())
+                    {
+                        style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+                    }
                     Span::styled(span.content, style)
                 })
                 .collect();
@@ -2732,14 +3307,19 @@ fn highlight_preview_line(
     let mut new_spans = Vec::new();
     let mut span_global_offset = 0usize;
 
-    for span in line.spans {
+    for (span_idx, span) in line.spans.into_iter().enumerate() {
         let span_len = span.content.len();
         let span_start = span_global_offset;
         let span_end = span_global_offset + span_len;
         span_global_offset = span_end;
 
         let base_style = if is_current_line {
-            span.style.bg(theme.preview_current_line_bg)
+            let mut style = span.style.bg(theme.preview_current_line_bg);
+            let trimmed = span.content.trim();
+            if span_idx == 0 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+            }
+            style
         } else {
             span.style
         };

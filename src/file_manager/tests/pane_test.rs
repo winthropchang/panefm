@@ -23,6 +23,7 @@ use super::{
 use crate::file_manager::entry::FileEntry;
 use crate::file_manager::search::GlobalSearchEntry;
 use crate::theme::Theme;
+use ratatui::style::Modifier;
 
 #[test]
 /// 驗證 pane 重新載入目錄時，資料夾會排在檔案前面。
@@ -1351,6 +1352,199 @@ fn pane_state_search_preview_marks_current_match_line() {
 }
 
 #[test]
+/// 驗證一般檔案 preview 會依據 preview_cursor 將游標所在行標示高亮與粗體行號。
+/// 保護目的：確保 preview mode 游標移動時，使用者能明確識別目前聚焦在檔案哪一行。
+fn pane_state_preview_lines_highlights_cursor_line() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("source.rs");
+    fs::write(
+        &path,
+        "fn main() {\n    let a = 10;\n    let b = 20;\n    println!(\"{}\", a + b);\n}\n",
+    )
+    .expect("write source.rs");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(5);
+    pane.set_preview_viewport_size(60, 5);
+
+    let theme = Theme::default();
+
+    // 1. 預設游標在第 0 行（行號 1）
+    let lines = pane.preview_lines(5, theme);
+    assert_eq!(lines.len(), 5);
+
+    // 第 0 行應有 preview_current_line_bg，且行號 span 應為 accent 色與 BOLD 樣式
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    let first_line_num_span = &lines[0].spans[0];
+    assert_eq!(first_line_num_span.style.fg, Some(theme.accent));
+    assert!(
+        first_line_num_span
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+
+    // 第 1 行不應有 preview_current_line_bg，行號亦非 accent
+    assert!(
+        !lines[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    assert_ne!(lines[1].spans[0].style.fg, Some(theme.accent));
+
+    // 2. 游標移動到第 2 行（行號 3）
+    pane.move_preview_cursor_to_line(3);
+    assert_eq!(pane.preview_cursor, 2);
+
+    let lines_after = pane.preview_lines(5, theme);
+    // 第 0 行不再是焦點
+    assert!(
+        !lines_after[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    // 第 2 行（行號 3）成為焦點
+    assert!(
+        lines_after[2]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    let target_line_num_span = &lines_after[2].spans[0];
+    assert_eq!(target_line_num_span.style.fg, Some(theme.accent));
+    assert!(
+        target_line_num_span
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+}
+
+#[test]
+/// 驗證短檔案在未達捲動門檻時，preview_cursor 仍可自由向下與向上移動。
+/// 保護目的：避免短檔案因 max_scroll 為 0 而使游標永遠鎖死在第一行。
+fn pane_state_short_file_preview_cursor_moves_freely() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("short.txt");
+    fs::write(&path, "one\ntwo\nthree\n").expect("write short.txt");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(60, 10);
+
+    let theme = Theme::default();
+
+    // 初始游標在第 0 行
+    assert_eq!(pane.preview_cursor, 0);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 向下移動 1 行
+    pane.scroll_preview_down(1);
+    assert_eq!(pane.preview_cursor, 1);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 再次向下移動 1 行
+    pane.scroll_preview_down(1);
+    assert_eq!(pane.preview_cursor, 2);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 再往下不能超出總行數（3 行，最大 cursor 為 2）
+    pane.scroll_preview_down(1);
+    assert_eq!(pane.preview_cursor, 2);
+
+    // 向上移動 1 行
+    pane.scroll_preview_up(1);
+    assert_eq!(pane.preview_cursor, 1);
+
+    // 驗證當前行有高亮
+    let lines = pane.preview_lines(10, theme);
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+}
+
+#[test]
+/// 驗證長檔案中 preview 游標可如文字編輯器般在可視範圍內自由上下移動，
+/// 僅在游標超出可視範圍邊界時才觸發 viewport 捲動。
+/// 保護目的：確保游標不被固定在首行或頂部，而是如 Vim / 編輯器般自由穿梭在可見行之間。
+fn pane_state_preview_cursor_moves_freely_within_viewport_before_scrolling() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("code.rs");
+    let code = (1..=50)
+        .map(|i| format!("fn line_{i}() {{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, code).expect("write code.rs");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(80, 10);
+
+    let theme = Theme::default();
+
+    // 初始游標與捲動皆為 0
+    assert_eq!(pane.preview_cursor, 0);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 1. 游標在 viewport (10 行) 內向下移動 5 行：游標改變，但 viewport 不捲動！
+    for expected_cursor in 1..=5 {
+        pane.move_preview_cursor_down(1);
+        assert_eq!(pane.preview_cursor, expected_cursor);
+        assert_eq!(pane.preview_scroll, 0, "游標未達底部邊界前視窗不應捲動");
+    }
+
+    // 驗證此時高亮確實套用在第 5 行 (index 5) 而非第 0 行
+    let lines = pane.preview_lines(10, theme);
+    assert!(
+        lines[5]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    assert!(
+        !lines[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+
+    // 2. 移動游標至第 9 行 (index 9，即 viewport 的最底行)
+    for _ in 6..=9 {
+        pane.move_preview_cursor_down(1);
+    }
+    assert_eq!(pane.preview_cursor, 9);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 3. 再次向下移動 1 行 (至 index 10)：游標超出 viewport 底部，此時視窗才向下捲動 1 行！
+    pane.move_preview_cursor_down(1);
+    assert_eq!(pane.preview_cursor, 10);
+    assert_eq!(
+        pane.preview_scroll, 1,
+        "游標超出 viewport 底部時視窗應捲動 1 行"
+    );
+
+    // 4. 向上移動 1 行 (回 index 9)：游標仍在目前 viewport (1..11) 內，視窗不捲動
+    pane.move_preview_cursor_up(1);
+    assert_eq!(pane.preview_cursor, 9);
+    assert_eq!(pane.preview_scroll, 1, "向上移動未達頂部邊界時視窗不捲動");
+
+    // 5. 連續向上移動直到超出頂部邊界 (index 0)
+    pane.move_preview_cursor_up(9);
+    assert_eq!(pane.preview_cursor, 0);
+    assert_eq!(pane.preview_scroll, 0, "游標回到頂部時視窗捲回 0");
+}
+
+#[test]
 /// 驗證搜尋 preview 即使遇到大檔案，也會顯示命中片段而不是只顯示 skipped 訊息。
 /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
 fn pane_state_search_preview_for_large_file_shows_match_snippet() {
@@ -1779,3 +1973,388 @@ fn sync_target_file_succeeds_on_real_file() {
     let file = File::create(&file_path).expect("create file");
     assert!(sync_target_file(&file).is_ok());
 }
+
+#[test]
+/// 驗證鄰近預覽背景預熱功能：
+/// 當 Pane 載入目前檔案預覽時，背景執行緒會自動預先快取鄰近檔案，
+/// 讓使用者切換至鄰近檔案時達到 0ms 記憶體快取命中。
+fn pane_state_prefetches_adjacent_previews_into_cache() {
+    let dir = tempdir().expect("tempdir");
+    let file_a = dir.path().join("a.rs");
+    let file_b = dir.path().join("b.rs");
+    let file_c = dir.path().join("c.rs");
+
+    fs::write(&file_a, "fn a() { println!(\"A\"); }\n").expect("write a");
+    fs::write(&file_b, "fn b() { println!(\"B\"); }\n").expect("write b");
+    fs::write(&file_c, "fn c() { println!(\"C\"); }\n").expect("write c");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(80, 10);
+
+    // 游標移動至中間項目 b.rs
+    pane.move_to_visible_index(1);
+    let selected_name = pane.selected_entry().map(|e| e.name.clone());
+    assert_eq!(selected_name.as_deref(), Some("b.rs"));
+
+    // 載入 b.rs 預覽，觸發鄰近預熱
+    let _ = pane.preview_lines(10, Theme::default());
+
+    // 等待背景預熱執行緒完成（通常 < 50ms）
+    let mut a_cached = false;
+    let mut c_cached = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard
+            .get(
+                &file_a,
+                Some(fs::metadata(&file_a).unwrap().modified().unwrap()),
+                pane.preview_viewport_width,
+            )
+            .is_some()
+        {
+            a_cached = true;
+        }
+        if guard
+            .get(
+                &file_c,
+                Some(fs::metadata(&file_c).unwrap().modified().unwrap()),
+                pane.preview_viewport_width,
+            )
+            .is_some()
+        {
+            c_cached = true;
+        }
+        if a_cached && c_cached {
+            break;
+        }
+    }
+
+    assert!(a_cached, "鄰近項目 a.rs 應被背景預熱至快取");
+    assert!(c_cached, "鄰近項目 c.rs 應被背景預熱至快取");
+}
+
+#[test]
+/// 驗證清單模式預熱會將當前選取項目 (include_current = true) 一併預熱進入快取，
+/// 且重複觸發會被 in_flight 機制過濾防重。
+fn pane_state_prefetches_current_and_adjacent_in_list_mode() {
+    let dir = tempdir().expect("tempdir");
+    let file_x = dir.path().join("x.rs");
+    let file_y = dir.path().join("y.rs");
+    let file_z = dir.path().join("z.rs");
+
+    fs::write(&file_x, "fn x() {}\n").expect("write x");
+    fs::write(&file_y, "fn y() {}\n").expect("write y");
+    fs::write(&file_z, "fn z() {}\n").expect("write z");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_size(80, 10);
+
+    // 停留在 y.rs
+    pane.move_to_visible_index(1);
+
+    // 觸發清單模式預熱 (include_current = true)
+    pane.prefetch_current_and_adjacent_previews(true);
+
+    // 驗證 in_flight 或已在快取中
+    {
+        let guard = pane.preview_content_cache.lock().unwrap();
+        assert!(guard.is_in_flight_or_cached(
+            &file_y,
+            Some(fs::metadata(&file_y).unwrap().modified().unwrap()),
+            80
+        ));
+    }
+
+    // 等待背景預熱完成
+    let mut y_cached = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard
+            .get(
+                &file_y,
+                Some(fs::metadata(&file_y).unwrap().modified().unwrap()),
+                pane.preview_viewport_width,
+            )
+            .is_some()
+        {
+            y_cached = true;
+            break;
+        }
+    }
+    assert!(y_cached, "當前選取項目 y.rs 應在清單模式下被預熱至快取");
+}
+
+#[test]
+/// 驗證鄰近預覽背景預熱 (Speculative Prefetching) 在預熱短小檔案後，
+/// 絕不會污染當前選取較大檔案的 max_preview_scroll，且進入 preview 模式後游標與捲動皆可立即流暢操作。
+fn test_adjacent_prefetch_does_not_corrupt_active_preview_max_scroll() {
+    let dir = tempdir().expect("tempdir");
+    let file_big = dir.path().join("a_big.md");
+    let file_small = dir.path().join("b_small.toml");
+
+    // a_big 有 500 行，b_small 只有 10 行
+    let big_content = (1..=500).map(|i| format!("Line {i}\n")).collect::<String>();
+    let small_content = (1..=10)
+        .map(|i| format!("Config {i}\n"))
+        .collect::<String>();
+
+    fs::write(&file_big, big_content).expect("write big");
+    fs::write(&file_small, small_content).expect("write small");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_size(80, 20);
+
+    // 游標停留在 a_big.md (index 0)
+    pane.move_to_visible_index(0);
+    assert_eq!(pane.selected_entry().unwrap().name, "a_big.md");
+
+    // 在清單模式下觸發預熱（會依序將 a_big.md 與相鄰的 b_small.toml 預熱進快取）
+    pane.prefetch_current_and_adjacent_previews(true);
+
+    // 等待背景預熱完成
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let guard = pane.preview_content_cache.lock().unwrap();
+        if guard.contains(&file_big, None, 80) && guard.contains(&file_small, None, 80) {
+            break;
+        }
+    }
+
+    // 按下 Tab 進入 preview 模式
+    assert!(pane.toggle_preview_active());
+
+    // 核心驗證 1：max_preview_scroll 必須精準反映 a_big.md 的 500 行 (500 - 20 = 480)，
+    // 絕不能被相鄰預熱的 b_small.toml (10 行 -> saturating_sub 變 0) 鎖死！
+    let max_scroll = pane.max_preview_scroll();
+    assert_eq!(
+        max_scroll, 480,
+        "max_preview_scroll 必須為 a_big.md 的 480，而非相鄰檔案的 0"
+    );
+    assert!(
+        pane.preview_has_more_below(),
+        "preview_has_more_below 應回傳 true"
+    );
+
+    // 核心驗證 2：向下捲動 5 行，游標與捲動位置必須立即反映，絕不卡死在 0
+    pane.scroll_preview_down(5);
+    assert_eq!(
+        pane.preview_scroll, 5,
+        "向下捲動 5 行後 preview_scroll 應為 5"
+    );
+
+    // 核心驗證 3：向下翻半頁
+    pane.page_preview_down();
+    assert_eq!(
+        pane.preview_scroll, 15,
+        "向下翻半頁後 preview_scroll 應為 15"
+    );
+
+    // 核心驗證 4：捲動至最底部
+    pane.scroll_preview_bottom();
+    assert_eq!(
+        pane.preview_scroll, 480,
+        "捲動至最底部後 preview_scroll 應為 480"
+    );
+
+    // 核心驗證 5：捲動回最上方
+    pane.scroll_preview_top();
+    assert_eq!(
+        pane.preview_scroll, 0,
+        "捲動至最上方後 preview_scroll 應為 0"
+    );
+}
+
+#[test]
+/// 驗證 `PaneState::toggle_preview_diff_mode` 能正確在 Diff 模式與全文模式間切換，
+/// 且在預覽未開啟時會自動開啟預覽並設為 Diff 模式。
+fn pane_state_toggle_preview_diff_mode_states() {
+    let dir = tempdir().expect("tempdir");
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+
+    assert!(!pane.preview_open);
+    assert!(!pane.preview_diff_mode);
+
+    // 1. 預覽未開時按 Ctrl+d：直接開啟預覽並設為 diff 模式
+    let is_diff = pane.toggle_preview_diff_mode();
+    assert!(is_diff);
+    assert!(pane.preview_open);
+    assert!(pane.preview_diff_mode);
+
+    // 2. 預覽已在 diff 模式時按 Ctrl+d：保持預覽開啟，切換回全文模式
+    let is_diff = pane.toggle_preview_diff_mode();
+    assert!(!is_diff);
+    assert!(pane.preview_open);
+    assert!(!pane.preview_diff_mode);
+
+    // 3. 預覽在全文模式時按 Ctrl+d：切回 diff 模式
+    let is_diff = pane.toggle_preview_diff_mode();
+    assert!(is_diff);
+    assert!(pane.preview_open);
+    assert!(pane.preview_diff_mode);
+
+    // 4. 按 Tab 關閉預覽：diff 模式重設為 false
+    let is_open = pane.toggle_preview_open();
+    assert!(!is_open);
+    assert!(!pane.preview_diff_mode);
+
+    // 5. 按 Tab 重新開啟預覽：預設為一般全文預覽
+    let is_open = pane.toggle_preview_open();
+    assert!(is_open);
+    assert!(!pane.preview_diff_mode);
+}
+
+#[test]
+/// 驗證 VCS Diff 模式下，游標所在行會被正確套用 `preview_current_line_bg` 高亮，
+/// 且移動游標時高亮位置能同步更新。
+fn pane_diff_mode_applies_cursor_highlight_to_active_line() {
+    use ratatui::text::Line;
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("main.rs");
+    fs::write(&file_path, "fn main() {}\n").expect("write");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    let theme = Theme::default_theme();
+
+    // 模擬已載入快取的 Diff 行
+    let sample_diff_lines = vec![
+        Line::from("--- a/main.rs"),
+        Line::from("+++ b/main.rs"),
+        Line::from("+// added line"),
+    ];
+    let entry = pane.selected_entry().expect("entry").clone();
+    if let Ok(mut guard) = pane.preview_diff_cache.lock() {
+        *guard = Some((entry.path.clone(), Some(entry.modified), sample_diff_lines));
+    }
+
+    pane.preview_open = true;
+    pane.preview_diff_mode = true;
+    pane.preview_cursor = 0;
+    pane.preview_scroll = 0;
+
+    // 1. 游標在第 0 行時，第 0 行應有 preview_current_line_bg，第 1 行沒有
+    let rendered = pane.preview_lines(10, theme);
+    assert!(
+        rendered[0]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.preview_current_line_bg)),
+        "第 0 行必須帶有游標高亮背景色"
+    );
+    assert!(
+        !rendered[1]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.preview_current_line_bg)),
+        "第 1 行不應有游標高亮"
+    );
+
+    // 2. 移動游標至第 1 行
+    pane.move_preview_cursor_down(1);
+    assert_eq!(pane.preview_cursor, 1);
+
+    let rendered_after_move = pane.preview_lines(10, theme);
+    assert!(
+        !rendered_after_move[0]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.preview_current_line_bg)),
+        "第 0 行已非游標行，不應有高亮"
+    );
+    assert!(
+        rendered_after_move[1]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.preview_current_line_bg)),
+        "第 1 行現在是游標行，必須帶有游標高亮背景色"
+    );
+
+    // 3. 驗證 preview_focused 時標題包含 [preview]
+    pane.set_preview_focused(true);
+    let title = pane.preview_title_for_entry(&entry);
+    assert!(title.contains("[preview]"));
+}
+
+#[test]
+/// 驗證 VCS Diff 模式下搜尋 `/`：
+/// 1. 不會跳回一般全文預覽，依然保留 diff 內容。
+/// 2. 能命中 diff 行中的字串（如 `+`、`-`、context 行中的關鍵字）。
+/// 3. 能正確計算命中數、套用搜尋顏色高亮，且標題顯示 `[/{query}]`。
+/// 4. 支援 `n`/`N` (jump_to_next_preview_match) 切換命中位置。
+fn pane_diff_mode_search_highlights_and_retains_diff_content() {
+    use ratatui::text::Line;
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("main.rs");
+    // 實體檔案內容為純 stub，若跳回全文預覽會顯示 fn main()
+    fs::write(&file_path, "fn main() {}\n").expect("write");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_size(80, 20);
+    let theme = Theme::default_theme();
+
+    // 模擬已載入快取的 Diff 行
+    let sample_diff_lines = vec![
+        Line::from("--- a/main.rs"),
+        Line::from("+++ b/main.rs"),
+        Line::from("@@ -1,1 +1,3 @@"),
+        Line::from(" fn main() {"),
+        Line::from("+    pub vcs_token: String,"),
+        Line::from("-    pub vcs_old: String,"),
+        Line::from(" }"),
+    ];
+    let entry = pane.selected_entry().expect("entry").clone();
+    if let Ok(mut guard) = pane.preview_diff_cache.lock() {
+        *guard = Some((entry.path.clone(), Some(entry.modified), sample_diff_lines));
+    }
+
+    pane.preview_open = true;
+    pane.preview_diff_mode = true;
+    pane.preview_cursor = 0;
+    pane.preview_scroll = 0;
+
+    // 1. 設定搜尋關鍵字 "vcs_token"
+    pane.set_preview_search_query("vcs_token");
+
+    // 驗證 match count 為 1
+    assert_eq!(pane.preview_match_count(), 1);
+
+    // 取得預覽行：必須依然為 diff 模式內容，絕對不可跳回 full preview
+    let rendered = pane.preview_lines(10, theme);
+    assert_eq!(rendered.len(), 7);
+    assert_eq!(rendered[0].to_string(), "--- a/main.rs");
+    assert!(rendered[4].to_string().contains("+    pub vcs_token: String,"));
+
+    // 驗證命中文字帶有 preview_match_fg 高亮樣式
+    let match_line = &rendered[4];
+    assert!(
+        match_line
+            .spans
+            .iter()
+            .any(|s| s.content == "vcs_token" && s.style.fg == Some(theme.preview_match_fg)),
+        "命中行中的 vcs_token 必須套用 preview_match_fg 高亮"
+    );
+
+    // 驗證標題包含 [diff] 與 [/{query}]
+    let title = pane.preview_title_for_entry(&entry);
+    assert!(title.contains("Preview [diff]:"));
+    assert!(title.contains("[/vcs_token]"));
+
+    // 2. 搜尋多次出現的詞彙 "pub"
+    pane.set_preview_search_query("pub");
+    assert_eq!(pane.preview_match_count(), 2);
+    assert_eq!(pane.preview_current_match, Some(0));
+
+    // 切換到下一個命中 (N)
+    assert!(pane.jump_to_next_preview_match());
+    assert_eq!(pane.preview_current_match, Some(1));
+
+    // 3. 清除搜尋，應恢復無搜尋狀態，標題不再有 [/pub]
+    pane.clear_preview_search();
+    assert_eq!(pane.preview_match_count(), 0);
+    let title_after_clear = pane.preview_title_for_entry(&entry);
+    assert!(!title_after_clear.contains("[/pub]"));
+}
+
+

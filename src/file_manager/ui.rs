@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Local};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -205,14 +205,11 @@ pub(crate) fn render_pane(
     list_find_editing: bool,
     text_input_cursor: usize,
     active_job_badges: &std::collections::HashMap<std::path::PathBuf, String>,
+    easymotion_labels: Option<&[(char, usize)]>,
+    update_badge: Option<(&str, bool)>,
 ) -> Option<(u16, u16)> {
     let visual_mode_active = visual_range.is_some();
     let mark_column_active = visual_mode_active || pane.marked_count() > 0;
-    let border_style = if focused {
-        theme.focused_border_style()
-    } else {
-        theme.muted_style()
-    };
 
     let filter_suffix = if pane.has_active_filter() {
         "  [filter]"
@@ -237,25 +234,34 @@ pub(crate) fn render_pane(
         Some(PaneListState::RegexRename { .. }) => "  [rename-regex]",
         None => "",
     };
-    let (badge, path_text, suffix) = format_pane_title_parts(
-        pane_id,
-        pane.cwd.as_path(),
-        filter_suffix,
-        &mark_suffix,
-        panel_suffix,
-        &pane.title_mode_label(),
-        area.width.saturating_sub(3) as usize,
-    );
-    let title = render_pane_title_line(&badge, &path_text, &suffix, focused, theme);
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
 
-    if preview_focused {
+    let is_side_by_side = pane.is_preview_open() && panel_state.is_none() && area.width >= 60;
+    let (list_area, preview_area) = if is_side_by_side {
+        let list_w = (area.width * 38 / 100).max(22);
+        let prev_w = area.width.saturating_sub(list_w);
+        (
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: list_w,
+                height: area.height,
+            },
+            Some(Rect {
+                x: area.x + list_w,
+                y: area.y,
+                width: prev_w,
+                height: area.height,
+            }),
+        )
+    } else {
+        (area, None)
+    };
+
+    if preview_area.is_none() && (preview_focused || pane.is_preview_focused()) {
         let preview_viewport_height = area.height.saturating_sub(2).max(1) as usize;
         let preview_content_width = area.width.saturating_sub(2).max(1) as usize;
         pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
+
         let (preview_title, preview_lines) = match panel_state {
             Some(PaneListState::Search(search_state))
                 if !search_state.results.is_empty() && search_state.preview_query.is_some() =>
@@ -288,18 +294,90 @@ pub(crate) fn render_pane(
         };
         let preview_lines =
             pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
+        let preview_border_style = if focused {
+            theme.focused_border_style()
+        } else {
+            theme.muted_style()
+        };
         let preview = Paragraph::new(preview_lines).block(
             Block::default()
                 .title(preview_title)
                 .borders(Borders::ALL)
-                .border_style(border_style),
+                .border_style(preview_border_style),
         );
         frame.render_widget(preview, area);
         return None;
     }
 
-    let content_width = area.width.saturating_sub(4) as usize;
-    let list_viewport_height = area.height.saturating_sub(2).max(1) as usize;
+    if let Some(prev_rect) = preview_area {
+        let preview_viewport_height = prev_rect.height.saturating_sub(2).max(1) as usize;
+        let preview_content_width = prev_rect.width.saturating_sub(2).max(1) as usize;
+        pane.set_preview_viewport_size(preview_content_width, preview_viewport_height);
+
+        let default_preview_title = pane
+            .selected_entry()
+            .map(|entry| pane.preview_title_for_entry(entry))
+            .unwrap_or_else(|| "Preview".to_string());
+        let preview_lines = pane.preview_lines(preview_viewport_height, theme);
+        let preview_lines =
+            pad_preview_lines_for_render(preview_lines, preview_content_width, theme);
+        let preview_border_style = if focused && pane.is_preview_focused() {
+            theme.focused_border_style()
+        } else {
+            theme.muted_style()
+        };
+        let preview = Paragraph::new(preview_lines).block(
+            Block::default()
+                .title(default_preview_title)
+                .borders(Borders::ALL)
+                .border_style(preview_border_style),
+        );
+        frame.render_widget(preview, prev_rect);
+    }
+
+    // 在清單模式下，若 Pane 處於焦點且非特殊面板，背景預熱當前選取項目與相鄰項目
+    if focused && panel_state.is_none() {
+        pane.prefetch_current_and_adjacent_previews(true);
+    }
+
+    let list_focused = focused && !pane.is_preview_focused();
+    let vcs_suffix = if config.ui.vcs.enabled {
+        pane.vcs_header_label()
+            .map(|l| format!("[{l}]"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (badge, path_text, suffix) = format_pane_title_parts(
+        pane_id,
+        pane.cwd.as_path(),
+        filter_suffix,
+        &mark_suffix,
+        panel_suffix,
+        &vcs_suffix,
+        &pane.title_mode_label(),
+        list_area.width.saturating_sub(3) as usize,
+    );
+    let title = render_pane_title_line(&badge, &path_text, &suffix, list_focused, theme);
+    let list_border_style = if list_focused {
+        theme.focused_border_style()
+    } else {
+        theme.muted_style()
+    };
+    let mut block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(list_border_style);
+
+    if let Some((latest_ver, is_updating)) = update_badge
+        && focused
+        && let Some(badge_line) = render_update_badge(latest_ver, is_updating, list_area.width)
+    {
+        block = block.title(badge_line.alignment(Alignment::Right));
+    }
+
+    let content_width = list_area.width.saturating_sub(4) as usize;
+    let list_viewport_height = list_area.height.saturating_sub(2).max(1) as usize;
     pane.set_list_viewport_height(list_viewport_height);
     // 一般檔案列表只建立目前 viewport 內的 widget。大型目錄可能有數萬筆項目，
     // 若每一幀仍替畫面外項目配置空白 ListItem，單次 j/k 也會產生 O(n) 配置並卡住。
@@ -443,6 +521,17 @@ pub(crate) fn render_pane(
                 .map(|(index, entry)| {
                     let visible_index = view_start + index;
                     let active_job_badge = active_job_badges.get(&entry.path).map(|s| s.as_str());
+                    let jump_label = easymotion_labels.and_then(|labels| {
+                        labels
+                            .iter()
+                            .find(|(_, idx)| *idx == visible_index)
+                            .map(|(ch, _)| *ch)
+                    });
+                    let vcs_status = if config.ui.vcs.enabled {
+                        pane.vcs_status_for_path(&entry.path)
+                    } else {
+                        None
+                    };
                     ListItem::new(render_entry_line(
                         entry,
                         pane.is_marked(entry),
@@ -462,6 +551,8 @@ pub(crate) fn render_pane(
                         pane.list_find_query(),
                         find_match_position.filter(|_| visible_index == pane.selected),
                         active_job_badge,
+                        jump_label,
+                        vcs_status,
                     ))
                 })
                 .collect()
@@ -502,7 +593,7 @@ pub(crate) fn render_pane(
             }
             _ => {}
         }
-        frame.render_stateful_widget(list, area, &mut list_state);
+        frame.render_stateful_widget(list, list_area, &mut list_state);
     } else {
         if let Some(window_start) = normal_list_window_start {
             // 傳給 ratatui 的 items 已是局部 viewport，因此 selected 也必須轉成局部索引。
@@ -510,20 +601,20 @@ pub(crate) fn render_pane(
             // 因虛擬化而改變語意。
             let mut viewport_state = ListState::default();
             viewport_state.select(Some(pane.selected.saturating_sub(window_start)));
-            frame.render_stateful_widget(list, area, &mut viewport_state);
+            frame.render_stateful_widget(list, list_area, &mut viewport_state);
             pane.list_state.select(Some(pane.selected));
             *pane.list_state.offset_mut() = window_start;
         } else {
-            frame.render_stateful_widget(list, area, &mut pane.list_state);
+            frame.render_stateful_widget(list, list_area, &mut pane.list_state);
         }
     }
 
     let mut editor_cursor = None;
     if let Some(state) = editor_state {
-        editor_cursor = render_inline_editor(frame, area, pane, theme, state);
+        editor_cursor = render_inline_editor(frame, list_area, pane, theme, state);
     }
     if let Some(state) = picker_state {
-        render_inline_picker(frame, area, pane, theme, state);
+        render_inline_picker(frame, list_area, pane, theme, state);
     }
 
     let panel_cursor = match panel_state {
@@ -534,7 +625,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             "Trash Search",
             search,
@@ -548,7 +639,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             if custom_title.is_some() {
                 "Cheatsheet Search"
@@ -565,7 +656,7 @@ pub(crate) fn render_pane(
             ..
         }) => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             "Task Search",
             search,
@@ -573,7 +664,7 @@ pub(crate) fn render_pane(
         )),
         _ if list_find_editing => Some(render_top_right_input(
             frame,
-            area,
+            list_area,
             theme,
             "Find next",
             list_find_buffer.unwrap_or_default(),
@@ -582,7 +673,11 @@ pub(crate) fn render_pane(
         _ => None,
     };
 
-    editor_cursor.or(panel_cursor)
+    if focused && pane.is_preview_focused() {
+        None
+    } else {
+        editor_cursor.or(panel_cursor)
+    }
 }
 
 /// 回傳搜尋列表在尚未收到任何結果時應顯示的提示文字。
@@ -668,19 +763,21 @@ fn regex_rename_status_style(theme: Theme, status: &str) -> Style {
 }
 
 /// 組合 pane 標題列文字三元素：(膠囊徽章字串, 壓縮或完整路徑, 狀態後綴)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn format_pane_title_parts(
     pane_id: usize,
     cwd: &Path,
     filter_suffix: &str,
     mark_suffix: &str,
     panel_suffix: &str,
+    vcs_suffix: &str,
     mode_label: &str,
     max_width: usize,
 ) -> (String, String, String) {
     let prefix = format!(" {pane_id} ");
     let full_path = cwd.display().to_string();
     let status_suffix =
-        normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix]);
+        normalize_title_status_segments(&[filter_suffix, mark_suffix, panel_suffix, vcs_suffix]);
     let suffix_candidates = [
         if status_suffix.is_empty() {
             format!("[{mode_label}]")
@@ -724,13 +821,14 @@ pub(crate) fn format_pane_title_parts(
 }
 
 /// 組合 pane 標題列文字，讓 pane 編號以膠囊標記固定顯示在最前面，方便搭配數字切換。
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn format_pane_title(
     pane_id: usize,
     cwd: &Path,
     filter_suffix: &str,
     mark_suffix: &str,
     panel_suffix: &str,
+    vcs_suffix: &str,
     mode_label: &str,
     max_width: usize,
 ) -> String {
@@ -740,6 +838,7 @@ pub(crate) fn format_pane_title(
         filter_suffix,
         mark_suffix,
         panel_suffix,
+        vcs_suffix,
         mode_label,
         max_width,
     );
@@ -773,6 +872,47 @@ pub(crate) fn render_pane_title_line(
     }
 
     Line::from(spans)
+}
+
+/// 建立頂部更新提示膠囊徽章（高對比黃底紅字）。
+pub(crate) fn render_update_badge(
+    latest_version: &str,
+    is_updating: bool,
+    available_width: u16,
+) -> Option<Line<'static>> {
+    let badge_style = Style::default()
+        .fg(ratatui::style::Color::Rgb(180, 0, 0))
+        .bg(ratatui::style::Color::Rgb(255, 220, 0))
+        .add_modifier(Modifier::BOLD);
+
+    if is_updating {
+        if available_width >= 20 {
+            return Some(Line::from(vec![Span::styled(
+                " [ ⏳ 升級中... ] ".to_string(),
+                badge_style,
+            )]));
+        }
+        return None;
+    }
+
+    if available_width >= 55 {
+        Some(Line::from(vec![Span::styled(
+            format!(" [ 🚀 新版 v{latest_version} 可用！按 :update 升級 ] "),
+            badge_style,
+        )]))
+    } else if available_width >= 35 {
+        Some(Line::from(vec![Span::styled(
+            format!(" [ 🚀 v{latest_version} :update ] "),
+            badge_style,
+        )]))
+    } else if available_width >= 20 {
+        Some(Line::from(vec![Span::styled(
+            format!(" [ 🚀 v{latest_version} ] "),
+            badge_style,
+        )]))
+    } else {
+        None
+    }
 }
 
 /// 將多個標題狀態片段去掉前後空白後重新用單一空格組合，避免出現多餘空隙。
@@ -2234,7 +2374,7 @@ fn truncate_text_to_display_width(text: &str, max_width: usize) -> String {
 
 /// 根據目前排序模式，產生單一列表列的顯示內容。
 #[allow(clippy::too_many_arguments)]
-fn render_entry_line(
+pub(crate) fn render_entry_line(
     entry: &super::entry::FileEntry,
     marked: bool,
     mark_column_active: bool,
@@ -2247,15 +2387,37 @@ fn render_entry_line(
     list_find_query: Option<&str>,
     list_find_position: Option<(usize, usize)>,
     active_job_badge: Option<&str>,
+    jump_label: Option<char>,
+    vcs_status: Option<super::vcs::VcsFileStatus>,
 ) -> Line<'static> {
-    let marker = if mark_column_active {
+    let (marker, jump_span) = if let Some(ch) = jump_label {
+        let tag = format!("[{ch}] ");
+        let style = Style::default()
+            .fg(ratatui::style::Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        ("", Some(Span::styled(tag, style)))
+    } else if mark_column_active {
         if marked || visual_selected {
-            "[*] "
+            ("[*] ", None)
         } else {
-            "    "
+            ("    ", None)
         }
     } else {
-        ""
+        ("", None)
+    };
+    let (vcs_span, vcs_width) = if let Some(status) = vcs_status {
+        let text = format!("{} ", status.badge_char());
+        let style = Style::default()
+            .fg(status.color(&theme))
+            .add_modifier(Modifier::BOLD);
+        (Some(Span::styled(text, style)), 2usize)
+    } else {
+        (None, 0usize)
+    };
+    let base_entry_style = if jump_label.is_some() {
+        theme.muted_style()
+    } else {
+        entry_style(entry, theme)
     };
     let icon = if icons_enabled {
         format!("{} ", entry_icon(entry, icon_style))
@@ -2265,7 +2427,11 @@ fn render_entry_line(
     let mut display_name = entry.display_name();
     let badge = list_find_position.map(|(current, total)| format!("[{current}/{total}]"));
     let detail = format_sort_detail(entry, detail_kind);
-    let marker_width = UnicodeWidthStr::width(marker);
+    let marker_width = if jump_label.is_some() {
+        4
+    } else {
+        UnicodeWidthStr::width(marker)
+    };
     let icon_width = UnicodeWidthStr::width(icon.as_str());
     let badge_width = badge
         .as_ref()
@@ -2276,6 +2442,7 @@ fn render_entry_line(
         .unwrap_or(0);
     let detail_width = UnicodeWidthStr::width(detail.as_str());
     let fixed_width = marker_width
+        .saturating_add(vcs_width)
         .saturating_add(icon_width)
         .saturating_add(job_badge_width)
         .saturating_add(badge_width)
@@ -2284,17 +2451,22 @@ fn render_entry_line(
 
     if detail.is_empty() || width < fixed_width {
         let mut spans = Vec::new();
-        if !marker.is_empty() {
+        if let Some(j_span) = jump_span {
+            spans.push(j_span);
+        } else if !marker.is_empty() {
             spans.push(Span::raw(marker.to_string()));
         }
+        if let Some(v_span) = vcs_span {
+            spans.push(v_span);
+        }
         if !icon.is_empty() {
-            spans.push(Span::styled(icon, entry_style(entry, theme)));
+            spans.push(Span::styled(icon, base_entry_style));
         }
         spans.extend(highlight_name_spans(
             &display_name,
             list_find_query,
             theme,
-            entry_style(entry, theme),
+            base_entry_style,
         ));
         if let Some(job_badge) = active_job_badge {
             spans.push(Span::raw(" ".to_string()));
@@ -2325,6 +2497,7 @@ fn render_entry_line(
     display_name = truncate_text_to_display_width(&display_name, available_name_width);
     let name_width = UnicodeWidthStr::width(display_name.as_str());
     let used_width = marker_width
+        .saturating_add(vcs_width)
         .saturating_add(icon_width)
         .saturating_add(name_width)
         .saturating_add(job_badge_width)
@@ -2333,17 +2506,22 @@ fn render_entry_line(
     let spacer_len = width.saturating_sub(used_width).max(1);
 
     let mut spans = Vec::new();
-    if !marker.is_empty() {
+    if let Some(j_span) = jump_span {
+        spans.push(j_span);
+    } else if !marker.is_empty() {
         spans.push(Span::raw(marker.to_string()));
     }
+    if let Some(v_span) = vcs_span {
+        spans.push(v_span);
+    }
     if !icon.is_empty() {
-        spans.push(Span::styled(icon, entry_style(entry, theme)));
+        spans.push(Span::styled(icon, base_entry_style));
     }
     spans.extend(highlight_name_spans(
         &display_name,
         list_find_query,
         theme,
-        entry_style(entry, theme),
+        base_entry_style,
     ));
     if let Some(job_badge) = active_job_badge {
         spans.push(Span::raw(" ".to_string()));

@@ -389,6 +389,9 @@ impl App {
         };
         self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
         self.zoxide_tracker.track(&current_cwd);
+        if self.config.ui.vcs.enabled {
+            self.vcs_manager.request_query(pane_id, current_cwd);
+        }
         Ok(())
     }
 
@@ -418,6 +421,9 @@ impl App {
         };
         self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
         self.zoxide_tracker.track(&current_cwd);
+        if self.config.ui.vcs.enabled {
+            self.vcs_manager.request_query(pane_id, current_cwd);
+        }
         Ok(())
     }
 
@@ -719,6 +725,12 @@ impl App {
         for pane_id in size_panes {
             self.start_directory_size_scan(pane_id);
         }
+        self.vcs_manager.invalidate(None);
+        if self.config.ui.vcs.enabled {
+            for (pane_id, pane) in &self.panes {
+                self.vcs_manager.request_query(*pane_id, pane.cwd.clone());
+            }
+        }
         Ok(())
     }
 
@@ -747,6 +759,14 @@ impl App {
             !cached_path.starts_with(directory)
                 || self.panes.values().any(|pane| &pane.cwd == cached_path)
         });
+        self.vcs_manager.invalidate(Some(directory.to_path_buf()));
+        if self.config.ui.vcs.enabled {
+            for (pane_id, pane) in &self.panes {
+                if pane.cwd == directory || pane.cwd.starts_with(directory) {
+                    self.vcs_manager.request_query(*pane_id, pane.cwd.clone());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -807,6 +827,44 @@ impl App {
             pane_id: self.focused_pane,
         });
         self.status = String::from("panel: choose h/j/k/l/c/o/t/d from the panel");
+    }
+
+    /// 開啟 EasyMotion 全螢幕標籤直達跳轉模式。
+    /// 取得目前聚焦視窗的可見行，指派主鍵位標籤並等待單鍵瞬移。
+    pub(crate) fn open_easymotion(&mut self) {
+        let Some(pane) = self.panes.get(&self.focused_pane) else {
+            return;
+        };
+        let visible_total = pane.visible_indices.len();
+        if visible_total == 0 {
+            self.status = String::from("easymotion: directory is empty");
+            return;
+        }
+
+        let viewport_height = pane.list_viewport_height;
+        let (view_start, view_end) = crate::file_manager::ui::visible_list_window_range(
+            visible_total,
+            pane.selected,
+            viewport_height,
+            pane.list_state.offset(),
+        );
+
+        let mut labels = Vec::new();
+        for (i, visible_idx) in (view_start..view_end).enumerate() {
+            if let Some(&key_char) = crate::file_manager::preview::EASYMOTION_KEYS.get(i) {
+                labels.push((key_char, visible_idx));
+            }
+        }
+
+        if labels.is_empty() {
+            return;
+        }
+
+        self.pending_action = Some(PendingAction::EasyMotion {
+            pane_id: self.focused_pane,
+            labels,
+        });
+        self.status = String::from("-- EASYMOTION -- (press key to jump, Esc to cancel)");
     }
 
     /// 打開底部 Move / LineMode 面板，等待使用者輸入搬移或欄位顯示模式。
@@ -1505,6 +1563,9 @@ impl App {
                 search.editing,
             ),
             PendingAction::ToolPanel { .. } => String::from("dependencies: j/k move, Esc close"),
+            PendingAction::EasyMotion { .. } => {
+                String::from("-- EASYMOTION -- (press key to jump, Esc to cancel)")
+            }
             PendingAction::BookmarkList {
                 selected,
                 mode,
@@ -1677,13 +1738,33 @@ impl App {
             self.status = String::from("panel no longer exists");
             return;
         };
-        let preview_active = pane.toggle_preview_active();
+        let preview_open = pane.toggle_preview_open();
         self.pending_g = false;
         self.pending_y = false;
-        self.status = if preview_active {
-            String::from("preview mode")
+        self.status = if preview_open {
+            String::from("preview enabled (press 'l' to focus preview, 'Tab' to close)")
         } else {
             String::from("normal mode")
+        };
+    }
+
+    /// 切換目前焦點 panel 的 VCS Diff 預覽模式。
+    ///
+    /// - 若 preview 未開啟：打開 preview 並切換至 diff 模式。
+    /// - 若 preview 已開啟且處於 diff 模式：切回全文預覽模式。
+    /// - 若 preview 已開啟但處於全文模式：切換至 diff 模式。
+    pub(crate) fn toggle_preview_diff_mode(&mut self) {
+        let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
+            self.status = String::from("panel no longer exists");
+            return;
+        };
+        let is_diff = pane.toggle_preview_diff_mode();
+        self.pending_g = false;
+        self.pending_y = false;
+        self.status = if is_diff {
+            String::from("preview diff mode (press 'Ctrl+d' for full content, 'Tab' to close)")
+        } else {
+            String::from("preview full content (press 'Ctrl+d' for diff)")
         };
     }
 
@@ -1877,7 +1958,8 @@ pub(crate) fn remap_pending_action_pane_id(
         | PendingAction::OpenPicker { pane_id, .. }
         | PendingAction::Rename { pane_id, .. }
         | PendingAction::CreateEntry { pane_id, .. }
-        | PendingAction::RegexRename { pane_id, .. } => {
+        | PendingAction::RegexRename { pane_id, .. }
+        | PendingAction::EasyMotion { pane_id, .. } => {
             if let Some(&new_id) = map.get(pane_id) {
                 *pane_id = new_id;
             }

@@ -5,9 +5,26 @@
 //! 且在下載驗證完成前絕不觸碰現有執行檔。
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// 預設遠端版本檢查間隔：24 小時（86400 秒）。
+pub const DEFAULT_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// 本地更新狀態快取，記錄上一次向 GitHub 查詢的時間與最新版本資訊。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStateCache {
+    /// 上一次向遠端檢查之 UNIX 時間戳記（秒）。
+    pub last_check_timestamp: u64,
+    /// 遠端已發布之最新版本號（例如 "0.1.15"）。
+    pub latest_version: String,
+    /// 對應當前平台之二進位資產檔名。
+    pub asset_name: String,
+    /// 對應當前平台之資產下載網址。
+    pub download_url: String,
+}
 
 /// GitHub Release API 之 JSON 結構。
 #[derive(Debug, Deserialize)]
@@ -23,8 +40,6 @@ struct GithubAsset {
     name: String,
     browser_download_url: String,
 }
-
-use std::path::PathBuf;
 
 /// 啟動應用程式時的附加參數。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -293,6 +308,11 @@ pub fn check_for_update(timeout_secs: u64) -> Result<UpdateCheckResult, UpdateEr
 ///
 /// 回傳：`Result<(), UpdateError>`。
 pub fn download_and_install(download_url: &str, timeout_secs: u64) -> Result<(), UpdateError> {
+    let trimmed = download_url.trim();
+    if trimmed.is_empty() || (!trimmed.starts_with("http://") && !trimmed.starts_with("https://")) {
+        return Err(UpdateError::Network("下載網址無效或為空".to_string()));
+    }
+
     let current_version = env!("CARGO_PKG_VERSION");
     let user_agent = format!("panefm/{current_version}");
 
@@ -340,9 +360,21 @@ pub fn download_and_install(download_url: &str, timeout_secs: u64) -> Result<(),
 pub fn run_cli_update() -> Result<(), UpdateError> {
     println!("正在向 GitHub 檢查最新版本...");
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     match check_for_update(8)? {
         UpdateCheckResult::UpToDate { current_version } => {
             println!("目前版本 v{current_version} 已是最新版本，無須更新。");
+            let cache = UpdateStateCache {
+                last_check_timestamp: now_secs,
+                latest_version: current_version,
+                asset_name: String::new(),
+                download_url: String::new(),
+            };
+            let _ = save_update_cache(&cache, None);
             Ok(())
         }
         UpdateCheckResult::UpdateAvailable {
@@ -356,8 +388,183 @@ pub fn run_cli_update() -> Result<(), UpdateError> {
 
             download_and_install(&download_url, 60)?;
 
+            let cache = UpdateStateCache {
+                last_check_timestamp: now_secs,
+                latest_version: latest_version.clone(),
+                asset_name: asset_name.clone(),
+                download_url: download_url.clone(),
+            };
+            let _ = save_update_cache(&cache, None);
+
             println!("更新完成！已成功升級至 v{latest_version}。");
             Ok(())
         }
     }
+}
+
+/// 回傳預設存放本地快取的檔案路徑（優先與可執行檔同層，命名為 `.panefm_update.json`）。
+pub fn default_update_cache_path() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        parent.join(".panefm_update.json")
+    } else {
+        PathBuf::from(".panefm_update.json")
+    }
+}
+
+/// 當可執行檔所在目錄為唯讀時（例如系統 `/usr/bin`），備用的使用者設定目錄路徑。
+pub fn fallback_config_update_cache_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("panefm").join(".panefm_update.json"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+            Some(xdg.join("panefm").join(".panefm_update.json"))
+        } else {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|p| p.join(".config").join("panefm").join(".panefm_update.json"))
+        }
+    }
+}
+
+/// 從指定路徑（或預設路徑）載入本地更新狀態快取。
+///
+/// 若指定的檔案不存在或內容毀損，回傳 `None`。
+pub fn load_update_cache(custom_path: Option<&Path>) -> Option<UpdateStateCache> {
+    let candidate = custom_path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_update_cache_path);
+    if let Ok(content) = std::fs::read_to_string(&candidate)
+        && let Ok(cache) = serde_json::from_str::<UpdateStateCache>(&content)
+    {
+        return Some(cache);
+    }
+    if custom_path.is_none()
+        && let Some(fallback) = fallback_config_update_cache_path()
+        && let Ok(content) = std::fs::read_to_string(&fallback)
+        && let Ok(cache) = serde_json::from_str::<UpdateStateCache>(&content)
+    {
+        return Some(cache);
+    }
+    None
+}
+
+/// 將更新快取儲存至磁碟（優先存於執行檔同層，若權限不足則嘗試備用目錄）。
+pub fn save_update_cache(
+    cache: &UpdateStateCache,
+    custom_path: Option<&Path>,
+) -> Result<PathBuf, std::io::Error> {
+    let json = serde_json::to_string_pretty(cache)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let path = custom_path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_update_cache_path);
+
+    match std::fs::write(&path, &json) {
+        Ok(()) => Ok(path),
+        Err(e) if custom_path.is_none() => {
+            if let Some(fallback) = fallback_config_update_cache_path() {
+                if let Some(parent) = fallback.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&fallback, &json)?;
+                Ok(fallback)
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 比對兩個版本字串，判斷 `latest_version` 是否大於（更新於）`current_version`。
+pub fn is_newer_version(latest_version: &str, current_version: &str) -> bool {
+    let latest_clean = latest_version
+        .trim()
+        .strip_prefix('v')
+        .unwrap_or(latest_version.trim());
+    let current_clean = current_version
+        .trim()
+        .strip_prefix('v')
+        .unwrap_or(current_version.trim());
+    match (
+        semver::Version::parse(latest_clean),
+        semver::Version::parse(current_clean),
+    ) {
+        (Ok(latest), Ok(current)) => latest > current,
+        _ => false,
+    }
+}
+
+/// 判斷當前是否需要發起遠端 GitHub 檢查。
+///
+/// 邏輯：
+/// - 若從未檢查過（`cache` 為 `None`）：回傳 `true`。
+/// - 若距離上次檢查時間戳已達到或超過 `interval_secs`（預設 24 小時）：回傳 `true`。
+/// - 否則回傳 `false`（不連網）。
+pub fn should_check_remote(
+    cache: Option<&UpdateStateCache>,
+    current_time_secs: u64,
+    interval_secs: u64,
+) -> bool {
+    match cache {
+        None => true,
+        Some(c) => current_time_secs.saturating_sub(c.last_check_timestamp) >= interval_secs,
+    }
+}
+
+/// 在背景執行緒發起 GitHub API 版本檢查，並在完成時更新本地快取檔。
+///
+/// 參數：
+/// - `timeout_secs`: 連線逾時秒數（建議 5 秒）。
+/// - `cache_path`: 自訂快取路徑（一般傳入 `None` 即使用預設路徑）。
+///
+/// 回傳：`std::sync::mpsc::Receiver<UpdateCheckResult>`。
+pub fn spawn_background_update_check(
+    timeout_secs: u64,
+    cache_path: Option<PathBuf>,
+) -> std::sync::mpsc::Receiver<UpdateCheckResult> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Ok(check_result) = check_for_update(timeout_secs) {
+            match &check_result {
+                UpdateCheckResult::UpdateAvailable {
+                    latest_version,
+                    download_url,
+                    asset_name,
+                    ..
+                } => {
+                    let cache = UpdateStateCache {
+                        last_check_timestamp: now_secs,
+                        latest_version: latest_version.clone(),
+                        asset_name: asset_name.clone(),
+                        download_url: download_url.clone(),
+                    };
+                    let _ = save_update_cache(&cache, cache_path.as_deref());
+                }
+                UpdateCheckResult::UpToDate { current_version } => {
+                    let cache = UpdateStateCache {
+                        last_check_timestamp: now_secs,
+                        latest_version: current_version.clone(),
+                        asset_name: String::new(),
+                        download_url: String::new(),
+                    };
+                    let _ = save_update_cache(&cache, cache_path.as_deref());
+                }
+            }
+            let _ = tx.send(check_result);
+        }
+    });
+    rx
 }

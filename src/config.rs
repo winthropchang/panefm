@@ -129,9 +129,23 @@ pub struct AppConfig {
 pub struct UiConfig {
     pub theme_preset: ThemePreset,
     pub icons: IconsConfig,
+    pub vcs: VcsConfig,
     pub poll_rate: Duration,
     pub preview: PreviewConfig,
     pub dialogs: DialogsConfig,
+}
+
+/// 表示版本控制（Git 與 SVN）狀態整合設定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VcsConfig {
+    /// 是否在標題列顯示分支/版本號，以及在檔案清單顯示 M/A/D 等狀態標籤。
+    pub enabled: bool,
+}
+
+impl Default for VcsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// 表示檔案列表圖示的顯示設定。
@@ -297,6 +311,7 @@ impl Default for AppConfig {
                     enabled: true,
                     style: IconStyle::NerdFont,
                 },
+                vcs: VcsConfig { enabled: true },
                 poll_rate: Duration::from_millis(150),
                 preview: PreviewConfig {
                     height: 8,
@@ -458,6 +473,7 @@ struct LegacyAppConfigFile {
 struct UiConfigFile {
     theme: Option<String>,
     icons: Option<IconsConfigFile>,
+    vcs: Option<VcsConfigFile>,
     poll_rate_ms: Option<u64>,
     preview: Option<PreviewConfigFile>,
     dialog: Option<DialogsConfigFile>,
@@ -468,6 +484,12 @@ struct UiConfigFile {
 struct IconsConfigFile {
     enabled: Option<bool>,
     style: Option<String>,
+}
+
+/// 表示 `[ui.vcs]` 在 TOML 中的可選設定欄位。
+#[derive(Debug, Default, Deserialize)]
+struct VcsConfigFile {
+    enabled: Option<bool>,
 }
 
 /// 表示 `pane` 區塊的原始設定格式。
@@ -706,6 +728,10 @@ enabled = true
 #   - "nerd-font": 精美現代的終端圖示（終端機需搭配 Nerd Font 字型）
 #   - "ascii"    : 純文字方括號圖示 [D] [F] [S]，相容所有終端字型
 style = "nerd-font"
+
+[ui.vcs]
+# 是否在標題列顯示版本控制（Git 與 SVN）分支/版本號，以及在檔案清單顯示 M/A/D 等狀態標籤。
+enabled = true
 
 [ui.preview]
 # 底部快速預覽視窗開啟時的預設高度（列數）。
@@ -1000,6 +1026,12 @@ fn apply_ui_config(config: &mut AppConfig, ui: UiConfigFile) -> Result<()> {
             config.ui.icons.style = IconStyle::from_name(&style)
                 .with_context(|| format!("unknown ui.icons.style: {}", style.trim()))?;
         }
+    }
+
+    if let Some(vcs) = ui.vcs
+        && let Some(enabled) = vcs.enabled
+    {
+        config.ui.vcs.enabled = enabled;
     }
 
     if let Some(preview) = ui.preview {

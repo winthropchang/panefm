@@ -49,6 +49,168 @@ pub(crate) struct PreviewContentCache {
     pub(crate) is_complete: bool,
 }
 
+/// 支援多項目 LRU 與鄰近預熱的檔案預覽快取容器。
+#[derive(Clone, Debug)]
+pub(crate) struct PreviewContentCacheMap {
+    pub(crate) current: Option<PreviewContentCache>,
+    pub(crate) entries: Vec<PreviewContentCache>,
+    pub(crate) in_flight: std::collections::HashSet<PathBuf>,
+    pub(crate) capacity: usize,
+}
+
+impl Default for PreviewContentCacheMap {
+    fn default() -> Self {
+        Self::new(32)
+    }
+}
+
+impl PreviewContentCacheMap {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            current: None,
+            entries: Vec::with_capacity(capacity.max(8)),
+            in_flight: std::collections::HashSet::new(),
+            capacity: capacity.max(8),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_some(&self) -> bool {
+        self.current.is_some() || !self.entries.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_ref(&self) -> Option<&PreviewContentCache> {
+        self.current.as_ref().or_else(|| self.entries.first())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_mut(&mut self) -> Option<&mut PreviewContentCache> {
+        self.current.as_mut().or_else(|| self.entries.first_mut())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_in_flight(&self, path: &Path) -> bool {
+        self.in_flight.contains(path)
+    }
+
+    pub(crate) fn mark_in_flight(&mut self, path: PathBuf) {
+        self.in_flight.insert(path);
+    }
+
+    pub(crate) fn clear_in_flight(&mut self, path: &Path) {
+        self.in_flight.remove(path);
+    }
+
+    pub(crate) fn is_in_flight_or_cached(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        viewport_width: usize,
+    ) -> bool {
+        self.in_flight.contains(path) || self.contains(path, modified, viewport_width)
+    }
+
+    pub(crate) fn get(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        viewport_width: usize,
+    ) -> Option<&PreviewContentCache> {
+        if let Some(cur) = self.current.as_ref()
+            && cur.path == path
+            && (modified.is_none() || cur.modified == modified)
+            && (cur.viewport_width == viewport_width || !path.is_dir())
+        {
+            return Some(cur);
+        }
+        self.entries.iter().find(|c| {
+            c.path == path
+                && (modified.is_none() || c.modified == modified)
+                && (c.viewport_width == viewport_width || !path.is_dir())
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_by_path(&self, path: &Path) -> Option<&PreviewContentCache> {
+        if let Some(cur) = self.current.as_ref()
+            && cur.path == path
+        {
+            return Some(cur);
+        }
+        self.entries.iter().find(|c| c.path == path)
+    }
+
+    pub(crate) fn contains(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        viewport_width: usize,
+    ) -> bool {
+        self.get(path, modified, viewport_width).is_some()
+    }
+
+    pub(crate) fn put(&mut self, cache: PreviewContentCache) {
+        self.in_flight.remove(&cache.path);
+        if let Some(pos) = self.entries.iter().position(|c| c.path == cache.path) {
+            self.entries.remove(pos);
+        }
+        self.entries.insert(0, cache.clone());
+        if self.entries.len() > self.capacity {
+            self.entries.pop();
+        }
+        // 若 current 尚未設定或傳入項目即為目前 current，才同步更新 current
+        if self.current.as_ref().is_none_or(|c| c.path == cache.path) {
+            self.current = Some(cache);
+        }
+    }
+
+    pub(crate) fn put_current(&mut self, cache: PreviewContentCache) {
+        self.in_flight.remove(&cache.path);
+        if let Some(pos) = self.entries.iter().position(|c| c.path == cache.path) {
+            self.entries.remove(pos);
+        }
+        self.entries.insert(0, cache.clone());
+        if self.entries.len() > self.capacity {
+            self.entries.pop();
+        }
+        self.current = Some(cache);
+    }
+
+    pub(crate) fn update_complete(
+        &mut self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        full_lines: Vec<Line<'static>>,
+    ) {
+        let full_count = full_lines.len();
+        if let Some(cur) = self.current.as_mut()
+            && cur.path == path
+            && (modified.is_none() || cur.modified == modified)
+        {
+            cur.total_lines = full_count.max(cur.total_lines);
+            cur.lines = full_lines.clone();
+            cur.is_complete = true;
+        }
+        if let Some(c) = self
+            .entries
+            .iter_mut()
+            .find(|c| c.path == path && (modified.is_none() || c.modified == modified))
+        {
+            c.total_lines = full_count.max(c.total_lines);
+            c.lines = full_lines;
+            c.is_complete = true;
+        }
+    }
+}
+
+/// EasyMotion 全螢幕標籤優先使用的快速字鍵序列（Home-row 優先，其後為數字與大寫）。
+pub(crate) const EASYMOTION_KEYS: &[char] = &[
+    'j', 'k', 'd', 'f', 's', 'l', 'a', 'h', 'g', 'e', 'w', 'r', 'u', 'i', 'o', 'p', 'c', 'v', 'b',
+    'n', 'm', 'x', 'z', 'q', 'y', 't', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'J', 'K',
+    'D', 'F', 'S', 'L', 'A', 'H', 'G', 'E', 'W', 'R', 'U', 'I', 'O', 'P',
+];
+
 /// 圖片解碼成功時回傳的縮圖列與原圖解析度。
 pub type ImageDecodeResult = Result<(Vec<Line<'static>>, (u32, u32)), String>;
 
@@ -996,6 +1158,377 @@ pub fn highlight_toml_line(line: &str) -> Vec<Span<'static>> {
     spans
 }
 
+/// 解析 Markdown 行內的 inline 標記（如 `code`、**bold**、[label](url) 等）。
+pub fn highlight_markdown_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    let mut last_idx = 0;
+
+    let code_style = Style::default().fg(Color::Rgb(235, 203, 139));
+    let link_style = Style::default()
+        .fg(Color::Rgb(143, 188, 187))
+        .add_modifier(Modifier::UNDERLINED);
+    let url_style = Style::default().fg(Color::Rgb(101, 115, 126));
+
+    while let Some(&(idx, ch)) = chars.peek() {
+        // 1. 行內程式碼 `code`
+        if ch == '`' {
+            if idx > last_idx {
+                spans.push(Span::styled(text[last_idx..idx].to_string(), base_style));
+            }
+            chars.next();
+            let code_start = idx;
+            let mut closed = false;
+            while let Some(&(_, c)) = chars.peek() {
+                chars.next();
+                if c == '`' {
+                    let code_end = chars.peek().map(|&(i, _)| i).unwrap_or(text.len());
+                    spans.push(Span::styled(
+                        text[code_start..code_end].to_string(),
+                        code_style,
+                    ));
+                    last_idx = code_end;
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                spans.push(Span::styled(text[code_start..].to_string(), code_style));
+                last_idx = text.len();
+            }
+            continue;
+        }
+
+        // 2. 粗體 **bold** 或 __bold__
+        if (ch == '*' && text[idx..].starts_with("**"))
+            || (ch == '_' && text[idx..].starts_with("__"))
+        {
+            let delim = if ch == '*' { "**" } else { "__" };
+            if idx > last_idx {
+                spans.push(Span::styled(text[last_idx..idx].to_string(), base_style));
+            }
+            chars.next();
+            chars.next();
+            let content_start = idx + 2;
+            if let Some(close_pos) = text[content_start..].find(delim) {
+                let bold_text = &text[content_start..content_start + close_pos];
+                spans.push(Span::styled(
+                    bold_text.to_string(),
+                    base_style.add_modifier(Modifier::BOLD),
+                ));
+                let end_pos = content_start + close_pos + 2;
+                while let Some(&(i, _)) = chars.peek() {
+                    if i < end_pos {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                last_idx = end_pos;
+                continue;
+            }
+        }
+
+        // 3. 超連結 [label](url)
+        if ch == '['
+            && let Some(close_bracket) = text[idx..].find(']')
+        {
+            let label_text = &text[idx + 1..idx + close_bracket];
+            let after_bracket = &text[idx + close_bracket + 1..];
+            if after_bracket.starts_with('(')
+                && let Some(close_paren) = after_bracket.find(')')
+            {
+                if idx > last_idx {
+                    spans.push(Span::styled(text[last_idx..idx].to_string(), base_style));
+                }
+                let url_text = &after_bracket[1..close_paren];
+                spans.push(Span::styled(format!("[{label_text}]"), link_style));
+                spans.push(Span::styled(format!("({url_text})"), url_style));
+                let end_pos = idx + close_bracket + 1 + close_paren + 1;
+                while let Some(&(i, _)) = chars.peek() {
+                    if i < end_pos {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                last_idx = end_pos;
+                continue;
+            }
+        }
+
+        // 4. 原始 URL <http...>
+        if ch == '<'
+            && (text[idx..].starts_with("<http://") || text[idx..].starts_with("<https://"))
+            && let Some(close_pos) = text[idx..].find('>')
+        {
+            if idx > last_idx {
+                spans.push(Span::styled(text[last_idx..idx].to_string(), base_style));
+            }
+            let raw_url = &text[idx..=idx + close_pos];
+            spans.push(Span::styled(raw_url.to_string(), link_style));
+            let end_pos = idx + close_pos + 1;
+            while let Some(&(i, _)) = chars.peek() {
+                if i < end_pos {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            last_idx = end_pos;
+            continue;
+        }
+
+        chars.next();
+    }
+
+    if last_idx < text.len() {
+        spans.push(Span::styled(text[last_idx..].to_string(), base_style));
+    }
+
+    spans
+}
+
+/// 為單一行 Markdown 內容產生語法高亮 Span 清單。
+pub fn highlight_markdown_line(line: &str, in_code_fence: &mut bool) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    let mut spans = Vec::new();
+    if !indent.is_empty() {
+        spans.push(Span::raw(indent.to_string()));
+    }
+
+    if trimmed.is_empty() {
+        return spans;
+    }
+
+    // 1. 程式碼區塊標記 (Code Fence)：``` 或 ~~~
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        *in_code_fence = !*in_code_fence;
+        let fence_prefix = if trimmed.starts_with("```") {
+            "```"
+        } else {
+            "~~~"
+        };
+        let rest = &trimmed[fence_prefix.len()..];
+        let fence_style = Style::default()
+            .fg(Color::Rgb(208, 135, 112))
+            .add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(fence_prefix.to_string(), fence_style));
+        if !rest.is_empty() {
+            let lang_style = Style::default()
+                .fg(Color::Rgb(235, 203, 139))
+                .add_modifier(Modifier::ITALIC);
+            spans.push(Span::styled(rest.to_string(), lang_style));
+        }
+        return spans;
+    }
+
+    // 2. 處於程式碼區塊內部：以代碼風格呈現
+    if *in_code_fence {
+        let code_style = Style::default().fg(Color::Rgb(192, 197, 206));
+        spans.push(Span::styled(trimmed.to_string(), code_style));
+        return spans;
+    }
+
+    // 3. 標題行 (#, ##, ###, ####, #####, ######)
+    if trimmed.starts_with('#') {
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if hashes <= 6 && trimmed[hashes..].starts_with(' ') {
+            let hash_str = &trimmed[..hashes];
+            let rest = &trimmed[hashes..];
+            let header_style = match hashes {
+                1 => Style::default()
+                    .fg(Color::Rgb(143, 188, 187))
+                    .add_modifier(Modifier::BOLD),
+                2 => Style::default()
+                    .fg(Color::Rgb(129, 161, 193))
+                    .add_modifier(Modifier::BOLD),
+                3 => Style::default()
+                    .fg(Color::Rgb(235, 203, 139))
+                    .add_modifier(Modifier::BOLD),
+                4 => Style::default()
+                    .fg(Color::Rgb(163, 190, 140))
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default()
+                    .fg(Color::Rgb(180, 142, 173))
+                    .add_modifier(Modifier::BOLD),
+            };
+            spans.push(Span::styled(hash_str.to_string(), header_style));
+            spans.extend(highlight_markdown_inline(rest, header_style));
+            return spans;
+        }
+    }
+
+    // 4. 引言行與 GitHub Alert 標記 (> [!NOTE], > [!TIP], etc.)
+    if let Some(after_gt) = trimmed.strip_prefix('>') {
+        let quote_mark_style = Style::default().fg(Color::Rgb(101, 115, 126));
+        spans.push(Span::styled(">".to_string(), quote_mark_style));
+
+        let quote_trimmed = after_gt.trim_start();
+        let leading_spaces = &after_gt[..after_gt.len() - quote_trimmed.len()];
+        if !leading_spaces.is_empty() {
+            spans.push(Span::raw(leading_spaces.to_string()));
+        }
+
+        let alert_opt = if quote_trimmed.starts_with("[!NOTE]") {
+            Some((
+                "[!NOTE]",
+                Style::default()
+                    .fg(Color::Rgb(129, 161, 193))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if quote_trimmed.starts_with("[!TIP]") {
+            Some((
+                "[!TIP]",
+                Style::default()
+                    .fg(Color::Rgb(163, 190, 140))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if quote_trimmed.starts_with("[!IMPORTANT]") {
+            Some((
+                "[!IMPORTANT]",
+                Style::default()
+                    .fg(Color::Rgb(180, 142, 173))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if quote_trimmed.starts_with("[!WARNING]") {
+            Some((
+                "[!WARNING]",
+                Style::default()
+                    .fg(Color::Rgb(235, 203, 139))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if quote_trimmed.starts_with("[!CAUTION]") {
+            Some((
+                "[!CAUTION]",
+                Style::default()
+                    .fg(Color::Rgb(191, 97, 106))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            None
+        };
+
+        if let Some((alert_tag, alert_style)) = alert_opt {
+            spans.push(Span::styled(alert_tag.to_string(), alert_style));
+            let rest = &quote_trimmed[alert_tag.len()..];
+            if !rest.is_empty() {
+                let quote_body_style = Style::default()
+                    .fg(Color::Rgb(140, 150, 165))
+                    .add_modifier(Modifier::ITALIC);
+                spans.extend(highlight_markdown_inline(rest, quote_body_style));
+            }
+            return spans;
+        }
+
+        let quote_body_style = Style::default()
+            .fg(Color::Rgb(140, 150, 165))
+            .add_modifier(Modifier::ITALIC);
+        spans.extend(highlight_markdown_inline(quote_trimmed, quote_body_style));
+        return spans;
+    }
+
+    // 5. 分隔線 (---, ***, ___)
+    if (trimmed.chars().all(|c| c == '-') && trimmed.len() >= 3)
+        || (trimmed.chars().all(|c| c == '*') && trimmed.len() >= 3)
+        || (trimmed.chars().all(|c| c == '_') && trimmed.len() >= 3)
+    {
+        spans.push(Span::styled(
+            trimmed.to_string(),
+            Style::default().fg(Color::Rgb(101, 115, 126)),
+        ));
+        return spans;
+    }
+
+    let text_style = Style::default().fg(Color::Rgb(192, 197, 206));
+
+    // 6. 清單項目 (- , * , + , 1. , 及工作清單 - [ ] / - [x])
+    let bullet_prefix = if trimmed.starts_with("- ") {
+        Some("- ")
+    } else if trimmed.starts_with("* ") {
+        Some("* ")
+    } else if trimmed.starts_with("+ ") {
+        Some("+ ")
+    } else {
+        None
+    };
+
+    if let Some(prefix) = bullet_prefix {
+        let bullet_style = Style::default().fg(Color::Rgb(180, 142, 173));
+        spans.push(Span::styled(prefix.to_string(), bullet_style));
+        let rest = &trimmed[prefix.len()..];
+
+        if let Some(sub) = rest.strip_prefix("[ ] ") {
+            spans.push(Span::styled(
+                "[ ] ".to_string(),
+                Style::default().fg(Color::Rgb(235, 203, 139)),
+            ));
+            spans.extend(highlight_markdown_inline(sub, text_style));
+            return spans;
+        } else if let Some(sub) = rest
+            .strip_prefix("[x] ")
+            .or_else(|| rest.strip_prefix("[X] "))
+        {
+            let marker = &rest[..4];
+            spans.push(Span::styled(
+                marker.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(163, 190, 140))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.extend(highlight_markdown_inline(sub, text_style));
+            return spans;
+        }
+
+        spans.extend(highlight_markdown_inline(rest, text_style));
+        return spans;
+    }
+
+    if let Some(dot_idx) = trimmed.find(". ")
+        && dot_idx > 0
+        && trimmed[..dot_idx].chars().all(|c| c.is_ascii_digit())
+    {
+        let num_prefix = &trimmed[..dot_idx + 2];
+        let num_style = Style::default().fg(Color::Rgb(208, 135, 112));
+        spans.push(Span::styled(num_prefix.to_string(), num_style));
+        let rest = &trimmed[dot_idx + 2..];
+        spans.extend(highlight_markdown_inline(rest, text_style));
+        return spans;
+    }
+
+    // 7. 表格行 (| col1 | col2 |)
+    if trimmed.starts_with('|') && trimmed.contains('|') {
+        let border_style = Style::default().fg(Color::Rgb(101, 115, 126));
+        if trimmed
+            .chars()
+            .all(|c| c == '|' || c == '-' || c == ':' || c.is_whitespace())
+        {
+            spans.push(Span::styled(trimmed.to_string(), border_style));
+            return spans;
+        }
+
+        let parts = trimmed.split('|');
+        let mut first = true;
+        for part in parts {
+            if !first {
+                spans.push(Span::styled("|".to_string(), border_style));
+            }
+            first = false;
+            if !part.is_empty() {
+                spans.extend(highlight_markdown_inline(part, text_style));
+            }
+        }
+        return spans;
+    }
+
+    // 8. 一般內文段落
+    spans.extend(highlight_markdown_inline(trimmed, text_style));
+    spans
+}
+
 /// 將程式碼特定區間（例如捲動到第 5000 行時的 20 行）直接轉換為帶有色彩與正確全域行號的預覽行清單。
 pub fn highlight_code_preview_slice(
     path: &Path,
@@ -1023,6 +1556,16 @@ pub fn highlight_code_preview_slice(
             .map(|n| n.ends_with(".toml") || n == "Cargo.lock")
             .unwrap_or(false);
 
+    let is_markdown = ext == "md"
+        || ext == "markdown"
+        || ext == "mdown"
+        || ext == "mkd"
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".md"))
+            .unwrap_or(false);
+
     let num_width = total_lines.to_string().len().max(3);
     let line_num_style = Style::default().fg(Color::Rgb(110, 115, 128));
 
@@ -1035,6 +1578,30 @@ pub fn highlight_code_preview_slice(
 
             let mut spans = vec![line_num_span];
             spans.extend(highlight_toml_line(line));
+            lines.push(Line::from(spans));
+        }
+        return lines;
+    }
+
+    if is_markdown {
+        let mut lines = Vec::new();
+        let mut in_code_fence = false;
+        if start_line > 0 {
+            for l in contents.lines().take(start_line) {
+                let t = l.trim_start();
+                if t.starts_with("```") || t.starts_with("~~~") {
+                    in_code_fence = !in_code_fence;
+                }
+            }
+        }
+
+        for (index, line) in content_lines.into_iter().enumerate() {
+            let line_num = start_line + index + 1;
+            let line_num_str = format!("{:>width$} ", line_num, width = num_width);
+            let line_num_span = Span::styled(line_num_str, line_num_style);
+
+            let mut spans = vec![line_num_span];
+            spans.extend(highlight_markdown_line(line, &mut in_code_fence));
             lines.push(Line::from(spans));
         }
         return lines;
@@ -1104,6 +1671,27 @@ pub fn highlight_code_preview(
         return vec![Line::from("[empty file]")];
     }
     highlight_code_preview_slice(path, contents, 0, max_lines, total_lines, theme_name)
+}
+
+/// 在背景預熱 syntect 常用語言語法引擎，消除使用者首次開啟程式碼預覽時的冷啟動編譯延遲。
+pub(crate) fn preheat_syntect_common_syntaxes() {
+    let syntax_set = &*SYNTAX_SET;
+    let theme_set = &*THEME_SET;
+    let theme = theme_set
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| theme_set.themes.values().next());
+
+    if let Some(theme) = theme {
+        for ext in [
+            "rs", "py", "js", "ts", "json", "yaml", "sh", "c", "cpp", "go",
+        ] {
+            if let Some(syntax) = syntax_set.find_syntax_by_extension(ext) {
+                let mut highlighter = HighlightLines::new(syntax, theme);
+                let _ = highlighter.highlight_line("// warm\n", syntax_set);
+            }
+        }
+    }
 }
 
 /// 產生檔案指定行區間之預覽內容切片（用於跳頁、按 G 等快速捲動時避免全檔同步解析阻塞）。
