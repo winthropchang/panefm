@@ -14,3 +14,8 @@
 
 # 檔案管理操作可能產生的交易暫存檔。
 .panefm-transfer-*
+
+# 本機產生的獨立二進位檔案與更新快取
+/panefm-*
+/panefm
+/.panefm_update.json

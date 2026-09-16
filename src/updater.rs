@@ -415,17 +415,16 @@ where
     self_replace::self_replace(&temp_path)
         .map_err(|e| UpdateError::ReplacementFailed(e.to_string()))?;
 
-    // 替換完成後，確保當前執行檔保持 0755 執行權限，並在 macOS 上清理屬性與重新 ad-hoc 簽名
+    // 替換完成後，在 Unix 系統上確保當前執行檔保持 0755 執行權限，並在 macOS 上清理屬性與重新 ad-hoc 簽名
+    #[cfg(unix)]
     if let Ok(current_exe) = std::env::current_exe() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&current_exe) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&current_exe, perms);
-            }
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&current_exe) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&current_exe, perms);
         }
+
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("xattr")

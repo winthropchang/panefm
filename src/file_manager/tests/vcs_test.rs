@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
+#[cfg(windows)]
+use super::normalize_path;
 use super::{
     VcsFileStatus, VcsRepoInfo, VcsType, find_vcs_candidates, find_vcs_root, format_diff_lines,
     is_valid_git_dir, parse_git_status_output, parse_svn_info_output, parse_svn_status_output,
