@@ -1,6 +1,6 @@
 [package]
 name = "panefm"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 description = "A fast, pane-first terminal file manager with Vim-style controls"
 license = "MIT"
