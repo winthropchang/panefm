@@ -110,7 +110,13 @@ impl VcsRepoInfo {
     pub(crate) fn format_header_label(&self) -> String {
         match self.vcs_type {
             VcsType::Git => format!("git:{}", self.branch_or_rev),
-            VcsType::Svn => format!("svn:{}", self.branch_or_rev),
+            VcsType::Svn => {
+                if self.branch_or_rev == "svn" {
+                    "svn".to_string()
+                } else {
+                    format!("svn:{}", self.branch_or_rev)
+                }
+            }
         }
     }
 
@@ -156,8 +162,13 @@ pub(crate) fn is_valid_git_dir(dir: &Path) -> bool {
 }
 
 /// 向上搜尋目錄階層以找出所有可能的 VCS 候選根目錄（由深至淺，支援回退）。
+///
+/// 優先權規範：
+/// 若專案同時混用 SVN 與 Git（例如 SVN 作為主要團隊版本庫，Git 作為本地暫存），
+/// 必須優先採用 SVN，避免被本地過期之 Git HEAD 覆蓋。
 pub(crate) fn find_vcs_candidates(start_dir: &Path) -> Vec<(VcsType, PathBuf)> {
-    let mut candidates = Vec::new();
+    let mut svn_candidates = Vec::new();
+    let mut git_candidates = Vec::new();
     let mut current = if start_dir.is_file() {
         start_dir.parent()
     } else {
@@ -165,10 +176,6 @@ pub(crate) fn find_vcs_candidates(start_dir: &Path) -> Vec<(VcsType, PathBuf)> {
     };
 
     while let Some(dir) = current {
-        if is_valid_git_dir(dir) {
-            candidates.push((VcsType::Git, dir.to_path_buf()));
-        }
-
         let svn_marker = dir.join(".svn");
         if svn_marker.is_dir() {
             // SVN 1.7+ 通常在工作區根目錄有一個 .svn 目錄。若父層也有，以最高層為準。
@@ -182,17 +189,24 @@ pub(crate) fn find_vcs_candidates(start_dir: &Path) -> Vec<(VcsType, PathBuf)> {
                     break;
                 }
             }
-            if !candidates
+            if !svn_candidates
                 .iter()
                 .any(|(t, p)| *t == VcsType::Svn && p == &top_svn)
             {
-                candidates.push((VcsType::Svn, top_svn));
+                svn_candidates.push((VcsType::Svn, top_svn));
             }
+        }
+
+        if is_valid_git_dir(dir) {
+            git_candidates.push((VcsType::Git, dir.to_path_buf()));
         }
 
         current = dir.parent();
     }
 
+    // 依據「SVN 優先於 Git」原則：SVN 候選放置於最前列，Git 作為次要備用
+    let mut candidates = svn_candidates;
+    candidates.extend(git_candidates);
     candidates
 }
 
@@ -362,10 +376,11 @@ pub(crate) fn parse_svn_status_output(
             continue;
         }
 
+        let base_dir = normalize_path(repo_root);
         let rel_path = normalize_path(Path::new(path_part));
-        let full_path = normalize_path(&repo_root.join(rel_path));
+        let full_path = normalize_path(&base_dir.join(rel_path));
         statuses.insert(full_path.clone(), status);
-        rollup_status_to_ancestors(&mut statuses, &full_path, repo_root, status);
+        rollup_status_to_ancestors(&mut statuses, &full_path, &base_dir, status);
     }
 
     statuses
@@ -456,28 +471,32 @@ pub(crate) fn query_git_repo_info(repo_root: &Path, _target_dir: &Path) -> Optio
     })
 }
 
-/// 查詢 SVN 工作副本完整資訊（針對當前目錄執行局部查詢，保證大型專案效能）。
+/// 查詢 SVN 工作副本完整資訊（針對當前目錄執行遞迴 status 查詢，使所有子目錄變更向上 rollup 至父資料夾呈現 M 標記）。
 pub(crate) fn query_svn_repo_info(repo_root: &Path, target_dir: &Path) -> Option<VcsRepoInfo> {
     // 優先在目前瀏覽目錄執行 svn info，若失敗再回退至 repo_root
     let mut info_cmd = Command::new("svn");
-    info_cmd.arg("info").current_dir(target_dir);
+    info_cmd
+        .args(["info", "--non-interactive"])
+        .current_dir(target_dir);
 
-    let branch_or_rev = run_command_with_timeout(info_cmd, Duration::from_secs(2))
+    let branch_or_rev = run_command_with_timeout(info_cmd, Duration::from_secs(3))
         .or_else(|| {
             let mut root_cmd = Command::new("svn");
-            root_cmd.arg("info").current_dir(repo_root);
-            run_command_with_timeout(root_cmd, Duration::from_secs(2))
+            root_cmd
+                .args(["info", "--non-interactive"])
+                .current_dir(repo_root);
+            run_command_with_timeout(root_cmd, Duration::from_secs(3))
         })
         .map(|out| parse_svn_info_output(&out))
         .unwrap_or_else(|| "svn".to_string());
 
-    // 針對目前目錄執行局部 status 查詢，避免全儲存庫遞迴掃描逾時
+    // 針對目前目錄執行遞迴 status 查詢，確保所有子目錄變更向上 rollup 至父資料夾呈現 M 標記
     let mut status_cmd = Command::new("svn");
     status_cmd
-        .args(["status", "--depth", "immediates"])
+        .args(["status", "--non-interactive", "--ignore-externals"])
         .current_dir(target_dir);
 
-    let statuses = run_command_with_timeout(status_cmd, Duration::from_secs(2))
+    let statuses = run_command_with_timeout(status_cmd, Duration::from_secs(3))
         .map(|out| parse_svn_status_output(&out, target_dir))
         .unwrap_or_default();
 
@@ -496,6 +515,18 @@ pub(crate) fn query_vcs_file_diff(file_path: &Path) -> Option<String> {
 
     for (vcs_type, repo_root) in candidates {
         match vcs_type {
+            VcsType::Svn => {
+                let mut cmd = Command::new("svn");
+                cmd.args(["diff", "--non-interactive"])
+                    .arg(file_path)
+                    .current_dir(parent);
+                if let Some(out) = run_command_with_timeout(cmd, Duration::from_millis(1500)) {
+                    let trimmed = out.trim();
+                    if !trimmed.is_empty() {
+                        return Some(out);
+                    }
+                }
+            }
             VcsType::Git => {
                 // 1. 優先比對 HEAD 的變更（包含已暫存與工作區未暫存修改）
                 let mut cmd = Command::new("git");
@@ -518,16 +549,6 @@ pub(crate) fn query_vcs_file_diff(file_path: &Path) -> Option<String> {
                 if let Some(out) =
                     run_command_with_timeout(cmd_fallback, Duration::from_millis(800))
                 {
-                    let trimmed = out.trim();
-                    if !trimmed.is_empty() {
-                        return Some(out);
-                    }
-                }
-            }
-            VcsType::Svn => {
-                let mut cmd = Command::new("svn");
-                cmd.arg("diff").arg(file_path).current_dir(parent);
-                if let Some(out) = run_command_with_timeout(cmd, Duration::from_millis(1000)) {
                     let trimmed = out.trim();
                     if !trimmed.is_empty() {
                         return Some(out);

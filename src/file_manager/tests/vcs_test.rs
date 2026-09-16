@@ -496,3 +496,77 @@ fn format_diff_lines_highlighting_colors() {
     // + Green
     assert_eq!(lines[5].spans[0].style.fg, Some(Color::Green));
 }
+
+#[test]
+/// 驗證當工作目錄同時存在有效的 SVN 與 Git 時，PaneFM 嚴格優先使用 SVN。
+/// 保護目的：避免使用者在主要由 SVN 管理之團隊專案中，被本地暫存之 Git 倉庫覆蓋狀態。
+fn find_vcs_prioritizes_svn_over_git_when_coexisting() {
+    let temp = tempdir().expect("tempdir");
+    let project_dir = temp.path().join("PlatformClient");
+
+    // 建立有效的 SVN 工作副本標記
+    fs::create_dir_all(project_dir.join(".svn")).expect("create .svn");
+
+    // 同時建立有效的 Git 倉庫標記（包含 HEAD）
+    let git_dir = project_dir.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/master\n").expect("write git HEAD");
+
+    let candidates = find_vcs_candidates(&project_dir);
+    assert!(candidates.len() >= 2, "必須同時偵測到 SVN 與 Git 候選");
+    assert_eq!(candidates[0].0, VcsType::Svn, "第 0 順位必須優先採用 SVN");
+    assert_eq!(candidates[1].0, VcsType::Git, "第 1 順位作為次要 Git 回退");
+    assert_eq!(
+        find_vcs_root(&project_dir),
+        Some((VcsType::Svn, project_dir.clone()))
+    );
+}
+
+#[test]
+/// 驗證 SVN status 能將深層子目錄之檔案變更向上 rollup 至所有父資料夾（如 BusinessCard/Referral.ts 使 BusinessCard/ 獲得 M 標記）。
+/// 保護目的：確保使用者在外部檢視父目錄清單時，能清晰掌握內部子目錄有尚未提交之修改。
+fn parse_svn_status_rolls_up_nested_subdirectories() {
+    let repo_root = PathBuf::from("R:\\PlatformClient\\src\\MainProgram\\Scene\\Lobby\\Module");
+    let svn_output = "\
+M       BusinessCard/Referral.ts
+A       Assets/Sounds/bgm.mp3
+";
+    let statuses = parse_svn_status_output(svn_output, &repo_root);
+
+    let info = VcsRepoInfo {
+        vcs_type: VcsType::Svn,
+        repo_root: repo_root.clone(),
+        branch_or_rev: "svn".to_string(),
+        statuses,
+    };
+
+    // 1. 本身修改的檔案必須標記為 Modified
+    let referral_file = repo_root.join("BusinessCard").join("Referral.ts");
+    assert_eq!(
+        info.status_for_path(&referral_file),
+        Some(VcsFileStatus::Modified)
+    );
+
+    // 2. 其父目錄 BusinessCard/ 必須被 rollup 標記為 Modified（出現 M 符號）
+    let business_card_dir = repo_root.join("BusinessCard");
+    assert_eq!(
+        info.status_for_path(&business_card_dir),
+        Some(VcsFileStatus::Modified),
+        "父目錄 BusinessCard/ 必須被自動標記為 Modified (M)"
+    );
+
+    // 3. 多層新增的檔案與中間所有父目錄階層皆必須被 rollup
+    let bgm_file = repo_root.join("Assets").join("Sounds").join("bgm.mp3");
+    let sounds_dir = repo_root.join("Assets").join("Sounds");
+    let assets_dir = repo_root.join("Assets");
+    assert_eq!(info.status_for_path(&bgm_file), Some(VcsFileStatus::Added));
+    assert_eq!(
+        info.status_for_path(&sounds_dir),
+        Some(VcsFileStatus::Added)
+    );
+    assert_eq!(
+        info.status_for_path(&assets_dir),
+        Some(VcsFileStatus::Added),
+        "最外層父目錄 Assets/ 也必須被 rollup 標記為 Added (A)"
+    );
+}
