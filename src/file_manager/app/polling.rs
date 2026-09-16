@@ -835,28 +835,50 @@ impl App {
         let Some(rx) = &self.in_app_update_rx else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(latest_version)) => {
-                self.in_app_updating = false;
-                self.in_app_update_rx = None;
-                self.update_badge_info = None;
-                self.status = format!("✅ 成功升級至 v{latest_version}！請重啟 panefm 生效。");
-            }
-            Ok(Err(err)) => {
-                self.in_app_updating = false;
-                self.in_app_update_rx = None;
-                if err.contains("無須更新") || err.contains("無更新") {
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(InAppUpdateMsg::Progress { downloaded, total }) => {
+                    let dl_mb = downloaded as f64 / (1024.0 * 1024.0);
+                    if let Some(total_bytes) = total {
+                        let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+                        let percent =
+                            ((downloaded as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+                        self.status = format!(
+                            "⏳ 正在下載更新: {percent:.1}% ({dl_mb:.1} MB / {total_mb:.1} MB)..."
+                        );
+                    } else {
+                        self.status = format!("⏳ 正在下載更新: {dl_mb:.1} MB...");
+                    }
+                }
+                Ok(InAppUpdateMsg::Completed(Ok(latest_version))) => {
+                    self.in_app_updating = false;
+                    self.in_app_update_rx = None;
                     self.update_badge_info = None;
-                    self.status = format!("ℹ️ {err}");
-                } else {
-                    self.status = format!("❌ 升級失敗: {err}");
+                    self.status = format!("✅ 成功升級至 v{latest_version}！請重啟 panefm 生效。");
+                    return;
+                }
+                Ok(InAppUpdateMsg::Completed(Err(err))) => {
+                    self.in_app_updating = false;
+                    self.in_app_update_rx = None;
+                    if err.contains("無須更新") || err.contains("無更新") {
+                        self.update_badge_info = None;
+                        self.status = format!("ℹ️ {err}");
+                    } else {
+                        self.status = format!("❌ 升級失敗: {err}");
+                    }
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.in_app_updating = false;
-                self.in_app_update_rx = None;
-            }
+        }
+        if disconnected {
+            self.in_app_updating = false;
+            self.in_app_update_rx = None;
         }
     }
 
@@ -874,13 +896,24 @@ impl App {
         self.status = String::from("🚀 正在連線檢查並下載最新版本...");
 
         std::thread::spawn(move || {
+            let do_download = |url: &str| {
+                let tx_p = tx.clone();
+                crate::updater::download_and_install_with_progress(
+                    url,
+                    crate::updater::DEFAULT_DOWNLOAD_TIMEOUT_SECS,
+                    move |downloaded, total| {
+                        let _ = tx_p.send(InAppUpdateMsg::Progress { downloaded, total });
+                    },
+                )
+            };
+
             let valid_info = download_info.filter(|info| {
                 let url = info.download_url.trim();
                 url.starts_with("http://") || url.starts_with("https://")
             });
 
             let result = if let Some(info) = valid_info {
-                match crate::updater::download_and_install(&info.download_url, 60) {
+                match do_download(&info.download_url) {
                     Ok(()) => {
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -903,7 +936,7 @@ impl App {
                                 download_url,
                                 asset_name,
                                 ..
-                            }) => match crate::updater::download_and_install(&download_url, 60) {
+                            }) => match do_download(&download_url) {
                                 Ok(()) => {
                                     let now_secs = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -932,7 +965,7 @@ impl App {
                         download_url,
                         asset_name,
                         ..
-                    }) => match crate::updater::download_and_install(&download_url, 60) {
+                    }) => match do_download(&download_url) {
                         Ok(()) => {
                             let now_secs = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -968,7 +1001,7 @@ impl App {
                     Err(err) => Err(err.to_string()),
                 }
             };
-            let _ = tx.send(result);
+            let _ = tx.send(InAppUpdateMsg::Completed(result));
         });
     }
 

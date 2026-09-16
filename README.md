@@ -46,7 +46,19 @@
 
 ## 安裝方式 (Installation)
 
-### 1. 外部工具相依
+### 1. 一鍵快速安裝（macOS 推薦）
+
+透過官方安裝腳本直接下載最新版本並完成系統整合（自動設定可執行權限、解除 macOS Gatekeeper 阻擋並進行程式碼簽名）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/winthropchang/panefm/main/install.sh | bash
+```
+
+> 安裝腳本會自動偵測硬體架構（Apple Silicon / Intel），並優先安裝至 `/usr/local/bin/panefm`（若無權限則自動安裝至 `~/.local/bin/panefm`）。
+
+---
+
+### 2. 外部工具相依
 
 PaneFM 依賴系統 `PATH` 中的外部工具以發揮完整搜尋與跳轉效能：
 
@@ -69,25 +81,29 @@ winget install sharkdp.fd BurntSushi.ripgrep.MSVC junegunn.fzf ajeetdsouza.zoxid
 
 ---
 
-### 2. 下載預先編譯版本
+### 3. 下載預先編譯版本 (GitHub Releases)
 
 至 [Releases 頁面](https://github.com/winthropchang/panefm/releases) 下載對應作業系統的執行檔：
 
 - **macOS (Apple Silicon / ARM64)**：`panefm-macos-arm64`
-- **macOS (Intel / x86_64)**：`panefm-macos-x86_64`
-- **Windows (x64)**：`panefm-windows-x86_64.exe`
+- **macOS (Intel / x86_64)**：`panefm-macos-x64`
+- **Windows (x64)**：`panefm-windows-x64.exe`
 
-#### macOS 隔離標記解除 (Gatekeeper)
-初次由瀏覽器下載執行若遇到系統提示無法驗證開發者，可在終端機執行：
+#### macOS 隔離標記解除 (Gatekeeper 阻擋排除)
+若透過瀏覽器下載執行時遇到系統提示「無法打開，因為 Apple 無法檢查其是否包含惡意軟體」或「檔案已損毀」，請在終端機執行以下指令解除 Gatekeeper 隔離並賦予執行權限：
 ```bash
-xattr -d com.apple.quarantine ./panefm-macos-arm64
+# 解除隔離屬性、賦予執行權限與本機簽名
+xattr -c ./panefm-macos-arm64
 chmod +x ./panefm-macos-arm64
+codesign -s - --force ./panefm-macos-arm64
+
+# 移動至全域 PATH 目錄（選用）
 sudo mv ./panefm-macos-arm64 /usr/local/bin/panefm
 ```
 
 ---
 
-### 3. 從原始碼編譯
+### 4. 從原始碼編譯
 
 ```bash
 git clone https://github.com/winthropchang/panefm.git

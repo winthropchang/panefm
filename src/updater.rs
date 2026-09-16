@@ -4,14 +4,17 @@
 //! 並透過 `self-replace` 進行安全替換。在無網路或離線環境下提供清楚友善的診斷提示，
 //! 且在下載驗證完成前絕不觸碰現有執行檔。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 /// 預設遠端版本檢查間隔：24 小時（86400 秒）。
 pub const DEFAULT_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// 預設自我更新下載逾時時間：300 秒（5 分鐘）。
+pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
 /// 本地更新狀態快取，記錄上一次向 GitHub 查詢的時間與最新版本資訊。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,10 +307,18 @@ pub fn check_for_update(timeout_secs: u64) -> Result<UpdateCheckResult, UpdateEr
 ///
 /// 參數：
 /// - `download_url`: 二進位檔案下載網址。
-/// - `timeout_secs`: 下載逾時秒數。
+/// - `timeout_secs`: 下載逾時秒數（建議使用 `DEFAULT_DOWNLOAD_TIMEOUT_SECS`）。
+/// - `on_progress`: 進度回呼函式，傳入 `(已下載位元組數, 預估總位元組數 Option<u64>)`。
 ///
 /// 回傳：`Result<(), UpdateError>`。
-pub fn download_and_install(download_url: &str, timeout_secs: u64) -> Result<(), UpdateError> {
+pub fn download_and_install_with_progress<F>(
+    download_url: &str,
+    timeout_secs: u64,
+    mut on_progress: F,
+) -> Result<(), UpdateError>
+where
+    F: FnMut(usize, Option<u64>),
+{
     let trimmed = download_url.trim();
     if trimmed.is_empty() || (!trimmed.starts_with("http://") && !trimmed.starts_with("https://")) {
         return Err(UpdateError::Network("下載網址無效或為空".to_string()));
@@ -332,13 +343,37 @@ pub fn download_and_install(download_url: &str, timeout_secs: u64) -> Result<(),
             other => UpdateError::Network(format!("下載連線失敗: {other}")),
         })?;
 
+    // 嘗試由 HTTP 回應標頭讀取 Content-Length 取得二進位檔案總大小
+    let total_bytes = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
     // 建立臨時檔案儲存下載二進位資料
     let mut temp_file = tempfile::NamedTempFile::new()
         .map_err(|e| UpdateError::ReplacementFailed(format!("無法建立暫存檔案: {e}")))?;
 
     let mut reader = response.into_body().into_reader();
-    std::io::copy(&mut reader, &mut temp_file)
-        .map_err(|e| UpdateError::Network(format!("串流下載檔案中斷: {e}")))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut downloaded: usize = 0;
+
+    // 初始通知進度 0
+    on_progress(0, total_bytes);
+
+    loop {
+        let n = reader
+            .read(&mut buffer)
+            .map_err(|e| UpdateError::Network(format!("串流下載檔案中斷: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        temp_file
+            .write_all(&buffer[..n])
+            .map_err(|e| UpdateError::ReplacementFailed(format!("寫入暫存檔案失敗: {e}")))?;
+        downloaded += n;
+        on_progress(downloaded, total_bytes);
+    }
 
     // 確保所有位元組均已寫入磁碟並關閉寫入 handle
     temp_file
@@ -347,11 +382,79 @@ pub fn download_and_install(download_url: &str, timeout_secs: u64) -> Result<(),
 
     let temp_path = temp_file.path().to_path_buf();
 
+    // 在 Unix 系統上，確保暫存檔案具備可執行權限 (0755)
+    // 預設 NamedTempFile 建立權限為 0600，若不調整會在 self_replace 後導致執行檔失去執行權限 (Permission Denied)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&temp_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&temp_path, perms);
+        }
+    }
+
+    // 在 macOS 上，清除可能附帶的隔離屬性並進行 ad-hoc 程式碼簽名
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(&temp_path)
+            .output();
+        let _ = std::process::Command::new("xattr")
+            .args(["-c"])
+            .arg(&temp_path)
+            .output();
+        let _ = std::process::Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(&temp_path)
+            .output();
+    }
+
     // 呼叫 self_replace 原子替換當前執行檔
     self_replace::self_replace(&temp_path)
         .map_err(|e| UpdateError::ReplacementFailed(e.to_string()))?;
 
+    // 替換完成後，確保當前執行檔保持 0755 執行權限，並在 macOS 上清理屬性與重新 ad-hoc 簽名
+    if let Ok(current_exe) = std::env::current_exe() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&current_exe) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&current_exe, perms);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("xattr")
+                .args(["-d", "com.apple.quarantine"])
+                .arg(&current_exe)
+                .output();
+            let _ = std::process::Command::new("xattr")
+                .args(["-c"])
+                .arg(&current_exe)
+                .output();
+            let _ = std::process::Command::new("codesign")
+                .args(["-f", "-s", "-"])
+                .arg(&current_exe)
+                .output();
+        }
+    }
+
     Ok(())
+}
+
+/// 下載指定 URL 的二進位檔案至暫存檔，並透過 `self-replace` 替換當前執行檔（不帶進度回呼的相容介面）。
+///
+/// 參數：
+/// - `download_url`: 二進位檔案下載網址。
+/// - `timeout_secs`: 下載逾時秒數。
+///
+/// 回傳：`Result<(), UpdateError>`。
+pub fn download_and_install(download_url: &str, timeout_secs: u64) -> Result<(), UpdateError> {
+    download_and_install_with_progress(download_url, timeout_secs, |_, _| {})
 }
 
 /// 命令列 `panefm update` 的主進入點函式。
@@ -386,7 +489,61 @@ pub fn run_cli_update() -> Result<(), UpdateError> {
             println!("發現新版本：v{latest_version}（目前版本：v{current_version}）");
             println!("正在下載 {asset_name} 並安裝更新...");
 
-            download_and_install(&download_url, 60)?;
+            let start_time = Instant::now();
+            let mut last_render = Instant::now();
+
+            download_and_install_with_progress(
+                &download_url,
+                DEFAULT_DOWNLOAD_TIMEOUT_SECS,
+                |downloaded, total| {
+                    let now = Instant::now();
+                    let is_done = total.map(|t| downloaded as u64 >= t).unwrap_or(false);
+                    if !is_done && now.duration_since(last_render).as_millis() < 80 {
+                        return;
+                    }
+                    last_render = now;
+
+                    let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.001);
+                    let speed_bytes_sec = downloaded as f64 / elapsed_secs;
+                    let speed_str = if speed_bytes_sec >= 1024.0 * 1024.0 {
+                        format!("{:.2} MB/s", speed_bytes_sec / (1024.0 * 1024.0))
+                    } else {
+                        format!("{:.1} KB/s", speed_bytes_sec / 1024.0)
+                    };
+
+                    let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
+
+                    if let Some(total_bytes) = total {
+                        let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+                        let percent =
+                            ((downloaded as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+                        let bar_width = 25;
+                        let filled = ((percent / 100.0) * bar_width as f64).round() as usize;
+                        let bar: String = (0..bar_width)
+                            .map(|i| {
+                                if i < filled {
+                                    '='
+                                } else if i == filled {
+                                    '>'
+                                } else {
+                                    ' '
+                                }
+                            })
+                            .collect();
+
+                        print!(
+                            "\r下載進度: [{bar}] {:.1} MB / {:.1} MB ({:.1}%) [{speed_str}]   ",
+                            downloaded_mb, total_mb, percent
+                        );
+                    } else {
+                        print!("\r下載進度: {:.1} MB [{speed_str}]   ", downloaded_mb);
+                    }
+                    let _ = std::io::stdout().flush();
+                },
+            )?;
+
+            // 印出換行讓進度條與完成訊息分開
+            println!("\n更新完成！已成功升級至 v{latest_version}。");
 
             let cache = UpdateStateCache {
                 last_check_timestamp: now_secs,
@@ -396,7 +553,6 @@ pub fn run_cli_update() -> Result<(), UpdateError> {
             };
             let _ = save_update_cache(&cache, None);
 
-            println!("更新完成！已成功升級至 v{latest_version}。");
             Ok(())
         }
     }

@@ -8,10 +8,10 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use panefm::updater::{
-    CliCommand, LaunchArgs, UpdateCheckResult, UpdateError, UpdateStateCache,
-    default_update_cache_path, is_newer_version, load_update_cache, match_platform_asset,
-    parse_cli_args, parse_cli_command, parse_latest_release, save_update_cache,
-    should_check_remote,
+    CliCommand, DEFAULT_DOWNLOAD_TIMEOUT_SECS, LaunchArgs, UpdateCheckResult, UpdateError,
+    UpdateStateCache, default_update_cache_path, download_and_install_with_progress,
+    is_newer_version, load_update_cache, match_platform_asset, parse_cli_args, parse_cli_command,
+    parse_latest_release, save_update_cache, should_check_remote,
 };
 
 #[test]
@@ -364,4 +364,26 @@ fn default_update_cache_path_format() {
         path.file_name().and_then(|n| n.to_str()),
         Some(".panefm_update.json")
     );
+}
+
+#[test]
+/// 驗證預設下載逾時時間足夠長（至少 300 秒 = 5 分鐘），避免跨國下載或大檔案提早斷線。
+/// 保護目的：防止回歸成過短的 60 秒導致使用者在慢速網路下無法更新。
+fn default_download_timeout_is_at_least_300_seconds() {
+    const { assert!(DEFAULT_DOWNLOAD_TIMEOUT_SECS >= 300) };
+}
+
+#[test]
+/// 驗證無效或非 HTTP/HTTPS 下載網址會被及時攔截並回傳友善錯誤，不會發起非預期連線。
+/// 保護目的：確保自定義下載網址格式不正確時安全回退。
+fn download_and_install_with_invalid_url_fails_gracefully() {
+    let mut progress_called = false;
+    let res = download_and_install_with_progress("ftp://invalid.example.com", 5, |_, _| {
+        progress_called = true;
+    });
+    assert!(res.is_err());
+    assert!(!progress_called);
+
+    let res_empty = download_and_install_with_progress("   ", 5, |_, _| {});
+    assert!(res_empty.is_err());
 }

@@ -671,12 +671,24 @@ pub(crate) struct App {
     pub(crate) update_badge_info: Option<UpdateBadgeInfo>,
     /// 背景版本檢查接收端。
     pub(crate) update_check_rx: Option<Receiver<crate::updater::UpdateCheckResult>>,
-    /// 內部就地升級工作接收端：回傳 `Ok(version)` 或 `Err(error_message)`。
-    pub(crate) in_app_update_rx: Option<Receiver<Result<String, String>>>,
+    /// 內部就地升級工作接收端。
+    pub(crate) in_app_update_rx: Option<Receiver<InAppUpdateMsg>>,
     /// 目前是否正在下載與安裝更新。
     pub(crate) in_app_updating: bool,
     /// 版本控制（Git 與 SVN）背景管理與查詢 worker。
     pub(crate) vcs_manager: super::vcs::VcsManager,
+}
+
+/// 應用程式內部就地升級通訊訊息。
+#[derive(Debug)]
+pub(crate) enum InAppUpdateMsg {
+    /// 下載進度事件（已下載位元組, 總位元組）。
+    Progress {
+        downloaded: usize,
+        total: Option<u64>,
+    },
+    /// 升級結束事件（成功回傳新版本字串，失敗回傳錯誤訊息）。
+    Completed(Result<String, String>),
 }
 
 /// 記錄 F1 help 關閉後應回復到哪一種互動上下文。
