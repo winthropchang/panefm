@@ -1695,10 +1695,10 @@ pub(crate) fn find_syntax_for_path<'a>(
             _ => None,
         };
 
-        if let Some(target) = fallback_ext {
-            if let Some(syntax) = syntax_set.find_syntax_by_extension(target) {
-                return syntax;
-            }
+        if let Some(syntax) =
+            fallback_ext.and_then(|target| syntax_set.find_syntax_by_extension(target))
+        {
+            return syntax;
         }
     }
 
