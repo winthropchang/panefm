@@ -829,8 +829,8 @@ impl App {
         self.status = String::from("panel: choose h/j/k/l/c/o/t/d from the panel");
     }
 
-    /// 開啟 EasyMotion 全螢幕標籤直達跳轉模式。
-    /// 取得目前聚焦視窗的可見行，指派主鍵位標籤並等待單鍵瞬移。
+    /// 開啟 EasyMotion 兩階段精準跳轉模式。
+    /// 進入等待輸入目標字元階段，畫面維持原樣，待輸入開頭字母後才指派標籤與高亮。
     pub(crate) fn open_easymotion(&mut self) {
         let Some(pane) = self.panes.get(&self.focused_pane) else {
             return;
@@ -841,30 +841,12 @@ impl App {
             return;
         }
 
-        let viewport_height = pane.list_viewport_height;
-        let (view_start, view_end) = crate::file_manager::ui::visible_list_window_range(
-            visible_total,
-            pane.selected,
-            viewport_height,
-            pane.list_state.offset(),
-        );
-
-        let mut labels = Vec::new();
-        for (i, visible_idx) in (view_start..view_end).enumerate() {
-            if let Some(&key_char) = crate::file_manager::preview::EASYMOTION_KEYS.get(i) {
-                labels.push((key_char, visible_idx));
-            }
-        }
-
-        if labels.is_empty() {
-            return;
-        }
-
         self.pending_action = Some(PendingAction::EasyMotion {
             pane_id: self.focused_pane,
-            labels,
+            target_char: None,
+            labels: Vec::new(),
         });
-        self.status = String::from("-- EASYMOTION -- (press key to jump, Esc to cancel)");
+        self.status = String::from("-- EASYMOTION -- (type target char, Esc to cancel)");
     }
 
     /// 打開底部 Move / LineMode 面板，等待使用者輸入搬移或欄位顯示模式。
@@ -1563,8 +1545,12 @@ impl App {
                 search.editing,
             ),
             PendingAction::ToolPanel { .. } => String::from("dependencies: j/k move, Esc close"),
-            PendingAction::EasyMotion { .. } => {
-                String::from("-- EASYMOTION -- (press key to jump, Esc to cancel)")
+            PendingAction::EasyMotion { target_char, .. } => {
+                if let Some(c) = target_char {
+                    format!("-- EASYMOTION [{c}] -- (press label to jump, Esc to cancel)")
+                } else {
+                    String::from("-- EASYMOTION -- (type target char, Esc to cancel)")
+                }
             }
             PendingAction::BookmarkList {
                 selected,

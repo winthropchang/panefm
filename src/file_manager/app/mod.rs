@@ -586,6 +586,7 @@ pub(crate) enum PendingAction {
     DiffMatrix(DiffMatrixState),
     EasyMotion {
         pane_id: usize,
+        target_char: Option<char>,
         labels: Vec<(char, usize)>,
     },
 }
@@ -1284,7 +1285,10 @@ impl App {
                     Some(PendingAction::EasyMotion {
                         pane_id: action_pane_id,
                         labels,
-                    }) if *action_pane_id == pane_id => Some(labels.as_slice()),
+                        ..
+                    }) if *action_pane_id == pane_id && !labels.is_empty() => {
+                        Some(labels.as_slice())
+                    }
                     _ => None,
                 };
                 let update_badge = if pane_id == self.focused_pane {

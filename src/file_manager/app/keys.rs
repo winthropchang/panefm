@@ -1894,17 +1894,86 @@ impl App {
         }
 
         match action {
-            PendingAction::EasyMotion { pane_id, labels } => match key.code {
-                KeyCode::Esc | KeyCode::Char('q')
-                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::NONE =>
+            PendingAction::EasyMotion {
+                pane_id,
+                target_char,
+                labels,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.status = String::from("easymotion cancelled");
+                }
+                KeyCode::Char(c)
+                    if (key.modifiers.is_empty()
+                        || key.modifiers == KeyModifiers::NONE
+                        || key.modifiers == KeyModifiers::SHIFT)
+                        && target_char.is_none() =>
                 {
-                    self.status = String::from("easymotion cancelled");
+                    let Some(pane) = self.panes.get_mut(&pane_id) else {
+                        return Ok(true);
+                    };
+                    let visible_total = pane.visible_indices.len();
+                    let viewport_height = pane.list_viewport_height;
+                    let (view_start, view_end) = crate::file_manager::ui::visible_list_window_range(
+                        visible_total,
+                        pane.selected,
+                        viewport_height,
+                        pane.list_state.offset(),
+                    );
+                    let lower_c = c.to_ascii_lowercase();
+                    let mut matches = Vec::new();
+                    for visible_idx in view_start..view_end {
+                        if let Some(&entry_idx) = pane.visible_indices.get(visible_idx)
+                            && let Some(entry) = pane.entries.get(entry_idx)
+                        {
+                            let name_lower = entry.name.to_lowercase();
+                            let name_trimmed_lower =
+                                entry.name.trim_start_matches('.').to_lowercase();
+                            if name_lower.starts_with(lower_c)
+                                || name_trimmed_lower.starts_with(lower_c)
+                            {
+                                matches.push(visible_idx);
+                            }
+                        }
+                    }
+
+                    if matches.is_empty() {
+                        self.status = format!("easymotion: no items starting with '{}'", c);
+                    } else if matches.len() == 1 {
+                        pane.move_to_visible_index(matches[0]);
+                        let entry_name = pane
+                            .selected_entry()
+                            .map(|e| e.name.clone())
+                            .unwrap_or_default();
+                        self.status = format!("jumped to {}", entry_name);
+                    } else {
+                        let mut new_labels = Vec::new();
+                        for (i, &visible_idx) in matches.iter().enumerate() {
+                            if let Some(&key_char) =
+                                crate::file_manager::preview::EASYMOTION_KEYS.get(i)
+                            {
+                                new_labels.push((key_char, visible_idx));
+                            }
+                        }
+                        self.status = format!(
+                            "-- EASYMOTION [{c}] -- (press label to jump, Esc to cancel)"
+                        );
+                        self.pending_action = Some(PendingAction::EasyMotion {
+                            pane_id,
+                            target_char: Some(c),
+                            labels: new_labels,
+                        });
+                    }
                 }
-                _ if key_matches_plain_letter(&key, 'e') => {
-                    self.status = String::from("easymotion cancelled");
-                }
-                KeyCode::Char(c) => {
-                    if let Some(&(_, target_visible_idx)) = labels.iter().find(|(ch, _)| *ch == c) {
+                KeyCode::Char(c)
+                    if (key.modifiers.is_empty()
+                        || key.modifiers == KeyModifiers::NONE
+                        || key.modifiers == KeyModifiers::SHIFT)
+                        && target_char.is_some() =>
+                {
+                    let lower_c = c.to_ascii_lowercase();
+                    if let Some(&(_, target_visible_idx)) =
+                        labels.iter().find(|(ch, _)| ch.to_ascii_lowercase() == lower_c)
+                    {
                         if let Some(pane) = self.panes.get_mut(&pane_id) {
                             pane.move_to_visible_index(target_visible_idx);
                             let entry_name = pane
