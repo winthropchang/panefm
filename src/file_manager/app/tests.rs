@@ -5901,11 +5901,24 @@ fn app_preview_mode_scrolls_and_exits_cleanly() {
     assert!(app.panes.get(&1).expect("pane").is_preview_active());
 
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-        .expect("scroll down");
+        .expect("cursor down");
+    assert_eq!(app.panes.get(&1).expect("pane").preview_cursor, 1);
+    assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
+
+    // 游標在可視範圍 (4 行) 內自由移動，超出邊界時才捲動視窗
+    for _ in 0..3 {
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("cursor down");
+    }
+    assert_eq!(app.panes.get(&1).expect("pane").preview_cursor, 4);
     assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 1);
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
-        .expect("scroll up");
+    // 向上移動回頂部，視窗捲回 0
+    for _ in 0..4 {
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("cursor up");
+    }
+    assert_eq!(app.panes.get(&1).expect("pane").preview_cursor, 0);
     assert_eq!(app.panes.get(&1).expect("pane").preview_scroll, 0);
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -9646,31 +9659,42 @@ fn test_user_journey_prefetch_tab_preview_and_scroll_responsiveness() {
         "預覽焦點必須處於開啟狀態"
     );
 
-    // 步驟 2：使用者立即按下 j 鍵向下捲動
+    // 步驟 2：使用者立即按下 j 鍵向下移動游標
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         .expect("j scroll");
     assert_eq!(
-        app.panes.get(&1).unwrap().preview_scroll,
+        app.panes.get(&1).unwrap().preview_cursor,
         1,
-        "按下 j 後必須立即向下移動至第 1 行"
+        "按下 j 後游標必須立即向下移動至第 1 行"
+    );
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        0,
+        "在 viewport 內移動游標時不應產生非預期視窗位移"
     );
 
-    // 步驟 3：使用者按下方向鍵 Down 繼續向下捲動
+    // 步驟 3：使用者按下方向鍵 Down 繼續向下移動游標
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
         .expect("Down scroll");
     assert_eq!(
-        app.panes.get(&1).unwrap().preview_scroll,
+        app.panes.get(&1).unwrap().preview_cursor,
         2,
-        "按下 Down 後必須移動至第 2 行"
+        "按下 Down 後游標必須移動至第 2 行"
     );
+    assert_eq!(app.panes.get(&1).unwrap().preview_scroll, 0);
 
     // 步驟 4：使用者按下 PageDown 翻頁
     app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
         .expect("PageDown");
     assert_eq!(
         app.panes.get(&1).unwrap().preview_scroll,
+        25,
+        "PageDown 應向下翻 25 行 (0 + 25 = 25)"
+    );
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_cursor,
         27,
-        "PageDown 應向下翻 25 行 (2 + 25 = 27)"
+        "PageDown 游標同步向下位移 25 行 (2 + 25 = 27)"
     );
 
     // 步驟 5：使用者按下 ] 鍵在預覽中切換到下一個檔案 (02_short.toml)
@@ -9689,6 +9713,11 @@ fn test_user_journey_prefetch_tab_preview_and_scroll_responsiveness() {
     // 步驟 6：在 15 行的 short.toml 嘗試捲動（viewport 為 25，max_scroll 為 0）
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         .expect("j on short file");
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_cursor,
+        1,
+        "短檔案游標仍可自由移動"
+    );
     assert_eq!(
         app.panes.get(&1).unwrap().preview_scroll,
         0,
@@ -9712,9 +9741,14 @@ fn test_user_journey_prefetch_tab_preview_and_scroll_responsiveness() {
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         .expect("j after switch back");
     assert_eq!(
-        app.panes.get(&1).unwrap().preview_scroll,
+        app.panes.get(&1).unwrap().preview_cursor,
         1,
-        "切換回大檔案後 j 依然能正常捲動"
+        "切換回大檔案後 j 依然能正常移動游標"
+    );
+    assert_eq!(
+        app.panes.get(&1).unwrap().preview_scroll,
+        0,
+        "未達 viewport 邊界不捲動"
     );
 
     // 步驟 9：使用者按下 Tab 鍵退出預覽模式回到檔案列表
@@ -10470,11 +10504,8 @@ fn test_preview_scroll_preserved_across_background_directory_load_and_watcher_re
         .expect("focus preview");
     assert!(app.panes[&1].is_preview_active());
 
-    // 按下 j 捲動 15 行
-    for _ in 0..15 {
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-            .expect("scroll down");
-    }
+    // 捲動 15 行
+    app.panes.get_mut(&1).unwrap().scroll_preview_down(15);
     assert_eq!(app.panes[&1].preview_scroll, 15);
 
     // 模擬背景目錄載入 Batch 到達
@@ -10592,10 +10623,11 @@ fn test_side_by_side_preview_workflow_with_tab_l_and_h() {
     );
     assert_eq!(app.status, "preview focused (press 'h' to return to list)");
 
-    // 4. 在 preview 焦點中按 j 捲動預覽內容
+    // 4. 在 preview 焦點中按 j 移動預覽游標
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-        .expect("j scrolls preview");
-    assert_eq!(app.panes[&1].preview_scroll, 1);
+        .expect("j moves preview cursor");
+    assert_eq!(app.panes[&1].preview_cursor, 1);
+    assert_eq!(app.panes[&1].preview_scroll, 0);
     assert_eq!(
         app.panes[&1].selected_entry().unwrap().name,
         "a_file.txt",

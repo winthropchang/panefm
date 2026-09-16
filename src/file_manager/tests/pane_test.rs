@@ -1474,6 +1474,77 @@ fn pane_state_short_file_preview_cursor_moves_freely() {
 }
 
 #[test]
+/// 驗證長檔案中 preview 游標可如文字編輯器般在可視範圍內自由上下移動，
+/// 僅在游標超出可視範圍邊界時才觸發 viewport 捲動。
+/// 保護目的：確保游標不被固定在首行或頂部，而是如 Vim / 編輯器般自由穿梭在可見行之間。
+fn pane_state_preview_cursor_moves_freely_within_viewport_before_scrolling() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("code.rs");
+    let code = (1..=50)
+        .map(|i| format!("fn line_{i}() {{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, code).expect("write code.rs");
+
+    let mut pane = PaneState::new(dir.path().to_path_buf()).expect("pane");
+    pane.set_preview_viewport_height(10);
+    pane.set_preview_viewport_size(80, 10);
+
+    let theme = Theme::default();
+
+    // 初始游標與捲動皆為 0
+    assert_eq!(pane.preview_cursor, 0);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 1. 游標在 viewport (10 行) 內向下移動 5 行：游標改變，但 viewport 不捲動！
+    for expected_cursor in 1..=5 {
+        pane.move_preview_cursor_down(1);
+        assert_eq!(pane.preview_cursor, expected_cursor);
+        assert_eq!(pane.preview_scroll, 0, "游標未達底部邊界前視窗不應捲動");
+    }
+
+    // 驗證此時高亮確實套用在第 5 行 (index 5) 而非第 0 行
+    let lines = pane.preview_lines(10, theme);
+    assert!(
+        lines[5]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+    assert!(
+        !lines[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme.preview_current_line_bg))
+    );
+
+    // 2. 移動游標至第 9 行 (index 9，即 viewport 的最底行)
+    for _ in 6..=9 {
+        pane.move_preview_cursor_down(1);
+    }
+    assert_eq!(pane.preview_cursor, 9);
+    assert_eq!(pane.preview_scroll, 0);
+
+    // 3. 再次向下移動 1 行 (至 index 10)：游標超出 viewport 底部，此時視窗才向下捲動 1 行！
+    pane.move_preview_cursor_down(1);
+    assert_eq!(pane.preview_cursor, 10);
+    assert_eq!(
+        pane.preview_scroll, 1,
+        "游標超出 viewport 底部時視窗應捲動 1 行"
+    );
+
+    // 4. 向上移動 1 行 (回 index 9)：游標仍在目前 viewport (1..11) 內，視窗不捲動
+    pane.move_preview_cursor_up(1);
+    assert_eq!(pane.preview_cursor, 9);
+    assert_eq!(pane.preview_scroll, 1, "向上移動未達頂部邊界時視窗不捲動");
+
+    // 5. 連續向上移動直到超出頂部邊界 (index 0)
+    pane.move_preview_cursor_up(9);
+    assert_eq!(pane.preview_cursor, 0);
+    assert_eq!(pane.preview_scroll, 0, "游標回到頂部時視窗捲回 0");
+}
+
+#[test]
 /// 驗證搜尋 preview 即使遇到大檔案，也會顯示命中片段而不是只顯示 skipped 訊息。
 /// 保護目的：避免目錄載入、排序、預覽或檔案操作重構後，破壞單一 panel 的資料一致性。
 fn pane_state_search_preview_for_large_file_shows_match_snippet() {

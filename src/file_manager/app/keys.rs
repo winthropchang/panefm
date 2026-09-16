@@ -985,7 +985,7 @@ impl App {
             KeyCode::Down => {
                 let count = self.take_count_or_one();
                 let pane = self.current_pane_mut()?;
-                pane.scroll_preview_down(count);
+                pane.move_preview_cursor_down(count);
                 let line_no = pane.preview_cursor + 1;
                 let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
@@ -994,7 +994,7 @@ impl App {
             _ if key_matches_plain_letter(&key, 'j') => {
                 let count = self.take_count_or_one();
                 let pane = self.current_pane_mut()?;
-                pane.scroll_preview_down(count);
+                pane.move_preview_cursor_down(count);
                 let line_no = pane.preview_cursor + 1;
                 let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
@@ -1003,7 +1003,7 @@ impl App {
             KeyCode::Up => {
                 let count = self.take_count_or_one();
                 let pane = self.current_pane_mut()?;
-                pane.scroll_preview_up(count);
+                pane.move_preview_cursor_up(count);
                 let line_no = pane.preview_cursor + 1;
                 let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;
@@ -1012,7 +1012,7 @@ impl App {
             _ if key_matches_plain_letter(&key, 'k') => {
                 let count = self.take_count_or_one();
                 let pane = self.current_pane_mut()?;
-                pane.scroll_preview_up(count);
+                pane.move_preview_cursor_up(count);
                 let line_no = pane.preview_cursor + 1;
                 let total = pane.preview_total_lines().max(1);
                 self.pending_g = false;

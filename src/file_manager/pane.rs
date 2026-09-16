@@ -1102,37 +1102,56 @@ impl PaneState {
         }
     }
 
+    /// 確保 preview 游標落在可視區域內；若超出則捲動 preview_scroll。
+    pub(crate) fn ensure_preview_cursor_visible(&mut self) {
+        let total = self.preview_total_lines();
+        if total == 0 {
+            self.preview_cursor = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        self.preview_cursor = self.preview_cursor.min(total.saturating_sub(1));
+        let viewport_height = self.preview_viewport_height.max(1);
+        if self.preview_cursor < self.preview_scroll {
+            self.preview_scroll = self.preview_cursor;
+        } else if self.preview_cursor >= self.preview_scroll + viewport_height {
+            self.preview_scroll = self.preview_cursor.saturating_sub(viewport_height - 1);
+        }
+        self.clamp_preview_scroll();
+    }
+
+    /// 將 preview 游標向下移動指定列數（如像文字編輯器般移動游標，僅在游標超出可視範圍時捲動）。
+    pub(crate) fn move_preview_cursor_down(&mut self, lines: usize) {
+        let total = self.preview_total_lines();
+        if total == 0 {
+            self.preview_cursor = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        self.preview_cursor = (self.preview_cursor + lines).min(total.saturating_sub(1));
+        self.ensure_preview_cursor_visible();
+    }
+
+    /// 將 preview 游標向上移動指定列數（如像文字編輯器般移動游標，僅在游標超出可視範圍時捲動）。
+    pub(crate) fn move_preview_cursor_up(&mut self, lines: usize) {
+        self.preview_cursor = self.preview_cursor.saturating_sub(lines);
+        self.ensure_preview_cursor_visible();
+    }
+
     /// 將 preview 向下捲動指定列數。
     pub(crate) fn scroll_preview_down(&mut self, lines: usize) {
         let max_scroll = self.max_preview_scroll();
         let total = self.preview_total_lines();
-        if self.preview_scroll < max_scroll {
-            let new_scroll = (self.preview_scroll + lines).min(max_scroll);
-            let delta = new_scroll - self.preview_scroll;
-            self.preview_scroll = new_scroll;
-            let remaining = lines.saturating_sub(delta);
-            self.preview_cursor = (self.preview_scroll + remaining).min(total.saturating_sub(1));
-        } else {
-            self.preview_cursor = (self.preview_cursor + lines).min(total.saturating_sub(1));
-        }
+        self.preview_scroll = (self.preview_scroll + lines).min(max_scroll);
+        self.preview_cursor = (self.preview_cursor + lines).min(total.saturating_sub(1));
+        self.ensure_preview_cursor_visible();
     }
 
     /// 將 preview 向上捲動指定列數。
     pub(crate) fn scroll_preview_up(&mut self, lines: usize) {
-        if self.preview_cursor > self.preview_scroll {
-            let in_view_delta = self.preview_cursor - self.preview_scroll;
-            if lines <= in_view_delta {
-                self.preview_cursor -= lines;
-                return;
-            }
-            self.preview_cursor = self.preview_scroll;
-            let remaining = lines - in_view_delta;
-            self.preview_scroll = self.preview_scroll.saturating_sub(remaining);
-            self.preview_cursor = self.preview_scroll;
-        } else {
-            self.preview_scroll = self.preview_scroll.saturating_sub(lines);
-            self.preview_cursor = self.preview_scroll;
-        }
+        self.preview_scroll = self.preview_scroll.saturating_sub(lines);
+        self.preview_cursor = self.preview_cursor.saturating_sub(lines);
+        self.ensure_preview_cursor_visible();
     }
 
     /// 將 preview 捲到最上方。
@@ -1146,6 +1165,7 @@ impl PaneState {
         self.preview_scroll = self.max_preview_scroll();
         let total = self.preview_total_lines();
         self.preview_cursor = total.saturating_sub(1);
+        self.ensure_preview_cursor_visible();
     }
 
     /// 將 preview 游標跳至指定行號（1-indexed）。
@@ -1160,13 +1180,7 @@ impl PaneState {
             .saturating_sub(1)
             .min(total.saturating_sub(1));
         self.preview_cursor = target_0_indexed;
-        let viewport_height = self.preview_viewport_height.max(1);
-        if self.preview_cursor < self.preview_scroll {
-            self.preview_scroll = self.preview_cursor;
-        } else if self.preview_cursor >= self.preview_scroll + viewport_height {
-            self.preview_scroll = self.preview_cursor.saturating_sub(viewport_height - 1);
-        }
-        self.clamp_preview_scroll();
+        self.ensure_preview_cursor_visible();
     }
 
     /// 依照目前 viewport 高度向下翻半頁。
@@ -1854,6 +1868,7 @@ impl PaneState {
         };
 
         self.preview_current_match = Some(target);
+        self.preview_cursor = line_index;
         self.preview_scroll = line_index.min(self.max_preview_scroll());
         true
     }
