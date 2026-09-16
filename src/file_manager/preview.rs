@@ -482,20 +482,24 @@ pub fn detect_file_kind(path: &Path, extension: Option<&str>) -> &'static str {
         "rs" => "Rust Source Code",
         "go" => "Go Source Code",
         "py" => "Python Source Code",
-        "js" => "JavaScript Source Code",
-        "ts" => "TypeScript Source Code",
+        "js" | "mjs" | "cjs" => "JavaScript Source Code",
+        "ts" | "mts" | "cts" => "TypeScript Source Code",
+        "jsx" => "React JSX Source Code",
+        "tsx" => "React TSX Source Code",
         "c" | "h" => "C Source Code",
         "cpp" | "hpp" | "cc" | "cxx" => "C++ Source Code",
         "java" => "Java Source Code",
         "rb" => "Ruby Source Code",
         "php" => "PHP Script",
         "sh" | "bash" | "zsh" => "Shell Script",
+        "ps1" | "psm1" | "psd1" => "PowerShell Script",
+        "bat" | "cmd" => "Batch Script",
         "json" => "JSON Data",
         "toml" => "TOML Configuration",
         "yaml" | "yml" => "YAML Data",
         "xml" => "XML Document",
         "html" | "htm" => "HTML Document",
-        "css" => "CSS Stylesheet",
+        "css" | "scss" | "sass" | "less" => "CSS Stylesheet",
         "md" | "markdown" => "Markdown Document",
         "txt" => "Plain Text Document",
         "log" => "Log File",
@@ -1607,12 +1611,7 @@ pub fn highlight_code_preview_slice(
         return lines;
     }
 
-    let syntax = Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(|ext| SYNTAX_SET.find_syntax_by_extension(ext))
-        .or_else(|| SYNTAX_SET.find_syntax_for_file(path).ok().flatten())
-        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+    let syntax = find_syntax_for_path(&SYNTAX_SET, path);
 
     let theme_key = theme_name.unwrap_or("base16-ocean.dark");
     let theme = THEME_SET
@@ -1659,6 +1658,57 @@ pub fn highlight_code_preview_slice(
     lines
 }
 
+/// 依據副檔名與檔案路徑尋找最佳語法定義。
+///
+/// 由於 syntect 預設內建語法庫（Sublime Text 預設包）未包含 TypeScript、JSX、SCSS 等現代前端格式，
+/// 此函式提供智慧別名與相容語法映射（例如 `ts`/`tsx`/`jsx` 映射至 `JavaScript`，`scss`/`sass`/`less` 映射至 `CSS`），
+/// 確保所有常見語言皆能享有完整的語法色彩渲染。
+pub(crate) fn find_syntax_for_path<'a>(
+    syntax_set: &'a SyntaxSet,
+    path: &Path,
+) -> &'a syntect::parsing::SyntaxReference {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    if let Some(ref ext_str) = ext {
+        if let Some(syntax) = syntax_set.find_syntax_by_extension(ext_str) {
+            return syntax;
+        }
+
+        let fallback_ext = match ext_str.as_str() {
+            // TypeScript 與現代 JavaScript 擴充
+            "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" => Some("js"),
+            // 樣式表預處理器
+            "scss" | "sass" | "less" => Some("css"),
+            // Shell 與終端腳本（PowerShell / Unix Shell）
+            "bash" | "zsh" | "fish" | "ksh" | "ps1" | "psm1" | "psd1" => Some("sh"),
+            "cmd" => Some("bat"),
+            // C / C++ 標頭檔與變體
+            "hpp" | "hxx" | "hh" | "cxx" | "cc" => Some("cpp"),
+            "h" => Some("c"),
+            // JSON 變體
+            "jsonc" | "json5" => Some("json"),
+            // 現代前端單一元件檔
+            "vue" | "svelte" => Some("html"),
+            _ => None,
+        };
+
+        if let Some(target) = fallback_ext {
+            if let Some(syntax) = syntax_set.find_syntax_by_extension(target) {
+                return syntax;
+            }
+        }
+    }
+
+    syntax_set
+        .find_syntax_for_file(path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text())
+}
+
 /// 將程式碼或文字內容依據副檔名與語法定義轉換為帶有色彩與自適應暗色行號的預覽行清單。
 pub fn highlight_code_preview(
     path: &Path,
@@ -1686,10 +1736,10 @@ pub(crate) fn preheat_syntect_common_syntaxes() {
         for ext in [
             "rs", "py", "js", "ts", "json", "yaml", "sh", "c", "cpp", "go",
         ] {
-            if let Some(syntax) = syntax_set.find_syntax_by_extension(ext) {
-                let mut highlighter = HighlightLines::new(syntax, theme);
-                let _ = highlighter.highlight_line("// warm\n", syntax_set);
-            }
+            let fake_path = Path::new("file").with_extension(ext);
+            let syntax = find_syntax_for_path(syntax_set, &fake_path);
+            let mut highlighter = HighlightLines::new(syntax, theme);
+            let _ = highlighter.highlight_line("// warm\n", syntax_set);
         }
     }
 }

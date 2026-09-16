@@ -183,6 +183,87 @@ fn integration_code_preview_syntax_highlighting() {
 }
 
 #[test]
+/// 驗證 TypeScript (.ts)、TSX、JSX 與 SCSS 等前端常見語言透過別名映射皆能享有彩色語法高亮。
+/// 保護目的：防止 syntect 預設未打包之現代前端語言退化為無色彩純文字。
+fn integration_typescript_and_modern_web_syntax_highlighting() {
+    use panefm::file_manager::preview::highlight_code_preview;
+
+    // 1. TypeScript (.ts) 測試
+    let ts_path = Path::new("index.ts");
+    let ts_code = "const greeting: string = 'hello';\nexport function add(a: number, b: number): number { return a + b; }\n";
+    let ts_lines = highlight_code_preview(ts_path, ts_code, 10, None);
+
+    assert_eq!(ts_lines.len(), 2);
+    // 第 1 行應被切分為多個帶有不同語法顏色的 Token（如 const 關鍵字、hello 字串），而非整行單一 span
+    assert!(
+        ts_lines[0].spans.len() > 2,
+        "TypeScript 行應被語法解析為多個 token span"
+    );
+    let has_const_keyword = ts_lines[0]
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref() == "const" && s.style.fg.is_some());
+    assert!(has_const_keyword, "const 關鍵字應帶有語法高亮色彩");
+
+    let has_string_token = ts_lines[0]
+        .spans
+        .iter()
+        .any(|s| s.content.as_ref() == "hello" && s.style.fg.is_some());
+    assert!(has_string_token, "hello 字串應帶有語法高亮色彩");
+
+    // 2. React TSX (.tsx) 測試
+    let tsx_path = Path::new("App.tsx");
+    let tsx_code = "import React from 'react';\nexport const App = () => <div>Hello</div>;\n";
+    let tsx_lines = highlight_code_preview(tsx_path, tsx_code, 10, None);
+    assert_eq!(tsx_lines.len(), 2);
+    assert!(tsx_lines[0].spans.len() > 2);
+    assert!(
+        tsx_lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "import")
+    );
+
+    // 3. SCSS (.scss) 測試
+    let scss_path = Path::new("styles.scss");
+    let scss_code = "$primary-color: #333;\nbody { color: $primary-color; }\n";
+    let scss_lines = highlight_code_preview(scss_path, scss_code, 10, None);
+    assert_eq!(scss_lines.len(), 2);
+    assert!(scss_lines[1].spans.len() > 2);
+
+    // 4. PowerShell (.ps1) 測試
+    let ps1_path = Path::new("deploy.ps1");
+    let ps1_code = "$service = \"nginx\"\n# Check status\nif ($service) { Write-Host \"Starting: $service\" }\n";
+    let ps1_lines = highlight_code_preview(ps1_path, ps1_code, 10, None);
+    assert_eq!(ps1_lines.len(), 3);
+    assert!(
+        ps1_lines[0].spans.len() > 2,
+        "PowerShell 行應包含多個 token span"
+    );
+    assert!(
+        ps1_lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "service" && s.style.fg.is_some()),
+        "變數名稱應帶有語法色彩"
+    );
+    assert!(
+        ps1_lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "nginx" && s.style.fg.is_some()),
+        "字串應帶有語法色彩"
+    );
+    assert!(
+        ps1_lines[1]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref().contains("Check status")),
+        "註解應被保留且正確標記"
+    );
+}
+
+#[test]
 /// 驗證 TOML 檔案（如 Cargo.toml、Config.toml）透過公開 API 可享有客製化語法高亮著色。
 /// 保護目的：確保 TOML 專用解析器在整合情境下運作正常。
 fn integration_toml_code_preview_syntax_highlighting() {
