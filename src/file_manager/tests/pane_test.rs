@@ -2324,7 +2324,11 @@ fn pane_diff_mode_search_highlights_and_retains_diff_content() {
     let rendered = pane.preview_lines(10, theme);
     assert_eq!(rendered.len(), 7);
     assert_eq!(rendered[0].to_string(), "--- a/main.rs");
-    assert!(rendered[4].to_string().contains("+    pub vcs_token: String,"));
+    assert!(
+        rendered[4]
+            .to_string()
+            .contains("+    pub vcs_token: String,")
+    );
 
     // 驗證命中文字帶有 preview_match_fg 高亮樣式
     let match_line = &rendered[4];
@@ -2356,5 +2360,3 @@ fn pane_diff_mode_search_highlights_and_retains_diff_content() {
     let title_after_clear = pane.preview_title_for_entry(&entry);
     assert!(!title_after_clear.contains("[/pub]"));
 }
-
-

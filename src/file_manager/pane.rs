@@ -1113,9 +1113,7 @@ impl PaneState {
 
         let diff_output = super::vcs::query_vcs_file_diff(&entry.path);
         let lines = match diff_output {
-            Some(diff) if !diff.trim().is_empty() => {
-                super::vcs::format_diff_lines(&diff, theme)
-            }
+            Some(diff) if !diff.trim().is_empty() => super::vcs::format_diff_lines(&diff, theme),
             _ => {
                 vec![Line::from(Span::styled(
                     "[No VCS modifications detected in Git/SVN]",
@@ -1179,7 +1177,9 @@ impl PaneState {
 
         if self.preview_diff_mode {
             let default_theme = Theme::default_theme();
-            return self.get_or_load_preview_diff_lines(entry, &default_theme).len();
+            return self
+                .get_or_load_preview_diff_lines(entry, &default_theme)
+                .len();
         }
 
         let ext = entry.path.extension().and_then(|e| e.to_str());
@@ -3190,7 +3190,10 @@ fn is_preview_searchable_line(text: &str) -> bool {
         return false;
     }
     let trimmed_start = text.trim_start();
-    let digit_count = trimmed_start.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    let digit_count = trimmed_start
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
 
     if digit_count > 0
         && trimmed_start

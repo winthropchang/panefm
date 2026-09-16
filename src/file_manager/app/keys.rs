@@ -1954,9 +1954,8 @@ impl App {
                                 new_labels.push((key_char, visible_idx));
                             }
                         }
-                        self.status = format!(
-                            "-- EASYMOTION [{c}] -- (press label to jump, Esc to cancel)"
-                        );
+                        self.status =
+                            format!("-- EASYMOTION [{c}] -- (press label to jump, Esc to cancel)");
                         self.pending_action = Some(PendingAction::EasyMotion {
                             pane_id,
                             target_char: Some(c),
@@ -1971,8 +1970,9 @@ impl App {
                         && target_char.is_some() =>
                 {
                     let lower_c = c.to_ascii_lowercase();
-                    if let Some(&(_, target_visible_idx)) =
-                        labels.iter().find(|(ch, _)| ch.to_ascii_lowercase() == lower_c)
+                    if let Some(&(_, target_visible_idx)) = labels
+                        .iter()
+                        .find(|(ch, _)| ch.to_ascii_lowercase() == lower_c)
                     {
                         if let Some(pane) = self.panes.get_mut(&pane_id) {
                             pane.move_to_visible_index(target_visible_idx);

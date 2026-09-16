@@ -6101,8 +6101,16 @@ fn app_preview_diff_mode_search_stays_in_diff_and_searches_diff_lines() {
 
     // 預覽行依然為 diff 內容
     let rendered = pane.preview_lines(10, Theme::default_theme());
-    assert!(rendered.iter().any(|line| line.to_string().contains("diff_feature")));
-    assert!(!rendered.iter().any(|line| line.to_string().contains("fn main()")));
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.to_string().contains("diff_feature"))
+    );
+    assert!(
+        !rendered
+            .iter()
+            .any(|line| line.to_string().contains("fn main()"))
+    );
 }
 
 #[test]

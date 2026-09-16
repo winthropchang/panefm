@@ -401,7 +401,10 @@ fn find_vcs_skips_empty_git_and_finds_parent_svn() {
     fs::create_dir_all(svn_root.join(".svn")).expect("create .svn");
 
     // 多層子目錄，其中一層有殘留的空 .git
-    let client_dir = svn_root.join("hot168").join("Client").join("PlatformClient");
+    let client_dir = svn_root
+        .join("hot168")
+        .join("Client")
+        .join("PlatformClient");
     fs::create_dir_all(client_dir.join(".git")).expect("create empty .git");
 
     // 最深層的資產目錄
@@ -493,4 +496,3 @@ fn format_diff_lines_highlighting_colors() {
     // + Green
     assert_eq!(lines[5].spans[0].style.fg, Some(Color::Green));
 }
-

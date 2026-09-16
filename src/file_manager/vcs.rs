@@ -182,7 +182,10 @@ pub(crate) fn find_vcs_candidates(start_dir: &Path) -> Vec<(VcsType, PathBuf)> {
                     break;
                 }
             }
-            if !candidates.iter().any(|(t, p)| *t == VcsType::Svn && p == &top_svn) {
+            if !candidates
+                .iter()
+                .any(|(t, p)| *t == VcsType::Svn && p == &top_svn)
+            {
                 candidates.push((VcsType::Svn, top_svn));
             }
         }
@@ -512,7 +515,9 @@ pub(crate) fn query_vcs_file_diff(file_path: &Path) -> Option<String> {
                     .args(["diff", "--"])
                     .arg(file_path)
                     .current_dir(&repo_root);
-                if let Some(out) = run_command_with_timeout(cmd_fallback, Duration::from_millis(800)) {
+                if let Some(out) =
+                    run_command_with_timeout(cmd_fallback, Duration::from_millis(800))
+                {
                     let trimmed = out.trim();
                     if !trimmed.is_empty() {
                         return Some(out);
@@ -521,9 +526,7 @@ pub(crate) fn query_vcs_file_diff(file_path: &Path) -> Option<String> {
             }
             VcsType::Svn => {
                 let mut cmd = Command::new("svn");
-                cmd.arg("diff")
-                    .arg(file_path)
-                    .current_dir(parent);
+                cmd.arg("diff").arg(file_path).current_dir(parent);
                 if let Some(out) = run_command_with_timeout(cmd, Duration::from_millis(1000)) {
                     let trimmed = out.trim();
                     if !trimmed.is_empty() {
@@ -544,12 +547,16 @@ pub(crate) fn format_diff_lines(diff_text: &str, theme: &Theme) -> Vec<Line<'sta
         if raw_line.starts_with("+++") || raw_line.starts_with("---") {
             lines.push(Line::from(Span::styled(
                 raw_line.to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
         } else if raw_line.starts_with("@@") {
             lines.push(Line::from(Span::styled(
                 raw_line.to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
         } else if raw_line.starts_with('+') {
             lines.push(Line::from(Span::styled(
