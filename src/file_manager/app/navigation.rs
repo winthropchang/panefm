@@ -1742,7 +1742,7 @@ impl App {
         self.pending_g = false;
         self.pending_y = false;
         self.status = if preview_open {
-            String::from("preview enabled (press 'l' to focus preview, 'Tab' to close)")
+            String::from("preview focused (press 'h' to return to list, 'Tab' to close)")
         } else {
             String::from("normal mode")
         };

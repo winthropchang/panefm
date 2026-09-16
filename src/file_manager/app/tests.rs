@@ -1885,11 +1885,17 @@ fn app_tab_opens_preview_mode() {
         .expect("open preview with tab");
 
     assert!(app.panes.get(&1).expect("pane").is_preview_open());
-    assert!(!app.panes.get(&1).expect("pane").is_preview_focused());
+    assert!(app.panes.get(&1).expect("pane").is_preview_focused());
+    assert!(app.panes.get(&1).expect("pane").is_preview_active());
     assert_eq!(
         app.status,
-        "preview enabled (press 'l' to focus preview, 'Tab' to close)"
+        "preview focused (press 'h' to return to list, 'Tab' to close)"
     );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        .expect("return to list with h");
+    assert!(!app.panes.get(&1).expect("pane").is_preview_focused());
+    assert_eq!(app.status, "file list (preview open)");
 
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
         .expect("focus preview with l");
@@ -5889,16 +5895,12 @@ fn app_preview_mode_scrolls_and_exits_cleanly() {
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
         .expect("open preview");
     assert!(app.panes.get(&1).expect("pane").is_preview_open());
-    assert!(!app.panes.get(&1).expect("pane").is_preview_focused());
-    assert_eq!(
-        app.status,
-        "preview enabled (press 'l' to focus preview, 'Tab' to close)"
-    );
-
-    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
-        .expect("focus preview");
     assert!(app.panes.get(&1).expect("pane").is_preview_focused());
     assert!(app.panes.get(&1).expect("pane").is_preview_active());
+    assert_eq!(
+        app.status,
+        "preview focused (press 'h' to return to list, 'Tab' to close)"
+    );
 
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         .expect("cursor down");
@@ -5945,10 +5947,10 @@ fn app_preview_mode_toggles_with_tab() {
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
         .expect("open preview");
     assert!(app.panes.get(&1).expect("pane").is_preview_open());
-    assert!(!app.panes.get(&1).expect("pane").is_preview_focused());
+    assert!(app.panes.get(&1).expect("pane").is_preview_focused());
     assert_eq!(
         app.status,
-        "preview enabled (press 'l' to focus preview, 'Tab' to close)"
+        "preview focused (press 'h' to return to list, 'Tab' to close)"
     );
 
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
@@ -10654,20 +10656,26 @@ fn test_side_by_side_preview_workflow_with_tab_l_and_h() {
     assert!(!app.panes[&1].is_preview_open());
     assert!(!app.panes[&1].is_preview_focused());
 
-    // 1. 按 Tab 開啟預覽
+    // 1. 按 Tab 開啟預覽，焦點直接進入右側 preview
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
         .expect("tab opens preview");
     assert!(app.panes[&1].is_preview_open(), "preview 應開啟");
     assert!(
-        !app.panes[&1].is_preview_focused(),
-        "焦點應停在左側檔案列表"
+        app.panes[&1].is_preview_focused(),
+        "焦點應直接進入右側 preview"
     );
     assert_eq!(
         app.status,
-        "preview enabled (press 'l' to focus preview, 'Tab' to close)"
+        "preview focused (press 'h' to return to list, 'Tab' to close)"
     );
 
-    // 2. 在檔案列表中移動 j，右側預覽即時更新
+    // 2. 按 h 退出 preview 焦點回到檔案列表
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        .expect("h returns to list");
+    assert!(!app.panes[&1].is_preview_focused());
+    assert_eq!(app.status, "file list (preview open)");
+
+    // 在檔案列表中移動 j，右側預覽即時更新
     let initial_selected = app.panes[&1].selected;
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         .expect("j moves in list");

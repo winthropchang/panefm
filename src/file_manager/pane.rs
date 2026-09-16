@@ -380,7 +380,7 @@ impl PaneState {
             self.preview_diff_mode = false;
             self.preview_search_query = None;
             self.preview_current_match = None;
-            self.preview_focused = false;
+            self.preview_focused = true;
         } else {
             self.preview_focused = false;
             self.preview_diff_mode = false;
@@ -402,13 +402,14 @@ impl PaneState {
             self.preview_cursor = 0;
             self.preview_search_query = None;
             self.preview_current_match = None;
-            self.preview_focused = false;
+            self.preview_focused = true;
         } else {
             self.preview_diff_mode = !self.preview_diff_mode;
             self.preview_scroll = 0;
             self.preview_cursor = 0;
             self.preview_search_query = None;
             self.preview_current_match = None;
+            self.preview_focused = true;
         }
         self.preview_active = self.preview_open && self.preview_focused;
         self.preview_diff_mode
