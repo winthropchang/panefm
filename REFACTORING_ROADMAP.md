@@ -16,37 +16,37 @@
 | **Phase 4** | `src/file_manager/ui.rs`<br>**(3,364 行)** | 拆分為 `ui/` 目錄下 **8 個渲染子模組**，門面僅 **76 行** | `2627f35` | ✅ 單檔最大僅 756 行，渲染與格式化完全解耦 |
 | **Phase 5** | `src/file_manager/preview.rs`<br>**(2,009 行)** | 拆分為 `preview/` 目錄下 **8 個領域子模組**，門面僅 **42 行** | `04fec9d` | ✅ 單檔最大僅 435 行，Halfblock、語法、壓縮檔樹全面解耦 |
 | **Phase 6** | `src/file_manager/app/file_ops.rs`<br>**(2,197 行)** | 拆分為 `app/file_ops/` 目錄下 **7 個領域子模組**，門面僅 **9 行** | `e83fc3b` | ✅ 單檔最大僅 647 行，開啟、建立、壓縮、刪除、剪貼、貼上、傳輸完全解耦 |
-| **Phase 7** | `src/file_manager/app/help.rs`<br>**(2,064 行)** | 拆分為 `app/help/` 目錄下 **8 個領域子模組**，門面僅 **14 行** | 待提交 | ✅ 單檔最大僅 566 行，F1 字典、搜尋、編輯模式與面板速查表完全解耦 |
+| **Phase 7** | `src/file_manager/app/help.rs`<br>**(2,064 行)** | 拆分為 `app/help/` 目錄下 **8 個領域子模組**，門面僅 **14 行** | `bf63dfb` | ✅ 單檔最大僅 566 行，F1 字典、搜尋、編輯模式與面板速查表完全解耦 |
+| **Phase 8** | `src/file_manager/app/navigation.rs`<br>**(1,970 行)** | 拆分為 `app/navigation/` 目錄下 **6 個領域子模組**，門面僅 **7 行** | 待提交 | ✅ 單檔最大僅 428 行，視窗佈局、路徑追蹤、書籤、說明狀態、選擇器與搜尋啟動完全解耦 |
 
 ---
 
 ## 2. 目前剩餘大型檔案規模統計 (> 1,000 行)
 
-截至版本 `v0.1.21`（Phase 7 完成後），程式碼庫中仍超過 1,000 行的檔案如下（已依優先級排序）：
+截至 Phase 8 完成後，程式碼庫中仍超過 1,000 行的檔案如下（已依優先級排序）：
 
 ```text
 優先級   檔案路徑                              目前行數    主要職責
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/file_manager/app/navigation.rs   1,970 行   目錄切換、跨視窗焦點、歷史路徑跳轉、多選同步
-[P2]    src/file_manager/app/polling.rs      1,783 行   檔案監聽事件處理、目錄大小更新、非同步背景傳輸輪詢
-[P3]    src/file_manager/app/mod.rs          1,648 行   App 結構體定義、初始化、全域生命週期與事件調度
-[P4]    src/config.rs                        1,362 行   TOML 設定檔載入、驗證、持久化、預設範本與快捷鍵配置
-[P5]    src/file_manager/app/status.rs       1,258 行   底部狀態列動態快捷鍵提示、狀態字串折疊與格式化
-[P6]    src/file_manager/app/keys/mod.rs     1,100 行   Normal 模式按鍵調度、計數前綴 (Count)、貼上事件
-[P7]    src/file_manager/pane/preview.rs     1,017 行   PaneState 專屬預覽視窗滾動、搜尋跳轉、非同步預熱
-[P8]    src/file_manager/app/tests.rs       10,835 行   整合測試套件（可按領域拆分為多個測試檔案）
+[P1]    src/file_manager/app/polling.rs      1,783 行   檔案監聽事件處理、目錄大小更新、非同步背景傳輸輪詢
+[P2]    src/file_manager/app/mod.rs          1,647 行   App 結構體定義、初始化、全域生命週期與事件調度
+[P3]    src/config.rs                        1,362 行   TOML 設定檔載入、驗證、持久化、預設範本與快捷鍵配置
+[P4]    src/file_manager/app/status.rs       1,258 行   底部狀態列動態快捷鍵提示、狀態字串折疊與格式化
+[P5]    src/file_manager/app/keys/mod.rs     1,100 行   Normal 模式按鍵調度、計數前綴 (Count)、貼上事件
+[P6]    src/file_manager/pane/preview.rs     1,017 行   PaneState 專屬預覽視窗滾動、搜尋跳轉、非同步預熱
+[P7]    src/file_manager/app/tests.rs       10,835 行   整合測試套件（可按領域拆分為多個測試檔案）
 ```
 
 ---
 
 ## 3. 接續處理建議清單與拆分方案 (Action Plan)
 
-### 推薦第一順位：`src/file_manager/app/navigation.rs` (1,970 行)
-**目標**：拆分目錄與游標導航。
-- **`navigation/cursor.rs`** (~500 行)：列表游標上下移動、換頁、開頭/結尾跳轉、計數跳轉。
-- **`navigation/panes.rs`** (~600 行)：視窗間焦點切換、分割視窗同步、寬度與權重調整。
-- **`navigation/path.rs`** (~500 行)：目錄切換 (`cd`)、父目錄 (`..`)、歷史目錄後退與前進。
-- **`navigation/marks.rs`** (~350 行)：多選標記連動、反選、全選操作。
+### 推薦第一順位：`src/file_manager/app/polling.rs` (1,783 行)
+**目標**：拆分背景工作輪詢與事件分發。
+- **`polling/fs_watcher.rs`** (~450 行)：檔案系統變更監聽事件 (notify/watcher)、pane 資料夾重載觸發。
+- **`polling/transfer.rs`** (~450 行)：非同步背景檔案複製/移動/刪除進度與結果輪詢。
+- **`polling/directory_size.rs`** (~450 行)：背景目錄大小遞迴計算工作輪詢與快取更新。
+- **`polling/diff.rs`** (~450 行)：非同步 VCS diff 計算工作輪詢與結果刷新。
 
 ---
 
@@ -78,3 +78,6 @@ cargo test -- --test-threads=1
   - `845f808` (`refactor(keys): modularize keys.rs into 14 domain submodules`)
   - `3707766` (`refactor(pane): modularize pane.rs into 13 domain submodules`)
   - `2627f35` (`refactor(ui): modularize ui.rs into 8 domain submodules`)
+  - `04fec9d` (`refactor(preview): modularize preview.rs into 8 domain submodules`)
+  - `e83fc3b` (`refactor(file_ops): modularize file_ops.rs into 7 domain submodules`)
+  - `bf63dfb` (`refactor(help): modularize help.rs into 8 domain submodules`)
