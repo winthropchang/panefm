@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    env, io,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -27,7 +27,6 @@ use ratatui::{
     style::Style,
     widgets::{Block, Borders, Paragraph},
 };
-use regex::Regex;
 
 use crate::{
     config::{AppConfig, LoadedConfig, StartupLinemode, StartupSort, persist_theme},
