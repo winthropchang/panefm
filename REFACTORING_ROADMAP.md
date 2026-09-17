@@ -17,7 +17,7 @@
 | **Phase 5** | `src/file_manager/preview.rs`<br>**(2,009 行)** | 拆分為 `preview/` 目錄下 **8 個領域子模組**，門面僅 **42 行** | `04fec9d` | ✅ 單檔最大僅 435 行，Halfblock、語法、壓縮檔樹全面解耦 |
 | **Phase 6** | `src/file_manager/app/file_ops.rs`<br>**(2,197 行)** | 拆分為 `app/file_ops/` 目錄下 **7 個領域子模組**，門面僅 **9 行** | `e83fc3b` | ✅ 單檔最大僅 647 行，開啟、建立、壓縮、刪除、剪貼、貼上、傳輸完全解耦 |
 | **Phase 7** | `src/file_manager/app/help.rs`<br>**(2,064 行)** | 拆分為 `app/help/` 目錄下 **8 個領域子模組**，門面僅 **14 行** | `bf63dfb` | ✅ 單檔最大僅 566 行，F1 字典、搜尋、編輯模式與面板速查表完全解耦 |
-| **Phase 8** | `src/file_manager/app/navigation.rs`<br>**(1,970 行)** | 拆分為 `app/navigation/` 目錄下 **6 個領域子模組**，門面僅 **7 行** | 待提交 | ✅ 單檔最大僅 428 行，視窗佈局、路徑追蹤、書籤、說明狀態、選擇器與搜尋啟動完全解耦 |
+| **Phase 8** | `src/file_manager/app/navigation.rs`<br>**(1,970 行)** | 拆分為 `app/navigation/` 目錄下 **6 個領域子模組**，門面僅 **7 行** | `95a258b` | ✅ 單檔最大僅 428 行，視窗佈局、路徑追蹤、書籤、說明狀態、選擇器與搜尋啟動完全解耦 |
 
 ---
 
@@ -81,3 +81,4 @@ cargo test -- --test-threads=1
   - `04fec9d` (`refactor(preview): modularize preview.rs into 8 domain submodules`)
   - `e83fc3b` (`refactor(file_ops): modularize file_ops.rs into 7 domain submodules`)
   - `bf63dfb` (`refactor(help): modularize help.rs into 8 domain submodules`)
+  - `95a258b` (`refactor(navigation): modularize navigation.rs into 6 domain submodules`)
