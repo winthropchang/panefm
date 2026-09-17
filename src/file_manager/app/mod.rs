@@ -14,10 +14,9 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::Receiver,
     },
-    thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::Result;
