@@ -19,33 +19,34 @@
 | **Phase 7** | `src/file_manager/app/help.rs`<br>**(2,064 行)** | 拆分為 `app/help/` 目錄下 **8 個領域子模組**，門面僅 **14 行** | `bf63dfb` | ✅ 單檔最大僅 566 行，F1 字典、搜尋、編輯模式與面板速查表完全解耦 |
 | **Phase 8** | `src/file_manager/app/navigation.rs`<br>**(1,970 行)** | 拆分為 `app/navigation/` 目錄下 **6 個領域子模組**，門面僅 **7 行** | `95a258b` | ✅ 單檔最大僅 428 行，視窗佈局、路徑追蹤、書籤、說明狀態、選擇器與搜尋啟動完全解耦 |
 | **Phase 9** | `src/file_manager/app/polling.rs`<br>**(1,783 行)** | 拆分為 `app/polling/` 目錄下 **6 個領域子模組**，門面僅 **141 行** | `7f5439b` | ✅ 單檔最大僅 412 行，任務管理、搜尋緩衝、目錄載入與大小掃描、監聽與檔案操作完全解耦 |
-| **Phase 10** | `src/config.rs`<br>**(1,362 行)** | 拆分為 `src/config/` 目錄下 **7 個領域子模組**，門面僅 **15 行** | 待提交 | ✅ 單檔最大僅 362 行，資料結構、檔案型別、路徑、範本、持久化、外掛與驗證套用完全解耦 |
+| **Phase 10** | `src/config.rs`<br>**(1,362 行)** | 拆分為 `src/config/` 目錄下 **7 個領域子模組**，門面僅 **15 行** | `32029f4` | ✅ 單檔最大僅 362 行，資料結構、檔案型別、路徑、範本、持久化、外掛與驗證套用完全解耦 |
+| **Phase 11** | `src/file_manager/app/status.rs`<br>**(1,258 行)** | 拆分為 `app/status/` 目錄下 **4 個領域子模組**，門面僅 **23 行** | 待提交 | ✅ 單檔最大僅 401 行，操作提示、快捷選單提示、全域快捷鍵列與文字格式化完全解耦 |
 
 ---
 
 ## 2. 目前剩餘大型檔案規模統計 (> 1,000 行)
 
-截至 Phase 10 完成後，程式碼庫中仍超過 1,000 行的檔案如下（已依優先級排序）：
+截至 Phase 11 完成後，程式碼庫中仍超過 1,000 行的檔案如下（已依優先級排序）：
 
 ```text
 優先級   檔案路徑                              目前行數    主要職責
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/file_manager/app/status.rs       1,258 行   底部狀態列動態快捷鍵提示、狀態字串折疊與格式化
-[P2]    src/file_manager/app/keys/mod.rs     1,100 行   Normal 模式按鍵調度、計數前綴 (Count)、貼上事件
-[P3]    src/file_manager/pane/preview.rs     1,017 行   PaneState 專屬預覽視窗滾動、搜尋跳轉、非同步預熱
-[P4]    src/file_manager/app/mod.rs          1,643 行   App 結構體定義、初始化、全域生命週期與事件調度
-[P5]    src/file_manager/app/tests.rs       10,835 行   整合測試套件（可按領域拆分為多個測試檔案）
+[P1]    src/file_manager/app/keys/mod.rs     1,100 行   Normal 模式按鍵調度、計數前綴 (Count)、貼上事件
+[P2]    src/file_manager/pane/preview.rs     1,017 行   PaneState 專屬預覽視窗滾動、搜尋跳轉、非同步預熱
+[P3]    src/file_manager/app/mod.rs          1,643 行   App 結構體定義、初始化、全域生命週期與事件調度
+[P4]    src/file_manager/app/tests.rs       10,835 行   整合測試套件（可按領域拆分為多個測試檔案）
 ```
 
 ---
 
 ## 3. 接續處理建議清單與拆分方案 (Action Plan)
 
-### 推薦第一順位：`src/file_manager/app/status.rs` (1,258 行)
-**目標**：拆分狀態列提示、字串格式化與折疊計算至 `app/status/`。
-- **`shortcuts.rs`** (~450 行)：`StatusShortcutHint`, `active_status_shortcut_hints`, `status_shortcut_line`
-- **`format.rs`** (~420 行)：路徑折疊、狀態訊息格式化、進度百分比計算
-- **`mod.rs`** (~100 行)：門面與公開介面相容匯出
+### 推薦第一順位：`src/file_manager/app/keys/mod.rs` (1,100 行)
+**目標**：細拆 Normal 模式按鍵分發。
+- **`keys/normal_ops.rs`** (~400 行)：檔案操作（複製、剪下、貼上、刪除、復原、改名）快捷鍵
+- **`keys/normal_nav.rs`** (~350 行)：導航與視窗切換快捷鍵
+- **`keys/mod.rs`** (~350 行)：頂層事件分發、數字前綴 (Count) 解析與 Bracketed Paste
+
 
 ---
 
