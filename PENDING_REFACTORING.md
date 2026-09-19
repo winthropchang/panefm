@@ -10,7 +10,7 @@
 - **當前分支**: `main`
 - **測試狀態**: **629 / 629 全數通過**（560 單元 + 19 config + 4 diff + 14 layout + 9 preview + 4 theme + 3 undo + 16 updater）
 - **品質標準**: `cargo clippy --all-targets -- -D warnings` 零警告，`cargo fmt --check` 排版通過。
-- **已完成重構里程碑（累計 9 大模組完成，全部 < 450 行）**:
+- **已完成重構里程碑（累計 10 大模組完成，全部 < 450 行）**:
   1. `Phase 1`: `src/file_manager/app/mod.rs` (6,908 -> 1,643 行，抽出 10 個領域子模組)
   2. `Phase 2`: `src/file_manager/app/keys/` (5,469 行 -> 14 個子模組，主調度 1,100 行)
   3. `Phase 3`: `src/file_manager/pane/` (5,206 行 -> 13 個子模組，門面 154 行)
@@ -20,6 +20,7 @@
   7. `Phase 7`: `src/file_manager/app/help/` (2,064 行 -> 8 個子模組，門面 14 行)
   8. `Phase 8`: `src/file_manager/app/navigation/` (1,970 行 -> 6 個子模組，門面 7 行)
   9. `Phase 9`: `src/file_manager/app/polling/` (1,783 行 -> 6 個子模組，門面 141 行)
+  10. `Phase 10`: `src/config.rs` (1,362 行 -> 7 個子模組，門面 15 行，單檔最大 362 行)
 
 ---
 
@@ -30,37 +31,27 @@
 ```text
 優先級   檔案路徑                              目前行數    建議目標
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/config.rs                        1,362 行   拆分為 src/config/ (6 個子模組)
-[P2]    src/file_manager/app/status.rs       1,258 行   拆分為 app/status/ (3 個子模組)
-[P3]    src/file_manager/app/keys/mod.rs     1,100 行   細拆 normal 模式鍵位至 keys/
-[P4]    src/file_manager/pane/preview.rs     1,017 行   拆分為 pane/preview/ (3 個子模組)
-[P5]    src/file_manager/app/mod.rs          1,643 行   抽出 state.rs 與 lifecycle.rs
-[P6]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
+[P1]    src/file_manager/app/status.rs       1,258 行   拆分為 app/status/ (3 個子模組)
+[P2]    src/file_manager/app/keys/mod.rs     1,100 行   細拆 normal 模式鍵位至 keys/
+[P3]    src/file_manager/pane/preview.rs     1,017 行   拆分為 pane/preview/ (3 個子模組)
+[P4]    src/file_manager/app/mod.rs          1,643 行   抽出 state.rs 與 lifecycle.rs
+[P5]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
 ```
 
 ---
 
 ## 3. 接續各階段詳細拆分規劃 (Step-by-Step Plans)
 
-### 🚀 第一順位：`src/config.rs` (1,362 行)
-**目標目錄**: `src/config/`
-- **`schema.rs`** (~365 行)：
-  - 執行期設定結構：`AppConfig`, `Default for AppConfig`, `StartupSort`, `StartupLinemode`
-  - 子結構：`UiConfig`, `VcsConfig`, `IconsConfig`, `IconStyle`, `PaneConfig`, `SearchConfig`, `WatcherConfig`, `NavigationConfig`, `BehaviorConfig`, `ActionsConfig`, `TerminalLauncherConfig`, `TerminalPluginConfig`, `CustomOpenActionConfig`, `ActionTargetScope`, `ActionLaunchMode`, `PreviewConfig`, `DialogsConfig`, `DialogConfig`, `LoadedConfig`
-- **`file_types.rs`** (~160 行)：
-  - TOML 反序列化過渡模型：`AppConfigFile`, `LegacyAppConfigFile`, `UiConfigFile`, `IconsConfigFile`, `VcsConfigFile`, `PaneConfigFile`, `SearchConfigFile`, `WatcherConfigFile`, `NavigationConfigFile`, `BehaviorConfigFile`, `PluginsConfigFile`, `TerminalLauncherFile`, `TerminalPluginFile`, `ActionsConfigFile`, `CustomOpenActionFile`, `DialogsConfigFile`, `DialogConfigFileRaw`, `PreviewConfigFile`
-- **`paths.rs`** (~110 行)：
-  - 跨平台設定路徑搜尋：`config_search_paths`, `plugins_search_paths`, `app_config_file`
-- **`template.rs`** (~150 行)：
-  - 預設設定檔範本常數 `DEFAULT_CONFIG_TEMPLATE`
-  - 自動寫入預設設定檔：`ensure_default_config_file`, `default_config_creation_candidates`
-- **`persist.rs`** (~80 行)：
-  - 主題持久化更新：`persist_theme`
-- **`apply.rs`** (~420 行)：
-  - 設定載入總流程：`load_config`
-  - 各分區套用與校驗：`apply_new_file`, `apply_legacy_file`, `apply_ui_config`, `apply_pane_config`, `apply_search_config`, `apply_watcher_config`, `apply_behavior_config`, `apply_actions_config`, `apply_terminal_launcher_config`, `apply_terminal_plugins_config`, `apply_navigation_config`, `apply_preview_config`, `apply_dialog_config`
-- **`mod.rs`** (~90 行)：
-  - 子模組宣告與所有公開 API 的透明 `pub use` re-export
+### 🚀 第一順位：`src/file_manager/app/status.rs` (1,258 行)
+**目標目錄**: `src/file_manager/app/status/`
+- **`shortcuts.rs`** (~450 行)：
+  - 底部動態快捷鍵模型：`StatusShortcutHint`, `active_status_shortcut_hints`, `status_shortcut_line`
+- **`formatters.rs`** (~450 行)：
+  - 各模式狀態文字格式化：`global_search_status`, `format_filter_status`, `preview_search_status`, `list_find_status`, `list_find_locked_status`, `missing_search_tool_status`, `paste_success_status`, `paste_failure_status`, `trash_confirm_status` 等
+- **`wrap.rs`** (~250 行)：
+  - 狀態列多行文字折疊與寬度排版：`wrap_status_text`, `format_status_detail`
+- **`mod.rs`** (~50 行)：
+  - 子模組宣告與 re-export
 
 ---
 
