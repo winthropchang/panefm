@@ -22,6 +22,7 @@
   9. `Phase 9`: `src/file_manager/app/polling/` (1,783 行 -> 6 個子模組，門面 141 行)
   10. `Phase 10`: `src/config.rs` (1,362 行 -> 7 個子模組，門面 15 行，單檔最大 362 行)
   11. `Phase 11`: `src/file_manager/app/status.rs` (1,258 行 -> 4 個子模組，門面 23 行，單檔最大 401 行)
+  12. `Phase 12`: `src/file_manager/app/keys/mod.rs` (1,100 行 -> 5 個子模組，門面 167 行，單檔最大 362 行)
 
 ---
 
@@ -32,39 +33,25 @@
 ```text
 優先級   檔案路徑                              目前行數    建議目標
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/file_manager/app/keys/mod.rs     1,100 行   細拆 normal 模式鍵位至 keys/
-[P2]    src/file_manager/pane/preview.rs     1,017 行   拆分為 pane/preview/ (3 個子模組)
-[P3]    src/file_manager/app/mod.rs          1,643 行   抽出 state.rs 與 lifecycle.rs
-[P4]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
+[P1]    src/file_manager/pane/preview.rs     1,017 行   拆分為 pane/preview/ (3 個子模組)
+[P2]    src/file_manager/app/mod.rs          1,643 行   抽出 state.rs 與 lifecycle.rs
+[P3]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
 ```
 
 ---
 
 ## 3. 接續各階段詳細拆分規劃 (Step-by-Step Plans)
 
-
----
-
-### 🚀 第一順位：`src/file_manager/app/keys/mod.rs` (1,100 行)
-**目標**: 瘦身主按鍵分發器
-- **`keys/normal_ops.rs`** (~400 行)：
-  - 剪下/複製/貼上/刪除/改名等 Normal 模式檔案操作按鍵分發
-- **`keys/normal_nav.rs`** (~350 行)：
-  - 上下移動、分頁、書籤觸發、跳轉觸發等 Normal 導航按鍵分發
-- **`keys/mod.rs`** (~350 行)：
-  - 頂層事件分發、Bracketed Paste 事件處理、數字前綴 (Count) 解析
-
----
-
-### 🚀 第二順位：`src/file_manager/pane/preview.rs` (1,017 行)
+### 🚀 第一順位：`src/file_manager/pane/preview.rs` (1,017 行)
 **目標目錄**: `src/file_manager/pane/preview/`
 - **`content.rs`** (~400 行)：預覽內容產生與雙欄文字呈現
 - **`scroll.rs`** (~300 行)：預覽內部滾動與搜尋結果跳轉
 - **`preheat.rs`** (~300 行)：非同步預覽預熱與快取命中管理
+- **`mod.rs`** (~100 行)：門面與透明 re-export
 
 ---
 
-### 🚀 第三順位：`src/file_manager/app/mod.rs` (1,643 行)
+### 🚀 第二順位：`src/file_manager/app/mod.rs` (1,643 行)
 **目標**: 抽取 App 生命週期與初始化
 - **`app/state.rs`** (~400 行)：`App` struct 完整欄位定義與預設值
 - **`app/lifecycle.rs`** (~500 行)：`App::new` 初始化與終端退出演奏
@@ -72,7 +59,7 @@
 
 ---
 
-### 🚀 第四順位：`src/file_manager/app/tests.rs` (10,835 行)
+### 🚀 第三順位：`src/file_manager/app/tests.rs` (10,835 行)
 **目標**: 依測試領域拆分為獨立檔案
 - `tests/app_keys_test.rs`
 - `tests/app_navigation_test.rs`
