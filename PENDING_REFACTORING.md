@@ -10,7 +10,7 @@
 - **當前分支**: `main`
 - **測試狀態**: **629 / 629 全數通過**（560 單元 + 19 config + 4 diff + 14 layout + 9 preview + 4 theme + 3 undo + 16 updater）
 - **品質標準**: `cargo clippy --all-targets -- -D warnings` 零警告，`cargo fmt --check` 排版通過。
-- **已完成重構里程碑（累計 10 大模組完成，全部 < 450 行）**:
+- **已完成重構里程碑（累計 15 大模組完成，全部 < 450 行）**:
   1. `Phase 1`: `src/file_manager/app/mod.rs` (6,908 -> 1,643 行，抽出 10 個領域子模組)
   2. `Phase 2`: `src/file_manager/app/keys/` (5,469 行 -> 14 個子模組，主調度 1,100 行)
   3. `Phase 3`: `src/file_manager/pane/` (5,206 行 -> 13 個子模組，門面 154 行)
@@ -25,18 +25,23 @@
   12. `Phase 12`: `src/file_manager/app/keys/mod.rs` (1,100 行 -> 5 個子模組，門面 167 行，單檔最大 362 行)
   13. `Phase 13`: `src/file_manager/pane/preview.rs` (1,017 行 -> 6 個子模組，門面 99 行，單檔最大 341 行)
   14. `Phase 14`: `src/file_manager/app/mod.rs` (1,647 行 -> 5 個子模組，門面 204 行，單檔最大 439 行)
+  15. `Phase 15`: `src/file_manager/platform.rs` (933 行 -> 5 個子模組，門面 48 行，單檔最大 302 行)
 
 ---
 
-## 2. 剩餘待優化大型檔案清單 (> 1,000 行)
+## 2. 剩餘待優化檔案清單
 
-**專案中所有核心業務邏輯原始碼已全數低於 1,000 行！**
-僅剩單一整合測試檔案超過 1,000 行：
+目前專案所有生產程式碼單檔已全數在 850 行以內。剩餘可持續關注或進一步優化的檔案如下：
 
 ```text
-優先級   檔案路徑                              目前行數    建議目標
+優先級   檔案路徑                              目前行數    性質與建議目標
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
+[P1]    src/file_manager/app/tests.rs       10,835 行   測試套件：可依領域拆分獨立測試檔
+[P2]    src/file_manager/tests/pane_test.rs  2,362 行   測試套件：可拆分 Pane 操作/導航/渲染測試
+[P3]    src/file_manager/app/keys/pickers.rs   815 行   生產程式碼：選單快捷鍵派發與過濾處理
+[P4]    src/file_manager/ui/pane.rs            756 行   生產程式碼：單一面板與樹狀檢視渲染
+[P5]    src/updater.rs                         725 行   生產程式碼：更新檢查、下載與安裝驗證
+[P6]    src/file_manager/vcs.rs                719 行   生產程式碼：Git / SVN 狀態追蹤與查詢
 ```
 
 ---
@@ -53,21 +58,11 @@
 
 ---
 
-### 🚀 第二順位：`src/file_manager/app/mod.rs` (1,643 行)
-**目標**: 抽取 App 生命週期與初始化
-- **`app/state.rs`** (~400 行)：`App` struct 完整欄位定義與預設值
-- **`app/lifecycle.rs`** (~500 行)：`App::new` 初始化與終端退出演奏
-- **`app/mod.rs`** (~700 行)：主事件迴圈、渲染總調度
-
----
-
-### 🚀 第三順位：`src/file_manager/app/tests.rs` (10,835 行)
-**目標**: 依測試領域拆分為獨立檔案
-- `tests/app_keys_test.rs`
-- `tests/app_navigation_test.rs`
-- `tests/app_search_test.rs`
-- `tests/app_ops_test.rs`
-- `tests/app_ui_test.rs`
+### 🚀 第二順位：`src/file_manager/app/keys/pickers.rs` (815 行)
+**目標**: 拆解選單快捷鍵交互
+- 快捷鍵選擇器按鍵處理
+- 搜尋與過濾對話框按鍵
+- 主題與配置即時切換按鍵
 
 ---
 
