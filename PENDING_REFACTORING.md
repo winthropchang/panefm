@@ -24,29 +24,32 @@
   11. `Phase 11`: `src/file_manager/app/status.rs` (1,258 行 -> 4 個子模組，門面 23 行，單檔最大 401 行)
   12. `Phase 12`: `src/file_manager/app/keys/mod.rs` (1,100 行 -> 5 個子模組，門面 167 行，單檔最大 362 行)
   13. `Phase 13`: `src/file_manager/pane/preview.rs` (1,017 行 -> 6 個子模組，門面 99 行，單檔最大 341 行)
+  14. `Phase 14`: `src/file_manager/app/mod.rs` (1,647 行 -> 5 個子模組，門面 204 行，單檔最大 439 行)
 
 ---
 
 ## 2. 剩餘待優化大型檔案清單 (> 1,000 行)
 
-目前代碼庫中剩餘 > 1,000 行的檔案如下，建議依此順序處理：
+**專案中所有核心業務邏輯原始碼已全數低於 1,000 行！**
+僅剩單一整合測試檔案超過 1,000 行：
 
 ```text
 優先級   檔案路徑                              目前行數    建議目標
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/file_manager/app/mod.rs          1,643 行   抽出 state.rs 與 lifecycle.rs
-[P2]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
+[P1]    src/file_manager/app/tests.rs       10,835 行   拆分為 tests/ 領域專用測試檔案
 ```
 
 ---
 
 ## 3. 接續各階段詳細拆分規劃 (Step-by-Step Plans)
 
-### 🚀 第一順位：`src/file_manager/app/mod.rs` (1,643 行)
-**目標**: 抽取 App 生命週期與初始化
-- **`app/state.rs`** (~400 行)：`App` struct 完整欄位定義與預設值
-- **`app/lifecycle.rs`** (~500 行)：`App::new` 初始化與終端退出演奏
-- **`app/mod.rs`** (~700 行)：主事件迴圈、渲染總調度
+### 🚀 第一順位：`src/file_manager/app/tests.rs` (10,835 行)
+**目標**: 依測試領域拆分為獨立測試檔案
+- `tests/app_keys_test.rs`：鍵盤事件、Vim 模式、前綴計數測試
+- `tests/app_navigation_test.rs`：目錄導航、歷史回退、Zoxide、書籤跳轉測試
+- `tests/app_search_test.rs`：即時搜尋、全域搜尋、過濾比對測試
+- `tests/app_ops_test.rs`：檔案改名、建立、刪除、垃圾桶與非同步任務測試
+- `tests/app_ui_test.rs`：面板渲染、狀態列、對話框與樣式測試
 
 ---
 
