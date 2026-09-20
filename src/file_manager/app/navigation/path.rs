@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+use crate::file_manager::smb;
+
 use super::super::*;
 
 impl App {
@@ -98,8 +100,8 @@ impl App {
     /// 回傳：`io::Result<()>`。
     /// - 成功時代表目前 pane 已切到指定目錄，或定位到指定檔案。
     pub(crate) fn change_directory_from_command(&mut self, target: &str) -> io::Result<()> {
-        let trimmed = target.trim();
-        if trimmed.starts_with("smb://") {
+        let trimmed = smb::strip_quotes(target);
+        if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("smb://") {
             return self.goto_smb_location(trimmed);
         }
 
@@ -135,8 +137,10 @@ impl App {
         target: &str,
         mount_root: &std::path::Path,
     ) -> io::Result<()> {
-        let trimmed = target.trim();
-        if trimmed.starts_with("smb://") || is_unc_path(trimmed) {
+        let trimmed = smb::strip_quotes(target);
+        if (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("smb://"))
+            || is_unc_path(trimmed)
+        {
             return self.goto_smb_location_with_mount_root(trimmed, mount_root);
         }
         self.change_directory_from_command(target)
@@ -172,22 +176,45 @@ impl App {
 
         match resolved {
             ResolvedSmbLocation::Ready(path) => {
-                if !path.exists() {
-                    self.status = format!("smb path missing: {}", path.display());
-                    return Ok(());
-                }
+                let target_path = if path.exists() {
+                    path
+                } else {
+                    let mut fallback = path.parent();
+                    while let Some(parent) = fallback {
+                        if parent.exists()
+                            && parent != Path::new("/Volumes")
+                            && parent != Path::new("/")
+                        {
+                            break;
+                        }
+                        fallback = parent.parent();
+                    }
+                    if let Some(existing_ancestor) = fallback.filter(|p| p.exists()) {
+                        self.status = format!(
+                            "SMB 子路徑不存在: {}；已切換至 {}",
+                            path.display(),
+                            existing_ancestor.display()
+                        );
+                        existing_ancestor.to_path_buf()
+                    } else {
+                        self.status = format!("smb path missing: {}", path.display());
+                        return Ok(());
+                    }
+                };
                 if !self.panes.contains_key(&self.focused_pane) {
                     self.status = String::from("panel no longer exists");
                     return Ok(());
                 }
-                self.go_to_path_and_track(self.focused_pane, &path)?;
+                self.go_to_path_and_track(self.focused_pane, &target_path)?;
                 let Some(pane) = self.panes.get_mut(&self.focused_pane) else {
                     self.status = String::from("panel no longer exists");
                     return Ok(());
                 };
                 pane.set_bookmark_target(BookmarkTarget::SmbLocation(location.url.clone()));
                 self.full_redraw_requested = true;
-                self.status = format!("jumped to smb: {}", location.url);
+                if !self.status.starts_with("SMB 子路徑不存在") {
+                    self.status = format!("jumped to smb: {}", location.url);
+                }
             }
             ResolvedSmbLocation::NeedsMount { local_path } => {
                 let launch = build_smb_mount_launch(&location);
@@ -328,7 +355,7 @@ impl App {
 
     /// 將命令列中的路徑字串解析成實際可用的目標路徑。
     pub(crate) fn resolve_path_argument(&self, target: &str) -> Option<PathBuf> {
-        let trimmed = target.trim();
+        let trimmed = smb::strip_quotes(target);
         if trimmed.is_empty() {
             return None;
         }

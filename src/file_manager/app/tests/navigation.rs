@@ -454,6 +454,46 @@ fn app_change_directory_from_command_as_macos_routes_unc_to_smb() {
 }
 
 #[test]
+/// 驗證 SMB 指令帶有引號或大小寫不同時仍能正確跳轉。
+fn app_change_directory_from_command_as_macos_handles_quotes_and_case() {
+    let dir = tempdir().expect("tempdir");
+    let mount_root = dir.path().join("mounts");
+    let share_root = mount_root.join("shared");
+    fs::create_dir_all(share_root.join("docs")).expect("share docs");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.change_directory_from_command_as_macos(
+        r#""SMB://192.0.2.10/shared/docs""#,
+        &mount_root,
+    )
+    .expect("goto quoted smb");
+
+    let pane = app.current_pane_mut().expect("pane");
+    assert_eq!(pane.cwd, share_root.join("docs"));
+    assert_eq!(app.status, "jumped to smb: SMB://192.0.2.10/shared/docs");
+}
+
+#[test]
+/// 驗證 SMB 目標的子路徑不存在但掛載根目錄存在時，會平滑降級進入根目錄並提示。
+fn app_goto_smb_location_falls_back_to_root_when_subpath_missing() {
+    let dir = tempdir().expect("tempdir");
+    let mount_root = dir.path().join("mounts");
+    let share_root = mount_root.join("shared");
+    fs::create_dir_all(&share_root).expect("share root");
+
+    let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
+    app.change_directory_from_command_as_macos(
+        "smb://192.0.2.10/shared/nonexistent_folder",
+        &mount_root,
+    )
+    .expect("goto smb missing subpath");
+
+    let pane = app.current_pane_mut().expect("pane");
+    assert_eq!(pane.cwd, share_root);
+    assert!(app.status.starts_with("SMB 子路徑不存在"));
+}
+
+#[test]
 /// 驗證按下 `z` 後會建立 `fzf` 跳轉請求，並記住目前 pane 的根目錄設定。
 /// 保護目的：避免快捷鍵、模式或狀態分派重構後，破壞上述使用者可觀察的操作流程。
 fn app_jump_key_queues_fzf_request() {

@@ -3,10 +3,13 @@
 //! `smb://host/share/path` 是書籤與 command 使用的穩定表示；macOS 會解析已掛載
 //! volume，Windows 則轉成 UNC path。此層只解析或產生掛載請求，不應執行檔案複製。
 
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 #[cfg(any(test, target_os = "macos"))]
-use std::path::Path;
+use std::fs;
 
 #[cfg(all(target_os = "macos", not(test)))]
 use std::process::Command;
@@ -32,12 +35,38 @@ pub(crate) enum ResolvedSmbLocation {
     },
 }
 
+/// 去除字串前後的外層引號（若有的話）。
+pub(crate) fn strip_quotes(input: &str) -> &str {
+    let trimmed = input.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    }
+}
+
+/// 去除主機字串中的帳號資訊（如 `user@` 或 `domain;user@`）、IPv6 中括號與 port（如 `:445`）。
+pub(crate) fn clean_host(raw: &str) -> &str {
+    let without_user = raw.rsplit('@').next().unwrap_or(raw);
+    if let Some(stripped) = without_user.strip_prefix('[')
+        && let Some(end) = stripped.find(']')
+    {
+        return &stripped[..end];
+    }
+    without_user.split(':').next().unwrap_or(without_user)
+}
+
 /// 解析 `smb://host/share/path`、`//host/share/path` 或 `\\host\share\path` 這類字串，
 /// 整理出 host、share 與子路徑，並將 UNC 格式正規化為標準 `smb://` 格式。
+/// 支援首尾引號清除與大小寫不敏感的 scheme 前綴。
 pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
-    let trimmed = input.trim();
-    let (rest, was_unc) = if let Some(rest) = trimmed.strip_prefix("smb://") {
-        (rest, false)
+    let trimmed = strip_quotes(input);
+
+    let (rest, was_unc) = if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("smb://") {
+        (&trimmed[6..], false)
     } else if let Some(rest) = trimmed.strip_prefix("//") {
         (rest, true)
     } else if let Some(rest) = trimmed.strip_prefix(r"\\") {
@@ -56,16 +85,16 @@ pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
     };
 
     let mut segments = normalized.split('/').filter(|s| !s.is_empty());
-    let host = segments.next().unwrap_or_default().trim();
-    let share = segments.next().unwrap_or_default().trim();
-    if host.is_empty() || share.is_empty() {
+    let raw_host = segments.next().unwrap_or_default().trim();
+    let raw_share = segments.next().unwrap_or_default().trim();
+    if raw_host.is_empty() || raw_share.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "SMB 位址格式錯誤：請使用 goto smb://host/share[/path]，不能只有 IP 或主機名稱",
         ));
     }
 
-    let decoded_share = percent_decode(share)?;
+    let decoded_share = percent_decode(raw_share)?;
     let mut subpath = PathBuf::new();
     let mut subpath_segments = Vec::new();
     for segment in segments {
@@ -77,8 +106,10 @@ pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
         subpath_segments.push(trimmed_seg);
     }
 
+    let host = percent_decode(clean_host(raw_host))?;
+
     let url = if was_unc {
-        let mut canonical = format!("smb://{host}/{share}");
+        let mut canonical = format!("smb://{host}/{raw_share}");
         for seg in subpath_segments {
             canonical.push('/');
             canonical.push_str(seg);
@@ -90,7 +121,7 @@ pub(crate) fn parse_smb_location(input: &str) -> io::Result<SmbLocation> {
 
     Ok(SmbLocation {
         url,
-        host: percent_decode(host)?,
+        host,
         share: decoded_share,
         subpath,
     })
@@ -118,17 +149,14 @@ pub(crate) fn resolve_smb_location(location: &SmbLocation) -> ResolvedSmbLocatio
 
 /// 從 macOS 的 mount table 找出 host 與 share 都相符的 SMB 掛載點，
 /// 若主機名稱不完全一致則 fallback 至 share 名稱相符的 smbfs 掛載點，
-/// 若依然沒有則檢查本機 `/Volumes/{share}` 是否已是現存目錄。
+/// 若 mount 未列出則嘗試 `smbutil statshares -a`，
+/// 若依然沒有則動態掃描 `/Volumes` 是否有相符或帶有 `-1` 等後綴的現存目錄。
 ///
 /// 參數：`location: &SmbLocation`，使用者輸入的 SMB 位址。
 /// 回傳：`ResolvedSmbLocation`；找到正確掛載點時會再接上 SMB 子路徑。
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
-    let mount_output = Command::new("mount")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok());
+    let mount_output = get_macos_mount_output();
 
     let mounted_root = mount_output
         .as_deref()
@@ -139,13 +167,17 @@ fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
                 .and_then(|output| find_macos_smb_mount_by_share(output, &location.share))
         })
         .or_else(|| {
-            let volumes_share = Path::new("/Volumes").join(&location.share);
-            if volumes_share.is_dir() {
-                Some(volumes_share)
-            } else {
-                None
-            }
-        });
+            let smbutil_output = get_macos_smbutil_output();
+            smbutil_output.as_deref().and_then(|output| {
+                find_smbutil_mount(
+                    output,
+                    &location.host,
+                    &location.share,
+                    Path::new("/Volumes"),
+                )
+            })
+        })
+        .or_else(|| find_matching_volume(Path::new("/Volumes"), &location.share));
 
     let Some(share_root) = mounted_root else {
         return ResolvedSmbLocation::NeedsMount {
@@ -162,11 +194,41 @@ fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
     ResolvedSmbLocation::Ready(local_path)
 }
 
+#[cfg(all(target_os = "macos", not(test)))]
+fn get_macos_mount_output() -> Option<String> {
+    let try_cmd = |prog: &str, args: &[&str]| {
+        Command::new(prog)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+
+    try_cmd("/sbin/mount", &[])
+        .or_else(|| try_cmd("mount", &[]))
+        .or_else(|| try_cmd("/sbin/mount", &["-t", "smbfs"]))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn get_macos_smbutil_output() -> Option<String> {
+    let output = Command::new("/usr/bin/smbutil")
+        .args(["statshares", "-a"])
+        .output()
+        .or_else(|_| Command::new("smbutil").args(["statshares", "-a"]).output())
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
 /// 解析 macOS `mount` 輸出，找出指定 SMB host/share 對應的本機掛載目錄。
 ///
 /// 例如 `//user@server/share on /Volumes/share-1 (smbfs, ...)` 會回傳
 /// `/Volumes/share-1`，而不是只依 share 名稱猜測 `/Volumes/share`。
-/// 支援 host 欄位包含 port (例如 `server:445`) 時的比對。
+/// 支援 host 欄位包含 port (例如 `server:445`) 或帳號時的比對。
 ///
 /// 參數：
 /// - `mount_output: &str`，`mount` 命令的完整標準輸出。
@@ -175,27 +237,27 @@ fn resolve_macos_smb_location(location: &SmbLocation) -> ResolvedSmbLocation {
 ///
 /// 回傳：`Option<PathBuf>`；找不到相符的 SMB 掛載時回傳 `None`。
 #[cfg(any(test, target_os = "macos"))]
-fn find_macos_smb_mount(
+pub(crate) fn find_macos_smb_mount(
     mount_output: &str,
     expected_host: &str,
     expected_share: &str,
 ) -> Option<PathBuf> {
+    let clean_expected_host = clean_host(expected_host.trim());
+    let clean_expected_share = decode_share_name(expected_share.trim().trim_matches('/'));
+
     mount_output.lines().find_map(|line| {
         let (source, mounted) = line.split_once(" on ")?;
-        let mounted_path = mounted.split_once(" (")?.0;
+        let (mounted_path, _fs_info) = mounted.rsplit_once(" (")?;
         let remote = source.strip_prefix("//")?;
-        let (authority, share) = remote.split_once('/')?;
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        let decoded_share = percent_decode(share).unwrap_or_else(|_| share.to_string());
+        let (authority, share_part) = remote.split_once('/')?;
+        let host = clean_host(authority);
+        let raw_share = share_part.split('/').next().unwrap_or(share_part);
+        let decoded_share = decode_share_name(raw_share);
 
-        let host_without_port = host.split(':').next().unwrap_or(host);
-        let expected_host_without_port = expected_host.split(':').next().unwrap_or(expected_host);
+        let host_matches = host.eq_ignore_ascii_case(clean_expected_host);
+        let share_matches = decoded_share.eq_ignore_ascii_case(&clean_expected_share);
 
-        let host_matches = host.eq_ignore_ascii_case(expected_host)
-            || host_without_port.eq_ignore_ascii_case(expected_host_without_port);
-
-        (host_matches && decoded_share.eq_ignore_ascii_case(expected_share))
-            .then(|| PathBuf::from(decode_mount_field(mounted_path)))
+        (host_matches && share_matches).then(|| PathBuf::from(decode_mount_field(mounted_path)))
     })
 }
 
@@ -209,17 +271,23 @@ fn find_macos_smb_mount(
 ///
 /// 回傳：`Option<PathBuf>`；找到相符的 smbfs 掛載時回傳本機掛載目錄。
 #[cfg(any(test, target_os = "macos"))]
-fn find_macos_smb_mount_by_share(mount_output: &str, expected_share: &str) -> Option<PathBuf> {
+pub(crate) fn find_macos_smb_mount_by_share(
+    mount_output: &str,
+    expected_share: &str,
+) -> Option<PathBuf> {
+    let clean_expected_share = decode_share_name(expected_share.trim().trim_matches('/'));
+
     mount_output.lines().find_map(|line| {
         let (source, mounted) = line.split_once(" on ")?;
-        let (mounted_path, fs_info) = mounted.split_once(" (")?;
+        let (mounted_path, fs_info) = mounted.rsplit_once(" (")?;
         if !fs_info.starts_with("smbfs") {
             return None;
         }
         let remote = source.strip_prefix("//")?;
-        let (_authority, share) = remote.split_once('/')?;
-        let decoded_share = percent_decode(share).unwrap_or_else(|_| share.to_string());
-        if decoded_share.eq_ignore_ascii_case(expected_share) {
+        let (_authority, share_part) = remote.split_once('/')?;
+        let raw_share = share_part.split('/').next().unwrap_or(share_part);
+        let decoded_share = decode_share_name(raw_share);
+        if decoded_share.eq_ignore_ascii_case(&clean_expected_share) {
             Some(PathBuf::from(decode_mount_field(mounted_path)))
         } else {
             None
@@ -227,12 +295,153 @@ fn find_macos_smb_mount_by_share(mount_output: &str, expected_share: &str) -> Op
     })
 }
 
+/// 同時支援八進位跳脫（如 `\040`）與百分比編碼（如 `%20`）之 share 名稱解碼。
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn decode_share_name(input: &str) -> String {
+    let unescaped = decode_mount_field(input);
+    percent_decode(&unescaped).unwrap_or(unescaped)
+}
+
+/// 解析 macOS `smbutil statshares -a` 輸出，取得活躍 SMB share 與 server 資訊。
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn parse_smbutil_statshares(output: &str) -> Vec<(String, String)> {
+    let mut shares = Vec::new();
+    for line in output.lines() {
+        if let Some((before, after)) = line.split_once("SERVER_NAME") {
+            let share = before.trim();
+            let server = after.split_whitespace().next().unwrap_or("").trim();
+            if !share.is_empty()
+                && !server.is_empty()
+                && !share.eq_ignore_ascii_case("SHARE")
+                && !share.eq_ignore_ascii_case("ATTRIBUTE TYPE")
+            {
+                shares.push((share.to_string(), server.to_string()));
+            }
+        }
+    }
+    shares
+}
+
+/// 結合 `smbutil statshares` 輸出與 volumes 目錄掃描，確認掛載路徑。
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn find_smbutil_mount(
+    smbutil_output: &str,
+    expected_host: &str,
+    expected_share: &str,
+    volumes_dir: &Path,
+) -> Option<PathBuf> {
+    let shares = parse_smbutil_statshares(smbutil_output);
+    let clean_expected_host = clean_host(expected_host.trim());
+    let clean_expected_share = decode_share_name(expected_share.trim().trim_matches('/'));
+
+    // 1. 同時比對 host 與 share
+    for (share, server) in &shares {
+        let clean_server = clean_host(server);
+        let decoded_share = decode_share_name(share);
+        if clean_server.eq_ignore_ascii_case(clean_expected_host)
+            && decoded_share.eq_ignore_ascii_case(&clean_expected_share)
+            && let Some(vol) = find_matching_volume(volumes_dir, &decoded_share)
+        {
+            return Some(vol);
+        }
+    }
+
+    // 2. 備援：依 share 名稱比對
+    for (share, _) in &shares {
+        let decoded_share = decode_share_name(share);
+        if decoded_share.eq_ignore_ascii_case(&clean_expected_share)
+            && let Some(vol) = find_matching_volume(volumes_dir, &decoded_share)
+        {
+            return Some(vol);
+        }
+    }
+
+    None
+}
+
+/// 檢查目錄是否存在且包含至少一筆項目。
+#[cfg(any(test, target_os = "macos"))]
+fn is_dir_non_empty(path: &Path) -> bool {
+    if let Ok(mut rd) = fs::read_dir(path) {
+        rd.next().is_some()
+    } else {
+        false
+    }
+}
+
+/// 依 share 名稱在指定 volumes 目錄（通常為 `/Volumes`）中比對相符的掛載目錄。
+/// 支援精確名稱、大小寫不敏感、以及 macOS 常見的重複掛載後綴（如 `-1`, `-2`, ` 1`）。
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn find_matching_volume(volumes_dir: &Path, expected_share: &str) -> Option<PathBuf> {
+    let clean_expected = decode_share_name(expected_share.trim().trim_matches('/'));
+    if clean_expected.is_empty() {
+        return None;
+    }
+
+    let exact_path = volumes_dir.join(&clean_expected);
+    let exact_exists = exact_path.is_dir();
+
+    let read_dir = match fs::read_dir(volumes_dir) {
+        Ok(rd) => rd,
+        Err(_) => {
+            return if exact_exists { Some(exact_path) } else { None };
+        }
+    };
+
+    let mut exact_match: Option<PathBuf> = None;
+    let mut suffixed_matches: Vec<PathBuf> = Vec::new();
+
+    for entry in read_dir.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        if name_str.eq_ignore_ascii_case(&clean_expected) {
+            exact_match = Some(entry.path());
+        } else if name_str.len() > clean_expected.len()
+            && name_str[..clean_expected.len()].eq_ignore_ascii_case(&clean_expected)
+        {
+            let suffix = &name_str[clean_expected.len()..];
+            if (suffix.starts_with('-') || suffix.starts_with(' '))
+                && suffix[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                suffixed_matches.push(entry.path());
+            }
+        }
+    }
+
+    if !suffixed_matches.is_empty() {
+        suffixed_matches.sort_by(|a, b| b.cmp(a));
+        if let Some(exact) = exact_match.as_ref()
+            && is_dir_non_empty(exact)
+        {
+            return exact_match;
+        }
+        return Some(suffixed_matches.remove(0));
+    }
+
+    if exact_match.is_some() {
+        exact_match
+    } else if exact_exists {
+        Some(exact_path)
+    } else {
+        None
+    }
+}
+
 /// 解開 mount 輸出欄位中的八進位跳脫，例如 `\040` 代表空白。
 ///
 /// 參數：`input: &str`，mount table 中的單一路徑欄位。
 /// 回傳：`String`，可交給 `PathBuf` 使用的本機路徑。
 #[cfg(any(test, target_os = "macos"))]
-fn decode_mount_field(input: &str) -> String {
+pub(crate) fn decode_mount_field(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
@@ -262,7 +471,8 @@ pub(crate) fn resolve_smb_location_with_mount_root(
     location: &SmbLocation,
     mount_root: &Path,
 ) -> ResolvedSmbLocation {
-    let share_root = mount_root.join(&location.share);
+    let share_root = find_matching_volume(mount_root, &location.share)
+        .unwrap_or_else(|| mount_root.join(&location.share));
     let local_path = if location.subpath.as_os_str().is_empty() {
         share_root.clone()
     } else {
