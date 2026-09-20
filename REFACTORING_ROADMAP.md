@@ -81,7 +81,7 @@ cargo test -- --test-threads=1
 ---
 
 ## 5. 本次發布版本資訊 (Release Info)
-- **最新版本**: `v0.1.22`
+- **最新版本**: `v0.1.23`
 - **當前分支**: `main`
 - **累計重構提交**:
   - `1647f6e` (`refactor(app): modularize app/mod.rs into domain submodules`)

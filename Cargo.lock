@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "panefm"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1353,6 +1353,7 @@ dependencies = [
  "flate2",
  "ignore",
  "image",
+ "libc",
  "notify",
  "nucleo-matcher",
  "ratatui",
