@@ -26,35 +26,41 @@
   13. `Phase 13`: `src/file_manager/pane/preview.rs` (1,017 行 -> 6 個子模組，門面 99 行，單檔最大 341 行)
   14. `Phase 14`: `src/file_manager/app/mod.rs` (1,647 行 -> 5 個子模組，門面 204 行，單檔最大 439 行)
   15. `Phase 15`: `src/file_manager/platform.rs` (933 行 -> 5 個子模組，門面 48 行，單檔最大 302 行)
+  16. `Phase 16`: `src/file_manager/app/tests.rs` (10,836 行 -> 20 個領域測試子模組 + `helpers.rs`，門面 65 行，單檔最大 917 行)
 
 ---
 
 ## 2. 剩餘待優化檔案清單
 
-目前專案所有生產程式碼單檔已全數在 850 行以內。剩餘可持續關注或進一步優化的檔案如下：
+目前專案所有生產程式碼單檔已全數在 850 行以內，且 10,836 行巨石測試套件已徹底消除！剩餘可持續關注或進一步優化的檔案如下：
 
 ```text
 優先級   檔案路徑                              目前行數    性質與建議目標
 ─────────────────────────────────────────────────────────────────────────────
-[P1]    src/file_manager/app/tests.rs       10,835 行   測試套件：可依領域拆分獨立測試檔
-[P2]    src/file_manager/tests/pane_test.rs  2,362 行   測試套件：可拆分 Pane 操作/導航/渲染測試
-[P3]    src/file_manager/app/keys/pickers.rs   815 行   生產程式碼：選單快捷鍵派發與過濾處理
-[P4]    src/file_manager/ui/pane.rs            756 行   生產程式碼：單一面板與樹狀檢視渲染
-[P5]    src/updater.rs                         725 行   生產程式碼：更新檢查、下載與安裝驗證
-[P6]    src/file_manager/vcs.rs                719 行   生產程式碼：Git / SVN 狀態追蹤與查詢
+[P1]    src/file_manager/tests/pane_test.rs  2,362 行   測試套件：可拆分 Pane 操作/導航/渲染測試
+[P2]    src/file_manager/app/keys/pickers.rs   815 行   生產程式碼：選單快捷鍵派發與過濾處理
+[P3]    src/file_manager/ui/pane.rs            756 行   生產程式碼：單一面板與樹狀檢視渲染
+[P4]    src/updater.rs                         725 行   生產程式碼：更新檢查、下載與安裝驗證
+[P5]    src/file_manager/vcs.rs                719 行   生產程式碼：Git / SVN 狀態追蹤與查詢
 ```
 
 ---
 
 ## 3. 接續各階段詳細拆分規劃 (Step-by-Step Plans)
 
-### 🚀 第一順位：`src/file_manager/app/tests.rs` (10,835 行)
+### 🚀 第一順位：`src/file_manager/tests/pane_test.rs` (2,362 行)
 **目標**: 依測試領域拆分為獨立測試檔案
-- `tests/app_keys_test.rs`：鍵盤事件、Vim 模式、前綴計數測試
-- `tests/app_navigation_test.rs`：目錄導航、歷史回退、Zoxide、書籤跳轉測試
-- `tests/app_search_test.rs`：即時搜尋、全域搜尋、過濾比對測試
-- `tests/app_ops_test.rs`：檔案改名、建立、刪除、垃圾桶與非同步任務測試
-- `tests/app_ui_test.rs`：面板渲染、狀態列、對話框與樣式測試
+- `tests/pane/ops_test.rs`：分割、關閉、等寬/平衡調整測試
+- `tests/pane/navigation_test.rs`：目錄移動、歷史歷程、聚焦邊界測試
+- `tests/pane/render_test.rs`：視口計算、寬高縮放、標籤格式化測試
+
+---
+
+### 🚀 第二順位：`src/file_manager/app/keys/pickers.rs` (815 行)
+**目標**: 拆解選單快捷鍵交互
+- 快捷鍵選擇器按鍵處理
+- 搜尋與過濾對話框按鍵
+- 主題與配置即時切換按鍵
 
 ---
 
