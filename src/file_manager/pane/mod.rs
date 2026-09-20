@@ -150,5 +150,4 @@ pub(crate) struct PaneState {
 }
 
 #[cfg(test)]
-#[path = "../tests/pane_test.rs"]
 mod tests;
