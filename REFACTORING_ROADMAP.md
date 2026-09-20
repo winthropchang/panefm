@@ -81,7 +81,7 @@ cargo test -- --test-threads=1
 ---
 
 ## 5. 本次發布版本資訊 (Release Info)
-- **最新版本**: `v0.1.21`
+- **最新版本**: `v0.1.22`
 - **當前分支**: `main`
 - **累計重構提交**:
   - `1647f6e` (`refactor(app): modularize app/mod.rs into domain submodules`)
@@ -93,3 +93,11 @@ cargo test -- --test-threads=1
   - `bf63dfb` (`refactor(help): modularize help.rs into 8 domain submodules`)
   - `95a258b` (`refactor(navigation): modularize navigation.rs into 6 domain submodules`)
   - `7f5439b` (`refactor(polling): modularize polling.rs into 6 domain submodules`)
+  - `32029f4` (`refactor(config): modularize config.rs into 7 domain submodules`)
+  - `c4cdfa1` (`refactor(status): modularize status.rs into 4 domain submodules`)
+  - `e260303` (`refactor(keys): modularize normal keys and dispatch into 5 submodules`)
+  - `d28004a` (`refactor(pane): modularize preview.rs into 6 domain submodules`)
+  - `394b33f` (`refactor(app): modularize app/mod.rs into 5 domain submodules`)
+  - `8a49bf1` (`refactor(platform): modularize platform.rs into domain submodules`)
+  - `8f35378` (`refactor(tests): modularize app/tests.rs into 20 domain submodules`)
+  - `b165419` (`refactor(tests): modularize pane_test.rs into domain submodules under pane/tests`)
