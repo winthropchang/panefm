@@ -772,3 +772,29 @@ fn sync_target_file_succeeds_on_real_file() {
     let file = File::create(&file_path).expect("create file");
     assert!(sync_target_file(&file).is_ok());
 }
+
+#[test]
+/// 驗證單一檔案複製時，能正確發送 TargetVisible 事件以通知目的端 pane 刷新。
+/// 保護目的：避免單檔複製遺漏 TargetVisible，導致背景傳輸期間目的端檔案清單無法呈現進度。
+fn single_file_copy_emits_target_visible_progress() {
+    let dir = tempdir().expect("tempdir");
+    let source = dir.path().join("single.dat");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&target_dir).expect("target dir");
+    fs::write(&source, b"hello single file copy").expect("write source");
+
+    let mut target_became_visible = false;
+    let mut bytes_copied = 0u64;
+    PaneState::copy_path_to_dir_with_history_progress(&source, &target_dir, false, &mut |event| {
+        match event {
+            TransferProgress::TargetVisible => target_became_visible = true,
+            TransferProgress::BytesCopied(n) => bytes_copied += n,
+            TransferProgress::BytesDiscovered(_) => {}
+        }
+    })
+    .expect("copy single file");
+
+    assert!(target_became_visible);
+    assert_eq!(bytes_copied, 22);
+    assert!(target_dir.join("single.dat").exists());
+}

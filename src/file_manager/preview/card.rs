@@ -223,13 +223,30 @@ pub(crate) fn format_file_details_preview(
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_lowercase());
 
+    #[cfg(unix)]
+    let is_sparse_empty = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file() && metadata.len() > 0 && metadata.blocks() == 0
+    };
+    #[cfg(not(unix))]
+    let is_sparse_empty = false;
+
+    let size_text = if is_sparse_empty {
+        format!(
+            "size: {} [0 bytes on disk]",
+            format_size_with_bytes(metadata.len())
+        )
+    } else {
+        format!("size: {}", format_size_with_bytes(metadata.len()))
+    };
+
     let mut lines = vec![
         Line::from(format!("path: {}", path.display())),
         Line::from(format!(
             "type: {}",
             detect_file_kind(path, extension.as_deref())
         )),
-        Line::from(format!("size: {}", format_size_with_bytes(metadata.len()))),
+        Line::from(size_text),
         Line::from(format!(
             "modified: {}",
             format_system_time(metadata.modified())
@@ -246,6 +263,10 @@ pub(crate) fn format_file_details_preview(
 
     if let Some(msg) = notice {
         lines.push(Line::from(format!("notice: {msg}")));
+    } else if is_sparse_empty {
+        lines.push(Line::from(
+            "notice: warning: 0 blocks allocated on disk (transfer incomplete or sparse file)",
+        ));
     }
 
     lines.push(Line::from(

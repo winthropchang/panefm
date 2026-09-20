@@ -89,7 +89,7 @@ use super::smb::resolve_smb_location_with_mount_root;
 
 mod commands;
 mod completion;
-mod file_ops;
+pub(crate) mod file_ops;
 mod fs_jobs;
 mod help;
 mod keys;

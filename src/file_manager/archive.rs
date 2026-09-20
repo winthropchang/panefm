@@ -67,31 +67,54 @@ where
 
     let archive_name = default_archive_name(entries);
     let archive_path = unique_path_in_dir(cwd, &archive_name, false);
+    if let Ok(available) = crate::file_manager::platform::available_disk_space(cwd)
+        && available < 10 * 1024 * 1024
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "目標磁碟可用空間不足 (僅剩 {})，無法建立壓縮檔",
+                crate::file_manager::ui::format_size_short(available)
+            ),
+        ));
+    }
     let file = File::create(&archive_path)?;
     let buffered = BufWriter::with_capacity(1024 * 1024, file);
     let mut zip = ZipWriter::new(buffered);
     let file_options = FileOptions::default()
         .compression_method(CompressionMethod::Deflated)
-        .compression_level(Some(1));
-    let dir_options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        .compression_level(Some(1))
+        .unix_permissions(0o644);
+    let dir_options = FileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .unix_permissions(0o755);
     let mut buffer = vec![0u8; 256 * 1024];
 
-    for entry in entries {
-        let relative_path = PathBuf::from(&entry.name);
-        add_path_to_zip(
-            &mut zip,
-            &entry.path,
-            &relative_path,
-            entry.is_dir,
-            file_options,
-            dir_options,
-            &mut buffer,
-            progress,
-        )?;
+    let mut write_entries = || -> io::Result<()> {
+        for entry in entries {
+            let relative_path = PathBuf::from(&entry.name);
+            add_path_to_zip(
+                &mut zip,
+                &entry.path,
+                &relative_path,
+                entry.is_dir,
+                file_options,
+                dir_options,
+                &mut buffer,
+                progress,
+            )?;
+        }
+
+        let mut buffered = zip.finish()?;
+        buffered.flush()?;
+        Ok(())
+    };
+
+    if let Err(error) = write_entries() {
+        let _ = fs::remove_file(&archive_path);
+        return Err(error);
     }
 
-    let mut buffered = zip.finish()?;
-    buffered.flush()?;
     Ok(archive_path)
 }
 
@@ -138,6 +161,7 @@ where
         };
 
         let output_path = default_extract_output_path(cwd, &entry.path, format);
+        validate_archive_before_extract(&entry.path, &output_path, format)?;
         match format {
             ArchiveFormat::Zip => extract_zip_archive(&entry.path, &output_path, progress)?,
             ArchiveFormat::TarGz => extract_tar_gz_archive(&entry.path, &output_path, progress)?,
@@ -152,6 +176,96 @@ where
     }
 
     Ok((extracted, skipped))
+}
+
+/// 在實際解壓縮前驗證檔案有效性，攔截空檔、0 實體區塊未完成傳輸、全 0 空洞檔與檔頭損毀。
+pub(crate) fn validate_archive_before_extract(
+    archive_path: &Path,
+    output_target: &Path,
+    format: ArchiveFormat,
+) -> io::Result<()> {
+    let metadata = fs::metadata(archive_path)?;
+    let len = metadata.len();
+    let display_name = archive_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive");
+
+    // 1. 0 位元組空檔案
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("壓縮檔「{display_name}」大小為 0 位元組 (空檔案)，無法解壓縮"),
+        ));
+    }
+
+    // 2. 實體區塊未配置 (0 bytes on disk) 檢測 (Unix/macOS)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.is_file() && metadata.blocks() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "壓縮檔「{display_name}」未配置任何實體磁區 (0 bytes on disk)，傳輸可能未完成或中斷"
+                ),
+            ));
+        }
+    }
+
+    // 3. 讀取檔頭前 4 位元組檢查魔術字節與全 0 空洞檔案
+    let mut file = File::open(archive_path)?;
+    let mut header = [0u8; 4];
+    let bytes_read = file.read(&mut header)?;
+    if bytes_read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("壓縮檔「{display_name}」無法讀取內容"),
+        ));
+    }
+
+    if bytes_read >= 4 && header == [0, 0, 0, 0] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("壓縮檔「{display_name}」內容全為 0 (空洞檔案或寫入中斷)，非有效壓縮檔"),
+        ));
+    }
+
+    match format {
+        ArchiveFormat::Zip => {
+            if bytes_read >= 2 && &header[..2] != b"PK" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("壓縮檔「{display_name}」缺少 PK 標頭，非合法 ZIP 壓縮檔"),
+                ));
+            }
+        }
+        ArchiveFormat::TarGz | ArchiveFormat::Gz => {
+            if bytes_read >= 2 && (header[0] != 0x1f || header[1] != 0x8b) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("壓縮檔「{display_name}」缺少 Gzip 標頭 (0x1f 0x8b)，非合法 GZ 壓縮檔"),
+                ));
+            }
+        }
+        ArchiveFormat::Tar => {}
+    }
+
+    // 4. 目的磁區可用空間預檢
+    if let Ok(available) = crate::file_manager::platform::available_disk_space(output_target)
+        && available < len
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "目標磁碟可用空間不足 (僅剩 {}，需要至少 {})",
+                crate::file_manager::ui::format_size_short(available),
+                crate::file_manager::ui::format_size_short(len)
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 /// 根據副檔名推斷目前檔案屬於哪一種壓縮格式。
@@ -201,8 +315,16 @@ fn default_archive_name(entries: &[FileEntry]) -> String {
     }
 }
 
-/// 檢查副檔名是否為已壓縮格式，此類檔案使用 Stored 模式避免無效的 CPU 運算。
+/// 檢查副檔名或路徑是否為已壓縮格式，此類檔案使用 Stored 模式避免無效的 CPU 運算。
 fn is_already_compressed_file(path: &Path) -> bool {
+    // Git loose objects (.git/objects/xx/xxxx... 無副檔名且已由 zlib 壓縮)
+    if let Some(parent) = path.parent()
+        && let Some(grandparent) = parent.parent()
+        && grandparent.ends_with(".git/objects")
+    {
+        return true;
+    }
+
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
@@ -238,7 +360,40 @@ fn is_already_compressed_file(path: &Path) -> bool {
             | "jar"
             | "war"
             | "wasm"
+            | "pack"
+            | "idx"
+            | "woff"
+            | "woff2"
+            | "crate"
+            | "whl"
+            | "aar"
+            | "dmg"
+            | "iso"
     )
+}
+
+/// 將指定路徑遞迴寫入 zip，保留目前 pane 目錄下看到的相對名稱。
+/// 將符號連結寫入 ZIP，保留其指向的目標路徑，避免嘗試當作一般檔案開啟造成 NotFound。
+fn add_symlink_to_zip<W>(
+    zip: &mut ZipWriter<W>,
+    source_path: &Path,
+    archive_name: &str,
+) -> io::Result<()>
+where
+    W: io::Write + io::Seek,
+{
+    let Ok(target) = fs::read_link(source_path) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let sym_options = FileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .unix_permissions(0o120755);
+    #[cfg(not(unix))]
+    let sym_options = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+    zip.add_symlink(archive_name, target.to_string_lossy(), sym_options)?;
+    Ok(())
 }
 
 /// 將指定路徑遞迴寫入 zip，保留目前 pane 目錄下看到的相對名稱。
@@ -258,6 +413,14 @@ where
     F: FnMut(u64),
 {
     let archive_name = normalize_archive_path(relative_path);
+
+    // 檢查目前路徑是否為符號連結（包含指向不存在目標的 broken symlink）
+    if let Ok(meta) = fs::symlink_metadata(source_path)
+        && meta.file_type().is_symlink()
+    {
+        return add_symlink_to_zip(zip, source_path, &archive_name);
+    }
+
     if is_dir {
         let dir_name = if archive_name.ends_with('/') {
             archive_name.clone()
@@ -265,29 +428,97 @@ where
             format!("{archive_name}/")
         };
         zip.add_directory(dir_name, dir_options)?;
-        for item in fs::read_dir(source_path)? {
-            let item = item?;
-            let item_is_dir = item.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+
+        let read_dir = match fs::read_dir(source_path) {
+            Ok(rd) => rd,
+            Err(err)
+                if err.kind() == io::ErrorKind::PermissionDenied
+                    || err.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+
+        for item in read_dir {
+            let Ok(item) = item else { continue };
+            let Ok(file_type) = item.file_type() else {
+                continue;
+            };
+            let item_path = item.path();
             let next_relative = relative_path.join(item.file_name());
-            add_path_to_zip(
-                zip,
-                &item.path(),
-                &next_relative,
-                item_is_dir,
-                file_options,
-                dir_options,
-                buffer,
-                progress,
-            )?;
+
+            if file_type.is_symlink() {
+                let symlink_archive_name = normalize_archive_path(&next_relative);
+                let _ = add_symlink_to_zip(zip, &item_path, &symlink_archive_name);
+            } else if file_type.is_dir() {
+                add_path_to_zip(
+                    zip,
+                    &item_path,
+                    &next_relative,
+                    true,
+                    file_options,
+                    dir_options,
+                    buffer,
+                    progress,
+                )?;
+            } else if file_type.is_file() {
+                add_path_to_zip(
+                    zip,
+                    &item_path,
+                    &next_relative,
+                    false,
+                    file_options,
+                    dir_options,
+                    buffer,
+                    progress,
+                )?;
+            }
         }
     } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = fs::symlink_metadata(source_path) {
+                if !meta.is_file() {
+                    return Ok(());
+                }
+                // 實體區塊未配置 (0 bytes on disk) 檢測：
+                // 在 macOS APFS 上，若是 iCloud 隨選檔案（UF_DATALESS）或未配置實體區塊的檔案，
+                // 呼叫 read() 會在 APFS 核心空間阻塞等待網路下載。若磁碟空間不足或離線，會造成壓縮執行緒永久卡死。
+                // 對於此類檔案，直接以 0-byte Stored 寫入條目以避免引發 APFS 核心阻塞。
+                if meta.len() > 0 && meta.blocks() == 0 {
+                    zip.start_file(archive_name, dir_options)?;
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(meta) = fs::symlink_metadata(source_path)
+                && !meta.is_file()
+            {
+                return Ok(());
+            }
+        }
+
+        // 先嘗試開啟檔案；若為暫時消失檔（NotFound）或無讀取權限（PermissionDenied），優雅略過而不中斷整批壓縮
+        let mut file = match File::open(source_path) {
+            Ok(file) => file,
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         let options = if is_already_compressed_file(source_path) {
             dir_options
         } else {
             file_options
         };
         zip.start_file(archive_name, options)?;
-        let mut file = File::open(source_path)?;
         copy_with_progress(&mut file, zip, buffer, progress)?;
     }
     Ok(())
@@ -339,6 +570,17 @@ where
         if let Some(parent) = target_path.parent() {
             ensure_dir_created(parent, &mut created_dirs)?;
         }
+
+        #[cfg(unix)]
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            let mut link_target = String::new();
+            if entry.read_to_string(&mut link_target).is_ok() {
+                let _ = fs::remove_file(&target_path);
+                let _ = std::os::unix::fs::symlink(Path::new(&link_target), &target_path);
+            }
+            continue;
+        }
+
         let mut output_file = File::create(&target_path)?;
         copy_with_progress(&mut entry, &mut output_file, &mut buffer, progress)?;
     }

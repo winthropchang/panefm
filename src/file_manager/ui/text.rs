@@ -488,6 +488,8 @@ pub(crate) fn format_sort_detail(entry: &FileEntry, detail_kind: SortDetailKind)
                         }
                     })
                     .unwrap_or_else(|| String::from("…"))
+            } else if entry.is_sparse_empty {
+                format!("{} [0B]", format_size_short(entry.size))
             } else {
                 format_size_short(entry.size)
             }

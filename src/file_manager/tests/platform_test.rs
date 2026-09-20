@@ -291,3 +291,18 @@ fn simplify_path_written_to_file_is_clean_and_usable() {
     #[cfg(not(windows))]
     assert_eq!(content, r"\\?\D:\pngyu");
 }
+
+#[test]
+/// 驗證 available_disk_space 能正確查詢現存目錄或尚不存在之子目錄的磁碟可用容量。
+fn available_disk_space_returns_positive_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let space = super::available_disk_space(dir.path()).expect("available space");
+    assert!(space > 0);
+
+    // 測試尚不存在的子目錄也能正確回溯父目錄查詢
+    let non_existent = dir.path().join("sub").join("nested");
+    let space_nested = super::available_disk_space(&non_existent).expect("nested space");
+    assert!(space_nested > 0);
+    // 兩次查詢同一磁區應在同一數量級（允許作業系統背景少量 I/O 變動）
+    assert!((space as i128 - space_nested as i128).abs() < 100 * 1024 * 1024);
+}

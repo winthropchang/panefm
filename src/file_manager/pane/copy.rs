@@ -352,6 +352,7 @@ where
         .write(true)
         .create_new(true)
         .open(target_path)?;
+    progress(0);
     let mut target = BufWriter::with_capacity(STREAM_COPY_BUFFER_BYTES, target_file);
     let mut buffer = vec![0u8; STREAM_COPY_BUFFER_BYTES];
     let mut copied = 0u64;
@@ -429,6 +430,9 @@ where
             match done_receiver.recv_timeout(Duration::from_millis(200)) {
                 Ok(result) => break result,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if reported_size == 0 && target_path.exists() {
+                        progress(0);
+                    }
                     let stored_size = fs::metadata(target_path)
                         .map(|metadata| metadata.len())
                         .unwrap_or(0)

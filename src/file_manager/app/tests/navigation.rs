@@ -462,11 +462,8 @@ fn app_change_directory_from_command_as_macos_handles_quotes_and_case() {
     fs::create_dir_all(share_root.join("docs")).expect("share docs");
 
     let mut app = App::new(dir.path().to_path_buf(), default_loaded_config()).expect("app");
-    app.change_directory_from_command_as_macos(
-        r#""SMB://192.0.2.10/shared/docs""#,
-        &mount_root,
-    )
-    .expect("goto quoted smb");
+    app.change_directory_from_command_as_macos(r#""SMB://192.0.2.10/shared/docs""#, &mount_root)
+        .expect("goto quoted smb");
 
     let pane = app.current_pane_mut().expect("pane");
     assert_eq!(pane.cwd, share_root.join("docs"));

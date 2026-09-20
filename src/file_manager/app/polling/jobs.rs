@@ -26,6 +26,28 @@ impl App {
                         total_bytes,
                     }) => {
                         self.update_task_progress(task_id, completed_bytes, total_bytes);
+                        if let Some(task) = self.task_log.iter().find(|t| t.id == task_id) {
+                            let pct = task.progress_percent.unwrap_or(0);
+                            let action = match task.kind.as_str() {
+                                "paste" if task.title.starts_with("move") => "moving",
+                                "paste" => "copying",
+                                "compress" => "compressing",
+                                "extract" => "extracting",
+                                _ => "processing",
+                            };
+                            let first_item = task
+                                .source_locations
+                                .first()
+                                .and_then(|p| {
+                                    std::path::Path::new(p).file_name().and_then(|n| n.to_str())
+                                })
+                                .unwrap_or("item");
+                            self.status = if task.source_locations.len() <= 1 {
+                                format!("{action} {first_item} [{pct}%]")
+                            } else {
+                                format!("{action} {} items [{pct}%]", task.source_locations.len())
+                            };
+                        }
                     }
                     Ok(event) => {
                         self.apply_file_job_event(event);

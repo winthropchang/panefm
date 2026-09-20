@@ -202,9 +202,7 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| entry.display_name.trim_end_matches('/').to_string());
             busy.push(target_dir.join(&item_name));
-            if clipboard.operation == ClipboardOperation::Cut {
-                busy.push(entry.source_path.clone());
-            }
+            busy.push(entry.source_path.clone());
         }
         self.active_file_job_busy_paths.insert(task_id, busy);
         // 背景 paste 一排入就顯示初始 byte，避免總大小尚未發現時 task 面板只有
@@ -273,10 +271,31 @@ impl App {
             });
         });
         self.file_job_receivers.insert(task_id, receiver);
-        self.status = format!(
-            "pasting {entry_count} item(s) in background to {} [task {task_id}]",
-            target_dir.display()
-        );
+        let action = match operation {
+            ClipboardOperation::Copy => "copying",
+            ClipboardOperation::Cut => "moving",
+        };
+        let first_item = clipboard
+            .entries
+            .first()
+            .and_then(|entry| {
+                entry
+                    .source_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| String::from("item"));
+        self.status = if entry_count <= 1 {
+            format!(
+                "{action} {first_item} [0%] in background to {} [task {task_id}]",
+                target_dir.display()
+            )
+        } else {
+            format!(
+                "pasting {entry_count} item(s) in background to {} [task {task_id}]",
+                target_dir.display()
+            )
+        };
         Ok(())
     }
 

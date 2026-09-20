@@ -95,6 +95,7 @@ where
                 path: entry_path,
                 is_dir,
                 size: 0,
+                is_sparse_empty: false,
                 directory_size: None,
                 directory_size_complete: false,
                 modified: SystemTime::UNIX_EPOCH,
@@ -268,29 +269,33 @@ fn file_entry_from_dir_entry(item: fs::DirEntry) -> FileEntry {
         .or_else(|| metadata.as_ref().map(|m| m.is_dir()))
         .unwrap_or(false);
 
-    let (size, modified, created, readonly, unix_mode) = if let Some(meta) = metadata {
-        (
-            meta.len(),
-            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            meta.created().unwrap_or(SystemTime::UNIX_EPOCH),
-            meta.permissions().readonly(),
-            read_unix_mode(&meta),
-        )
-    } else {
-        (
-            0,
-            SystemTime::UNIX_EPOCH,
-            SystemTime::UNIX_EPOCH,
-            false,
-            None,
-        )
-    };
+    let (size, is_sparse_empty, modified, created, readonly, unix_mode) =
+        if let Some(meta) = metadata {
+            (
+                meta.len(),
+                is_metadata_sparse_empty(&meta),
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.created().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.permissions().readonly(),
+                read_unix_mode(&meta),
+            )
+        } else {
+            (
+                0,
+                false,
+                SystemTime::UNIX_EPOCH,
+                SystemTime::UNIX_EPOCH,
+                false,
+                None,
+            )
+        };
 
     FileEntry {
         name,
         path: entry_path,
         is_dir,
         size,
+        is_sparse_empty,
         directory_size: None,
         directory_size_complete: false,
         modified,
@@ -298,6 +303,19 @@ fn file_entry_from_dir_entry(item: fs::DirEntry) -> FileEntry {
         readonly,
         unix_mode,
     }
+}
+
+/// 判斷檔案是否為實體未配置區塊（0 bytes on disk）的稀疏空洞或未完成檔案。
+#[cfg(unix)]
+fn is_metadata_sparse_empty(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.is_file() && metadata.len() > 0 && metadata.blocks() == 0
+}
+
+#[cfg(not(unix))]
+fn is_metadata_sparse_empty(_: &fs::Metadata) -> bool {
+    false
 }
 
 /// 讀取目前平台可提供的 Unix 權限位元，供 linemode permissions 顯示。

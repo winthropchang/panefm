@@ -23,6 +23,7 @@ fn test_entry(name: &str, is_dir: bool) -> FileEntry {
         path: Path::new(name).to_path_buf(),
         is_dir,
         size: 0,
+        is_sparse_empty: false,
         directory_size: None,
         directory_size_complete: false,
         modified: SystemTime::UNIX_EPOCH,
@@ -467,6 +468,19 @@ fn size_detail_marks_partial_directory_size_until_scan_completes() {
 }
 
 #[test]
+/// 驗證未配置實體磁區 (0 bytes on disk) 的檔案在 Size 欄位會附加 [0B] 警告標籤。
+fn size_detail_marks_sparse_empty_file_with_zero_block_tag() {
+    let mut entry = test_entry("payload.zip", false);
+    entry.size = 209_715_200; // 200MB
+    entry.is_sparse_empty = true;
+
+    assert_eq!(
+        format_sort_detail(&entry, SortDetailKind::Size),
+        "200M [0B]"
+    );
+}
+
+#[test]
 /// 驗證 pane 標題會把固定 pane 編號以膠囊形式顯示在最前面，方便對照快捷鍵切換。
 /// 保護目的：避免畫面格式或主題重構後，造成狹窄 panel、選取狀態或語意顏色顯示錯誤。
 fn format_pane_title_keeps_stable_pane_id_prefix() {
@@ -610,6 +624,7 @@ fn format_permissions_detail_falls_back_to_cross_platform_text() {
         path: Path::new("/tmp/notes.txt").to_path_buf(),
         is_dir: false,
         size: 12,
+        is_sparse_empty: false,
         directory_size: None,
         directory_size_complete: false,
         modified: SystemTime::UNIX_EPOCH,

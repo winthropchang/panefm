@@ -14,6 +14,9 @@ pub(crate) struct FileEntry {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
     pub(crate) size: u64,
+    /// `true` 表示邏輯大小大於 0 但磁碟未配置任何實體區塊（0 bytes on disk），
+    /// 常見於未完成的 SMB/網路傳輸、雲端隨選檔案（Dataless）或稀疏空洞檔案。
+    pub(crate) is_sparse_empty: bool,
     /// 目錄目前已遞迴統計到的內容大小；一般檔案不使用這個欄位。
     pub(crate) directory_size: Option<u64>,
     /// `true` 表示 `directory_size` 已包含整棵目錄樹，而不是背景掃描中的暫存值。

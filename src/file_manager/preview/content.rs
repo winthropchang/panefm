@@ -183,11 +183,33 @@ pub(crate) fn preview_file_content_detailed(
     }
 
     // 2. 壓縮封裝檔案分流（免解壓內部檔案樹預覽）
-    if let Some(kind) = is_archive_file(path)
-        && let Some(archive_lines) = preview_archive_content(path, kind, max_lines, viewport_width)
-    {
-        let total = archive_lines.len();
-        return (archive_lines, total);
+    if let Some(kind) = is_archive_file(path) {
+        if let Some(archive_lines) = preview_archive_content(path, kind, max_lines, viewport_width)
+        {
+            let total = archive_lines.len();
+            return (archive_lines, total);
+        }
+
+        // 壓縮檔無法正常解析內部結構：給出精確診斷，避免誤導成純文字大小限制
+        #[cfg(unix)]
+        let is_sparse = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.is_file() && metadata.len() > 0 && metadata.blocks() == 0
+        };
+        #[cfg(not(unix))]
+        let is_sparse = false;
+
+        let notice = if is_sparse {
+            "warning: archive has 0 blocks allocated on disk (transfer incomplete or dataless placeholder)"
+        } else if metadata.len() == 0 {
+            "archive file is empty (0 bytes)"
+        } else {
+            "unable to read archive contents (corrupted, incomplete, or unsupported format)"
+        };
+
+        let lines = format_file_details_preview(path, &metadata, Some(notice));
+        let total = lines.len();
+        return (lines, total);
     }
 
     // 3. 非圖片大檔案：超過 2 MiB 時顯示結構化詳細資訊卡片

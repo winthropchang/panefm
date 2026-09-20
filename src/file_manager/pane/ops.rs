@@ -337,9 +337,20 @@ where
     } else {
         let size = fs::metadata(source_path)?.len();
         progress(TransferProgress::BytesDiscovered(size));
-        copy_file_native_with_progress(source_path, target_path, &mut |increment| {
-            progress(TransferProgress::BytesCopied(increment));
-        })
+        let mut target_visible_sent = false;
+        let result = copy_file_native_with_progress(source_path, target_path, &mut |increment| {
+            if !target_visible_sent && target_path.exists() {
+                target_visible_sent = true;
+                progress(TransferProgress::TargetVisible);
+            }
+            if increment > 0 {
+                progress(TransferProgress::BytesCopied(increment));
+            }
+        });
+        if !target_visible_sent && target_path.exists() {
+            progress(TransferProgress::TargetVisible);
+        }
+        result
     }
 }
 

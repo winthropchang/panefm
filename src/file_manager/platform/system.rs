@@ -138,3 +138,91 @@ pub(crate) fn reveal_in_system_spec_for_platform(
     };
     Ok(launch)
 }
+
+/// 查詢指定路徑所在檔案系統的可用空間（位元組）。
+///
+/// 若指定路徑尚未建立，會遞迴往上尋找最近存在的父目錄進行查詢。
+#[cfg(unix)]
+pub(crate) fn available_disk_space(path: &Path) -> io::Result<u64> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut check_path = path;
+    while !check_path.exists() {
+        if let Some(parent) = check_path.parent() {
+            check_path = parent;
+        } else {
+            break;
+        }
+    }
+
+    let c_path = CString::new(check_path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    let frsize = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+    Ok((stat.f_bavail as u64).saturating_mul(frsize))
+}
+
+/// 查詢指定路徑所在檔案系統的可用空間（位元組）。
+#[cfg(windows)]
+pub(crate) fn available_disk_space(path: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut check_path = path;
+    while !check_path.exists() {
+        if let Some(parent) = check_path.parent() {
+            check_path = parent;
+        } else {
+            break;
+        }
+    }
+
+    let wide: Vec<u16> = check_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let mut free_bytes_to_caller = 0u64;
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(free_bytes_to_caller)
+    }
+}
+
+/// 查詢指定路徑所在檔案系統的可用空間（位元組）。
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn available_disk_space(_path: &Path) -> io::Result<u64> {
+    Ok(u64::MAX)
+}

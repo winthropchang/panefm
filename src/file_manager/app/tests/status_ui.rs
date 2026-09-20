@@ -276,3 +276,139 @@ fn active_status_shortcut_hints_adapts_to_current_view_and_always_starts_with_he
     assert!(visual_keys.contains(&"x"));
     assert!(visual_keys.contains(&"d"));
 }
+
+#[test]
+/// 驗證單一檔案複製時，來源與目的端皆能顯示檔名與進度百分比，且狀態列即時回報進度。
+/// 保護目的：避免單檔複製未送 TargetVisible 導致目的端清單空白、
+/// 或 Copy 模式未加入 busy_paths 導致來源端無百分比 badge。
+fn single_file_background_copy_shows_filename_and_progress_percentage() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("video.mp4");
+    fs::File::create(&source_file)
+        .expect("source file")
+        .set_len(BACKGROUND_FILE_JOB_THRESHOLD_BYTES)
+        .expect("set len");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    app.copy_selected();
+
+    app.current_pane_mut().expect("pane").cwd = target_dir.clone();
+    app.current_pane_mut()
+        .expect("pane")
+        .reload()
+        .expect("reload target");
+
+    app.paste_into_focused_pane().expect("queue paste");
+
+    // 1. 驗證貼上一排入背景，狀態列即包含動作、檔名與初始 0%
+    assert!(app.status.contains("copying video.mp4 [0%]"));
+    assert!(app.status.contains("in background"));
+
+    // 2. 驗證來源端原檔在複製期間具備 [copying 0%] badge
+    assert_eq!(
+        app.active_job_badge_for_path(&source_file).as_deref(),
+        Some("[copying 0%]")
+    );
+
+    // 3. 驗證目的端目標路徑已登記至 busy_paths
+    let target_file = target_dir.join("video.mp4");
+    assert_eq!(
+        app.active_job_badge_for_path(&target_file).as_deref(),
+        Some("[copying 0%]")
+    );
+
+    // 4. 等待背景工作完成
+    wait_for_file_jobs(&mut app);
+
+    // 5. 驗證複製完成後檔案大小正確、狀態列更新為完成、且 badge 復原
+    assert_eq!(
+        fs::metadata(&target_file).expect("target metadata").len(),
+        BACKGROUND_FILE_JOB_THRESHOLD_BYTES
+    );
+    assert_eq!(app.status, "pasted copy: 1 item");
+    assert_eq!(app.active_job_badge_for_path(&source_file), None);
+    assert_eq!(app.active_job_badge_for_path(&target_file), None);
+}
+
+#[test]
+/// 驗證背景檔案工作收到 Progress 事件時，狀態列與 entry badge 即時反映最新百分比。
+/// 保護目的：避免 poll_file_jobs 僅更新內部 byte 統計而未即時更新 self.status 與介面呈現。
+fn file_job_progress_event_updates_status_bar_and_entry_badges() {
+    let dir = tempdir().expect("tempdir");
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    fs::create_dir(&source_dir).expect("source dir");
+    fs::create_dir(&target_dir).expect("target dir");
+    let source_file = source_dir.join("backup.tar");
+    let target_file = target_dir.join("backup.tar");
+    fs::write(&source_file, "data").expect("write source");
+
+    let mut app = App::new(source_dir.clone(), default_loaded_config()).expect("app");
+    let task_id = app.push_task(
+        1,
+        "paste",
+        String::from("copy 1 item(s)"),
+        String::from("destination"),
+        vec![source_file.display().to_string()],
+        Some(target_dir.display().to_string()),
+    );
+    app.active_file_job_busy_paths
+        .insert(task_id, vec![target_file.clone(), source_file.clone()]);
+
+    let (sender, receiver) = mpsc::channel();
+    app.file_job_receivers.insert(task_id, receiver);
+
+    // 模擬背景傳輸中途送出 50% 進度
+    sender
+        .send(FileJobEvent::Progress {
+            task_id,
+            completed_bytes: 500,
+            total_bytes: 1000,
+        })
+        .expect("send progress");
+
+    app.poll_file_jobs();
+
+    // 驗證狀態列更新為 50%
+    assert_eq!(app.status, "copying backup.tar [50%]");
+
+    // 驗證來源端與目的端 badge 同步呈現 50%
+    assert_eq!(
+        app.active_job_badge_for_path(&source_file).as_deref(),
+        Some("[copying 50%]")
+    );
+    assert_eq!(
+        app.active_job_badge_for_path(&target_file).as_deref(),
+        Some("[copying 50%]")
+    );
+
+    // 模擬傳輸完成
+    sender
+        .send(FileJobEvent::Paste {
+            task_id,
+            clipboard: ClipboardState {
+                entries: vec![ClipboardEntry {
+                    source_path: source_file.clone(),
+                    display_name: String::from("backup.tar"),
+                }],
+                operation: ClipboardOperation::Copy,
+            },
+            overwrite: false,
+            result: PasteJobResult {
+                history_items: Vec::new(),
+                pasted_count: 1,
+                failure: None,
+            },
+        })
+        .expect("send completion");
+
+    app.poll_file_jobs();
+
+    // 驗證完成後 busy_paths 清除
+    assert_eq!(app.active_job_badge_for_path(&source_file), None);
+    assert_eq!(app.active_job_badge_for_path(&target_file), None);
+}
