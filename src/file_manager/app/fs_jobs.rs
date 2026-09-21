@@ -493,19 +493,19 @@ pub(crate) fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
 
     if path.exists() {
         ensure_path_writable(path);
-        if fs::remove_dir(path).is_err() {
-            if let Err(all_err) = fs::remove_dir_all(path) {
-                return Err(last_error.unwrap_or(all_err));
-            }
+        if fs::remove_dir(path).is_err()
+            && let Err(all_err) = fs::remove_dir_all(path)
+        {
+            return Err(last_error.unwrap_or(all_err));
         }
     }
 
     if path.exists() {
         return Err(last_error.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to remove directory '{}': directory still exists", path.display()),
-            )
+            io::Error::other(format!(
+                "failed to remove directory '{}': directory still exists",
+                path.display()
+            ))
         }));
     }
 
@@ -528,10 +528,10 @@ where
         let entry_path = entry.path();
         if let Ok(file_type) = entry.file_type() {
             if file_type.is_dir() && !file_type.is_symlink() {
-                if let Err(err) = remove_dir_all_fast_recursive(&entry_path, on_progress) {
-                    if child_error.is_none() {
-                        child_error = Some(err);
-                    }
+                if let Err(err) = remove_dir_all_fast_recursive(&entry_path, on_progress)
+                    && child_error.is_none()
+                {
+                    child_error = Some(err);
                 }
             } else {
                 match remove_file_or_symlink_with_retry(&entry_path) {
@@ -624,12 +624,12 @@ where
                     };
                     for child in chunk {
                         if child.is_dir() && !child.is_symlink() {
-                            if let Err(err) = remove_dir_all_fast_recursive(&child, &mut local_progress) {
-                                if let Ok(mut guard) = w_err_ref.lock()
-                                    && guard.is_none()
-                                {
-                                    *guard = Some(err);
-                                }
+                            if let Err(err) =
+                                remove_dir_all_fast_recursive(&child, &mut local_progress)
+                                && let Ok(mut guard) = w_err_ref.lock()
+                                && guard.is_none()
+                            {
+                                *guard = Some(err);
                             }
                         } else {
                             match remove_file_or_symlink_with_retry(&child) {

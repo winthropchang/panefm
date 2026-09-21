@@ -6,7 +6,7 @@
 
 ## 1. 專案當前狀態快照 (Current Snapshot)
 
-- **最新發布版本**: `v0.1.23`
+- **最新發布版本**: `v0.1.24`
 - **當前分支**: `main`
 - **測試狀態**: **657 / 657 全數通過**（588 單元 + 19 config + 4 diff + 14 layout + 9 preview + 4 theme + 3 undo + 16 updater）
 - **品質標準**: `cargo clippy --all-targets -- -D warnings` 零警告，`cargo fmt --check` 排版通過。

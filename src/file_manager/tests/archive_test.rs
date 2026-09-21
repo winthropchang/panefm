@@ -284,6 +284,7 @@ fn compress_directory_with_broken_symlink_does_not_fail() {
     );
 }
 
+#[allow(dead_code)]
 fn walkdir_simple(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut results = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {

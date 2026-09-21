@@ -944,7 +944,10 @@ fn test_remove_dir_all_parallel_removes_readonly_and_hidden_entries() {
     });
 
     assert!(res.is_ok(), "delete failed: {:?}", res);
-    assert!(!target_dir.exists(), "target_dir should be completely removed");
+    assert!(
+        !target_dir.exists(),
+        "target_dir should be completely removed"
+    );
     assert!(!sub_dir.exists(), "sub_dir should be completely removed");
     assert!(!ds_store.exists(), ".DS_Store should be removed");
     assert!(!readonly_file.exists(), "readonly file should be removed");

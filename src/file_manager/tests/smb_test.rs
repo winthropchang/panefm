@@ -325,7 +325,8 @@ fn resolve_smb_location_with_mount_root_finds_suffixed_mount() {
 /// 驗證 `build_smb_mount_launch` 與 `smb_share_root_url` 僅針對 share 根目錄發起掛載請求，
 /// 不將深層子路徑傳給系統 open 命令，以保留完整目錄樹架構。
 fn smb_mount_launch_targets_share_root_without_subpath() {
-    let location = parse_smb_location("smb://192.168.0.141/mingfong/網路事業部/otto").expect("parse");
+    let location =
+        parse_smb_location("smb://192.168.0.141/mingfong/網路事業部/otto").expect("parse");
     let root_url = smb_share_root_url(&location);
     assert_eq!(root_url, "smb://192.168.0.141/mingfong");
 
@@ -346,4 +347,3 @@ fn smb_mount_launch_targets_share_root_without_subpath() {
         assert_eq!(launch.args, vec!["smb://192.168.0.141/mingfong"]);
     }
 }
-

@@ -491,10 +491,10 @@ fn remove_path(path: &Path) -> io::Result<()> {
         if let Ok(read_dir) = fs::read_dir(path) {
             for entry in read_dir.flatten() {
                 let entry_path = entry.path();
-                if let Err(err) = remove_path(&entry_path) {
-                    if child_error.is_none() {
-                        child_error = Some(err);
-                    }
+                if let Err(err) = remove_path(&entry_path)
+                    && child_error.is_none()
+                {
+                    child_error = Some(err);
                 }
             }
         }
@@ -533,9 +533,7 @@ fn remove_path(path: &Path) -> io::Result<()> {
         if path.exists() {
             ensure_path_writable(path);
             if fs::remove_dir(path).is_err() {
-                if let Err(all_err) = fs::remove_dir_all(path) {
-                    return Err(all_err);
-                }
+                fs::remove_dir_all(path)?;
             }
         }
     } else {
@@ -549,10 +547,10 @@ fn remove_path(path: &Path) -> io::Result<()> {
     }
 
     if path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("failed to remove path '{}': path still exists", path.display()),
-        ));
+        return Err(io::Error::other(format!(
+            "failed to remove path '{}': path still exists",
+            path.display()
+        )));
     }
     Ok(())
 }
