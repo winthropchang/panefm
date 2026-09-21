@@ -6,9 +6,10 @@ use std::{
 use tempfile::tempdir;
 
 use super::{
-    ResolvedSmbLocation, clean_host, decode_mount_field, decode_share_name, find_macos_smb_mount,
-    find_macos_smb_mount_by_share, find_matching_volume, find_smbutil_mount, parse_smb_location,
-    parse_smbutil_statshares, resolve_smb_location_with_mount_root,
+    ResolvedSmbLocation, build_smb_mount_launch, clean_host, decode_mount_field, decode_share_name,
+    find_macos_smb_mount, find_macos_smb_mount_by_share, find_matching_volume, find_smbutil_mount,
+    parse_smb_location, parse_smbutil_statshares, resolve_smb_location_with_mount_root,
+    smb_share_root_url,
 };
 
 #[test]
@@ -319,3 +320,30 @@ fn resolve_smb_location_with_mount_root_finds_suffixed_mount() {
         ResolvedSmbLocation::Ready(suffixed_root.join("docs"))
     );
 }
+
+#[test]
+/// 驗證 `build_smb_mount_launch` 與 `smb_share_root_url` 僅針對 share 根目錄發起掛載請求，
+/// 不將深層子路徑傳給系統 open 命令，以保留完整目錄樹架構。
+fn smb_mount_launch_targets_share_root_without_subpath() {
+    let location = parse_smb_location("smb://192.168.0.141/mingfong/網路事業部/otto").expect("parse");
+    let root_url = smb_share_root_url(&location);
+    assert_eq!(root_url, "smb://192.168.0.141/mingfong");
+
+    let launch = build_smb_mount_launch(&location);
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(launch.program, "explorer.exe");
+        assert_eq!(launch.args, vec![r"\\192.168.0.141\mingfong"]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(launch.program, "open");
+        assert_eq!(launch.args, vec!["smb://192.168.0.141/mingfong"]);
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        assert_eq!(launch.program, "xdg-open");
+        assert_eq!(launch.args, vec!["smb://192.168.0.141/mingfong"]);
+    }
+}
+

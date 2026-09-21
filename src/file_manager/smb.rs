@@ -489,6 +489,31 @@ pub(crate) fn resolve_smb_location_with_mount_root(
     }
 }
 
+/// 取得 SMB 位置的 Share 根目錄 URL（不含子路徑），例如 `smb://host/share`。
+/// 確保 macOS / Linux 請求系統掛載時以 Share 為單位掛載整顆 Volume，避免子目錄被單獨當成掛載點而失去父目錄結構。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn smb_share_root_url(location: &SmbLocation) -> String {
+    format!(
+        "smb://{}/{}",
+        location.host,
+        percent_encode_path_segment(&location.share)
+    )
+}
+
+/// 將路徑片段轉成能安全放進 SMB URL 的最小百分比編碼格式。
+pub(crate) fn percent_encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::new();
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 /// 建立目前平台用來請求系統掛載 SMB share 的外部命令。
 pub(crate) fn build_smb_mount_launch(location: &SmbLocation) -> LaunchSpec {
     #[cfg(target_os = "windows")]
@@ -504,7 +529,7 @@ pub(crate) fn build_smb_mount_launch(location: &SmbLocation) -> LaunchSpec {
     {
         LaunchSpec {
             program: "open".to_string(),
-            args: vec![location.url.clone()],
+            args: vec![smb_share_root_url(location)],
             mode: LaunchMode::Detached,
         }
     }
@@ -513,7 +538,7 @@ pub(crate) fn build_smb_mount_launch(location: &SmbLocation) -> LaunchSpec {
     {
         LaunchSpec {
             program: "xdg-open".to_string(),
-            args: vec![location.url.clone()],
+            args: vec![smb_share_root_url(location)],
             mode: LaunchMode::Detached,
         }
     }

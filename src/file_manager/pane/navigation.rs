@@ -575,7 +575,7 @@ impl PaneState {
 
 /// 將子目錄名稱接到現有 `smb://host/share[/path]` URL 後方，供 pane 在 SMB 內導航時更新書籤目標。
 fn append_smb_url_segment(base: &str, segment: &str) -> String {
-    let encoded = percent_encode_path_segment(segment);
+    let encoded = crate::file_manager::smb::percent_encode_path_segment(segment);
     if base.ends_with('/') {
         format!("{base}{encoded}")
     } else {
@@ -594,18 +594,4 @@ fn smb_parent_url(url: &str) -> Option<String> {
     }
     segments.pop();
     Some(format!("{prefix}{}", segments.join("/")))
-}
-
-/// 將路徑片段轉成能安全放進 SMB URL 的最小百分比編碼格式。
-fn percent_encode_path_segment(segment: &str) -> String {
-    let mut encoded = String::new();
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    encoded
 }

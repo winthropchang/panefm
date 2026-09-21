@@ -493,7 +493,7 @@ pub(crate) fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
 
     if path.exists() {
         ensure_path_writable(path);
-        if let Err(err) = fs::remove_dir(path) {
+        if fs::remove_dir(path).is_err() {
             if let Err(all_err) = fs::remove_dir_all(path) {
                 return Err(last_error.unwrap_or(all_err));
             }
