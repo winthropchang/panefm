@@ -915,3 +915,55 @@ fn diff_command_opens_and_navigates_matrix() {
     app.execute_command("equal").expect("equal");
     assert_eq!(app.status, "equalized all panels");
 }
+
+#[test]
+/// 驗證包含唯讀檔案、多層子目錄及模擬 macOS .DS_Store 隱藏檔時，remove_dir_all_parallel_with_progress 能徹底移除整個目錄結構。
+fn test_remove_dir_all_parallel_removes_readonly_and_hidden_entries() {
+    let dir = tempdir().expect("tempdir");
+    let target_dir = dir.path().join("target_folder");
+    fs::create_dir_all(&target_dir).expect("create target");
+
+    let sub_dir = target_dir.join("nested");
+    fs::create_dir_all(&sub_dir).expect("create sub");
+
+    let ds_store = target_dir.join(".DS_Store");
+    fs::write(&ds_store, "mock ds_store").expect("write ds_store");
+
+    let normal_file = target_dir.join("file.txt");
+    fs::write(&normal_file, "normal").expect("write normal");
+
+    let readonly_file = sub_dir.join("readonly.txt");
+    fs::write(&readonly_file, "readonly content").expect("write readonly");
+    let mut perms = fs::metadata(&readonly_file).expect("meta").permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&readonly_file, perms).expect("set readonly");
+
+    let mut progress_bytes = 0u64;
+    let res = remove_dir_all_parallel_with_progress(&target_dir, &mut |bytes| {
+        progress_bytes += bytes;
+    });
+
+    assert!(res.is_ok(), "delete failed: {:?}", res);
+    assert!(!target_dir.exists(), "target_dir should be completely removed");
+    assert!(!sub_dir.exists(), "sub_dir should be completely removed");
+    assert!(!ds_store.exists(), ".DS_Store should be removed");
+    assert!(!readonly_file.exists(), "readonly file should be removed");
+}
+
+#[test]
+/// 驗證在空目錄上執行 remove_dir_all_parallel_with_progress 與 remove_dir_with_retry 能正確刪除且回報 Ok。
+fn test_remove_dir_empty_directory() {
+    let dir = tempdir().expect("tempdir");
+    let empty_dir = dir.path().join("empty_folder");
+    fs::create_dir(&empty_dir).expect("create empty");
+
+    let res = remove_dir_with_retry(&empty_dir);
+    assert!(res.is_ok());
+    assert!(!empty_dir.exists());
+
+    let empty_dir2 = dir.path().join("empty_folder_2");
+    fs::create_dir(&empty_dir2).expect("create empty 2");
+    let res2 = remove_dir_all_parallel_with_progress(&empty_dir2, &mut |_| {});
+    assert!(res2.is_ok());
+    assert!(!empty_dir2.exists());
+}

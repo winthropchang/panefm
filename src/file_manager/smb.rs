@@ -5,8 +5,11 @@
 
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
+
+#[cfg(any(test, target_os = "macos"))]
+use std::path::Path;
 
 #[cfg(any(test, target_os = "macos"))]
 use std::fs;

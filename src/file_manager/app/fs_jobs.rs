@@ -428,6 +428,90 @@ pub(crate) fn remove_file_or_symlink_with_retry(path: &Path) -> io::Result<u64> 
 
 const DELETE_WORKERS: usize = 8;
 
+/// 移除目錄，遇到暫時性檔案鎖定（如 SMB 句柄延遲釋放）或 macOS 自動產生的系統隱藏檔（如 `.DS_Store`、`._*`）
+/// 時，自動清理殘留隱藏檔並配合短暫退避重試，若最終仍無法移除則回傳錯誤。
+pub(crate) fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    ensure_path_writable(path);
+    if fs::remove_dir(path).is_ok() {
+        return Ok(());
+    }
+
+    let mut last_error = None;
+    // 退避間隔：15ms, 30ms, 60ms, 120ms
+    let backoff_delays = [
+        std::time::Duration::from_millis(15),
+        std::time::Duration::from_millis(30),
+        std::time::Duration::from_millis(60),
+        std::time::Duration::from_millis(120),
+    ];
+
+    for delay in backoff_delays {
+        if !path.exists() {
+            return Ok(());
+        }
+
+        thread::sleep(delay);
+        ensure_path_writable(path);
+
+        // 清理可能在刪除過程中被 macOS Finder 或其他程式新生成的殘留隱藏檔
+        if let Ok(rd) = fs::read_dir(path) {
+            for entry in rd.flatten() {
+                let entry_path = entry.path();
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() && !ft.is_symlink() {
+                        let _ = fs::remove_dir_all(&entry_path);
+                    } else {
+                        let _ = remove_file_or_symlink_with_retry(&entry_path);
+                    }
+                } else {
+                    let _ = remove_file_or_symlink_with_retry(&entry_path);
+                }
+            }
+        }
+
+        ensure_path_writable(path);
+        if fs::remove_dir(path).is_ok() {
+            return Ok(());
+        }
+
+        // 嘗試以 remove_dir_all 作為保底
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+
+        if !path.exists() {
+            return Ok(());
+        }
+    }
+
+    if path.exists() {
+        ensure_path_writable(path);
+        if let Err(err) = fs::remove_dir(path) {
+            if let Err(all_err) = fs::remove_dir_all(path) {
+                return Err(last_error.unwrap_or(all_err));
+            }
+        }
+    }
+
+    if path.exists() {
+        return Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to remove directory '{}': directory still exists", path.display()),
+            )
+        }));
+    }
+
+    Ok(())
+}
+
 /// 高速遞迴刪除子目錄或檔案，遇到唯讀權限受阻時自動嘗試排除。
 pub(crate) fn remove_dir_all_fast_recursive<F>(path: &Path, on_progress: &mut F) -> io::Result<()>
 where
@@ -439,25 +523,42 @@ where
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
+    let mut child_error = None;
     for entry in read_dir.flatten() {
         let entry_path = entry.path();
         if let Ok(file_type) = entry.file_type() {
             if file_type.is_dir() && !file_type.is_symlink() {
-                let _ = remove_dir_all_fast_recursive(&entry_path, on_progress);
+                if let Err(err) = remove_dir_all_fast_recursive(&entry_path, on_progress) {
+                    if child_error.is_none() {
+                        child_error = Some(err);
+                    }
+                }
             } else {
-                let size = remove_file_or_symlink_with_retry(&entry_path).unwrap_or(0);
-                on_progress(size);
+                match remove_file_or_symlink_with_retry(&entry_path) {
+                    Ok(size) => on_progress(size),
+                    Err(err) => {
+                        if child_error.is_none() {
+                            child_error = Some(err);
+                        }
+                    }
+                }
             }
         } else {
-            let size = remove_file_or_symlink_with_retry(&entry_path).unwrap_or(0);
-            on_progress(size);
+            match remove_file_or_symlink_with_retry(&entry_path) {
+                Ok(size) => on_progress(size),
+                Err(err) => {
+                    if child_error.is_none() {
+                        child_error = Some(err);
+                    }
+                }
+            }
         }
     }
-    ensure_path_writable(path);
-    if fs::remove_dir(path).is_err() {
-        let _ = fs::remove_dir_all(path);
+    if let Some(err) = child_error {
+        let _ = remove_dir_with_retry(path);
+        return Err(err);
     }
-    Ok(())
+    remove_dir_with_retry(path)
 }
 
 /// 多執行緒平行刪除目錄，大幅提高 NVMe/SSD 與檔案系統的 unlink 吞吐量並回報 byte 進度。
@@ -476,22 +577,36 @@ where
     };
     let entries: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
     if entries.is_empty() {
-        let _ = fs::remove_dir(path);
-        return Ok(());
+        return remove_dir_with_retry(path);
     }
+
+    let worker_error = std::sync::Mutex::new(None::<io::Error>);
 
     if entries.len() <= 4 {
         for child in &entries {
             if child.is_dir() && !child.is_symlink() {
-                let _ = remove_dir_all_fast_recursive(child, on_progress);
+                if let Err(err) = remove_dir_all_fast_recursive(child, on_progress) {
+                    let mut guard = worker_error.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(err);
+                    }
+                }
             } else {
-                let size = remove_file_or_symlink_with_retry(child).unwrap_or(0);
-                on_progress(size);
+                match remove_file_or_symlink_with_retry(child) {
+                    Ok(size) => on_progress(size),
+                    Err(err) => {
+                        let mut guard = worker_error.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some(err);
+                        }
+                    }
+                }
             }
         }
     } else {
         let chunk_size = entries.len().div_ceil(DELETE_WORKERS);
         let progress_mutex = std::sync::Mutex::new(on_progress);
+        let w_err_ref = &worker_error;
         thread::scope(|scope| {
             for chunk in entries.chunks(chunk_size) {
                 let chunk = chunk.to_vec();
@@ -509,10 +624,24 @@ where
                     };
                     for child in chunk {
                         if child.is_dir() && !child.is_symlink() {
-                            let _ = remove_dir_all_fast_recursive(&child, &mut local_progress);
+                            if let Err(err) = remove_dir_all_fast_recursive(&child, &mut local_progress) {
+                                if let Ok(mut guard) = w_err_ref.lock()
+                                    && guard.is_none()
+                                {
+                                    *guard = Some(err);
+                                }
+                            }
                         } else {
-                            let size = remove_file_or_symlink_with_retry(&child).unwrap_or(0);
-                            local_progress(size);
+                            match remove_file_or_symlink_with_retry(&child) {
+                                Ok(size) => local_progress(size),
+                                Err(err) => {
+                                    if let Ok(mut guard) = w_err_ref.lock()
+                                        && guard.is_none()
+                                    {
+                                        *guard = Some(err);
+                                    }
+                                }
+                            }
                         }
                     }
                     if local_bytes > 0
@@ -525,17 +654,13 @@ where
         });
     }
 
-    ensure_path_writable(path);
-    if fs::remove_dir(path).is_err() {
-        // 若仍有殘留項目（例如 macOS Finder 動態寫入的 .DS_Store 或特殊屬性），
-        // 執行最終保底清理，確保 100% 清空
-        let _ = fs::remove_dir_all(path);
+    let dir_res = remove_dir_with_retry(path);
+    if let Ok(guard) = worker_error.into_inner()
+        && let Some(err) = guard
+    {
+        return Err(err);
     }
-    if path.exists() {
-        ensure_path_writable(path);
-        fs::remove_dir_all(path)?;
-    }
-    Ok(())
+    dir_res
 }
 
 /// 建立 paste 成功後的狀態文字，讓同步與背景流程使用相同規則。

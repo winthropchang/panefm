@@ -479,38 +479,80 @@ fn remove_path(path: &Path) -> io::Result<()> {
         #[cfg(windows)]
         {
             if file_type.is_dir() {
-                let _ = fs::remove_dir(path);
-                return Ok(());
+                return fs::remove_dir(path);
             }
         }
-        let _ = fs::remove_file(path);
-        return Ok(());
+        return fs::remove_file(path);
     }
 
     if file_type.is_dir() {
         ensure_path_writable(path);
+        let mut child_error = None;
         if let Ok(read_dir) = fs::read_dir(path) {
             for entry in read_dir.flatten() {
                 let entry_path = entry.path();
-                let _ = remove_path(&entry_path);
+                if let Err(err) = remove_path(&entry_path) {
+                    if child_error.is_none() {
+                        child_error = Some(err);
+                    }
+                }
             }
         }
         ensure_path_writable(path);
-        let _ = fs::remove_dir(path);
+        if fs::remove_dir(path).is_ok() {
+            return child_error.map_or(Ok(()), Err);
+        }
+
+        // 若直接 remove_dir 失敗（例如 SMB 鎖定延遲或 macOS 產生 .DS_Store），退避重試
+        let backoff_delays = [
+            std::time::Duration::from_millis(15),
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(120),
+        ];
+        for delay in backoff_delays {
+            if !path.exists() {
+                return child_error.map_or(Ok(()), Err);
+            }
+            std::thread::sleep(delay);
+            ensure_path_writable(path);
+            if let Ok(read_dir) = fs::read_dir(path) {
+                for entry in read_dir.flatten() {
+                    let _ = remove_path(&entry.path());
+                }
+            }
+            ensure_path_writable(path);
+            if fs::remove_dir(path).is_ok() || fs::remove_dir_all(path).is_ok() {
+                return child_error.map_or(Ok(()), Err);
+            }
+        }
+
+        if let Some(err) = child_error {
+            return Err(err);
+        }
+        if path.exists() {
+            ensure_path_writable(path);
+            if fs::remove_dir(path).is_err() {
+                if let Err(all_err) = fs::remove_dir_all(path) {
+                    return Err(all_err);
+                }
+            }
+        }
     } else {
         ensure_path_writable(path);
         if let Err(err) = fs::remove_file(path)
             && err.kind() != io::ErrorKind::NotFound
         {
             ensure_path_writable(path);
-            let _ = fs::remove_file(path);
+            fs::remove_file(path)?;
         }
     }
 
     if path.exists() {
-        ensure_path_writable(path);
-        let _ = fs::remove_dir(path);
-        let _ = fs::remove_file(path);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to remove path '{}': path still exists", path.display()),
+        ));
     }
     Ok(())
 }
