@@ -633,24 +633,48 @@ impl VcsManager {
         let (resp_tx, resp_rx) = mpsc::channel::<VcsQueryResponse>();
 
         thread::spawn(move || {
-            let mut cache: HashMap<PathBuf, (Option<Arc<VcsRepoInfo>>, Instant)> = HashMap::new();
+            // 單一目錄快取（針對 SVN、非版控目錄或直接命中的快速路徑）
+            let mut dir_cache: HashMap<PathBuf, (Option<Arc<VcsRepoInfo>>, Instant)> =
+                HashMap::new();
+            // Git 倉庫級別快取：以 repo_root 為鍵值，跨目錄共用整座倉庫的狀態
+            let mut git_repo_cache: HashMap<PathBuf, (Arc<VcsRepoInfo>, Instant)> = HashMap::new();
             let cache_ttl = Duration::from_secs(5);
 
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
                     VcsWorkerCommand::Invalidate { directory } => match directory {
-                        None => cache.clear(),
+                        None => {
+                            dir_cache.clear();
+                            git_repo_cache.clear();
+                        }
                         Some(dir) => {
-                            cache.retain(|cached_dir, _| {
-                                !cached_dir.starts_with(&dir) && !dir.starts_with(cached_dir)
+                            let affected_repos: Vec<PathBuf> = git_repo_cache
+                                .keys()
+                                .filter(|repo_root| {
+                                    dir.starts_with(repo_root) || repo_root.starts_with(&dir)
+                                })
+                                .cloned()
+                                .collect();
+
+                            for repo_root in &affected_repos {
+                                git_repo_cache.remove(repo_root);
+                            }
+
+                            dir_cache.retain(|cached_dir, _| {
+                                let affected_by_dir =
+                                    cached_dir.starts_with(&dir) || dir.starts_with(cached_dir);
+                                let affected_by_repo = affected_repos
+                                    .iter()
+                                    .any(|repo| cached_dir.starts_with(repo));
+                                !affected_by_dir && !affected_by_repo
                             });
                         }
                     },
                     VcsWorkerCommand::Query { pane_id, directory } => {
                         let now = Instant::now();
 
-                        // 檢查是否有未過期快取（以 directory 為 key）
-                        if let Some((cached_info, timestamp)) = cache.get(&directory)
+                        // 1. 快速路徑：檢查特定目錄是否已有未過期快取
+                        if let Some((cached_info, timestamp)) = dir_cache.get(&directory)
                             && now.duration_since(*timestamp) < cache_ttl
                         {
                             let _ = resp_tx.send(VcsQueryResponse {
@@ -661,22 +685,41 @@ impl VcsManager {
                             continue;
                         }
 
-                        // 搜尋所有候選 VCS 根目錄，嘗試查詢（內層損毀自動回退至外層）
+                        // 2. 搜尋候選根目錄（內層優先，依「SVN 優先於 Git」原則排序）
                         let candidates = find_vcs_candidates(&directory);
                         let mut resolved_info = None;
 
                         for (vcs_type, repo_root) in candidates {
                             let info = match vcs_type {
-                                VcsType::Git => query_git_repo_info(&repo_root, &directory),
-                                VcsType::Svn => query_svn_repo_info(&repo_root, &directory),
+                                VcsType::Git => {
+                                    // 跨目錄快取檢查：若同一 Git 倉庫已有有效快取，直接共用！
+                                    if let Some((cached_repo, timestamp)) =
+                                        git_repo_cache.get(&repo_root)
+                                        && now.duration_since(*timestamp) < cache_ttl
+                                    {
+                                        Some(cached_repo.clone())
+                                    } else {
+                                        let queried = query_git_repo_info(&repo_root, &directory)
+                                            .map(Arc::new);
+                                        if let Some(ref git_info) = queried {
+                                            git_repo_cache
+                                                .insert(repo_root.clone(), (git_info.clone(), now));
+                                        }
+                                        queried
+                                    }
+                                }
+                                VcsType::Svn => {
+                                    query_svn_repo_info(&repo_root, &directory).map(Arc::new)
+                                }
                             };
                             if let Some(info) = info {
-                                resolved_info = Some(Arc::new(info));
+                                resolved_info = Some(info);
                                 break;
                             }
                         }
 
-                        cache.insert(directory.clone(), (resolved_info.clone(), now));
+                        // 將查詢結果快取至 dir_cache（包含非版控目錄 None 的負快取）
+                        dir_cache.insert(directory.clone(), (resolved_info.clone(), now));
 
                         let _ = resp_tx.send(VcsQueryResponse {
                             pane_id,

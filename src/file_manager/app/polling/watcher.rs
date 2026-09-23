@@ -10,8 +10,9 @@ impl App {
     /// 接收檔案系統 watcher 事件，去重後刷新所有顯示受影響目錄的 panel。
     ///
     /// 參數：無；監看目錄來自目前 `panes`，事件來自 [`FilesystemWatcher`] channel。
-    /// 回傳：`()`；watcher 或單一目錄刷新失敗只寫入狀態列，不會結束主事件迴圈。
-    pub(crate) fn poll_filesystem_watcher(&mut self) {
+    /// 回傳：`bool`；若有任何目錄被刷新或狀態列變更則回傳 `true`，供主迴圈判定是否重繪。
+    pub(crate) fn poll_filesystem_watcher(&mut self) -> bool {
+        let mut changed_anything = false;
         let directories = self
             .panes
             .values()
@@ -22,11 +23,12 @@ impl App {
                 let errors = watcher.sync_directories(directories);
                 (watcher.changed_directories(), errors)
             }
-            None => return,
+            None => return false,
         };
 
         if !watch_errors.is_empty() {
             self.status = format!("filesystem watcher failed: {}", watch_errors.join(" | "));
+            changed_anything = true;
         }
         if !changed.is_empty() {
             // 如果目前有背景檔案傳輸或寫入進行中，且變更的目錄包含正在寫入的忙碌路徑，
@@ -65,10 +67,10 @@ impl App {
         }
 
         let Some(deadline) = self.filesystem_refresh_deadline else {
-            return;
+            return changed_anything;
         };
         if Instant::now() < deadline {
-            return;
+            return changed_anything;
         }
 
         self.filesystem_refresh_deadline = None;
@@ -76,6 +78,7 @@ impl App {
         if let Err(error) = self.reload_watched_directories(&changed) {
             self.status = format!("automatic directory refresh failed: {error}");
         }
+        true
     }
 
     /// 重新載入目前工作目錄出現在 watcher 變更集合中的所有 panel。
@@ -131,17 +134,17 @@ impl App {
     /// 非阻塞接收 UNC `goto` 的背景載入結果，完成後才替換指定 panel。
     ///
     /// 參數：無；資料來自 `network_goto_rx`。
-    /// 回傳：`()`；尚未完成時立即返回，取消後晚到的結果也不會被套用。
-    pub(crate) fn poll_network_goto(&mut self) {
+    /// 回傳：`bool`；若有工作完成或失敗變更狀態則回傳 `true`。
+    pub(crate) fn poll_network_goto(&mut self) -> bool {
         let Some(receiver) = self.network_goto_rx.take() else {
-            return;
+            return false;
         };
 
         let event = match receiver.try_recv() {
             Ok(event) => event,
             Err(mpsc::TryRecvError::Empty) => {
                 self.network_goto_rx = Some(receiver);
-                return;
+                return false;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 if let Some(task_id) = self.active_network_goto_task_id.take() {
@@ -152,12 +155,12 @@ impl App {
                     );
                 }
                 self.status = String::from("network goto failed: worker disconnected");
-                return;
+                return true;
             }
         };
 
         if self.active_network_goto_task_id != Some(event.task_id) {
-            return;
+            return false;
         }
         self.active_network_goto_task_id = None;
 
@@ -187,5 +190,6 @@ impl App {
                 self.status = format!("path jump failed: {} ({error})", event.target.display());
             }
         }
+        true
     }
 }

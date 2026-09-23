@@ -158,57 +158,79 @@ fn run_app(
     let mut last_cursor_mode = None;
     let mut presented_frame: Option<(Buffer, Option<Position>)> = None;
     let mut last_synced_cwd: Option<PathBuf> = None;
+    let mut needs_redraw = true;
 
     loop {
-        // 每輪先吸收有限量背景訊息再繪圖，讓搜尋結果能逐批出現，同時避免 channel
-        // 一次灌入太多資料而延後鍵盤事件。full redraw 只用於 Windows/SMB 等可能
-        // 留下舊 cell 的情況，平常交給 ratatui diff rendering 降低閃爍。
-        app.poll_background_tasks();
+        // 每輪先吸收有限量背景訊息再繪圖，若有背景任務更新則標記重繪。
+        // full redraw 只用於 Windows/SMB 等可能留下舊 cell 的情況，平常交給 ratatui diff rendering 降低閃爍。
+        let bg_changed = app.poll_background_tasks();
+        if bg_changed {
+            needs_redraw = true;
+        }
         let full_redraw_requested = app.take_full_redraw_request();
         if full_redraw_requested {
             presented_frame = None;
-        }
-        terminal.autoresize()?;
-        terminal.current_buffer_mut().reset();
-        let (buffer, cursor_position) = {
-            let mut frame = terminal.get_frame();
-            let cursor_position = app.render(&mut frame).map(Position::from);
-            (frame.buffer_mut().clone(), cursor_position)
-        };
-        let frame_changed = full_redraw_requested
-            || presented_frame
-                .as_ref()
-                .is_none_or(|(previous_buffer, previous_cursor)| {
-                    previous_buffer != &buffer || *previous_cursor != cursor_position
-                });
-        if frame_changed {
-            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-            terminal.apply_buffer_with_cursor(cursor_position)?;
-            presented_frame = Some((buffer, cursor_position));
-            sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
-            if let Some(active_cwd) = app.active_pane_cwd()
-                && last_synced_cwd.as_deref() != Some(active_cwd)
-            {
-                let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
-                last_synced_cwd = Some(active_cwd.to_path_buf());
-            }
-            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-        } else {
-            // Manual rendering leaves the candidate buffer active when it is not presented.
-            // Reset it so the next pass starts from the same clean state as Terminal::draw().
-            terminal.current_buffer_mut().reset();
-            sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
+            needs_redraw = true;
         }
 
-        if event::poll(poll_rate)? {
+        // 閒置重繪優化：待機無按鍵、無背景更新時完全跳過 render 與緩衝區 diffing，使 CPU 待機歸零。
+        if needs_redraw || presented_frame.is_none() {
+            terminal.autoresize()?;
+            terminal.current_buffer_mut().reset();
+            let (buffer, cursor_position) = {
+                let mut frame = terminal.get_frame();
+                let cursor_position = app.render(&mut frame).map(Position::from);
+                (frame.buffer_mut().clone(), cursor_position)
+            };
+            let frame_changed = full_redraw_requested
+                || presented_frame
+                    .as_ref()
+                    .is_none_or(|(previous_buffer, previous_cursor)| {
+                        previous_buffer != &buffer || *previous_cursor != cursor_position
+                    });
+            if frame_changed {
+                let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+                terminal.apply_buffer_with_cursor(cursor_position)?;
+                presented_frame = Some((buffer, cursor_position));
+                sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
+                if let Some(active_cwd) = app.active_pane_cwd()
+                    && last_synced_cwd.as_deref() != Some(active_cwd)
+                {
+                    let _ = sync_terminal_working_directory(terminal.backend_mut(), active_cwd);
+                    last_synced_cwd = Some(active_cwd.to_path_buf());
+                }
+                let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            } else {
+                // Manual rendering leaves the candidate buffer active when it is not presented.
+                // Reset it so the next pass starts from the same clean state as Terminal::draw().
+                terminal.current_buffer_mut().reset();
+                sync_cursor_style(terminal, app.rename_cursor_mode(), &mut last_cursor_mode)?;
+            }
+            needs_redraw = false;
+        }
+
+        let poll_timeout = app.next_event_timeout(poll_rate);
+
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    if should_handle_key_event(key.kind) && !app.handle_key(key)? {
-                        break;
+                    if should_handle_key_event(key.kind) {
+                        if !app.handle_key(key)? {
+                            break;
+                        }
+                        needs_redraw = true;
                     }
                 }
                 Event::Paste(text) => {
                     app.handle_bracketed_paste(&text)?;
+                    needs_redraw = true;
+                }
+                Event::Resize(_, _) => {
+                    presented_frame = None;
+                    needs_redraw = true;
+                }
+                Event::FocusGained | Event::FocusLost => {
+                    needs_redraw = true;
                 }
                 _ => {}
             }
@@ -222,6 +244,7 @@ fn run_app(
             app.finish_launch_task(queued.task_id, result);
             last_cursor_mode = None;
             presented_frame = None;
+            needs_redraw = true;
         }
 
         // fzf 會接管 alternate screen，必須走專用生命週期完整關閉再重建 TUI。
@@ -237,6 +260,7 @@ fn run_app(
             }
             last_cursor_mode = None;
             presented_frame = None;
+            needs_redraw = true;
         }
     }
 

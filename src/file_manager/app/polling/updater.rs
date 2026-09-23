@@ -1,9 +1,9 @@
 use super::super::*;
 
 impl App {
-    pub(crate) fn poll_update_check(&mut self) {
+    pub(crate) fn poll_update_check(&mut self) -> bool {
         let Some(rx) = &self.update_check_rx else {
-            return;
+            return false;
         };
         match rx.try_recv() {
             Ok(result) => {
@@ -21,23 +21,27 @@ impl App {
                     });
                 }
                 self.update_check_rx = None;
+                true
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.update_check_rx = None;
+                false
             }
         }
     }
 
     /// 輪詢就地升級工作進度與結果。
-    pub(crate) fn poll_in_app_update(&mut self) {
+    pub(crate) fn poll_in_app_update(&mut self) -> bool {
         let Some(rx) = &self.in_app_update_rx else {
-            return;
+            return false;
         };
         let mut disconnected = false;
+        let mut changed = false;
         loop {
             match rx.try_recv() {
                 Ok(InAppUpdateMsg::Progress { downloaded, total }) => {
+                    changed = true;
                     let dl_mb = downloaded as f64 / (1024.0 * 1024.0);
                     if let Some(total_bytes) = total {
                         let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
@@ -55,7 +59,7 @@ impl App {
                     self.in_app_update_rx = None;
                     self.update_badge_info = None;
                     self.status = format!("✅ 成功升級至 v{latest_version}！請重啟 panefm 生效。");
-                    return;
+                    return true;
                 }
                 Ok(InAppUpdateMsg::Completed(Err(err))) => {
                     self.in_app_updating = false;
@@ -66,7 +70,7 @@ impl App {
                     } else {
                         self.status = format!("❌ 升級失敗: {err}");
                     }
-                    return;
+                    return true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -79,6 +83,7 @@ impl App {
             self.in_app_updating = false;
             self.in_app_update_rx = None;
         }
+        changed
     }
 
     /// 在 TUI 內部觸發就地升級程序。

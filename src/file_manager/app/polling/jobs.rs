@@ -6,8 +6,9 @@ impl App {
     /// 非阻塞接收大型 paste/compress/extract 工作，並在主執行緒更新 UI 與 Undo。
     ///
     /// 參數：無；接收端保存於 `file_job_receivers`。
-    /// 回傳：`()`；每一輪只檢查現有 task，不等待尚未完成的 worker。
-    pub(crate) fn poll_file_jobs(&mut self) {
+    /// 回傳：`bool`；若有任何進度更新或工作完成則回傳 `true`。
+    pub(crate) fn poll_file_jobs(&mut self) -> bool {
+        let mut changed = false;
         let task_ids = self.file_job_receivers.keys().copied().collect::<Vec<_>>();
         for task_id in task_ids {
             let Some(receiver) = self.file_job_receivers.remove(&task_id) else {
@@ -19,12 +20,14 @@ impl App {
                 match receiver.try_recv() {
                     Ok(FileJobEvent::DestinationVisible { target_dir }) => {
                         refresh_target = Some(target_dir);
+                        changed = true;
                     }
                     Ok(FileJobEvent::Progress {
                         task_id,
                         completed_bytes,
                         total_bytes,
                     }) => {
+                        changed = true;
                         self.update_task_progress(task_id, completed_bytes, total_bytes);
                         if let Some(task) = self.task_log.iter().find(|t| t.id == task_id) {
                             let pct = task.progress_percent.unwrap_or(0);
@@ -52,11 +55,13 @@ impl App {
                     Ok(event) => {
                         self.apply_file_job_event(event);
                         completed = true;
+                        changed = true;
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         completed = true;
+                        changed = true;
                         if self
                             .task_log
                             .iter()
@@ -98,6 +103,7 @@ impl App {
                 }
             }
         }
+        changed
     }
 
     /// 套用單一背景檔案工作的完成結果。

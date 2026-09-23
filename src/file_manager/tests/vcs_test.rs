@@ -355,6 +355,94 @@ fn vcs_manager_query_and_response() {
 }
 
 #[test]
+/// 驗證 VcsManager 背景 Worker 具備 Git 跨目錄快取共用機制與精準失效。
+/// 保護目的：同專案切換子目錄時（如 src/ 至 tests/）共用 repo 快取，0 行程啟動開銷；檔案變動時精準失效。
+fn vcs_manager_cross_directory_git_cache_sharing_and_invalidation() {
+    let manager = super::VcsManager::new();
+    let temp = tempdir().expect("tempdir");
+
+    // 建立臨時 Git 儲存庫結構
+    let git_dir = temp.path().join(".git");
+    fs::create_dir(&git_dir).expect("create .git");
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/perf/vcs-cache\n").expect("write HEAD");
+
+    let sub_dir_a = temp.path().join("src").join("ui");
+    let sub_dir_b = temp.path().join("tests").join("integration");
+    fs::create_dir_all(&sub_dir_a).expect("create sub_dir_a");
+    fs::create_dir_all(&sub_dir_b).expect("create sub_dir_b");
+
+    // 1. 首次查詢 sub_dir_a
+    manager.request_query(1, sub_dir_a.clone());
+    let mut resp_a = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        if let Some(resp) = manager.try_recv_response()
+            && resp.directory == sub_dir_a
+        {
+            resp_a = Some(resp);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let info_a = resp_a
+        .expect("必須收到 sub_dir_a 查詢結果")
+        .info
+        .expect("必須偵測到 Git 資訊");
+    assert_eq!(info_a.branch_or_rev, "perf/vcs-cache");
+
+    // 2. 跨目錄查詢 sub_dir_b（同一 Git 倉庫之不同子目錄）
+    manager.request_query(2, sub_dir_b.clone());
+    let mut resp_b = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        if let Some(resp) = manager.try_recv_response()
+            && resp.directory == sub_dir_b
+        {
+            resp_b = Some(resp);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let info_b = resp_b
+        .expect("必須收到 sub_dir_b 查詢結果")
+        .info
+        .expect("必須偵測到 Git 資訊");
+
+    // 核心驗證：info_a 與 info_b 必須指向相同的 Arc（跨目錄快取命中，未重複執行 git 指令）
+    assert!(
+        std::sync::Arc::ptr_eq(&info_a, &info_b),
+        "跨目錄查詢同倉庫子目錄必須命中 git_repo_cache 並共用同一個 Arc 實例"
+    );
+
+    // 3. 測試失效機制：當 watcher 發送失效通知
+    manager.invalidate(Some(sub_dir_a.clone()));
+
+    // 4. 失效後再次查詢 sub_dir_b，應產生重新查詢之新結果
+    manager.request_query(3, sub_dir_b.clone());
+    let mut resp_c = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        if let Some(resp) = manager.try_recv_response()
+            && resp.pane_id == 3
+        {
+            resp_c = Some(resp);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let info_c = resp_c
+        .expect("必須收到失效後新查詢結果")
+        .info
+        .expect("必須重新取得 Git 資訊");
+
+    assert_eq!(info_c.branch_or_rev, "perf/vcs-cache");
+    assert!(
+        !std::sync::Arc::ptr_eq(&info_a, &info_c),
+        "快取失效後必須重新構建新的 VcsRepoInfo 實例"
+    );
+}
+
+#[test]
 /// 驗證 `is_valid_git_dir` 能精準識別空 .git 目錄與真正的 Git 儲存庫。
 /// 保護目的：避免子目錄中殘留空 .git 資料夾時誤將其判定為 Git，遮蔽上層有效的 SVN 儲存庫。
 fn is_valid_git_dir_differentiates_real_and_empty_dirs() {

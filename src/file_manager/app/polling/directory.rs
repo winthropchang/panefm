@@ -180,8 +180,9 @@ impl App {
 
     /// 非阻塞接收大型目錄清單；分批套用快速發現項目，並在完成時更新快取與 size linemode。
     ///
-    /// 參數：無。回傳：`() `；第一批（< 1ms）讓 UI 立即畫出列表與響應游標，後續增量批次平滑呈現。
-    pub(crate) fn poll_directory_load_jobs(&mut self) {
+    /// 參數：無。回傳：`bool`；若有任何目錄資料載入並更新畫面則回傳 `true`。
+    pub(crate) fn poll_directory_load_jobs(&mut self) -> bool {
+        let mut changed = false;
         let pane_ids = self.directory_load_jobs.keys().copied().collect::<Vec<_>>();
         for pane_id in pane_ids {
             let mut job_done = false;
@@ -192,6 +193,9 @@ impl App {
             else {
                 continue;
             };
+            if !events.is_empty() {
+                changed = true;
+            }
             for event in events {
                 if event.cwd != job_cwd {
                     continue;
@@ -278,13 +282,15 @@ impl App {
                 self.directory_load_jobs.remove(&pane_id);
             }
         }
+        changed
     }
 
     /// 非阻塞套用各 panel 的目錄大小快照。
     ///
     /// 參數：無，資料來自 `directory_size_jobs`。
-    /// 回傳：`() `；每個 job 每幀最多處理 64 筆，避免大量小目錄拖慢鍵盤事件。
-    pub(crate) fn poll_directory_size_jobs(&mut self) {
+    /// 回傳：`bool`；若有任何目錄大小被更新則回傳 `true`。
+    pub(crate) fn poll_directory_size_jobs(&mut self) -> bool {
+        let mut changed = false;
         let pane_ids = self.directory_size_jobs.keys().copied().collect::<Vec<_>>();
         for pane_id in pane_ids {
             let mut finished = false;
@@ -308,6 +314,9 @@ impl App {
                 .get(&pane_id)
                 .is_some_and(|pane| pane.cwd == job_cwd);
             if cwd_matches && let Some(pane) = self.panes.get_mut(&pane_id) {
+                if !updates.is_empty() {
+                    changed = true;
+                }
                 for (path, bytes, complete) in updates {
                     pane.update_directory_size(&path, bytes, complete);
                 }
@@ -316,5 +325,6 @@ impl App {
                 self.cancel_directory_size_scan(pane_id);
             }
         }
+        changed
     }
 }

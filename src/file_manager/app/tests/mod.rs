@@ -51,6 +51,7 @@ mod easymotion;
 mod file_ops;
 mod filter;
 mod help;
+mod idle_optimization;
 mod input_editor;
 mod navigation;
 mod panes;

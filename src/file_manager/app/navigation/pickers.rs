@@ -232,13 +232,13 @@ impl App {
     }
 
     /// 輪詢背景目錄比對工作的接收端，非阻塞更新差異矩陣。
-    pub(crate) fn poll_diff_job(&mut self) {
+    pub(crate) fn poll_diff_job(&mut self) -> bool {
         let Some(receiver) = &self.diff_job_rx else {
-            return;
+            return false;
         };
         let messages: Vec<DiffJobEvent> = receiver.try_iter().collect();
         if messages.is_empty() {
-            return;
+            return false;
         }
 
         for message in messages {
@@ -267,6 +267,7 @@ impl App {
                 }
             }
         }
+        true
     }
 
     /// 打開書籤列表彈窗，讓使用者可以用列表方式跳轉既有書籤。
