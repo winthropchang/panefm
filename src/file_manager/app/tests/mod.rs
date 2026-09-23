@@ -54,6 +54,7 @@ mod help;
 mod input_editor;
 mod navigation;
 mod panes;
+mod paste_conflicts;
 mod pickers;
 mod preview;
 mod preview_search;

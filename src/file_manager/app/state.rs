@@ -226,6 +226,10 @@ pub(crate) enum PendingAction {
         target_name: String,
         entry_count: usize,
         operation: ClipboardOperation,
+        conflicts: Vec<PasteConflictItem>,
+        current_index: usize,
+        selected_option: usize,
+        decisions: Vec<(PathBuf, CollisionStrategy)>,
     },
     ConfirmTrashAction {
         action: TrashConfirmAction,
@@ -436,4 +440,85 @@ pub(crate) enum InAppUpdateMsg {
     },
     /// 升級結束事件（成功回傳新版本字串，失敗回傳錯誤訊息）。
     Completed(Result<String, String>),
+}
+
+/// 單一檔案貼上衝突項目資訊。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PasteConflictItem {
+    pub(crate) entry_index: usize,
+    pub(crate) display_name: String,
+    pub(crate) source_path: PathBuf,
+    pub(crate) target_path: PathBuf,
+    pub(crate) is_dir: bool,
+}
+
+/// 檔案衝突處理策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollisionStrategy {
+    Overwrite,
+    Rename,
+    Skip,
+}
+
+/// 貼上衝突選單中的使用者可選選項。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasteConflictChoice {
+    Overwrite,
+    OverwriteAll,
+    AutoRename,
+    AutoRenameAll,
+    Skip,
+    SkipAll,
+    Cancel,
+}
+
+impl PasteConflictChoice {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Overwrite => "Overwrite",
+            Self::OverwriteAll => "Overwrite All",
+            Self::AutoRename => "Auto-rename",
+            Self::AutoRenameAll => "Auto-rename All",
+            Self::Skip => "Skip",
+            Self::SkipAll => "Skip All",
+            Self::Cancel => "Cancel",
+        }
+    }
+
+    pub(crate) fn description(&self) -> &'static str {
+        match self {
+            Self::Overwrite => "Replace existing item",
+            Self::OverwriteAll => "Replace all remaining conflicting items",
+            Self::AutoRename => "Keep both, rename this item",
+            Self::AutoRenameAll => "Keep both, rename all conflicting items",
+            Self::Skip => "Skip this item",
+            Self::SkipAll => "Skip all remaining conflicting items",
+            Self::Cancel => "Abort operation",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn hotkey(&self) -> char {
+        match self {
+            Self::Overwrite => 'o',
+            Self::OverwriteAll => 'O',
+            Self::AutoRename => 'r',
+            Self::AutoRenameAll => 'R',
+            Self::Skip => 's',
+            Self::SkipAll => 'S',
+            Self::Cancel => 'c',
+        }
+    }
+
+    pub(crate) fn hotkey_display(&self) -> &'static str {
+        match self {
+            Self::Overwrite => "o",
+            Self::OverwriteAll => "O",
+            Self::AutoRename => "r",
+            Self::AutoRenameAll => "R",
+            Self::Skip => "s",
+            Self::SkipAll => "S",
+            Self::Cancel => "Esc",
+        }
+    }
 }

@@ -43,16 +43,19 @@ pub(crate) fn render_pending_action_overlay(
         }
         Some(PendingAction::ConfirmPasteOverwrite {
             target_name,
-            entry_count,
+            conflicts,
+            current_index,
+            selected_option,
             ..
         }) => {
             render_paste_overwrite_dialog(
                 frame,
                 frame.area(),
                 target_name,
-                *entry_count,
+                *current_index,
+                conflicts.len(),
+                *selected_option,
                 app.theme,
-                &app.config,
             );
         }
         Some(PendingAction::ConfirmTrashAction {

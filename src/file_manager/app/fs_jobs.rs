@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use ignore::{WalkBuilder, WalkState};
 
-use super::{ClipboardOperation, ClipboardState};
+use super::{ClipboardOperation, ClipboardState, CollisionStrategy};
 use crate::file_manager::archive::ExtractedArchive;
 use crate::file_manager::entry::FileEntry;
 use crate::file_manager::operation_history::OperationItem;
@@ -173,10 +173,33 @@ pub(crate) fn is_probably_network_or_external_path(path: &Path) -> bool {
 /// 參數：`clipboard: &ClipboardState` 為固定來源；`target_dir: &Path` 為目的目錄；
 /// `overwrite: bool` 表示是否覆蓋。
 /// 回傳：`PasteJobResult`，包含成功的 Undo 資料及第一個失敗項目。
+#[allow(dead_code)]
 pub(crate) fn perform_paste_job<F>(
     clipboard: &ClipboardState,
     target_dir: &Path,
     overwrite: bool,
+    progress: &mut F,
+) -> PasteJobResult
+where
+    F: FnMut(TransferProgress),
+{
+    let default_strategy = if overwrite {
+        CollisionStrategy::Overwrite
+    } else {
+        CollisionStrategy::Rename
+    };
+    let mut strategies = std::collections::HashMap::new();
+    for entry in &clipboard.entries {
+        strategies.insert(entry.source_path.clone(), default_strategy);
+    }
+    perform_paste_job_with_strategies(clipboard, target_dir, &strategies, progress)
+}
+
+/// 在 worker 執行完整 paste 批次，並依各項目指定的碰撞策略處理。
+pub(crate) fn perform_paste_job_with_strategies<F>(
+    clipboard: &ClipboardState,
+    target_dir: &Path,
+    strategies: &std::collections::HashMap<PathBuf, CollisionStrategy>,
     progress: &mut F,
 ) -> PasteJobResult
 where
@@ -191,6 +214,21 @@ where
         {
             continue;
         }
+
+        let strategy = strategies
+            .get(&entry.source_path)
+            .copied()
+            .unwrap_or(CollisionStrategy::Overwrite);
+
+        if strategy == CollisionStrategy::Skip {
+            continue;
+        }
+
+        let overwrite = match strategy {
+            CollisionStrategy::Overwrite => true,
+            CollisionStrategy::Rename => false,
+            CollisionStrategy::Skip => unreachable!(),
+        };
 
         let planned_target =
             PaneState::planned_paste_target_in_dir(&entry.source_path, target_dir, overwrite)

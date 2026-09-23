@@ -275,9 +275,28 @@ impl App {
                 ]);
                 Some(hints)
             }
-            PendingAction::ConfirmDelete { .. }
-            | PendingAction::ConfirmPasteOverwrite { .. }
-            | PendingAction::ConfirmTrashAction { .. } => {
+            PendingAction::ConfirmPasteOverwrite { .. } => {
+                hints.extend_from_slice(&[
+                    StatusShortcutHint {
+                        key: "o",
+                        label: "overwrite",
+                    },
+                    StatusShortcutHint {
+                        key: "r",
+                        label: "rename",
+                    },
+                    StatusShortcutHint {
+                        key: "s",
+                        label: "skip",
+                    },
+                    StatusShortcutHint {
+                        key: "Esc",
+                        label: "cancel",
+                    },
+                ]);
+                Some(hints)
+            }
+            PendingAction::ConfirmDelete { .. } | PendingAction::ConfirmTrashAction { .. } => {
                 hints.extend_from_slice(&[
                     StatusShortcutHint {
                         key: "y",

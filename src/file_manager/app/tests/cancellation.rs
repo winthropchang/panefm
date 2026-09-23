@@ -332,6 +332,10 @@ fn q_cancels_confirmation_dialogs() {
         target_name: String::from("target.txt"),
         entry_count: 1,
         operation: ClipboardOperation::Copy,
+        conflicts: Vec::new(),
+        current_index: 0,
+        selected_option: 0,
+        decisions: Vec::new(),
     });
     app.handle_pending_action_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
         .expect("q cancels overwrite");

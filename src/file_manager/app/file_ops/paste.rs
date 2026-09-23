@@ -1,5 +1,6 @@
 //! 剪貼簿貼上、覆蓋確認、背景貼上任務與 Undo 復原歷史。
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -33,7 +34,7 @@ impl App {
     ///
     /// 規則：
     /// - 若沒有任何同名衝突，直接沿用一般貼上流程。
-    /// - 若有同名衝突，先詢問是否要整批覆蓋。
+    /// - 若有同名衝突，彈出衝突選單詢問使用者處理策略。
     /// - 若來源與目標本來就是同一路徑，仍維持原本的 duplicate 命名策略，不視為衝突。
     ///
     /// 參數：
@@ -47,13 +48,14 @@ impl App {
             self.status = String::from("clipboard is empty");
             return Ok(());
         };
-        let conflicts = self.paste_conflict_names()?;
+        let conflicts = self.paste_conflict_items()?;
         if conflicts.is_empty() {
             return self.paste_into_focused_pane_impl(false);
         }
 
+        let first_name = conflicts[0].display_name.clone();
         let target_name = if conflicts.len() == 1 {
-            conflicts[0].clone()
+            first_name.clone()
         } else {
             format!("{} items", conflicts.len())
         };
@@ -62,6 +64,10 @@ impl App {
             target_name: target_name.clone(),
             entry_count: clipboard.entries.len(),
             operation: clipboard.operation,
+            conflicts,
+            current_index: 0,
+            selected_option: 0,
+            decisions: Vec::new(),
         });
         self.status = paste_overwrite_confirm_status(&target_name, clipboard.entries.len());
         Ok(())
@@ -69,6 +75,41 @@ impl App {
 
     /// 負責實作一般貼上與覆蓋貼上的共用流程。
     pub(crate) fn paste_into_focused_pane_impl(&mut self, overwrite: bool) -> io::Result<()> {
+        let default_strategy = if overwrite {
+            CollisionStrategy::Overwrite
+        } else {
+            CollisionStrategy::Rename
+        };
+        let mut strategies = HashMap::new();
+        if let Some(clipboard) = &self.clipboard {
+            for entry in &clipboard.entries {
+                strategies.insert(entry.source_path.clone(), default_strategy);
+            }
+        }
+        self.paste_into_focused_pane_with_strategies(&strategies)
+    }
+
+    /// 依據對個別衝突項目所決定的碰撞策略執行貼上流程。
+    pub(crate) fn execute_paste_with_conflict_decisions(
+        &mut self,
+        decisions: Vec<(PathBuf, CollisionStrategy)>,
+    ) -> io::Result<()> {
+        let mut strategies: HashMap<PathBuf, CollisionStrategy> = decisions.into_iter().collect();
+        if let Some(clipboard) = &self.clipboard {
+            for entry in &clipboard.entries {
+                strategies
+                    .entry(entry.source_path.clone())
+                    .or_insert(CollisionStrategy::Overwrite);
+            }
+        }
+        self.paste_into_focused_pane_with_strategies(&strategies)
+    }
+
+    /// 依據指定的檔案碰撞策略表貼上內部剪貼簿中的項目。
+    pub(crate) fn paste_into_focused_pane_with_strategies(
+        &mut self,
+        strategies: &HashMap<PathBuf, CollisionStrategy>,
+    ) -> io::Result<()> {
         let Some(clipboard) = self.clipboard.clone() else {
             self.status = String::from("clipboard is empty");
             return Ok(());
@@ -83,16 +124,20 @@ impl App {
         };
 
         if paste_should_run_in_background(&clipboard, &target_dir) {
-            return self.start_background_paste(
+            return self.start_background_paste_with_strategies(
                 self.focused_pane,
                 target_dir,
                 clipboard,
-                overwrite,
+                strategies.clone(),
             );
         }
 
         let mut pasted_count = 0usize;
+        let mut skipped_count = 0usize;
+        let mut renamed_count = 0usize;
         let mut history_items = Vec::new();
+        let mut remaining_cut_entries = Vec::new();
+
         for entry in &clipboard.entries {
             if entry.source_path.parent() == Some(target_dir.as_path())
                 && clipboard.operation == ClipboardOperation::Cut
@@ -100,8 +145,28 @@ impl App {
                 continue;
             }
 
-            // 在真正執行前先保存目標名稱；失敗後檔案可能已被清理，不能再靠目錄內容
-            // 推測目的地。這也確保同名複製時能顯示實際的 `copy` 名稱。
+            let strategy = strategies
+                .get(&entry.source_path)
+                .copied()
+                .unwrap_or(CollisionStrategy::Overwrite);
+
+            if strategy == CollisionStrategy::Skip {
+                skipped_count += 1;
+                if clipboard.operation == ClipboardOperation::Cut {
+                    remaining_cut_entries.push(entry.clone());
+                }
+                continue;
+            }
+
+            let overwrite = match strategy {
+                CollisionStrategy::Overwrite => true,
+                CollisionStrategy::Rename => {
+                    renamed_count += 1;
+                    false
+                }
+                CollisionStrategy::Skip => unreachable!(),
+            };
+
             let planned_target = self
                 .panes
                 .get(&self.focused_pane)
@@ -144,16 +209,43 @@ impl App {
             });
         }
 
+        if pasted_count == 0 && skipped_count > 0 {
+            self.status = String::from("all conflicting items skipped; nothing pasted");
+            return Ok(());
+        }
+
         if pasted_count == 0 {
             self.status = String::from("nothing to paste into this directory");
             return Ok(());
         }
 
         self.reload_all_panes()?;
-        self.status = paste_success_status(clipboard.operation, overwrite, pasted_count);
+        if skipped_count > 0 {
+            let base = match clipboard.operation {
+                ClipboardOperation::Copy => format!("pasted copy: {pasted_count} item(s)"),
+                ClipboardOperation::Cut => format!("moved: {pasted_count} item(s)"),
+            };
+            self.status = format!("{base} (skipped {skipped_count} item(s))");
+        } else {
+            let has_overwrites = strategies
+                .values()
+                .any(|s| *s == CollisionStrategy::Overwrite);
+            self.status = paste_success_status(
+                clipboard.operation,
+                has_overwrites && renamed_count == 0,
+                pasted_count,
+            );
+        }
 
         if clipboard.operation == ClipboardOperation::Cut {
-            self.clipboard = None;
+            if remaining_cut_entries.is_empty() {
+                self.clipboard = None;
+            } else {
+                self.clipboard = Some(ClipboardState {
+                    operation: ClipboardOperation::Cut,
+                    entries: remaining_cut_entries,
+                });
+            }
         }
         self.record_file_operation(clipboard.operation, history_items);
 
@@ -161,20 +253,32 @@ impl App {
     }
 
     /// 把大型或網路目的地 paste 排入背景 task，避免傳輸期間凍結 TUI。
-    ///
-    /// 參數：
-    /// - `pane_id: usize`，啟動貼上的目標 panel。
-    /// - `target_dir: PathBuf`，實際目的目錄，可能是 UNC 或 macOS `/Volumes`。
-    /// - `clipboard: ClipboardState`，本次固定使用的來源批次與 copy/cut 模式。
-    /// - `overwrite: bool`，是否允許覆蓋同名項目。
-    ///
-    /// 回傳：`io::Result<()>`；成功表示工作已排入背景，完成結果稍後由主迴圈套用。
     pub(crate) fn start_background_paste(
         &mut self,
         pane_id: usize,
         target_dir: PathBuf,
         clipboard: ClipboardState,
         overwrite: bool,
+    ) -> io::Result<()> {
+        let default_strategy = if overwrite {
+            CollisionStrategy::Overwrite
+        } else {
+            CollisionStrategy::Rename
+        };
+        let mut strategies = HashMap::new();
+        for entry in &clipboard.entries {
+            strategies.insert(entry.source_path.clone(), default_strategy);
+        }
+        self.start_background_paste_with_strategies(pane_id, target_dir, clipboard, strategies)
+    }
+
+    /// 把大型或網路目的地 paste 依指定碰撞策略排入背景 task。
+    pub(crate) fn start_background_paste_with_strategies(
+        &mut self,
+        pane_id: usize,
+        target_dir: PathBuf,
+        clipboard: ClipboardState,
+        strategies: HashMap<PathBuf, CollisionStrategy>,
     ) -> io::Result<()> {
         let entry_count = clipboard.entries.len();
         let operation = clipboard.operation;
@@ -205,12 +309,11 @@ impl App {
             busy.push(entry.source_path.clone());
         }
         self.active_file_job_busy_paths.insert(task_id, busy);
-        // 背景 paste 一排入就顯示初始 byte，避免總大小尚未發現時 task 面板只有
-        // RUNNING 而沒有任何進度資訊。後續事件會逐步修正已完成量與總量。
         self.update_task_progress(task_id, 0, 1);
         let (sender, receiver) = mpsc::channel();
         let worker_clipboard = clipboard.clone();
         let worker_target_dir = target_dir.clone();
+        let worker_strategies = strategies.clone();
         thread::spawn(move || {
             let progress_sender = sender.clone();
             let progress_target_dir = worker_target_dir.clone();
@@ -237,9 +340,6 @@ impl App {
                     }
                     TransferProgress::TargetVisible => unreachable!(),
                 }
-                // 動態總量可能在相鄰檔案間持續增加；若每次都送到 App，task
-                // history 會持續寫檔並反過來拖慢數十萬個小檔案的 copy。固定節流為
-                // 每 500ms 最多一次，完成事件前仍會再送最後的精確值。
                 if last_progress_update.elapsed() >= Duration::from_millis(500) {
                     send_progress_if_changed(
                         &progress_sender,
@@ -251,10 +351,10 @@ impl App {
                     last_progress_update = Instant::now();
                 }
             };
-            let result = perform_paste_job(
+            let result = perform_paste_job_with_strategies(
                 &worker_clipboard,
                 &worker_target_dir,
-                overwrite,
+                &worker_strategies,
                 &mut progress,
             );
 
@@ -263,10 +363,13 @@ impl App {
                 completed_bytes,
                 total_bytes: total_bytes.max(completed_bytes),
             });
+            let effective_overwrite = worker_strategies
+                .values()
+                .any(|s| *s == CollisionStrategy::Overwrite);
             let _ = sender.send(FileJobEvent::Paste {
                 task_id,
                 clipboard: worker_clipboard,
-                overwrite,
+                overwrite: effective_overwrite,
                 result,
             });
         });
@@ -350,19 +453,8 @@ impl App {
         Ok(())
     }
 
-    /// 掃描這次貼上是否會和目前目標目錄中的既有項目同名。
-    ///
-    /// 規則：
-    /// - 只有「直接同名」的目標才算衝突。
-    /// - 若來源本身就位於同一個目錄，視為 duplicate copy / move 情境，不算衝突。
-    ///
-    /// 參數：
-    /// - `self: &App`，目前應用程式狀態。
-    ///
-    /// 回傳：`io::Result<Vec<String>>`。
-    /// - 成功時回傳所有會衝突的名稱清單。
-    /// - 失敗時回傳取得目標 pane 或檢查檔案資訊時的錯誤。
-    pub(crate) fn paste_conflict_names(&self) -> io::Result<Vec<String>> {
+    /// 掃描這次貼上是否會和目前目標目錄中的既有項目同名，並收集衝突項目詳細資訊。
+    pub(crate) fn paste_conflict_items(&self) -> io::Result<Vec<PasteConflictItem>> {
         let Some(clipboard) = self.clipboard.as_ref() else {
             return Ok(Vec::new());
         };
@@ -373,7 +465,7 @@ impl App {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "panel no longer exists"))?;
 
         let mut conflicts = Vec::new();
-        for entry in &clipboard.entries {
+        for (entry_index, entry) in clipboard.entries.iter().enumerate() {
             let Some(file_name) = entry.source_path.file_name() else {
                 continue;
             };
@@ -381,11 +473,28 @@ impl App {
             let same_location = entry.source_path.parent() == Some(target_dir.as_path())
                 && direct_target == entry.source_path;
             if !same_location && direct_target.exists() {
-                conflicts.push(entry.display_name.clone());
+                conflicts.push(PasteConflictItem {
+                    entry_index,
+                    display_name: entry.display_name.clone(),
+                    source_path: entry.source_path.clone(),
+                    target_path: direct_target,
+                    is_dir: entry.source_path.is_dir(),
+                });
             }
         }
 
         Ok(conflicts)
+    }
+
+    /// 掃描這次貼上是否會和目前目標目錄中的既有項目同名。
+    ///
+    /// 規則：
+    /// - 只有「直接同名」的目標才算衝突。
+    /// - 若來源本身就位於同一個目錄，視為 duplicate copy / move 情境，不算衝突。
+    #[allow(dead_code)]
+    pub(crate) fn paste_conflict_names(&self) -> io::Result<Vec<String>> {
+        self.paste_conflict_items()
+            .map(|items| items.into_iter().map(|item| item.display_name).collect())
     }
 
     /// 在使用者確認後，以覆蓋模式完成這次貼上。
