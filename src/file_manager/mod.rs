@@ -37,7 +37,7 @@ use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -212,27 +212,49 @@ fn run_app(
         let poll_timeout = app.next_event_timeout(poll_rate);
 
         if event::poll(poll_timeout)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if should_handle_key_event(key.kind) {
-                        if !app.handle_key(key)? {
-                            break;
+            let mut event_opt = Some(event::read()?);
+            let mut coalesced = 0;
+            let mut should_exit = false;
+
+            while let Some(event) = event_opt.take() {
+                match event {
+                    Event::Key(key) => {
+                        if should_handle_key_event(key.kind) {
+                            if !app.handle_key(key)? {
+                                should_exit = true;
+                                break;
+                            }
+                            needs_redraw = true;
                         }
+                    }
+                    Event::Paste(text) => {
+                        app.handle_bracketed_paste(&text)?;
                         needs_redraw = true;
                     }
+                    Event::Resize(_, _) => {
+                        presented_frame = None;
+                        needs_redraw = true;
+                    }
+                    Event::FocusGained | Event::FocusLost => {
+                        needs_redraw = true;
+                    }
+                    _ => {}
                 }
-                Event::Paste(text) => {
-                    app.handle_bracketed_paste(&text)?;
-                    needs_redraw = true;
+
+                if app.has_pending_external_takeover() {
+                    break;
                 }
-                Event::Resize(_, _) => {
-                    presented_frame = None;
-                    needs_redraw = true;
+
+                coalesced += 1;
+                // 長按滾動事件折疊：若輸入緩衝區內仍有排隊事件，一口氣在記憶體中消化（上限 16 個），
+                // 只做單次終端重繪，徹底消除鍵盤重複連發時的終端佇列積壓與輸入延遲（Input Lag）
+                if coalesced < 16 && event::poll(Duration::ZERO)? {
+                    event_opt = Some(event::read()?);
                 }
-                Event::FocusGained | Event::FocusLost => {
-                    needs_redraw = true;
-                }
-                _ => {}
+            }
+
+            if should_exit {
+                break;
             }
         }
 

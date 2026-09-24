@@ -291,6 +291,10 @@ fn apply_navigation_config(config: &mut AppConfig, navigation: NavigationConfigF
         config.navigation.panel_page_step = value;
     }
 
+    if let Some(value) = navigation.scroll_acceleration {
+        config.navigation.scroll_acceleration = value;
+    }
+
     Ok(())
 }
 

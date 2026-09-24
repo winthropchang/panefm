@@ -203,6 +203,7 @@ pub struct WatcherConfig {
 pub struct NavigationConfig {
     pub fast_move_step: usize,
     pub panel_page_step: usize,
+    pub scroll_acceleration: bool,
 }
 
 /// 表示互動行為相關的設定群組。
@@ -337,6 +338,7 @@ impl Default for AppConfig {
             navigation: NavigationConfig {
                 fast_move_step: 5,
                 panel_page_step: 10,
+                scroll_acceleration: true,
             },
             behavior: BehaviorConfig {
                 cancel_search_on_leave: true,

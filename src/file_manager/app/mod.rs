@@ -201,4 +201,9 @@ impl App {
     pub(crate) fn take_pending_fzf_jump(&mut self) -> Option<FzfJumpRequest> {
         self.pending_fzf_jump.take()
     }
+
+    /// 檢查是否有即將接管 terminal 的外部程式（如外部編輯器或 fzf）。
+    pub(crate) fn has_pending_external_takeover(&self) -> bool {
+        self.pending_launch.is_some() || self.pending_fzf_jump.is_some()
+    }
 }

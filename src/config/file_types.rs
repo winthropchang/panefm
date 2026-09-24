@@ -86,6 +86,7 @@ pub(crate) struct WatcherConfigFile {
 pub(crate) struct NavigationConfigFile {
     pub(crate) fast_move_step: Option<usize>,
     pub(crate) panel_page_step: Option<usize>,
+    pub(crate) scroll_acceleration: Option<bool>,
 }
 
 /// 表示 `behavior` 區塊的原始設定格式。

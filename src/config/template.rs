@@ -83,6 +83,9 @@ fast_move_step = 5
 # 使用 Ctrl+D / Ctrl+U 翻頁捲動時的移動列數。
 panel_page_step = 10
 
+# 長按 j / k 連發時是否啟用階梯式智能加速（長按平滑翻倍，放開瞬間 0ms 煞車回歸精確 1 格）。
+# scroll_acceleration = true
+
 [search]
 # 全域內容全文搜尋 (rg) 時，最多載入的符合項目上限。
 global_search_limit = 200

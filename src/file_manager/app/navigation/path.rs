@@ -38,9 +38,10 @@ impl App {
         let current_cwd = {
             let pane = self.panes.get_mut(&pane_id).expect("panel checked above");
             pane.go_to_path(target_path)?;
-            self.directory_entry_cache
-                .insert(pane.cwd.clone(), pane.entries.clone());
-            pane.cwd.clone()
+            let cwd = pane.cwd.clone();
+            let entries = pane.entries.clone();
+            self.store_directory_cache(cwd.clone(), entries);
+            cwd
         };
         self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
         self.zoxide_tracker.track(&current_cwd);
@@ -70,9 +71,10 @@ impl App {
         let current_cwd = {
             let pane = self.panes.get_mut(&pane_id).expect("panel checked above");
             pane.reveal_path(target_path)?;
-            self.directory_entry_cache
-                .insert(pane.cwd.clone(), pane.entries.clone());
-            pane.cwd.clone()
+            let cwd = pane.cwd.clone();
+            let entries = pane.entries.clone();
+            self.store_directory_cache(cwd.clone(), entries);
+            cwd
         };
         self.restart_directory_size_scan_after_navigation(pane_id, &previous_cwd);
         self.zoxide_tracker.track(&current_cwd);
@@ -383,9 +385,13 @@ impl App {
         for pane in self.panes.values_mut() {
             pane.reload()?;
         }
-        for pane in self.panes.values() {
-            self.directory_entry_cache
-                .insert(pane.cwd.clone(), pane.entries.clone());
+        let entries_to_cache: Vec<_> = self
+            .panes
+            .values()
+            .map(|p| (p.cwd.clone(), p.entries.clone()))
+            .collect();
+        for (cwd, entries) in entries_to_cache {
+            self.store_directory_cache(cwd, entries);
         }
         let size_panes = self
             .panes
@@ -417,18 +423,19 @@ impl App {
         {
             pane.reload()?;
         }
-        for pane in self
+        let entries_to_cache: Vec<_> = self
             .panes
             .values()
             .filter(|pane| pane.cwd == directory || pane.cwd.starts_with(directory))
-        {
-            self.directory_entry_cache
-                .insert(pane.cwd.clone(), pane.entries.clone());
+            .map(|p| (p.cwd.clone(), p.entries.clone()))
+            .collect();
+        for (cwd, entries) in entries_to_cache {
+            self.store_directory_cache(cwd, entries);
         }
+        let active_cwds: BTreeSet<_> = self.panes.values().map(|p| p.cwd.clone()).collect();
         // 清理不在目前開啟 panel 中的陳舊子目錄快取
-        self.directory_entry_cache.retain(|cached_path, _| {
-            !cached_path.starts_with(directory)
-                || self.panes.values().any(|pane| &pane.cwd == cached_path)
+        self.retain_directory_cache(|cached_path| {
+            !cached_path.starts_with(directory) || active_cwds.contains(cached_path)
         });
         self.vcs_manager.invalidate(Some(directory.to_path_buf()));
         if self.config.ui.vcs.enabled {

@@ -342,6 +342,21 @@ pub(crate) enum PendingAction {
     },
 }
 
+/// 記錄清單垂直導航方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavDirection {
+    Up,
+    Down,
+}
+
+/// 記錄連續長按滾動的智能加速狀態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NavAcceleration {
+    pub(crate) direction: NavDirection,
+    pub(crate) last_press: Instant,
+    pub(crate) repeat_count: usize,
+}
+
 /// 表示整個應用程式的核心狀態。
 ///
 /// 這個結構整合了設定、主題、視窗布局、焦點與互動模式，
@@ -370,6 +385,7 @@ pub(crate) struct App {
     pub(crate) pending_count: Option<usize>,
     pub(crate) pending_g: bool,
     pub(crate) pending_y: bool,
+    pub(crate) nav_acceleration: Option<NavAcceleration>,
     pub(crate) pending_bookmark: Option<BookmarkPrompt>,
     pub(crate) clipboard: Option<ClipboardState>,
     /// 全域檔案操作歷史；跨 panel 的 copy/move 仍應以同一批次復原。
@@ -397,6 +413,10 @@ pub(crate) struct App {
     pub(crate) directory_load_jobs: BTreeMap<usize, DirectoryLoadJob>,
     /// 已成功讀取的目錄清單快取；重複進出大型目錄時先立即顯示，再由背景結果校正。
     pub(crate) directory_entry_cache: BTreeMap<PathBuf, Vec<crate::file_manager::entry::FileEntry>>,
+    /// 目錄快取的寫入時間戳，用來判定是否在新鮮期內（5 秒內免重複開背景 worker 讀取）。
+    pub(crate) directory_cache_timestamps: BTreeMap<PathBuf, std::time::Instant>,
+    /// 離開目錄時記憶的游標選取項目，再次進入時自動還原。
+    pub(crate) directory_cache_cursors: BTreeMap<PathBuf, Option<PathBuf>>,
     pub(crate) visual_selection: Option<VisualSelectionState>,
     pub(crate) pending_action: Option<PendingAction>,
     pub(crate) help_return: Option<HelpReturnState>,

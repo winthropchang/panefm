@@ -6,9 +6,9 @@
 
 ## 1. 專案當前狀態快照 (Current Snapshot)
 
-- **最新發布版本**: `v0.1.25`
+- **最新發布版本**: `v0.1.26`
 - **當前分支**: `main`
-- **測試狀態**: **669 / 669 全數通過**（600 單元 + 19 config + 4 diff + 14 layout + 9 preview + 4 theme + 3 undo + 16 updater）
+- **測試狀態**: **682 / 682 全數通過**（613 單元 + 19 config + 4 diff + 14 layout + 9 preview + 4 theme + 3 undo + 16 updater）
 - **品質標準**: `cargo clippy --all-targets -- -D warnings` 零警告，`cargo fmt --check` 排版通過。
 - **已完成重構里程碑（累計 17 大模組完成，全專案 100% 檔案 < 1,000 行，多數 < 800 行）**:
   1. `Phase 1`: `src/file_manager/app/mod.rs` (6,908 -> 1,643 行，抽出 10 個領域子模組)

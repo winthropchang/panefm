@@ -101,8 +101,7 @@ impl App {
         }
         for pane_id in &affected_panes {
             if let Some(pane) = self.panes.get(pane_id) {
-                self.directory_entry_cache
-                    .insert(pane.cwd.clone(), pane.entries.clone());
+                self.store_directory_cache(pane.cwd.clone(), pane.entries.clone());
             }
         }
         for pane_id in &affected_panes {
@@ -118,7 +117,7 @@ impl App {
         for dir in directories {
             self.vcs_manager.invalidate(Some(dir.clone()));
             if !self.panes.values().any(|pane| &pane.cwd == dir) {
-                self.directory_entry_cache.remove(dir);
+                self.invalidate_directory_cache(dir);
             }
         }
         for pane_id in &affected_panes {

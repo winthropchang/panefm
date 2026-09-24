@@ -100,6 +100,71 @@ impl App {
     ///
     /// 參數：`pane_id` 是導航來源 panel；`cwd` 是新目錄；`selected_path` 是回到父目錄
     /// 時應重新選取的子目錄。回傳：`() `；I/O 結果由 `poll_directory_load_jobs` 套用。
+    /// 檢查目錄快取是否仍然新鮮（在指定的 max_age 時間內）。
+    pub(crate) fn is_directory_cache_fresh(
+        &self,
+        path: &Path,
+        max_age: std::time::Duration,
+    ) -> bool {
+        if !self.directory_entry_cache.contains_key(path) {
+            return false;
+        }
+        self.directory_cache_timestamps
+            .get(path)
+            .is_some_and(|timestamp| timestamp.elapsed() < max_age)
+    }
+
+    /// 將成功讀取的目錄清單存入快取並記錄時間戳與 LRU 限制。
+    pub(crate) fn store_directory_cache(
+        &mut self,
+        path: PathBuf,
+        entries: Vec<crate::file_manager::entry::FileEntry>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        self.directory_entry_cache.insert(path.clone(), entries);
+        self.directory_cache_timestamps
+            .insert(path, std::time::Instant::now());
+        self.prune_directory_cache_if_needed();
+    }
+
+    /// 主動讓指定目錄的快取失效（由 Watcher 或檔案變更調用）。
+    pub(crate) fn invalidate_directory_cache(&mut self, path: &Path) {
+        self.directory_entry_cache.remove(path);
+        self.directory_cache_timestamps.remove(path);
+        self.directory_cache_cursors.remove(path);
+    }
+
+    /// 依據條件保留快取項目，同步清理過期路徑。
+    pub(crate) fn retain_directory_cache<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&PathBuf) -> bool,
+    {
+        self.directory_entry_cache.retain(|path, _| predicate(path));
+        self.directory_cache_timestamps
+            .retain(|path, _| predicate(path));
+        self.directory_cache_cursors
+            .retain(|path, _| predicate(path));
+    }
+
+    /// 限制目錄快取最大容量（預設 64 個目錄），淘汰最舊的項目以防記憶體無界膨脹。
+    pub(crate) fn prune_directory_cache_if_needed(&mut self) {
+        const MAX_CACHED_DIRECTORIES: usize = 64;
+        if self.directory_cache_timestamps.len() > MAX_CACHED_DIRECTORIES
+            && let Some((oldest_path, _)) = self
+                .directory_cache_timestamps
+                .iter()
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(p, ts)| (p.clone(), *ts))
+        {
+            self.directory_entry_cache.remove(&oldest_path);
+            self.directory_cache_timestamps.remove(&oldest_path);
+            self.directory_cache_cursors.remove(&oldest_path);
+        }
+    }
+
+    /// 為指定 panel 啟動非同步目錄讀取工作，若目標處於新鮮快取中則直接 0ms 瞬間就緒。
     pub(crate) fn start_directory_load(
         &mut self,
         pane_id: usize,
@@ -111,6 +176,24 @@ impl App {
         if self.config.ui.vcs.enabled {
             self.vcs_manager.request_query(pane_id, cwd.clone());
         }
+
+        let target_selected =
+            selected_path.or_else(|| self.directory_cache_cursors.get(&cwd).cloned().flatten());
+
+        // 目錄穿梭 0ms 瞬間響應：在 5 秒 TTL 內重訪目錄直接命中快取，完全跳過背景 Worker 與硬碟 I/O
+        if self.is_directory_cache_fresh(&cwd, std::time::Duration::from_secs(5))
+            && let Some(cached) = self.directory_entry_cache.get(&cwd).cloned()
+            && let Some(pane) = self.panes.get_mut(&pane_id)
+        {
+            pane.replace_entries_presorted(cached, target_selected.as_deref());
+            if matches!(pane.active_detail_kind(), SortDetailKind::Size) {
+                pane.init_directory_sizes_if_missing();
+                self.start_directory_size_scan(pane_id);
+            }
+            self.status = format!("opened directory: {}", cwd.display());
+            return;
+        }
+
         let (sort_mode, random_seed) = self
             .panes
             .get(&pane_id)
@@ -119,12 +202,12 @@ impl App {
         if let Some(cached) = self.directory_entry_cache.get(&cwd).cloned()
             && let Some(pane) = self.panes.get_mut(&pane_id)
         {
-            pane.replace_entries_presorted(cached, selected_path.as_deref());
+            pane.replace_entries_presorted(cached, target_selected.as_deref());
         }
 
         let (sender, receiver) = mpsc::channel();
         let worker_cwd = cwd.clone();
-        let worker_selection = selected_path.clone();
+        let worker_selection = target_selected;
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         thread::spawn(move || {
@@ -243,8 +326,7 @@ impl App {
                     }
                     Ok(DirectoryLoadProgress::Complete(entries)) => {
                         job_done = true;
-                        self.directory_entry_cache
-                            .insert(event.cwd.clone(), entries.clone());
+                        self.store_directory_cache(event.cwd.clone(), entries.clone());
                         let mut restart_size_scan = false;
                         if let Some(pane) = self.panes.get_mut(&event.pane_id)
                             && pane.cwd == event.cwd

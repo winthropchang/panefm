@@ -281,6 +281,7 @@ fallback_poll_interval_ms = 3500
 [navigation]
 fast_move_step = 7
 panel_page_step = 14
+scroll_acceleration = false
 
 [behavior]
 cancel_search_on_leave = false
@@ -314,6 +315,7 @@ cancel_search_on_leave = false
     );
     assert_eq!(loaded.config.navigation.fast_move_step, 7);
     assert_eq!(loaded.config.navigation.panel_page_step, 14);
+    assert!(!loaded.config.navigation.scroll_acceleration);
     assert!(!loaded.config.behavior.cancel_search_on_leave);
     assert!(loaded.config.actions.open_with.is_empty());
     assert_eq!(loaded.source, Some(dir.path().join("config.toml")));
